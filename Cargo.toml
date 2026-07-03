@@ -5,6 +5,7 @@ members = [
     "crates/formwork-detect",
     "crates/formwork-compile",
     "crates/formwork-confine",
+    "crates/formwork-seam",
     "crates/formwork-cli",
 ]
 

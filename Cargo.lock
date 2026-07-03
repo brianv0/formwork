@@ -156,6 +156,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "formwork-seam"
+version = "0.1.0"
+dependencies = [
+ "formwork-compile",
+ "formwork-confine",
+ "formwork-detect",
+ "formwork-spec",
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "formwork-spec"
 version = "0.1.0"
 dependencies = [

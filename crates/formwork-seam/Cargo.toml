@@ -1,0 +1,23 @@
+[package]
+name = "formwork-seam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Dev-only: the seam tests compile a real net=Deny policy and spawn a confined child to prove the
+# injected-fd transport works with zero in-sandbox network (FW-E2E-010/011/012). These are never
+# part of the crate's own dependency surface.
+[dev-dependencies]
+formwork-spec = { workspace = true }
+formwork-detect = { workspace = true }
+formwork-compile = { workspace = true }
+formwork-confine = { workspace = true }
