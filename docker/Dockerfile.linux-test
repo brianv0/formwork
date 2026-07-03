@@ -1,0 +1,25 @@
+# First-line local Linux test image (plan §5). The kernel is the Docker VM's, not this image's, so
+# the harness gates on `formwork detect` and skips tiers the kernel can't carry. Run the container
+# with `--security-opt seccomp=unconfined --security-opt apparmor=unconfined` (see the justfile) so
+# Docker's own sandbox never masks the sandbox under test.
+FROM rust:1-bookworm
+
+# Toolchains the reuse tests exercise (FW-E2E-020..023): python, node, git, a C compiler.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-venv python3-pip \
+        nodejs npm \
+        git build-essential \
+        curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv for the modern-Python harness.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+WORKDIR /src
+COPY . .
+
+# Build and install the formwork binary onto PATH so `formwork detect` works in the container.
+RUN cargo build --workspace --release \
+    && install -m 0755 target/release/formwork /usr/local/bin/formwork
+
+CMD ["bash", "-lc", "formwork detect && cargo test --workspace"]

@@ -5,6 +5,7 @@ members = [
     "crates/formwork-detect",
     "crates/formwork-compile",
     "crates/formwork-confine",
+    "crates/formwork-cli",
 ]
 
 [workspace.package]
@@ -27,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 formwork-spec = { path = "crates/formwork-spec" }
 formwork-detect = { path = "crates/formwork-detect" }
 formwork-compile = { path = "crates/formwork-compile" }
+formwork-confine = { path = "crates/formwork-confine" }
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,68 @@
+# Formwork default profile — subtractive, not minimal (FW-CAP3, design §4).
+#
+# The philosophy (design §1): start from the real ambient environment and *subtract* a sensitive
+# set, rather than build a grant up from empty. Under this profile a well-behaved agent runs
+# pytest / npm / git / a C build with zero denials on the happy path (FW-TRA2), while credentials,
+# keys, other projects, and browser profiles stay denied even though reads are broad (FW-TRA3).
+#
+# `~` is expanded against $HOME when the CLI loads this file. Callers are expected to narrow this
+# (e.g. point writes at their actual project) — narrowing is always safe (FW-CAP2); widening is not.
+
+# Reads: broadly allowed over the ambient environment, minus the sensitive set below. On macOS this
+# is native `(allow default)` + deny holes; on Linux it is an enumerate-and-grant expansion at
+# enforce time (Landlock is allow-list only). See the plan §3.2.
+[fs]
+read-mode = "ambient-minus-subtract"
+
+# Reads still list the ambient roots explicitly: on Linux they seed the expansion, and they
+# document intent on both platforms.
+reads = [
+    "/**",
+]
+
+# Writable working set (FW-TRA5): the project and scratch areas. Callers should replace the project
+# path with their own. Everything else is read-only.
+writes = [
+    "~/project/**",
+    "/tmp/**",
+    "/private/tmp/**",   # macOS real path behind /tmp
+    "/var/tmp/**",
+]
+
+# Sensitive set subtracted even under the broad read grant (FW-TRA3). Kept in sync with
+# sensitive-set.toml. Deny wins over any grant, so these stay unreadable/unwritable.
+subtract = [
+    # SSH / GPG
+    "~/.ssh/**",
+    "~/.gnupg/**",
+    # cloud + CI credentials
+    "~/.aws/**",
+    "~/.config/gcloud/**",
+    "~/.azure/**",
+    "~/.kube/**",
+    "~/.docker/config.json",
+    "~/.netrc",
+    "~/.npmrc",
+    "~/.pypirc",
+    # shells / dotfile secrets frequently holding tokens
+    "~/.config/gh/**",
+    "~/.git-credentials",
+    # keychains (macOS)
+    "~/Library/Keychains/**",
+    "/Library/Keychains/**",
+    # browser profiles
+    "~/Library/Application Support/Google/Chrome/**",
+    "~/Library/Application Support/Firefox/**",
+    "~/.config/google-chrome/**",
+    "~/.mozilla/**",
+    # system credential stores
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/sudoers.d/**",
+]
+
+# Fail-closed egress (FW-XR3): the agent reaches the network only through the gateway fd.
+net = "deny"
+
+# Exec is unrestricted by default for transparency (FW-ISO4); set an allow-list to restrict.
+exec = "unrestricted"

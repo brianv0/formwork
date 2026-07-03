@@ -1,0 +1,36 @@
+# The sensitive superset (FW-TRA3, design §11 "sensitive-set discovery").
+#
+# The fail-closed answer to "how much is auto-detected vs configured": deny a broad KNOWN-sensitive
+# superset by default and let callers narrow. Missing a new secret location should fail safe (still
+# denied because it falls under a broad category), not fail open. This file is the canonical list;
+# profiles/default.toml mirrors it into its `subtract`, and tests assert the two stay in sync.
+#
+# Grouped by category so it is auditable. `~` expands against $HOME at load time.
+
+[credentials]
+ssh          = ["~/.ssh/**"]
+gpg          = ["~/.gnupg/**"]
+aws          = ["~/.aws/**"]
+gcloud       = ["~/.config/gcloud/**"]
+azure        = ["~/.azure/**"]
+kube         = ["~/.kube/**"]
+docker       = ["~/.docker/config.json"]
+netrc        = ["~/.netrc"]
+npm          = ["~/.npmrc"]
+pypi         = ["~/.pypirc"]
+github_cli   = ["~/.config/gh/**"]
+git_creds    = ["~/.git-credentials"]
+
+[keychains]
+macos_user   = ["~/Library/Keychains/**"]
+macos_system = ["/Library/Keychains/**"]
+
+[browser_profiles]
+chrome_macos   = ["~/Library/Application Support/Google/Chrome/**"]
+firefox_macos  = ["~/Library/Application Support/Firefox/**"]
+chrome_linux   = ["~/.config/google-chrome/**"]
+firefox_linux  = ["~/.mozilla/**"]
+
+[system]
+shadow   = ["/etc/shadow"]
+sudoers  = ["/etc/sudoers", "/etc/sudoers.d/**"]

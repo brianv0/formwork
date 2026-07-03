@@ -1,0 +1,15 @@
+# FW-E2E-001: granted read succeeds, ungranted read denied.
+
+# net defaults to fail-closed deny; explicit forms are `net = "deny"` or
+# `net = { ports = [8080] }`.
+net = "deny"
+
+[fs]
+read-mode = "closed"
+reads = ["/work/project/**"]
+writes = ["/work/project/**"]
+
+[mcp.files]
+tools = { allow = ["read_file"] }
+resources = "deny"
+prompts = "deny"
