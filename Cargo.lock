@@ -20,6 +20,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "formwork-confine"
+version = "0.1.0"
+dependencies = [
+ "formwork-compile",
+ "formwork-detect",
+ "formwork-spec",
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "formwork-detect"
 version = "0.1.0"
 dependencies = [
