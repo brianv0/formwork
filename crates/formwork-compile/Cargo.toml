@@ -1,0 +1,16 @@
+[package]
+name = "formwork-compile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+formwork-spec = { workspace = true }
+formwork-detect = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

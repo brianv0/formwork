@@ -1,0 +1,16 @@
+[package]
+name = "formwork-spec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# serde_json is used only by the path-pattern serde round-trip tests, not by the crate itself.
+serde_json = { workspace = true }
+toml = { workspace = true }
