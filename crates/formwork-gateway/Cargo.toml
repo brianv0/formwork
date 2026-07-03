@@ -1,0 +1,20 @@
+[package]
+name = "formwork-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+formwork-spec = { workspace = true }
+formwork-compile = { workspace = true }
+formwork-confine = { workspace = true }
+tracing = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "process", "sync", "time"] }
+
+[dev-dependencies]
+formwork-detect = { workspace = true }
