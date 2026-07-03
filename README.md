@@ -23,10 +23,10 @@ Under construction, kernel-mechanism-first (plan §4).
 | 3 | macOS confiner (Seatbelt) | **done** — real kernel enforcement; `FW-E2E-001..006, 024` green natively |
 | 5 | fd-injection transport (seam) | **done** — `FW-E2E-010/011/012` green; transport verified on macOS *and* Linux |
 | — | Python E2E harness | **done** — black-box CLI tests + generated traceability, `uv`-managed |
+| 6 | Gateway (MCP shading) | **done** — `FW-E2E-013..019` + `FW-ADV-004` green; backend confinement uses real Seatbelt |
 | 2 | Linux confiner (Landlock + seccomp) | designed ([`docs/linux-backend.md`](docs/linux-backend.md)); honest stub — needs a 5.13+ kernel to verify |
-| 6 | Gateway (MCP shading) | not started |
 
-57 Rust tests pass on macOS (`cargo test`), 8 Python E2E tests pass (`cd py && uv run pytest`),
+65 Rust tests pass on macOS (`cargo test`), 8 Python E2E tests pass (`cd py && uv run pytest`),
 clippy is clean under `-D warnings`, and the whole workspace cross-compiles for Linux
 (`cargo check --target x86_64-unknown-linux-gnu`). On real Linux (Docker, kernel 5.10 — no Landlock)
 `formwork detect` and the degraded-host honesty path (FW-E2E-025/026, FW-INV6) are verified.
@@ -38,6 +38,7 @@ clippy is clean under `-D warnings`, and the whole workspace cross-compiles for 
 - `crates/formwork-compile` — the pure `spec → {confiner, gateway, FidelityReport}` compiler.
 - `crates/formwork-confine` — the confiners (Landlock+seccomp / Seatbelt), two postures.
 - `crates/formwork-seam` — the fd-injection transport: socketpair-at-spawn + `SCM_RIGHTS` minting.
+- `crates/formwork-gateway` — the MCP-aware policy proxy: shading, policing, transparent passthrough.
 - `crates/formwork-cli` — the `formwork` binary (v1 embedding surface).
 - `profiles/` — the subtractive default profile and sensitive set.
 - `py/` — the pytest end-to-end / adversarial harness and MCP/reuse fixtures (dev-only).
