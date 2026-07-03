@@ -1,0 +1,24 @@
+[project]
+name = "formwork-harness"
+version = "0.1.0"
+description = "End-to-end / adversarial test harness for Formwork (dev-only; never shipped)"
+requires-python = ">=3.11"
+dependencies = [
+    "pytest>=8",
+    # MCP fixture servers (the official `mcp` SDK) arrive with the gateway work in Phase 6.
+    # Left out for now so the harness install is fast and dependency-light.
+]
+
+[tool.uv]
+# uv manages a modern Python; the system interpreter is 3.9 and is not used.
+
+[tool.pytest.ini_options]
+testpaths = ["harness"]
+markers = [
+    # Each end-to-end / adversarial test carries its design-doc ID as a marker, so the
+    # requirements<->tests traceability table can be generated rather than hand-maintained.
+    "fw_e2e: an FW-E2E-* end-to-end scenario",
+    "fw_adv: an FW-ADV-* adversarial scenario",
+    "macos: requires the macOS Seatbelt backend",
+    "linux: requires the Linux Landlock/seccomp backend",
+]
