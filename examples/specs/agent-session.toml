@@ -1,0 +1,49 @@
+# Sandbox for an interactive coding agent (Claude Code / codex / opencode) launched under
+# `formwork run`. The kernel — not the agent's own permission prompts — is the wall, which is what
+# makes it safe to hand the agent its "skip every prompt" flag (see each host's README).
+#
+# This is profiles/default.toml narrowed to one project. `~` expands against $HOME when the CLI
+# loads the spec; narrowing a grant is always safe, widening is not (FW-CAP2).
+#
+#   reads   the whole ambient environment MINUS a sensitive set (keys, cloud creds, keychains,
+#           browser profiles). The canonical superset lives in profiles/sensitive-set.toml.
+#   writes  one project tree + scratch. Point this at your repo.
+#   net     HTTPS egress only, so the agent still reaches its model API. This is port-scoped, not
+#           host-scoped: formwork does not (yet) allowlist egress by host, so treat :443 as "any
+#           HTTPS host". The fs sandbox is what stops secrets being read to exfiltrate at all.
+#   exec    unrestricted, so the agent runs tools freely; set an allowlist to restrict execve.
+
+net = { ports = [443] }
+exec = "unrestricted"
+
+[fs]
+read-mode = "ambient-minus-subtract"
+reads = ["/**"]
+writes = ["~/project/**", "/tmp/**", "/private/tmp/**", "/var/tmp/**"]
+subtract = [
+    # SSH / GPG / cloud + CI credentials
+    "~/.ssh/**",
+    "~/.gnupg/**",
+    "~/.aws/**",
+    "~/.config/gcloud/**",
+    "~/.azure/**",
+    "~/.kube/**",
+    "~/.docker/config.json",
+    "~/.netrc",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.config/gh/**",
+    "~/.git-credentials",
+    # keychains (macOS)
+    "~/Library/Keychains/**",
+    "/Library/Keychains/**",
+    # browser profiles
+    "~/Library/Application Support/Google/Chrome/**",
+    "~/Library/Application Support/Firefox/**",
+    "~/.config/google-chrome/**",
+    "~/.mozilla/**",
+    # system credential stores
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/sudoers.d/**",
+]

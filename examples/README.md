@@ -1,0 +1,65 @@
+# Formwork examples
+
+Two independent ways to put Formwork around a coding agent, and how to wire each into Claude Code,
+codex, and opencode. They compose — use either alone or both together.
+
+| Axis | What it does | Command | Where it's enforced |
+|---|---|---|---|
+| **A — confine the agent** | Run the whole agent process (and every child it spawns) behind a kernel-enforced fs/net/exec wall. | `formwork run --spec … -- <agent> <flags>` | Seatbelt (macOS) / Landlock+seccomp (Linux) |
+| **B — shade its MCP servers** | Put a policy gateway between the agent and each MCP server: only granted tools/resources/prompts are visible or callable, and the server itself runs confined. | `formwork gateway --spec … --server <name> -- <server cmd>` | The gateway is a stdio MCP server the host launches |
+
+## Why this matters: turn off the permission prompts, safely
+
+Every one of these agents ships a "stop asking me, just do it" mode — Claude Code's
+`--dangerously-skip-permissions`, codex's `--dangerously-bypass-approvals-and-sandbox` (`--yolo`),
+opencode's `permission: "allow"` / `--auto`. Those modes are dangerous precisely because the *only*
+thing standing between the model and your filesystem/network is the agent's own in-app confirmation.
+
+Axis A moves the wall down to the kernel. Once reads, writes, exec, and egress are boundaries the OS
+enforces on the process, the in-app prompt is no longer load-bearing — so you can turn it off and let
+the agent run uninterrupted, while credentials, other projects, and the network stay unreachable.
+Each host's `sandbox-agent.sh` shows the exact invocation.
+
+## What's actually enforced (be honest, check the host)
+
+Formwork claims only what the current host can back. Check yours:
+
+```sh
+formwork detect                                   # capabilities of this machine
+formwork compile --spec examples/specs/agent-session.toml --report-only   # per-capability fidelity
+```
+
+On macOS (Seatbelt) fs read/write, default-deny egress, and the direct-TCP port tier are all
+enforced by the kernel. Egress is **port-scoped, not host-scoped**: `net = { ports = [443] }` allows
+any HTTPS host, so the agent reaches its model API — the filesystem sandbox, not an egress
+allowlist, is what stops secrets being read to exfiltrate in the first place. On a host that can't
+enforce a capability, `formwork` reports the gap instead of pretending (it never fails open).
+
+## Layout
+
+```
+examples/
+  specs/agent-session.toml   # Axis A: confine an agent — scoped writes, secrets subtracted, HTTPS-only egress
+  specs/mcp-gateway.toml      # Axis B: gateway policy — [mcp.files] shading + backend confinement
+  gateway-demo.sh             # runnable Axis B demo against the built-in fixture (no external deps)
+  claude-code/                # per-host: sandbox-agent.sh + the MCP-override config to stage
+  codex/
+  opencode/
+```
+
+## Install `formwork`
+
+The examples call `formwork` on your PATH. Build and install it from the repo root:
+
+```sh
+cargo install --path crates/formwork-cli    # puts `formwork` on PATH
+# or, without installing, use the built binary directly:
+cargo build -p formwork-cli                 # ./target/debug/formwork
+```
+
+## Try it
+
+```sh
+./examples/gateway-demo.sh                  # Axis B, end to end, runs as-is
+cat examples/claude-code/README.md          # Axis A + staging the MCP override, per host
+```

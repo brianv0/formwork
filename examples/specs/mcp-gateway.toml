@@ -1,0 +1,27 @@
+# Spec for `formwork gateway`. One spec governs both surfaces the gateway controls:
+#
+#   [mcp.files]   shades the MCP protocol — only `read_file` is visible and callable; every other
+#                 tool (write_file, http_fetch), plus all resources and prompts, is absent from
+#                 listings and non-invocable. A hidden-but-real name and a nonexistent one get the
+#                 same refusal, so the shading is not an oracle (FW-GW2/GW3, FW-ADV-004).
+#
+#   fs / net      confine the spawned backend process itself (FW-GW5): the server runs behind the
+#                 same wall, so even a compromised or over-eager backend cannot read outside its
+#                 grant or open the network.
+#
+# The demo backend is the repo's built-in fixture (crates/formwork-gateway, bin fw-mcp-fixture), so
+# `examples/gateway-demo.sh` runs with no external dependencies. For a real server, keep this shape
+# and swap the backend command — see each host's config file — then narrow reads/writes to the tree
+# that server should see and set net to only what it needs.
+
+net = "deny"
+
+[fs]
+read-mode = "ambient-minus-subtract"
+reads = ["/**"]
+writes = []
+
+[mcp.files]
+tools = { allow = ["read_file"] }
+resources = "deny"
+prompts = "deny"

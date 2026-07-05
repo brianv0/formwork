@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "files": {
+      "type": "stdio",
+      "command": "formwork",
+      "args": [
+        "gateway",
+        "--spec", "./examples/specs/mcp-gateway.toml",
+        "--server", "files",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "."
+      ]
+    }
+  }
+}

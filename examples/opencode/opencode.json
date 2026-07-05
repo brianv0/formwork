@@ -1,0 +1,18 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": "allow",
+  "mcp": {
+    "files": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "formwork",
+        "gateway",
+        "--spec", "./examples/specs/mcp-gateway.toml",
+        "--server", "files",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "."
+      ]
+    }
+  }
+}

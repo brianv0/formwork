@@ -1,0 +1,19 @@
+# codex MCP config. Drop this into ~/.codex/config.toml (global) or ./.codex/config.toml (project,
+# trusted). Instead of launching the filesystem server directly, codex launches `formwork gateway`,
+# which shades the server's tools and confines the server process. Everything after `--` is the real
+# backend command the gateway wraps.
+#
+# Equivalent one-liner (no hand-editing):
+#   codex mcp add files -- formwork gateway \
+#       --spec ./examples/specs/mcp-gateway.toml --server files -- \
+#       npx -y @modelcontextprotocol/server-filesystem .
+
+[mcp_servers.files]
+command = "formwork"
+args = [
+    "gateway",
+    "--spec", "./examples/specs/mcp-gateway.toml",
+    "--server", "files",
+    "--",
+    "npx", "-y", "@modelcontextprotocol/server-filesystem", ".",
+]
