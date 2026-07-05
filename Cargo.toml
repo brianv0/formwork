@@ -31,6 +31,7 @@ formwork-spec = { path = "crates/formwork-spec" }
 formwork-detect = { path = "crates/formwork-detect" }
 formwork-compile = { path = "crates/formwork-compile" }
 formwork-confine = { path = "crates/formwork-confine" }
+formwork-gateway = { path = "crates/formwork-gateway" }
 
 [profile.release]
 lto = "thin"
