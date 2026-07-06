@@ -69,29 +69,30 @@ fn confined(
     compile(&spec, &detect())
 }
 
-/// Outcome of a direct-connect probe. Distinguishing these matters: "python exited nonzero" would
-/// also pass if python failed to *start*, never reaching `connect()` -- a false confirmation.
+/// Outcome of a direct-connect probe. Distinguishing these matters: a probe that failed to *start*,
+/// never reaching `connect()`, must not read as denial -- that would be a false confirmation.
 #[derive(Debug, PartialEq)]
 enum ConnectProbe {
     Connected,         // egress LEAKED (exit 0)
-    DeniedAtConnect,   // python ran, connect() raised PermissionError (exit 7)
-    OtherFailure(i32), // python failed for some other reason
+    DeniedAtConnect,   // connect() returned EPERM/EACCES (exit 7)
+    OtherFailure(i32), // reached connect() but failed otherwise, or the probe could not run
 }
 
-/// cwd must be readable, else the interpreter's `sys.path` scan trips before `connect()` is reached.
+/// Runs the self-contained `connect_probe` binary (`src/bin/connect_probe.rs`) *inside* the sandbox
+/// and reads its exit code. It is staged into `cwd` -- which the policy grants read -- because the
+/// build-output path is outside the read scope; being std-only it links just libSystem and so starts
+/// under the read-only policy wherever `/bin/cat` does. (An earlier version shelled out to
+/// `/usr/bin/python3`, but that CLT stub cannot load its interpreter when `xcode-select` points into
+/// `/Applications/Xcode.app`, as on GitHub's macOS runners -- it dies before reaching `connect()`.)
 fn tcp_connect_probe(policy: &formwork_compile::CompiledPolicy, cwd: &Path) -> ConnectProbe {
-    let script = "import socket,sys\n\
-        s=socket.socket()\n\
-        s.settimeout(3)\n\
-        try:\n    s.connect(('93.184.216.34',80)); sys.exit(0)\n\
-        except PermissionError:\n    sys.exit(7)\n\
-        except Exception:\n    sys.exit(8)\n";
-    let mut cmd = Command::new("/usr/bin/python3");
-    cmd.arg("-c").arg(script).current_dir(cwd);
+    let staged = cwd.join("connect_probe");
+    fs::copy(env!("CARGO_BIN_EXE_connect_probe"), &staged).expect("stage probe binary");
+    let mut cmd = Command::new(&staged);
+    cmd.current_dir(cwd);
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     formwork_confine::spawn_confined(&mut cmd, policy).expect("confinement applies");
-    match cmd.status().expect("python runs").code() {
+    match cmd.status().expect("probe runs").code() {
         Some(0) => ConnectProbe::Connected,
         Some(7) => ConnectProbe::DeniedAtConnect,
         other => ConnectProbe::OtherFailure(other.unwrap_or(-1)),

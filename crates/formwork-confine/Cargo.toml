@@ -6,6 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Test-support only: a self-contained egress probe the Seatbelt tests run *inside* the sandbox to
+# observe connect() denial from a binary that needs nothing outside the policy's read scope. Std-only
+# and not part of the shipped binary (releases build only formwork-cli). See src/bin/connect_probe.rs.
+[[bin]]
+name = "connect_probe"
+path = "src/bin/connect_probe.rs"
+
 [dependencies]
 formwork-spec = { workspace = true }
 formwork-detect = { workspace = true }
