@@ -78,15 +78,15 @@ enum ConnectProbe {
     OtherFailure(i32), // reached connect() but failed otherwise, or the probe could not run
 }
 
-/// Runs the self-contained `connect_probe` binary (`src/bin/connect_probe.rs`) *inside* the sandbox
-/// and reads its exit code. It is staged into `cwd` -- which the policy grants read -- because the
-/// build-output path is outside the read scope; being std-only it links just libSystem and so starts
-/// under the read-only policy wherever `/bin/cat` does. (An earlier version shelled out to
-/// `/usr/bin/python3`, but that CLT stub cannot load its interpreter when `xcode-select` points into
-/// `/Applications/Xcode.app`, as on GitHub's macOS runners -- it dies before reaching `connect()`.)
+/// Runs the self-contained `fw-connect-probe` binary *inside* the sandbox and reads its exit code.
+/// It is staged into `cwd` -- which the policy grants read -- because the build-output path is
+/// outside the read scope; being std-only it links just libSystem and so starts under the read-only
+/// policy wherever `/bin/cat` does. (An earlier version shelled out to `/usr/bin/python3`, but that
+/// CLT stub cannot load its interpreter when `xcode-select` points into `/Applications/Xcode.app`,
+/// as on GitHub's macOS runners -- it dies before reaching `connect()`.)
 fn tcp_connect_probe(policy: &formwork_compile::CompiledPolicy, cwd: &Path) -> ConnectProbe {
-    let staged = cwd.join("connect_probe");
-    fs::copy(env!("CARGO_BIN_EXE_connect_probe"), &staged).expect("stage probe binary");
+    let staged = cwd.join("fw-connect-probe");
+    fs::copy(env!("CARGO_BIN_EXE_fw-connect-probe"), &staged).expect("stage probe binary");
     let mut cmd = Command::new(&staged);
     cmd.current_dir(cwd);
     cmd.stdout(std::process::Stdio::null())
