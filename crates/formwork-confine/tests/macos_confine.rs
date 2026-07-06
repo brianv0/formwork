@@ -145,16 +145,24 @@ fn fw_e2e_005_descendant_inheritance() {
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     formwork_confine::spawn_confined(&mut cmd, &policy).unwrap();
-    assert!(!cmd.status().unwrap().success(), "descendant must not escape the sandbox");
+    assert!(
+        !cmd.status().unwrap().success(),
+        "descendant must not escape the sandbox"
+    );
 
     // The same pipeline reading an in-scope file still works.
     let mut ok = Command::new("/bin/sh");
-    ok.arg("-c")
-        .arg(format!("/bin/cat {}", fx.granted().join("ok.txt").display()));
+    ok.arg("-c").arg(format!(
+        "/bin/cat {}",
+        fx.granted().join("ok.txt").display()
+    ));
     ok.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     formwork_confine::spawn_confined(&mut ok, &policy).unwrap();
-    assert!(ok.status().unwrap().success(), "in-scope descendant read should still work");
+    assert!(
+        ok.status().unwrap().success(),
+        "in-scope descendant read should still work"
+    );
 }
 
 /// FW-E2E-002: writes inside the write grant succeed; a read-only-granted path and /etc are denied.
@@ -164,11 +172,17 @@ fn fw_e2e_002_write_scope_and_readonly() {
     let policy = confined(vec![pp(&fx.root)], vec![pp(&fx.granted())], vec![]);
 
     assert!(
-        sh_succeeds(&policy, &format!("echo x > {}/new.txt", fx.granted().display())),
+        sh_succeeds(
+            &policy,
+            &format!("echo x > {}/new.txt", fx.granted().display())
+        ),
         "write inside the write grant must succeed"
     );
     assert!(
-        !sh_succeeds(&policy, &format!("echo x > {}/secret/injected.txt", fx.root.display())),
+        !sh_succeeds(
+            &policy,
+            &format!("echo x > {}/secret/injected.txt", fx.root.display())
+        ),
         "write to a read-only-granted path must be denied"
     );
     assert!(
@@ -181,7 +195,11 @@ fn fw_e2e_002_write_scope_and_readonly() {
 #[test]
 fn fw_e2e_003_sensitive_subtraction_under_broad_grant() {
     let fx = Fixture::new("e2e003");
-    let policy = confined(vec![pp(&fx.root)], vec![], vec![pp(&fx.root.join("secret"))]);
+    let policy = confined(
+        vec![pp(&fx.root)],
+        vec![],
+        vec![pp(&fx.root.join("secret"))],
+    );
 
     assert!(
         cat_succeeds(&policy, &fx.granted().join("ok.txt")),
@@ -227,8 +245,14 @@ fn fw_e2e_024_report_soundness_probes() {
         }
         match cap {
             Capability::FsRead => {
-                assert!(cat_succeeds(&policy, &fx.granted().join("ok.txt")), "fs-read allow probe");
-                assert!(!cat_succeeds(&policy, &fx.secret_file()), "fs-read deny probe");
+                assert!(
+                    cat_succeeds(&policy, &fx.granted().join("ok.txt")),
+                    "fs-read allow probe"
+                );
+                assert!(
+                    !cat_succeeds(&policy, &fx.secret_file()),
+                    "fs-read deny probe"
+                );
             }
             Capability::NetDefaultDeny => {
                 assert_eq!(
@@ -272,7 +296,10 @@ fn fw_e2e_001_confine_self_posture() {
     } else {
         -1
     };
-    assert_eq!(exit, 0, "confine-self child: in-scope read ok AND out-of-scope denied");
+    assert_eq!(
+        exit, 0,
+        "confine-self child: in-scope read ok AND out-of-scope denied"
+    );
 }
 
 /// FW-E2E-006: under net=deny, an outbound connection fails closed at connect() (not masked by a

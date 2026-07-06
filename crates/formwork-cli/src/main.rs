@@ -25,7 +25,11 @@ use formwork_detect::{detect, HostProfile};
 use formwork_spec::McpPolicy;
 
 #[derive(Parser)]
-#[command(name = "formwork", version, about = "OS-level sandbox for agent sessions")]
+#[command(
+    name = "formwork",
+    version,
+    about = "OS-level sandbox for agent sessions"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -163,11 +167,7 @@ fn main() -> Result<()> {
         }
         Cmd::Run { spec, argv } => run(spec, argv, Posture::Spawn)?,
         Cmd::EnforceSelf { spec, argv } => run(spec, argv, Posture::Self_)?,
-        Cmd::Gateway {
-            spec,
-            server,
-            argv,
-        } => gateway(spec, server, argv)?,
+        Cmd::Gateway { spec, server, argv } => gateway(spec, server, argv)?,
     }
     Ok(())
 }
@@ -182,7 +182,8 @@ fn run(spec: PathBuf, argv: Vec<String>, posture: Posture) -> Result<()> {
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
     // faithfully rendered (FW-INV6).
-    let spec = spec_load::canonicalize_for_enforcement(&spec).context("canonicalizing grant paths")?;
+    let spec =
+        spec_load::canonicalize_for_enforcement(&spec).context("canonicalizing grant paths")?;
     let host = detect();
     let policy = compile(&spec, &host);
 

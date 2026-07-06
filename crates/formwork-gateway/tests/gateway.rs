@@ -92,7 +92,11 @@ async fn fw_e2e_013_tool_invisibility() {
     let mut agent = start(tools_only(&["read_file"]));
     agent.request(1, "tools/list", json!({})).await;
     let listed = names(&agent.recv().await, "tools", "name");
-    assert_eq!(listed, vec!["read_file"], "only the granted tool is visible");
+    assert_eq!(
+        listed,
+        vec!["read_file"],
+        "only the granted tool is visible"
+    );
 }
 
 /// FW-E2E-014 + FW-ADV-004: an ungranted call is refused as a genuine absence; a hidden-real tool is
@@ -102,17 +106,28 @@ async fn fw_e2e_014_adv_004_ungranted_call_refused_no_oracle() {
     let mut agent = start(tools_only(&["read_file"]));
 
     agent
-        .request(1, "tools/call", json!({"name": "http_fetch", "arguments": {}}))
+        .request(
+            1,
+            "tools/call",
+            json!({"name": "http_fetch", "arguments": {}}),
+        )
         .await;
     let hidden_real = agent.recv().await;
 
     agent
-        .request(2, "tools/call", json!({"name": "does_not_exist", "arguments": {}}))
+        .request(
+            2,
+            "tools/call",
+            json!({"name": "does_not_exist", "arguments": {}}),
+        )
         .await;
     let nonexistent = agent.recv().await;
 
     // Identical but for id and the echoed name, so nothing reveals that http_fetch exists-but-blocked.
-    assert!(hidden_real["error"].is_object(), "hidden-real call must error, not execute");
+    assert!(
+        hidden_real["error"].is_object(),
+        "hidden-real call must error, not execute"
+    );
     assert_eq!(hidden_real["error"]["code"], nonexistent["error"]["code"]);
     let strip = |v: &Value| {
         v["error"]["message"]
@@ -121,7 +136,11 @@ async fn fw_e2e_014_adv_004_ungranted_call_refused_no_oracle() {
             .replace("http_fetch", "X")
             .replace("does_not_exist", "X")
     };
-    assert_eq!(strip(&hidden_real), strip(&nonexistent), "refusals must be indistinguishable");
+    assert_eq!(
+        strip(&hidden_real),
+        strip(&nonexistent),
+        "refusals must be indistinguishable"
+    );
     assert!(!hidden_real["error"]["message"]
         .as_str()
         .unwrap()
@@ -140,10 +159,16 @@ async fn fw_e2e_015_resource_and_prompt_shading() {
     let mut agent = start(policy);
 
     agent.request(1, "resources/list", json!({})).await;
-    assert_eq!(names(&agent.recv().await, "resources", "uri"), vec!["file:///pub"]);
+    assert_eq!(
+        names(&agent.recv().await, "resources", "uri"),
+        vec!["file:///pub"]
+    );
 
     agent.request(2, "prompts/list", json!({})).await;
-    assert_eq!(names(&agent.recv().await, "prompts", "name"), vec!["greeting"]);
+    assert_eq!(
+        names(&agent.recv().await, "prompts", "name"),
+        vec!["greeting"]
+    );
 
     // Ungranted resource read and prompt get are refused.
     agent
@@ -152,7 +177,11 @@ async fn fw_e2e_015_resource_and_prompt_shading() {
     assert!(agent.recv().await["error"].is_object());
 
     agent
-        .request(4, "prompts/get", json!({"name": "secret_prompt", "arguments": {}}))
+        .request(
+            4,
+            "prompts/get",
+            json!({"name": "secret_prompt", "arguments": {}}),
+        )
         .await;
     assert!(agent.recv().await["error"].is_object());
 
@@ -174,7 +203,9 @@ async fn fw_e2e_015_resource_templates_shaded_by_uri_template() {
     };
     let mut agent = start(policy);
 
-    agent.request(1, "resources/templates/list", json!({})).await;
+    agent
+        .request(1, "resources/templates/list", json!({}))
+        .await;
     assert_eq!(
         names(&agent.recv().await, "resourceTemplates", "uriTemplate"),
         vec!["file:///logs/{name}"],
@@ -196,7 +227,11 @@ async fn fw_e2e_016_list_changed_refiltering() {
     assert_eq!(listed, vec!["read_file"], "runtime-added tool stays hidden");
 
     agent
-        .request(2, "tools/call", json!({"name": "new_tool", "arguments": {}}))
+        .request(
+            2,
+            "tools/call",
+            json!({"name": "new_tool", "arguments": {}}),
+        )
         .await;
     assert!(agent.recv().await["error"].is_object());
 }
@@ -226,7 +261,11 @@ async fn fw_e2e_017_sampling_policing() {
 async fn fw_e2e_018_transparent_passthrough() {
     let mut agent = start(tools_only(&["read_file"]));
     agent
-        .request(1, "tools/call", json!({"name": "read_file", "arguments": {"path": "/x"}}))
+        .request(
+            1,
+            "tools/call",
+            json!({"name": "read_file", "arguments": {"path": "/x"}}),
+        )
         .await;
     let result = agent.recv().await;
     assert_eq!(result["id"], 1);
@@ -244,7 +283,10 @@ async fn fw_e2e_017_sampling_allowed_passes_through() {
     let mut agent = start(policy);
     agent.notify("trigger/sampling", json!({})).await;
     let msg = agent.recv().await;
-    assert_eq!(msg["method"], "sampling/createMessage", "allowed sampling reaches the agent");
+    assert_eq!(
+        msg["method"], "sampling/createMessage",
+        "allowed sampling reaches the agent"
+    );
 }
 
 /// FW-E2E-019 / FW-GW5: a stdio backend the gateway spawns is itself confined to its own grant --
@@ -318,6 +360,12 @@ async fn fw_e2e_019_backend_confinement_recursion() {
         .await;
     let note = agent.recv().await;
     assert_eq!(note["method"], "note/probe");
-    assert_eq!(note["params"]["read_ok"], false, "backend read outside its grant must be denied");
-    assert_eq!(note["params"]["net_ok"], false, "backend direct egress must be denied");
+    assert_eq!(
+        note["params"]["read_ok"], false,
+        "backend read outside its grant must be denied"
+    );
+    assert_eq!(
+        note["params"]["net_ok"], false,
+        "backend direct egress must be denied"
+    );
 }
