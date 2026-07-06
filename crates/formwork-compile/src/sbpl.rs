@@ -35,7 +35,9 @@ fn render_net(b: &mut String, net: &NetPosture) {
         if !ports.is_empty() {
             b.push_str(";; optional direct TCP port tier (FW-ISO5)\n");
             for p in ports {
-                b.push_str(&format!("(allow network-outbound (remote tcp \"*:{p}\"))\n"));
+                b.push_str(&format!(
+                    "(allow network-outbound (remote tcp \"*:{p}\"))\n"
+                ));
             }
         }
     }

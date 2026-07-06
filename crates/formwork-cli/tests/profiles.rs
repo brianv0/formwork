@@ -24,7 +24,9 @@ fn sensitive_set_paths() -> BTreeSet<String> {
     let doc = read_toml("profiles/sensitive-set.toml");
     let mut paths = BTreeSet::new();
     for (_category, table) in doc.as_table().expect("sensitive-set is a table") {
-        let table = table.as_table().expect("each category is a table of arrays");
+        let table = table
+            .as_table()
+            .expect("each category is a table of arrays");
         for (_key, val) in table {
             for entry in val.as_array().expect("each entry is an array") {
                 paths.insert(entry.as_str().expect("entries are strings").to_string());
@@ -40,7 +42,11 @@ fn default_subtract_paths() -> BTreeSet<String> {
         .as_array()
         .expect("default.toml [fs].subtract is an array")
         .iter()
-        .map(|v| v.as_str().expect("subtract entries are strings").to_string())
+        .map(|v| {
+            v.as_str()
+                .expect("subtract entries are strings")
+                .to_string()
+        })
         .collect()
 }
 
@@ -59,5 +65,8 @@ fn default_subtract_covers_the_whole_sensitive_set() {
 #[test]
 fn sensitive_set_is_non_empty() {
     // Guard against the sync test passing vacuously if the list is emptied or mis-parsed.
-    assert!(sensitive_set_paths().len() >= 10, "sensitive-set.toml looks unexpectedly small");
+    assert!(
+        sensitive_set_paths().len() >= 10,
+        "sensitive-set.toml looks unexpectedly small"
+    );
 }

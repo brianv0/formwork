@@ -50,9 +50,10 @@ fn narrow_fs(parent: &FsSpec, req: &FsSpec) -> FsSpec {
             ReadMode::AmbientMinusSubtract,
             union_grants(&parent.reads, &req.reads),
         ),
-        (ReadMode::Closed, ReadMode::Closed) => {
-            (ReadMode::Closed, intersect_grants(&parent.reads, &req.reads))
-        }
+        (ReadMode::Closed, ReadMode::Closed) => (
+            ReadMode::Closed,
+            intersect_grants(&parent.reads, &req.reads),
+        ),
         // Closed bounds Ambient: the Closed side's grants bound the result; the Ambient side
         // contributes only its subtract holes (already unioned above).
         (ReadMode::Closed, ReadMode::AmbientMinusSubtract) => {

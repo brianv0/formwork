@@ -43,13 +43,38 @@ enum ListKind {
 /// so granted traffic forwards byte-for-byte (FW-GW8) with no re-serialization. [`Frame::parse`] is
 /// the single place raw JSON is inspected; the pumps then match on the variant, never on `Value`.
 enum Frame {
-    ToolCall { id: Value, target: String, raw: Vec<u8> },
-    ResourceRead { id: Value, target: String, raw: Vec<u8> },
-    PromptGet { id: Value, target: String, raw: Vec<u8> },
-    ListRequest { id: Value, kind: ListKind, raw: Vec<u8> },
-    Sampling { id: Value, raw: Vec<u8> },
-    Elicitation { id: Value, raw: Vec<u8> },
-    Response { id: Value, raw: Vec<u8> },
+    ToolCall {
+        id: Value,
+        target: String,
+        raw: Vec<u8>,
+    },
+    ResourceRead {
+        id: Value,
+        target: String,
+        raw: Vec<u8>,
+    },
+    PromptGet {
+        id: Value,
+        target: String,
+        raw: Vec<u8>,
+    },
+    ListRequest {
+        id: Value,
+        kind: ListKind,
+        raw: Vec<u8>,
+    },
+    Sampling {
+        id: Value,
+        raw: Vec<u8>,
+    },
+    Elicitation {
+        id: Value,
+        raw: Vec<u8>,
+    },
+    Response {
+        id: Value,
+        raw: Vec<u8>,
+    },
     Passthrough(Vec<u8>),
 }
 
@@ -59,10 +84,18 @@ impl Frame {
             Ok(v) => v,
             Err(_) => return Frame::Passthrough(raw),
         };
-        let method = value.get("method").and_then(Value::as_str).map(str::to_owned);
+        let method = value
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let id = value.get("id").filter(|v| !v.is_null()).cloned();
-        let pointer_str =
-            |ptr: &str| value.pointer(ptr).and_then(Value::as_str).unwrap_or("").to_owned();
+        let pointer_str = |ptr: &str| {
+            value
+                .pointer(ptr)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
         match (method.as_deref(), id) {
             (Some("tools/call"), Some(id)) => Frame::ToolCall {
                 id,
@@ -79,16 +112,26 @@ impl Frame {
                 target: pointer_str("/params/name"),
                 raw,
             },
-            (Some("tools/list"), Some(id)) => Frame::ListRequest { id, kind: ListKind::Tools, raw },
-            (Some("resources/list"), Some(id)) => {
-                Frame::ListRequest { id, kind: ListKind::Resources, raw }
-            }
-            (Some("resources/templates/list"), Some(id)) => {
-                Frame::ListRequest { id, kind: ListKind::ResourceTemplates, raw }
-            }
-            (Some("prompts/list"), Some(id)) => {
-                Frame::ListRequest { id, kind: ListKind::Prompts, raw }
-            }
+            (Some("tools/list"), Some(id)) => Frame::ListRequest {
+                id,
+                kind: ListKind::Tools,
+                raw,
+            },
+            (Some("resources/list"), Some(id)) => Frame::ListRequest {
+                id,
+                kind: ListKind::Resources,
+                raw,
+            },
+            (Some("resources/templates/list"), Some(id)) => Frame::ListRequest {
+                id,
+                kind: ListKind::ResourceTemplates,
+                raw,
+            },
+            (Some("prompts/list"), Some(id)) => Frame::ListRequest {
+                id,
+                kind: ListKind::Prompts,
+                raw,
+            },
             (Some("sampling/createMessage"), Some(id)) => Frame::Sampling { id, raw },
             (Some("elicitation/create"), Some(id)) => Frame::Elicitation { id, raw },
             (None, Some(id)) => Frame::Response { id, raw },
@@ -182,8 +225,15 @@ where
                 if policy.tools.permits(&target) {
                     write_frame(&backend_w, &raw).await?;
                 } else {
-                    refuse(&agent_w, &id, -32602, "tool", &target, format!("Unknown tool: {target}"))
-                        .await?;
+                    refuse(
+                        &agent_w,
+                        &id,
+                        -32602,
+                        "tool",
+                        &target,
+                        format!("Unknown tool: {target}"),
+                    )
+                    .await?;
                 }
             }
             Frame::ResourceRead { id, target, raw } => {
@@ -451,11 +501,18 @@ mod tests {
 
     #[test]
     fn frame_parse_classifies_by_method_and_id() {
-        let call = Frame::parse(br#"{"id":1,"method":"tools/call","params":{"name":"x"}}"#.to_vec());
+        let call =
+            Frame::parse(br#"{"id":1,"method":"tools/call","params":{"name":"x"}}"#.to_vec());
         assert!(matches!(call, Frame::ToolCall { target, .. } if target == "x"));
 
         let list = Frame::parse(br#"{"id":2,"method":"resources/templates/list"}"#.to_vec());
-        assert!(matches!(list, Frame::ListRequest { kind: ListKind::ResourceTemplates, .. }));
+        assert!(matches!(
+            list,
+            Frame::ListRequest {
+                kind: ListKind::ResourceTemplates,
+                ..
+            }
+        ));
 
         let resp = Frame::parse(br#"{"id":3,"result":{}}"#.to_vec());
         assert!(matches!(resp, Frame::Response { .. }));
@@ -465,6 +522,9 @@ mod tests {
             Frame::parse(br#"{"method":"notifications/x"}"#.to_vec()),
             Frame::Passthrough(_)
         ));
-        assert!(matches!(Frame::parse(b"not json".to_vec()), Frame::Passthrough(_)));
+        assert!(matches!(
+            Frame::parse(b"not json".to_vec()),
+            Frame::Passthrough(_)
+        ));
     }
 }

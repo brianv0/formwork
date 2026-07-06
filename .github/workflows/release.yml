@@ -1,0 +1,118 @@
+# Release binaries for the four supported host targets: macOS and Linux, on arm64 and x86_64.
+#
+# Trigger by pushing a version tag, e.g.  git tag v0.1.0 && git push origin v0.1.0
+# `workflow_dispatch` builds the same matrix without publishing, so the release path can be
+# dry-run from the Actions tab before cutting a real tag.
+#
+# Every target builds natively on matching hardware — no cross-compilation:
+#   * macos-14 (Apple Silicon) -> aarch64-apple-darwin ; macos-13 (Intel) -> x86_64-apple-darwin
+#   * ubuntu-22.04 (x86_64) and ubuntu-22.04-arm (arm64) build the two Linux slices.
+# Both Linux runners are 22.04 for a glibc 2.35 floor (widest downstream compatibility); 24.04 would
+# raise the required glibc. Native arm64 Linux runners are free on public repos and billed on private.
+# Only first-party actions/* and the preinstalled `gh` CLI are used (no third-party release actions).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel an in-flight release for the same tag mid-publish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) + target
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        env:
+          # Floor macOS support so binaries run on older releases; harmless on the Linux runners.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cargo build --release --locked --target ${{ matrix.target }} -p formwork-cli --bin formwork
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="formwork-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          staging="dist/${name}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/formwork" "$staging/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$staging/"
+          tar -C dist -czf "${name}.tar.gz" "${name}"
+          echo "asset=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    # Only publish for real tag pushes; workflow_dispatch stops after building.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # Idempotent: create the release on first run, re-upload assets on a re-run.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$tag" --verify-tag --generate-notes \
+              dist/*.tar.gz dist/SHA256SUMS
+          fi

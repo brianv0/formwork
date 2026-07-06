@@ -28,7 +28,10 @@ fn rich_spec() -> Spec {
 fn fw_e2e_026_dry_run_cross_platform_compile() {
     let linux = compile(&rich_spec(), &HostProfile::synthetic_linux(Some(6)));
     assert!(matches!(linux.confiner, ConfinerPolicy::Linux(_)));
-    assert!(linux.report.per_capability.contains_key(&Capability::FsRead));
+    assert!(linux
+        .report
+        .per_capability
+        .contains_key(&Capability::FsRead));
 
     let mac = compile(&rich_spec(), &HostProfile::synthetic_macos());
     assert!(matches!(mac.confiner, ConfinerPolicy::Macos(_)));
@@ -42,7 +45,10 @@ fn fw_e2e_026_dry_run_cross_platform_compile() {
         os_version: "bare".into(),
     };
     let bare_policy = compile(&rich_spec(), &bare);
-    assert!(matches!(bare_policy.confiner, ConfinerPolicy::Unavailable { .. }));
+    assert!(matches!(
+        bare_policy.confiner,
+        ConfinerPolicy::Unavailable { .. }
+    ));
 }
 
 /// FW-E2E-027: deterministic compile -- byte-identical output, insensitive to input ordering.
@@ -57,7 +63,10 @@ fn fw_e2e_027_deterministic_compile() {
     shuffled.fs.reads = vec![pp("/work/**"), pp("/work/**")];
     shuffled.fs.subtract = vec![pp("/work/.ssh/**"), pp("/work/project/.git/**")];
     let c = to_canonical_json(&compile(&shuffled, &host));
-    assert_eq!(a, c, "reordered/duplicated but equivalent spec must compile identically");
+    assert_eq!(
+        a, c,
+        "reordered/duplicated but equivalent spec must compile identically"
+    );
 }
 
 /// FW-INV5 (report soundness, compile half): every `Enforced` capability names a real backend.
@@ -112,7 +121,10 @@ fn fw_inv6_net_never_silently_open() {
         match net {
             Fidelity::Enforced { .. } | Fidelity::Partial { .. } => {}
             Fidelity::Unenforceable { reason } => {
-                assert!(!reason.is_empty(), "an unenforceable net must carry a surfaced reason");
+                assert!(
+                    !reason.is_empty(),
+                    "an unenforceable net must carry a surfaced reason"
+                );
             }
         }
     }

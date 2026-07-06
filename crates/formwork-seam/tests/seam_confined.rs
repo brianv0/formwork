@@ -104,7 +104,11 @@ fn fw_e2e_011_fd_minting_via_scm_rights() {
     let served = common::serve_ok(&mut backend);
 
     let code = child.wait().unwrap().code();
-    assert_eq!(code, Some(0), "child used the SCM_RIGHTS-passed fd; net-deny untouched");
+    assert_eq!(
+        code,
+        Some(0),
+        "child used the SCM_RIGHTS-passed fd; net-deny untouched"
+    );
     assert_eq!(served.unwrap(), "call");
 }
 

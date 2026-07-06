@@ -33,13 +33,21 @@ pub enum ConfineError {
 /// Configures `command` (does not spawn). Fails closed (FW-INV6): if a report-`Enforced` capability
 /// can't install here, returns `Err` rather than yielding a running-but-unconfined child.
 pub fn spawn_confined(command: &mut Command, policy: &CompiledPolicy) -> Result<(), ConfineError> {
-    tracing::info!(posture = "spawn", backend = backend_label(policy), "configuring confinement");
+    tracing::info!(
+        posture = "spawn",
+        backend = backend_label(policy),
+        "configuring confinement"
+    );
     backend::spawn_confined(command, policy)
 }
 
 /// Irreversible; confine-self posture (FW-ISO6).
 pub fn enforce_self(policy: &CompiledPolicy) -> Result<(), ConfineError> {
-    tracing::info!(posture = "self", backend = backend_label(policy), "configuring confinement");
+    tracing::info!(
+        posture = "self",
+        backend = backend_label(policy),
+        "configuring confinement"
+    );
     backend::enforce_self(policy)
 }
 

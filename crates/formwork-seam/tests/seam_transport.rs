@@ -25,7 +25,11 @@ fn fw_e2e_010_roundtrip_over_preopened_fd() {
     let served = common::serve_ok(&mut gw);
 
     let code = child.wait().unwrap().code();
-    assert_eq!(code, Some(0), "child completed the exchange over the injected fd");
+    assert_eq!(
+        code,
+        Some(0),
+        "child completed the exchange over the injected fd"
+    );
     assert_eq!(served.unwrap(), "hello");
 }
 
@@ -49,7 +53,11 @@ fn fw_e2e_011_mint_via_scm_rights() {
     let served = common::serve_ok(&mut backend);
 
     let code = child.wait().unwrap().code();
-    assert_eq!(code, Some(0), "child used the SCM_RIGHTS-passed fd for a full round-trip");
+    assert_eq!(
+        code,
+        Some(0),
+        "child used the SCM_RIGHTS-passed fd for a full round-trip"
+    );
     assert_eq!(served.unwrap(), "ping");
 }
 
@@ -75,7 +83,11 @@ fn fw_e2e_012_transport_uses_no_socket_path() {
     drop(listener);
     let _ = std::fs::remove_file(&sock_path);
 
-    assert_eq!(code, Some(0), "workload succeeds regardless of the on-disk socket");
+    assert_eq!(
+        code,
+        Some(0),
+        "workload succeeds regardless of the on-disk socket"
+    );
     assert_eq!(served.unwrap(), "payload");
 }
 

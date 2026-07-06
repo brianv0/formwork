@@ -47,10 +47,17 @@ pub enum DenialSemantics {
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum Fidelity {
     /// Backed by a real mechanism; a paired allow/deny probe must confirm it (FW-E2E-024).
-    Enforced { backend: Backend },
-    Partial { backend: Backend, reason: String },
+    Enforced {
+        backend: Backend,
+    },
+    Partial {
+        backend: Backend,
+        reason: String,
+    },
     /// This host cannot carry it; the reason is surfaced, never swallowed (FW-INV6).
-    Unenforceable { reason: String },
+    Unenforceable {
+        reason: String,
+    },
 }
 
 impl Fidelity {
