@@ -148,12 +148,60 @@ fn render_exec(b: &mut String, exec: &ExecPosture) {
 }
 
 fn filter(p: &PathPattern) -> String {
+    if p.is_any_depth() {
+        return format!("(regex #\"{}\")", any_depth_regex(p));
+    }
     let path = escape(&p.base().display().to_string());
     if p.is_subtree() {
         format!("(subpath \"{path}\")")
     } else {
         format!("(literal \"{path}\")")
     }
+}
+
+/// A `**/`-anchored pattern (FW-CAP6) matches its suffix at any depth. Seatbelt regexes are
+/// unanchored, so a leading `/` before the first component pins a component boundary and the
+/// trailing `$` (literal) or `(/|$)` (subtree) pins the end, while the start is free to match at
+/// any depth. E.g. `**/.env` -> `/\.env$`; `**/.git/hooks/**` -> `/\.git/hooks(/|$)`.
+fn any_depth_regex(p: &PathPattern) -> String {
+    let mut body = String::new();
+    for comp in p.base().components() {
+        body.push('/');
+        body.push_str(&regex_escape(&comp.as_os_str().to_string_lossy()));
+    }
+    if p.is_subtree() {
+        body.push_str("(/|$)");
+    } else {
+        body.push('$');
+    }
+    body
+}
+
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '^'
+                | '$'
+                | '*'
+                | '+'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
+                | '\\'
+                | '"'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn escape(s: &str) -> String {
@@ -238,5 +286,19 @@ mod tests {
         let s = render(&i);
         assert!(s.contains("(deny process-exec* (subpath \"/\"))"));
         assert!(s.contains("(allow process-exec* (literal \"/usr/bin/git\"))"));
+    }
+
+    #[test]
+    fn any_depth_subtract_renders_as_regex() {
+        let mut i = input();
+        i.read_mode = ReadMode::AmbientMinusSubtract;
+        i.subtract = vec![pp("**/.env"), pp("**/.git/hooks/**")];
+        let s = render(&i);
+        // literal suffix pins the end; subtree suffix matches the dir and anything under it.
+        assert!(s.contains(r#"(deny file-read* (regex #"/\.env$"))"#), "{s}");
+        assert!(
+            s.contains(r#"(deny file-write* (regex #"/\.git/hooks(/|$)"))"#),
+            "{s}"
+        );
     }
 }

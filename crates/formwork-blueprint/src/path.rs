@@ -1,6 +1,7 @@
-//! Path patterns: normalized absolute paths with an optional `/**` subtree marker. Normalization
-//! (lexical `.`/`..`, collapsed slashes, no trailing slash) makes equal scopes compare equal, which
-//! keeps compilation deterministic and narrowing exact. `~` is expanded by the CLI, not here.
+//! Path patterns: normalized absolute paths with an optional `/**` subtree marker, plus a `**/`
+//! recursive-basename form that matches a suffix at any depth (FW-CAP6). Normalization (lexical
+//! `.`/`..`, collapsed slashes, no trailing slash) makes equal scopes compare equal, which keeps
+//! compilation deterministic and narrowing exact. `~` is expanded by the CLI, not here.
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -10,8 +11,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PathPattern {
+    /// Absolute when `any_depth` is false; a relative suffix when it is true.
     base: PathBuf,
     subtree: bool,
+    /// A leading `**/`: match `base` as a trailing/containing component sequence at any depth.
+    any_depth: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -30,6 +34,25 @@ impl PathPattern {
             return Err(PathError::Empty);
         }
 
+        // Recursive-basename form (FW-CAP6): a leading `**/` matches the suffix at any depth. Used
+        // for sensitive files that appear anywhere in a tree, e.g. `**/.env`, `**/.git/hooks/**`.
+        if let Some(rest) = input.strip_prefix("**/") {
+            let (suffix, subtree) = match rest.strip_suffix("/**") {
+                Some(s) => (s, true),
+                None => (rest, false),
+            };
+            if suffix.is_empty() || suffix == "**" {
+                return Err(PathError::Empty);
+            }
+            let base = normalize_relative(suffix)
+                .ok_or_else(|| PathError::EscapesRoot(input.to_string()))?;
+            return Ok(PathPattern {
+                base,
+                subtree,
+                any_depth: true,
+            });
+        }
+
         let (path_part, subtree) = if input == "/**" {
             ("/", true)
         } else if let Some(stripped) = input.strip_suffix("/**") {
@@ -44,7 +67,11 @@ impl PathPattern {
 
         let base = normalize_absolute(path_part)
             .ok_or_else(|| PathError::EscapesRoot(input.to_string()))?;
-        Ok(PathPattern { base, subtree })
+        Ok(PathPattern {
+            base,
+            subtree,
+            any_depth: false,
+        })
     }
 
     pub fn base(&self) -> &Path {
@@ -55,9 +82,21 @@ impl PathPattern {
         self.subtree
     }
 
+    /// True for the `**/`-anchored recursive-basename form (FW-CAP6). The `base` is then a relative
+    /// suffix, and enforcement matches it at any depth (a regex on Seatbelt).
+    pub fn is_any_depth(&self) -> bool {
+        self.any_depth
+    }
+
     /// Round-trips through `parse`.
     pub fn canonical(&self) -> String {
-        if self.subtree {
+        if self.any_depth {
+            if self.subtree {
+                format!("**/{}/**", self.base.display())
+            } else {
+                format!("**/{}", self.base.display())
+            }
+        } else if self.subtree {
             if self.base == Path::new("/") {
                 "/**".to_string()
             } else {
@@ -69,12 +108,21 @@ impl PathPattern {
     }
 
     /// The primitive behind narrowing: a subtree covers any path at or below its base; a literal
-    /// covers only the identical literal.
+    /// covers only the identical literal. `**/` patterns compare among themselves the same way;
+    /// across the two forms only the everything-grant `/**` covers an any-depth pattern, and an
+    /// any-depth pattern is conservatively taken not to cover a fixed absolute path (a redundant
+    /// deny is harmless, a missed one is not -- FW-INV6).
     pub fn covers(&self, other: &PathPattern) -> bool {
-        if self.subtree {
-            other.base.starts_with(&self.base)
-        } else {
-            !other.subtree && self.base == other.base
+        match (self.any_depth, other.any_depth) {
+            (false, false) | (true, true) => {
+                if self.subtree {
+                    other.base.starts_with(&self.base)
+                } else {
+                    !other.subtree && self.base == other.base
+                }
+            }
+            (false, true) => self.subtree && self.base == Path::new("/"),
+            (true, false) => false,
         }
     }
 }
@@ -94,6 +142,33 @@ fn normalize_absolute(path: &str) -> Option<PathBuf> {
         }
     }
     let mut buf = PathBuf::from("/");
+    for c in out {
+        buf.push(c);
+    }
+    Some(buf)
+}
+
+/// The relative suffix of a `**/`-anchored pattern: normal components only -- no root, no `..`, no
+/// interior `**`. Returns a relative `PathBuf` with at least one component, else `None`.
+fn normalize_relative(path: &str) -> Option<PathBuf> {
+    let mut out: Vec<&std::ffi::OsStr> = Vec::new();
+    for comp in Path::new(path).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(c) => {
+                if c == "**" {
+                    return None; // interior `**` is unsupported; only a single leading `**/`
+                }
+                out.push(c);
+            }
+            // Root, `..`, and Windows prefixes are all invalid inside a suffix.
+            _ => return None,
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    let mut buf = PathBuf::new();
     for c in out {
         buf.push(c);
     }
@@ -188,6 +263,35 @@ mod tests {
     }
 
     #[test]
+    fn any_depth_parses_literal_and_subtree() {
+        let env = p("**/.env");
+        assert!(env.is_any_depth());
+        assert!(!env.is_subtree());
+        assert_eq!(env.canonical(), "**/.env");
+
+        let hooks = p("**/.git/hooks/**");
+        assert!(hooks.is_any_depth());
+        assert!(hooks.is_subtree());
+        assert_eq!(hooks.canonical(), "**/.git/hooks/**");
+
+        assert_eq!(p("**/.git/config").canonical(), "**/.git/config");
+    }
+
+    #[test]
+    fn any_depth_rejects_degenerate_and_interior_globs() {
+        assert!(matches!(PathPattern::parse("**/"), Err(PathError::Empty)));
+        assert!(matches!(PathPattern::parse("**/**"), Err(PathError::Empty)));
+        assert!(matches!(
+            PathPattern::parse("**/a/**/b"),
+            Err(PathError::EscapesRoot(_))
+        ));
+        assert!(matches!(
+            PathPattern::parse("**/../etc"),
+            Err(PathError::EscapesRoot(_))
+        ));
+    }
+
+    #[test]
     fn subtree_covers_descendants_literal_covers_only_self() {
         assert!(p("/work/**").covers(&p("/work/project/x")));
         assert!(p("/work/**").covers(&p("/work/**")));
@@ -201,6 +305,19 @@ mod tests {
     #[test]
     fn covers_is_component_aware_not_string_prefix() {
         assert!(!p("/work/proj/**").covers(&p("/work/project/x")));
+    }
+
+    #[test]
+    fn any_depth_covers_only_within_form_except_root_grant() {
+        // among any-depth patterns, subtree covers a deeper suffix
+        assert!(p("**/.git/**").covers(&p("**/.git/hooks/**")));
+        assert!(p("**/.env").covers(&p("**/.env")));
+        assert!(!p("**/.env").covers(&p("**/.envrc")));
+        // the everything-grant covers any-depth patterns; a specific path does not
+        assert!(p("/**").covers(&p("**/.env")));
+        assert!(!p("/work/**").covers(&p("**/.env")));
+        // an any-depth pattern is conservatively not taken to cover a fixed path
+        assert!(!p("**/.env").covers(&p("/work/.env")));
     }
 
     #[test]
@@ -221,5 +338,10 @@ mod tests {
         assert_eq!(j, "\"/a/c/**\"");
         let back: PathPattern = serde_json::from_str(&j).unwrap();
         assert_eq!(back, p("/a/c/**"));
+
+        let j2 = serde_json::to_string(&p("**/.env")).unwrap();
+        assert_eq!(j2, "\"**/.env\"");
+        let back2: PathPattern = serde_json::from_str(&j2).unwrap();
+        assert_eq!(back2, p("**/.env"));
     }
 }

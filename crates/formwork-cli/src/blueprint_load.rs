@@ -53,6 +53,12 @@ pub fn canonicalize_for_enforcement(blueprint: &Blueprint) -> Result<Blueprint> 
 }
 
 fn canon_pattern(p: &PathPattern) -> Result<PathPattern> {
+    // Any-depth (`**/`) patterns are relative match suffixes, not resolvable filesystem paths, so
+    // symlink/firmlink canonicalization does not apply -- pass them through unchanged. Resolving the
+    // relative base against cwd would wrongly re-root it (e.g. `**/.git/hooks/**` -> `<cwd>/.git/...`).
+    if p.is_any_depth() {
+        return Ok(p.clone());
+    }
     let base = canonicalize_existing_prefix(p.base());
     // `to_str`, not `to_string_lossy`: refuse to enforce a path we cannot render faithfully (FW-INV6).
     let base = base.to_str().ok_or_else(|| {
@@ -128,5 +134,23 @@ mod tests {
             blueprint.mcp["s"].tools,
             formwork_blueprint::Visibility::Allow(vec!["~weird_but_left_alone".into()])
         );
+    }
+
+    #[test]
+    fn any_depth_patterns_pass_canonicalization_unchanged() {
+        // A `**/` suffix is a match pattern, not a real path: it must survive enforcement-time
+        // canonicalization verbatim, never get re-rooted against cwd.
+        let blueprint = Blueprint {
+            fs: formwork_blueprint::FsBlueprint {
+                subtract: vec![
+                    PathPattern::parse("**/.env").unwrap(),
+                    PathPattern::parse("**/.git/hooks/**").unwrap(),
+                ],
+                ..Default::default()
+            },
+            ..Blueprint::empty()
+        };
+        let out = canonicalize_for_enforcement(&blueprint).unwrap();
+        assert_eq!(out.fs.subtract, blueprint.fs.subtract);
     }
 }
