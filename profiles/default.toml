@@ -8,6 +8,12 @@
 # `~` is expanded against $HOME when the CLI loads this file. Callers are expected to narrow this
 # (e.g. point writes at their actual project) — narrowing is always safe (FW-CAP2); widening is not.
 
+# Net and exec are top-level keys, so they must precede the [fs] table in TOML.
+# Fail-closed egress (FW-XR3): the agent reaches the network only through the gateway fd.
+net = "deny"
+# Exec is unrestricted by default for transparency (FW-ISO4); set an allow-list to restrict.
+exec = "unrestricted"
+
 # Reads: broadly allowed over the ambient environment, minus the sensitive set below. On macOS this
 # is native `(allow default)` + deny holes; on Linux it is an enumerate-and-grant expansion at
 # enforce time (Landlock is allow-list only). See the plan §3.2.
@@ -40,13 +46,19 @@ subtract = [
     "~/.config/gcloud/**",
     "~/.azure/**",
     "~/.kube/**",
-    "~/.docker/config.json",
+    "~/.docker/**",   # whole dir: ~/.docker/run/docker.sock is host-root (FEP-1 FW-TRA8)
     "~/.netrc",
     "~/.npmrc",
     "~/.pypirc",
     # shells / dotfile secrets frequently holding tokens
     "~/.config/gh/**",
     "~/.git-credentials",
+    # agent-tool state (OAuth creds, transcripts) -- protect one agent from another (FEP-1 FW-TRA8)
+    "~/.claude/**",
+    "~/.claude.json",
+    "~/.codex/**",
+    "~/.gemini/**",
+    "~/.cursor/**",
     # keychains (macOS)
     "~/Library/Keychains/**",
     "/Library/Keychains/**",
@@ -60,9 +72,3 @@ subtract = [
     "/etc/sudoers",
     "/etc/sudoers.d/**",
 ]
-
-# Fail-closed egress (FW-XR3): the agent reaches the network only through the gateway fd.
-net = "deny"
-
-# Exec is unrestricted by default for transparency (FW-ISO4); set an allow-list to restrict.
-exec = "unrestricted"

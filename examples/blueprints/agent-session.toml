@@ -19,7 +19,8 @@ exec = "unrestricted"
 [fs]
 read-mode = "ambient-minus-subtract"
 reads = ["/**"]
-writes = ["~/project/**", "/tmp/**", "/private/tmp/**", "/var/tmp/**"]
+# project + scratch + this agent's own state dir, so Claude can persist history/settings/auth.
+writes = ["~/project/**", "~/.claude/**", "/tmp/**", "/private/tmp/**", "/var/tmp/**"]
 subtract = [
     # SSH / GPG / cloud + CI credentials
     "~/.ssh/**",
@@ -28,12 +29,17 @@ subtract = [
     "~/.config/gcloud/**",
     "~/.azure/**",
     "~/.kube/**",
-    "~/.docker/config.json",
+    "~/.docker/**",   # whole dir incl. run/docker.sock (host-root); no agent needs it
     "~/.netrc",
     "~/.npmrc",
     "~/.pypirc",
     "~/.config/gh/**",
     "~/.git-credentials",
+    # other agents' state: deny so this confined Claude can't read Codex/Gemini/Cursor creds.
+    # ~/.claude is intentionally NOT subtracted -- it's this agent's own config/session.
+    "~/.codex/**",
+    "~/.gemini/**",
+    "~/.cursor/**",
     # keychains (macOS)
     "~/Library/Keychains/**",
     "/Library/Keychains/**",
