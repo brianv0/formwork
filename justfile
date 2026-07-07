@@ -58,3 +58,35 @@ lint:
 
 bench:
     cargo bench --workspace
+
+# --- dogfood & unattended dev ---------------------------------------------------------------
+
+# One gate for unattended runs: format check, lint, and the native test suite (real Seatbelt on
+# macOS). A green `just check` is the bar every checkpoint commit should clear. Mirrors CI.
+check:
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo test --workspace
+
+# Self-host: run Claude Code confined by Formwork against THIS checkout — prompts off, kernel wall
+# on. Renders examples/blueprints/dev-session.toml.tpl (with your checkout path) into a gitignored
+# .dev-session.toml, prints the enforced-capability report, then launches Claude confined.
+# macOS-only today (the Linux confiner is a stub). This is the VERIFICATION wall, not the Docker
+# loop: the dev blueprint subtracts ~/.docker/** so the host-root docker socket is unreachable, so
+# you cannot drive Docker from in here — run `just test-linux` from an unconfined shell for that.
+dev-confined *ARGS: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    repo="{{justfile_directory()}}"
+    bp="$repo/.dev-session.toml"
+    sed "s#@REPO@#$repo#g" "$repo/examples/blueprints/dev-session.toml.tpl" > "$bp"
+    fw="$repo/target/debug/formwork"
+    echo "Enforced capabilities for this dev session:"
+    "$fw" compile --blueprint "$bp" --report-only \
+        | awk '/"semantics"/{f=0} /"per-capability"/{f=1} f' | sed 's/^/  /'
+    echo
+    if ! command -v claude >/dev/null 2>&1; then
+        echo "claude not on PATH — install Claude Code, then re-run. Rendered blueprint: $bp"
+        exit 0
+    fi
+    exec "$fw" run --blueprint "$bp" -- claude --dangerously-skip-permissions {{ARGS}}

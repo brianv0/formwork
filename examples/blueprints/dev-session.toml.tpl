@@ -1,0 +1,80 @@
+# Self-hosting dev profile: build and test Formwork *itself* while confined by Formwork — the
+# ultimate FW-TRA2 check. If `cargo test` and a full edit loop run clean in here with zero spurious
+# denials, the confinement is transparent enough for real work.
+#
+# This is a TEMPLATE. `just dev-confined` renders it to a gitignored .dev-session.toml, substituting
+# @REPO@ with your actual checkout path. Blueprints are absolute-path only and the CLI does not yet
+# fold the child's cwd into the read grant (docs/spikes.md Spike 2), so the repo path must be named
+# explicitly — the recipe does that for you regardless of where you cloned.
+#
+# It is examples/blueprints/agent-session.toml widened to what a Rust build touches.
+
+# crates.io + git-over-HTTPS (cargo fetch) and the model API. Port-scoped = any HTTPS host; the fs
+# wall, not an egress allowlist, is what stops exfiltration. (Once FEP-1's AllowHosts lands, prefer
+# naming crates.io + the model host so egress is host-scoped and the SSRF/metadata block applies.)
+# DNS still resolves: on macOS it goes through the system resolver (mDNSResponder), not a socket the
+# confined process opens, so :443 egress is enough for cargo to reach the network.
+net = { ports = [443] }
+exec = "unrestricted"
+
+[fs]
+read-mode = "ambient-minus-subtract"
+reads = ["/**"]                      # ambient: rustc, ~/.rustup toolchains, system libs — read-only
+
+# Writable working set (FW-TRA5): the repo (edits + target/ output persist) and the cargo caches a
+# fetch/build writes. Everything else stays read-only.
+writes = [
+    "@REPO@/**",
+    "~/.cargo/**",                   # registry / git / package caches cargo writes during a build
+    "/tmp/**",
+    "/private/tmp/**",
+    "/var/tmp/**",
+]
+
+# Sensitive set (mirrors profiles/sensitive-set.toml) plus dev-specific holes. Deny wins over the
+# broad read and over the ~/.cargo write grant, so these stay denied even though their parents are
+# granted.
+subtract = [
+    # SSH / GPG
+    "~/.ssh/**",
+    "~/.gnupg/**",
+    # cloud + CI credentials
+    "~/.aws/**",
+    "~/.config/gcloud/**",
+    "~/.azure/**",
+    "~/.kube/**",
+    "~/.netrc",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.config/gh/**",
+    "~/.git-credentials",
+    # keychains (macOS)
+    "~/Library/Keychains/**",
+    "/Library/Keychains/**",
+    # browser profiles
+    "~/Library/Application Support/Google/Chrome/**",
+    "~/Library/Application Support/Firefox/**",
+    "~/.config/google-chrome/**",
+    "~/.mozilla/**",
+    # system credential stores
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/sudoers.d/**",
+
+    # --- dev-specific subtractions ---
+    # Docker: the WHOLE dir, not just config.json — ~/.docker/run/docker.sock is a host-root socket
+    # (docker.sock = host takeover). Subtracting it is why you cannot, and must not, drive Docker
+    # from inside this confined session; run `just test-linux` from an unconfined shell instead.
+    "~/.docker/**",
+    # other agents' state: this confined session is Claude developing Formwork; deny peers' creds.
+    # ~/.claude stays readable — it's this agent's own config/session.
+    "~/.codex/**",
+    "~/.gemini/**",
+    "~/.cursor/**",
+    # crates.io publish token — deny even though ~/.cargo/** is writable.
+    "~/.cargo/credentials.toml",
+    "~/.cargo/credentials",
+    # Installed binaries run UNSANDBOXED later; don't let a confined agent rewrite them (the FEP-1
+    # execution-vector concern). cargo build doesn't write here; cargo install would.
+    "~/.cargo/bin/**",
+]
