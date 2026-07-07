@@ -3,7 +3,7 @@
 # makes it safe to hand the agent its "skip every prompt" flag (see each host's README).
 #
 # This is profiles/default.toml narrowed to one project. `~` expands against $HOME when the CLI
-# loads the spec; narrowing a grant is always safe, widening is not (FW-CAP2).
+# loads the blueprint; narrowing a grant is always safe, widening is not (FW-CAP2).
 #
 #   reads   the whole ambient environment MINUS a sensitive set (keys, cloud creds, keychains,
 #           browser profiles). The canonical superset lives in profiles/sensitive-set.toml.

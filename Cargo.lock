@@ -142,16 +142,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "formwork-blueprint"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "formwork-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "formwork-blueprint",
  "formwork-compile",
  "formwork-confine",
  "formwork-detect",
  "formwork-gateway",
- "formwork-spec",
  "serde",
  "serde_json",
  "tokio",
@@ -164,8 +174,8 @@ dependencies = [
 name = "formwork-compile"
 version = "0.1.0"
 dependencies = [
+ "formwork-blueprint",
  "formwork-detect",
- "formwork-spec",
  "serde",
  "serde_json",
  "toml",
@@ -175,9 +185,9 @@ dependencies = [
 name = "formwork-confine"
 version = "0.1.0"
 dependencies = [
+ "formwork-blueprint",
  "formwork-compile",
  "formwork-detect",
- "formwork-spec",
  "libc",
  "thiserror",
  "tracing",
@@ -195,10 +205,10 @@ dependencies = [
 name = "formwork-gateway"
 version = "0.1.0"
 dependencies = [
+ "formwork-blueprint",
  "formwork-compile",
  "formwork-confine",
  "formwork-detect",
- "formwork-spec",
  "serde",
  "serde_json",
  "thiserror",
@@ -210,23 +220,13 @@ dependencies = [
 name = "formwork-seam"
 version = "0.1.0"
 dependencies = [
+ "formwork-blueprint",
  "formwork-compile",
  "formwork-confine",
  "formwork-detect",
- "formwork-spec",
  "libc",
  "thiserror",
  "tracing",
-]
-
-[[package]]
-name = "formwork-spec"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "toml",
 ]
 
 [[package]]

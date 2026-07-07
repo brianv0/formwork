@@ -8,14 +8,14 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 cargo build -q -p formwork-cli
 FORMWORK="$REPO/target/debug/formwork"
-SPEC="$REPO/examples/specs/agent-session.toml"
+BLUEPRINT="$REPO/examples/blueprints/agent-session.toml"
 
-echo "What this host actually enforces for this spec:"
-"$FORMWORK" compile --spec "$SPEC" --report-only \
+echo "What this host actually enforces for this blueprint:"
+"$FORMWORK" compile --blueprint "$BLUEPRINT" --report-only \
     | awk '/"semantics"/{f=0} /"per-capability"/{f=1} f' | sed 's/^/  /'
 echo
 
-CMD=( "$FORMWORK" run --spec "$SPEC" -- codex --dangerously-bypass-approvals-and-sandbox )
+CMD=( "$FORMWORK" run --blueprint "$BLUEPRINT" -- codex --dangerously-bypass-approvals-and-sandbox )
 
 echo "Confined launch:"
 printf '  '; printf '%q ' "${CMD[@]}"; echo; echo

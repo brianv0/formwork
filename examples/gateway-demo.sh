@@ -13,11 +13,11 @@ cargo build -q -p formwork-cli -p formwork-gateway --bin formwork --bin fw-mcp-f
 
 FORMWORK="$REPO/target/debug/formwork"
 FIXTURE="$REPO/target/debug/fw-mcp-fixture"
-SPEC="$REPO/examples/specs/mcp-gateway.toml"
+BLUEPRINT="$REPO/examples/blueprints/mcp-gateway.toml"
 
 echo
 echo "The fixture backend exposes: read_file, write_file, http_fetch (+ resources, prompts)."
-echo "The spec's [mcp.files] grants only read_file. Driving it through the gateway"
+echo "The blueprint's [mcp.files] grants only read_file. Driving it through the gateway"
 echo "(replies stream back as each completes, so match them by id):"
 echo
 
@@ -28,7 +28,7 @@ echo
     printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/x"}}}'
     printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"http_fetch","arguments":{}}}'
     sleep 1
-} | "$FORMWORK" gateway --spec "$SPEC" --server files -- "$FIXTURE"
+} | "$FORMWORK" gateway --blueprint "$BLUEPRINT" --server files -- "$FIXTURE"
 
 echo
 echo "Expected:"

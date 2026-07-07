@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/formwork-spec",
+    "crates/formwork-blueprint",
     "crates/formwork-detect",
     "crates/formwork-compile",
     "crates/formwork-confine",
@@ -27,7 +27,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-formwork-spec = { path = "crates/formwork-spec" }
+formwork-blueprint = { path = "crates/formwork-blueprint" }
 formwork-detect = { path = "crates/formwork-detect" }
 formwork-compile = { path = "crates/formwork-compile" }
 formwork-confine = { path = "crates/formwork-confine" }

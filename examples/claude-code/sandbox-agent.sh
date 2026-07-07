@@ -8,17 +8,17 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 cargo build -q -p formwork-cli
 FORMWORK="$REPO/target/debug/formwork"
-SPEC="$REPO/examples/specs/agent-session.toml"
+BLUEPRINT="$REPO/examples/blueprints/agent-session.toml"
 
 # Never claim more confinement than this host can back — print the per-capability fidelity report.
-echo "What this host actually enforces for this spec:"
-"$FORMWORK" compile --spec "$SPEC" --report-only \
+echo "What this host actually enforces for this blueprint:"
+"$FORMWORK" compile --blueprint "$BLUEPRINT" --report-only \
     | awk '/"semantics"/{f=0} /"per-capability"/{f=1} f' | sed 's/^/  /'
 echo
 
 # claude refuses --dangerously-skip-permissions as root; formwork run does not elevate, so this is
 # an ordinary user process behind a kernel wall — exactly the isolated environment the flag wants.
-CMD=( "$FORMWORK" run --spec "$SPEC" -- claude --dangerously-skip-permissions )
+CMD=( "$FORMWORK" run --blueprint "$BLUEPRINT" -- claude --dangerously-skip-permissions )
 
 echo "Confined launch:"
 printf '  '; printf '%q ' "${CMD[@]}"; echo; echo

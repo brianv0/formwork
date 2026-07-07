@@ -1,6 +1,6 @@
-//! The capability compiler: the single authority mapping a [`Spec`] to concrete mechanisms. Pure --
+//! The capability compiler: the single authority mapping a [`Blueprint`] to concrete mechanisms. Pure --
 //! it never touches the kernel -- so it runs anywhere, is inspectable without enforcing (FW-FID2),
-//! and is deterministic in `(spec, host)` (FW-FID4). Impurity is confined to the [`HostProfile`]
+//! and is deterministic in `(blueprint, host)` (FW-FID4). Impurity is confined to the [`HostProfile`]
 //! the caller passes in; a synthetic profile compiles a policy for a platform you are not on.
 
 mod linux;
@@ -16,8 +16,10 @@ pub use report::{Backend, Capability, DenialSemantics, Fidelity, FidelityReport}
 
 use std::collections::BTreeMap;
 
+use formwork_blueprint::{
+    canonicalize_set, Blueprint, ExecPosture, NetPosture, PathPattern, ReadMode,
+};
 use formwork_detect::{HostProfile, Os};
-use formwork_spec::{canonicalize_set, ExecPosture, NetPosture, PathPattern, ReadMode, Spec};
 
 use linux::PortTier;
 
@@ -33,31 +35,43 @@ pub struct CompileInput {
 }
 
 impl CompileInput {
-    fn from_spec(spec: &Spec) -> Self {
-        let mut reads = spec.fs.reads.clone();
-        reads.extend(spec.fs.writes.iter().cloned());
+    fn from_blueprint(blueprint: &Blueprint) -> Self {
+        let mut reads = blueprint.fs.reads.clone();
+        reads.extend(blueprint.fs.writes.iter().cloned());
         CompileInput {
-            read_mode: spec.fs.read_mode,
+            read_mode: blueprint.fs.read_mode,
             effective_reads: canonicalize_set(&reads),
-            writes: canonicalize_set(&spec.fs.writes),
-            subtract: canonicalize_set(&spec.fs.subtract),
-            net: spec.net.clone(),
-            exec: spec.exec.clone(),
+            writes: canonicalize_set(&blueprint.fs.writes),
+            subtract: canonicalize_set(&blueprint.fs.subtract),
+            net: blueprint.net.clone(),
+            exec: blueprint.exec.clone(),
         }
     }
 }
 
-/// Pure and deterministic in `(spec, host)`.
-pub fn compile(spec: &Spec, host: &HostProfile) -> CompiledPolicy {
-    let spec = spec.canonicalize();
-    let input = CompileInput::from_spec(&spec);
+/// Pure and deterministic in `(blueprint, host)`.
+pub fn compile(blueprint: &Blueprint, host: &HostProfile) -> CompiledPolicy {
+    let blueprint = blueprint.canonicalize();
+    let input = CompileInput::from_blueprint(&blueprint);
 
     let mut per_capability: BTreeMap<Capability, Fidelity> = BTreeMap::new();
     let mut semantics: BTreeMap<Capability, DenialSemantics> = BTreeMap::new();
 
     let (confiner, direct_tcp_ports) = match host.os {
-        Os::MacOs => compile_macos(&input, host, &spec, &mut per_capability, &mut semantics),
-        Os::Linux => compile_linux(&input, host, &spec, &mut per_capability, &mut semantics),
+        Os::MacOs => compile_macos(
+            &input,
+            host,
+            &blueprint,
+            &mut per_capability,
+            &mut semantics,
+        ),
+        Os::Linux => compile_linux(
+            &input,
+            host,
+            &blueprint,
+            &mut per_capability,
+            &mut semantics,
+        ),
     };
 
     // Filesystem invisibility is never provided; document it as an explicit, reported fact.
@@ -71,7 +85,7 @@ pub fn compile(spec: &Spec, host: &HostProfile) -> CompiledPolicy {
     semantics.insert(Capability::FsInvisibility, DenialSemantics::Deny);
 
     // MCP shading is a gateway property, independent of the OS confiner.
-    if !spec.mcp.is_empty() {
+    if !blueprint.mcp.is_empty() {
         per_capability.insert(
             Capability::McpShading,
             Fidelity::Enforced {
@@ -87,7 +101,7 @@ pub fn compile(spec: &Spec, host: &HostProfile) -> CompiledPolicy {
         semantics,
     };
     let gateway = GatewayPolicy {
-        servers: spec.mcp.clone(),
+        servers: blueprint.mcp.clone(),
         direct_tcp_ports,
     };
 
@@ -101,7 +115,7 @@ pub fn compile(spec: &Spec, host: &HostProfile) -> CompiledPolicy {
 fn compile_macos(
     input: &CompileInput,
     _host: &HostProfile,
-    spec: &Spec,
+    blueprint: &Blueprint,
     caps: &mut BTreeMap<Capability, Fidelity>,
     sem: &mut BTreeMap<Capability, DenialSemantics>,
 ) -> (ConfinerPolicy, Vec<u16>) {
@@ -131,7 +145,7 @@ fn compile_macos(
         caps.insert(Capability::Exec, seatbelt());
         sem.insert(Capability::Exec, DenialSemantics::Deny);
     }
-    let _ = spec;
+    let _ = blueprint;
 
     (ConfinerPolicy::Macos(MacosPolicy { sbpl }), direct_ports)
 }
@@ -139,7 +153,7 @@ fn compile_macos(
 fn compile_linux(
     input: &CompileInput,
     host: &HostProfile,
-    _spec: &Spec,
+    _blueprint: &Blueprint,
     caps: &mut BTreeMap<Capability, Fidelity>,
     sem: &mut BTreeMap<Capability, DenialSemantics>,
 ) -> (ConfinerPolicy, Vec<u16>) {
@@ -301,23 +315,23 @@ pub fn to_canonical_json(policy: &CompiledPolicy) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use formwork_spec::{FsSpec, Visibility};
+    use formwork_blueprint::{FsBlueprint, Visibility};
 
     fn pp(s: &str) -> PathPattern {
         PathPattern::parse(s).unwrap()
     }
 
-    fn sample_spec() -> Spec {
+    fn sample_blueprint() -> Blueprint {
         let mut mcp = BTreeMap::new();
         mcp.insert(
             "files".to_string(),
-            formwork_spec::McpPolicy {
+            formwork_blueprint::McpPolicy {
                 tools: Visibility::Allow(vec!["read_file".into()]),
                 ..Default::default()
             },
         );
-        Spec {
-            fs: FsSpec {
+        Blueprint {
+            fs: FsBlueprint {
                 read_mode: ReadMode::Closed,
                 reads: vec![pp("/work/**")],
                 writes: vec![pp("/work/project/**")],
@@ -331,14 +345,14 @@ mod tests {
 
     #[test]
     fn writes_fold_into_effective_reads() {
-        let input = CompileInput::from_spec(&sample_spec().canonicalize());
+        let input = CompileInput::from_blueprint(&sample_blueprint().canonicalize());
         // /work/project (write) is under /work (read) so it's canonicalized away.
         assert_eq!(input.effective_reads, vec![pp("/work/**")]);
     }
 
     #[test]
     fn macos_compile_is_seatbelt_enforced() {
-        let policy = compile(&sample_spec(), &HostProfile::synthetic_macos());
+        let policy = compile(&sample_blueprint(), &HostProfile::synthetic_macos());
         assert!(matches!(policy.confiner, ConfinerPolicy::Macos(_)));
         assert!(policy.report.per_capability[&Capability::FsRead].is_enforced());
         assert!(policy.report.per_capability[&Capability::NetDefaultDeny].is_enforced());
@@ -347,7 +361,7 @@ mod tests {
 
     #[test]
     fn linux_modern_uses_landlock_and_reports_socket_partial() {
-        let policy = compile(&sample_spec(), &HostProfile::synthetic_linux(Some(6)));
+        let policy = compile(&sample_blueprint(), &HostProfile::synthetic_linux(Some(6)));
         match &policy.confiner {
             ConfinerPolicy::Linux(l) => {
                 assert!(matches!(l.net, LinuxNetPlan::LandlockTcp { .. }));
@@ -363,7 +377,7 @@ mod tests {
 
     #[test]
     fn linux_old_kernel_denies_net_via_seccomp() {
-        let policy = compile(&sample_spec(), &HostProfile::synthetic_linux(Some(1)));
+        let policy = compile(&sample_blueprint(), &HostProfile::synthetic_linux(Some(1)));
         match &policy.confiner {
             ConfinerPolicy::Linux(l) => assert!(matches!(l.net, LinuxNetPlan::SeccompDenyInet)),
             other => panic!("expected Linux confiner, got {other:?}"),
@@ -375,7 +389,7 @@ mod tests {
     fn linux_without_landlock_reports_fs_unenforceable() {
         let mut host = HostProfile::synthetic_linux(None);
         host.seccomp = true;
-        let policy = compile(&sample_spec(), &host);
+        let policy = compile(&sample_blueprint(), &host);
         assert!(matches!(
             policy.report.per_capability[&Capability::FsRead],
             Fidelity::Unenforceable { .. }
@@ -392,7 +406,7 @@ mod tests {
             seatbelt: false,
             os_version: "ancient".to_string(),
         };
-        let policy = compile(&sample_spec(), &host);
+        let policy = compile(&sample_blueprint(), &host);
         assert!(matches!(
             policy.confiner,
             ConfinerPolicy::Unavailable { .. }
@@ -405,24 +419,24 @@ mod tests {
 
     #[test]
     fn deterministic_compile_is_byte_identical() {
-        let spec = sample_spec();
+        let blueprint = sample_blueprint();
         let host = HostProfile::synthetic_linux(Some(4));
-        let a = to_canonical_json(&compile(&spec, &host));
-        let b = to_canonical_json(&compile(&spec, &host));
+        let a = to_canonical_json(&compile(&blueprint, &host));
+        let b = to_canonical_json(&compile(&blueprint, &host));
         assert_eq!(a, b);
-        let mut spec2 = spec.clone();
-        spec2.fs.reads.insert(0, pp("/work/**")); // duplicate; canonicalization removes it
-        let c = to_canonical_json(&compile(&spec2, &host));
+        let mut blueprint2 = blueprint.clone();
+        blueprint2.fs.reads.insert(0, pp("/work/**")); // duplicate; canonicalization removes it
+        let c = to_canonical_json(&compile(&blueprint2, &host));
         assert_eq!(a, c);
     }
 
     #[test]
     fn port_tier_unenforceable_on_old_linux_but_fail_closed() {
-        let spec = Spec {
+        let blueprint = Blueprint {
             net: NetPosture::Ports(vec![8080]),
-            ..Spec::empty()
+            ..Blueprint::empty()
         };
-        let policy = compile(&spec, &HostProfile::synthetic_linux(Some(1)));
+        let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(1)));
         assert!(matches!(
             policy.report.per_capability[&Capability::NetPortTier],
             Fidelity::Unenforceable { .. }

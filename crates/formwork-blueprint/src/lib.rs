@@ -1,5 +1,5 @@
-//! The capability spec: pure data describing what a confined process may touch. Narrowing
-//! (`Spec::narrow`) can only shrink a grant, never widen it (FW-CAP2).
+//! The capability blueprint: pure data describing what a confined process may touch. Narrowing
+//! (`Blueprint::narrow`) can only shrink a grant, never widen it (FW-CAP2).
 
 mod narrow;
 mod path;
@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 /// `BTreeMap` keeps server order canonical for deterministic compiles.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Spec {
+pub struct Blueprint {
     #[serde(default)]
-    pub fs: FsSpec,
+    pub fs: FsBlueprint,
     #[serde(default)]
     pub net: NetPosture,
     #[serde(default)]
@@ -27,7 +27,7 @@ pub struct Spec {
 /// `write` grants imply `read`; `subtract` holes win over grants (FW-TRA3).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct FsSpec {
+pub struct FsBlueprint {
     #[serde(default)]
     pub read_mode: ReadMode,
     #[serde(default)]
@@ -125,11 +125,11 @@ pub enum Gate {
     Deny,
 }
 
-impl Spec {
+impl Blueprint {
     /// The fail-closed floor: nothing readable/writable, net denied, exec unrestricted, no MCP.
     pub fn empty() -> Self {
-        Spec {
-            fs: FsSpec::default(),
+        Blueprint {
+            fs: FsBlueprint::default(),
             net: NetPosture::Deny,
             exec: ExecPosture::Unrestricted,
             mcp: BTreeMap::new(),
@@ -138,13 +138,13 @@ impl Spec {
 
     /// Equal capabilities canonicalize identically, which is what makes compilation
     /// byte-deterministic (FW-FID4).
-    pub fn canonicalize(&self) -> Spec {
+    pub fn canonicalize(&self) -> Blueprint {
         let mut mcp = BTreeMap::new();
         for (k, v) in &self.mcp {
             mcp.insert(k.clone(), v.canonicalize());
         }
-        Spec {
-            fs: FsSpec {
+        Blueprint {
+            fs: FsBlueprint {
                 read_mode: self.fs.read_mode,
                 reads: canonicalize_set(&self.fs.reads),
                 writes: canonicalize_set(&self.fs.writes),
@@ -232,9 +232,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let s = Spec {
+        let s = Blueprint {
             mcp,
-            ..Spec::empty()
+            ..Blueprint::empty()
         }
         .canonicalize();
         assert_eq!(
@@ -245,9 +245,9 @@ mod tests {
 
     #[test]
     fn empty_ports_canonicalizes_to_deny() {
-        let s = Spec {
+        let s = Blueprint {
             net: NetPosture::Ports(vec![]),
-            ..Spec::empty()
+            ..Blueprint::empty()
         }
         .canonicalize();
         assert_eq!(s.net, NetPosture::Deny);
@@ -270,16 +270,16 @@ mod tests {
             resources = "allow-all"
             sampling = "deny"
         "#;
-        let spec: Spec = toml::from_str(src).unwrap();
+        let blueprint: Blueprint = toml::from_str(src).unwrap();
         assert_eq!(
-            spec.fs.reads,
+            blueprint.fs.reads,
             vec![PathPattern::parse("/work/project/**").unwrap()]
         );
-        assert_eq!(spec.net, NetPosture::Ports(vec![8080]));
+        assert_eq!(blueprint.net, NetPosture::Ports(vec![8080]));
         assert_eq!(
-            spec.mcp["files"].tools,
+            blueprint.mcp["files"].tools,
             Visibility::Allow(vec!["read_file".into()])
         );
-        assert_eq!(spec.mcp["files"].resources, Visibility::AllowAll);
+        assert_eq!(blueprint.mcp["files"].resources, Visibility::AllowAll);
     }
 }

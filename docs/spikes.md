@@ -51,7 +51,7 @@ EPERM, and `/etc/passwd` is denied.
 
 **Discovery — macOS firmlinks.** Grant paths under `/var`, `/tmp`, `/etc` must be canonicalized to
 their `/private/...` real paths before enforcement, because Seatbelt matches the resolved path. This
-canonicalization is an impure step done at spec load for the enforce path (like `~` expansion), not
+canonicalization is an impure step done at blueprint load for the enforce path (like `~` expansion), not
 in the pure compiler, and not for cross-platform dry-run compiles.
 
 **Discovery — device nodes (feeds Phase 4).** Interpreters need `/dev/urandom` at startup (CPython
@@ -86,7 +86,7 @@ kernel is `5.10.104-linuxkit`, which predates Landlock (5.13). Running the `form
 - **`formwork-detect` works** — the `landlock_create_ruleset(NULL,0,VERSION)` probe and
   `prctl(PR_GET_SECCOMP)` check (written on macOS, never before run on Linux) correctly report
   `landlock-abi: null, seccomp: true, os-version: 5.10.104-linuxkit`.
-- **Degraded-host honesty holds (FW-E2E-025/026, FW-INV6)** — compiling a normal spec on this host
+- **Degraded-host honesty holds (FW-E2E-025/026, FW-INV6)** — compiling a normal blueprint on this host
   reports `fs-read`/`fs-write` as `Unenforceable` (Landlock absent), while `net-default-deny` stays
   `Enforced` via seccomp. The report does not lie, and net fails closed rather than silently open.
 

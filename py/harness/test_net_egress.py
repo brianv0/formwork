@@ -4,7 +4,7 @@ import textwrap
 
 import pytest
 
-from helpers import write_spec
+from helpers import write_blueprint
 
 pytestmark = pytest.mark.macos
 
@@ -27,14 +27,14 @@ _CONNECT_PROBE = textwrap.dedent(
 
 @pytest.mark.fw_e2e("FW-E2E-006")
 def test_direct_egress_denied(cli, workspace, tmp_path):
-    spec = write_spec(
-        tmp_path / "spec.toml",
+    blueprint = write_blueprint(
+        tmp_path / "blueprint.toml",
         reads=[f"{workspace.granted}/**"],
         writes=[f"{workspace.granted}/**"],
     )
     # cwd inside the granted dir so the interpreter's sys.path scan doesn't trip on an unreadable cwd.
     result = cli(
-        "run", "--spec", spec, "--", "/usr/bin/python3", "-c", _CONNECT_PROBE,
+        "run", "--blueprint", blueprint, "--", "/usr/bin/python3", "-c", _CONNECT_PROBE,
         cwd=workspace.granted,
     )
     assert result.code == 7, (

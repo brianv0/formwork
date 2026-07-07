@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
+use formwork_blueprint::{Gate, McpPolicy, Visibility};
 use formwork_gateway::Gateway;
-use formwork_spec::{Gate, McpPolicy, Visibility};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
 use tokio::process::Command;
@@ -298,9 +298,9 @@ async fn fw_e2e_019_backend_confinement_recursion() {
     use std::path::Path;
     use std::process::Stdio;
 
+    use formwork_blueprint::{Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode};
     use formwork_compile::compile;
     use formwork_detect::detect;
-    use formwork_spec::{FsSpec, NetPosture, PathPattern, ReadMode, Spec};
 
     // Grant read of the repo tree (so the fixture binary + cwd load), net denied. /etc/hosts is out.
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -309,17 +309,17 @@ async fn fw_e2e_019_backend_confinement_recursion() {
         .parent()
         .unwrap();
     let repo_glob = PathPattern::parse(&format!("{}/**", repo_root.display())).unwrap();
-    let backend_spec = Spec {
-        fs: FsSpec {
+    let backend_blueprint = Blueprint {
+        fs: FsBlueprint {
             read_mode: ReadMode::Closed,
             reads: vec![repo_glob],
             writes: vec![],
             subtract: vec![],
         },
         net: NetPosture::Deny,
-        ..Spec::empty()
+        ..Blueprint::empty()
     };
-    let backend_policy = compile(&backend_spec, &detect());
+    let backend_policy = compile(&backend_blueprint, &detect());
 
     let std_cmd = formwork_gateway::confined_command(
         env!("CARGO_BIN_EXE_fw-mcp-fixture"),

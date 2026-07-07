@@ -8,15 +8,15 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 cargo build -q -p formwork-cli
 FORMWORK="$REPO/target/debug/formwork"
-SPEC="$REPO/examples/specs/agent-session.toml"
+BLUEPRINT="$REPO/examples/blueprints/agent-session.toml"
 
-echo "What this host actually enforces for this spec:"
-"$FORMWORK" compile --spec "$SPEC" --report-only \
+echo "What this host actually enforces for this blueprint:"
+"$FORMWORK" compile --blueprint "$BLUEPRINT" --report-only \
     | awk '/"semantics"/{f=0} /"per-capability"/{f=1} f' | sed 's/^/  /'
 echo
 
 # `permission: "allow"` lives in opencode.json; `--auto` is the launch-time equivalent for `run`.
-CMD=( "$FORMWORK" run --spec "$SPEC" -- opencode )
+CMD=( "$FORMWORK" run --blueprint "$BLUEPRINT" -- opencode )
 
 echo "Confined launch (with permission: \"allow\" set in opencode.json):"
 printf '  '; printf '%q ' "${CMD[@]}"; echo; echo

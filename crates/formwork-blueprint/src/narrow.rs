@@ -4,7 +4,9 @@
 //! approximate, so the result is always a genuine subset.
 
 use crate::path::{canonicalize_set, PathPattern};
-use crate::{ExecPosture, FsSpec, Gate, McpPolicy, NetPosture, ReadMode, Spec, Visibility};
+use crate::{
+    Blueprint, ExecPosture, FsBlueprint, Gate, McpPolicy, NetPosture, ReadMode, Visibility,
+};
 
 fn clamp_to(subject: &[PathPattern], bound: &[PathPattern]) -> Vec<PathPattern> {
     subject
@@ -27,10 +29,10 @@ fn union_grants(a: &[PathPattern], b: &[PathPattern]) -> Vec<PathPattern> {
     canonicalize_set(&out)
 }
 
-impl Spec {
+impl Blueprint {
     /// The result is a subset of both `self` (parent) and `requested` (FW-CAP2).
-    pub fn narrow(&self, requested: &Spec) -> Spec {
-        Spec {
+    pub fn narrow(&self, requested: &Blueprint) -> Blueprint {
+        Blueprint {
             fs: narrow_fs(&self.fs, &requested.fs),
             net: narrow_net(&self.net, &requested.net),
             exec: narrow_exec(&self.exec, &requested.exec),
@@ -40,7 +42,7 @@ impl Spec {
     }
 }
 
-fn narrow_fs(parent: &FsSpec, req: &FsSpec) -> FsSpec {
+fn narrow_fs(parent: &FsBlueprint, req: &FsBlueprint) -> FsBlueprint {
     let subtract = union_grants(&parent.subtract, &req.subtract);
     let writes = intersect_grants(&parent.writes, &req.writes);
 
@@ -62,7 +64,7 @@ fn narrow_fs(parent: &FsSpec, req: &FsSpec) -> FsSpec {
         (ReadMode::AmbientMinusSubtract, ReadMode::Closed) => (ReadMode::Closed, req.reads.clone()),
     };
 
-    FsSpec {
+    FsBlueprint {
         read_mode,
         reads: canonicalize_set(&reads),
         writes,
@@ -156,19 +158,19 @@ mod tests {
 
     #[test]
     fn read_intersection_clamps_to_narrower() {
-        let parent = Spec {
-            fs: FsSpec {
+        let parent = Blueprint {
+            fs: FsBlueprint {
                 reads: vec![pp("/work/**")],
                 ..Default::default()
             },
-            ..Spec::empty()
+            ..Blueprint::empty()
         };
-        let req = Spec {
-            fs: FsSpec {
+        let req = Blueprint {
+            fs: FsBlueprint {
                 reads: vec![pp("/work/project/**"), pp("/etc/**")],
                 ..Default::default()
             },
-            ..Spec::empty()
+            ..Blueprint::empty()
         };
         let n = parent.narrow(&req);
         // /work/project survives (covered by parent /work); /etc is dropped.
@@ -177,19 +179,19 @@ mod tests {
 
     #[test]
     fn subtract_unions_under_narrowing() {
-        let parent = Spec {
-            fs: FsSpec {
+        let parent = Blueprint {
+            fs: FsBlueprint {
                 subtract: vec![pp("/a/**")],
                 ..Default::default()
             },
-            ..Spec::empty()
+            ..Blueprint::empty()
         };
-        let req = Spec {
-            fs: FsSpec {
+        let req = Blueprint {
+            fs: FsBlueprint {
                 subtract: vec![pp("/b/**")],
                 ..Default::default()
             },
-            ..Spec::empty()
+            ..Blueprint::empty()
         };
         let n = parent.narrow(&req);
         assert_eq!(n.fs.subtract, vec![pp("/a/**"), pp("/b/**")]);
@@ -197,9 +199,9 @@ mod tests {
 
     #[test]
     fn net_narrows_to_deny_or_intersection() {
-        let ports = |v: Vec<u16>| Spec {
+        let ports = |v: Vec<u16>| Blueprint {
             net: NetPosture::Ports(v),
-            ..Spec::empty()
+            ..Blueprint::empty()
         };
         assert_eq!(
             ports(vec![80, 443]).narrow(&ports(vec![443, 8080])).net,
@@ -209,7 +211,10 @@ mod tests {
             ports(vec![80]).narrow(&ports(vec![443])).net,
             NetPosture::Deny
         );
-        assert_eq!(ports(vec![80]).narrow(&Spec::empty()).net, NetPosture::Deny);
+        assert_eq!(
+            ports(vec![80]).narrow(&Blueprint::empty()).net,
+            NetPosture::Deny
+        );
     }
 
     #[test]
@@ -222,11 +227,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        let req = Spec {
+        let req = Blueprint {
             mcp: req_mcp,
-            ..Spec::empty()
+            ..Blueprint::empty()
         };
-        let n = Spec::empty().narrow(&req);
+        let n = Blueprint::empty().narrow(&req);
         assert!(n.mcp.is_empty());
     }
 
@@ -241,9 +246,9 @@ mod tests {
                     ..Default::default()
                 },
             );
-            Spec {
+            Blueprint {
                 mcp: m,
-                ..Spec::empty()
+                ..Blueprint::empty()
             }
         };
         let n = mk(Visibility::Allow(vec!["a".into(), "b".into()]))
@@ -256,15 +261,15 @@ mod tests {
 
     #[test]
     fn narrowing_is_idempotent() {
-        let s = Spec {
-            fs: FsSpec {
+        let s = Blueprint {
+            fs: FsBlueprint {
                 reads: vec![pp("/work/**")],
                 writes: vec![pp("/work/project/**")],
                 subtract: vec![pp("/work/.ssh/**")],
                 ..Default::default()
             },
             net: NetPosture::Ports(vec![8080, 80]),
-            ..Spec::empty()
+            ..Blueprint::empty()
         };
         assert_eq!(s.narrow(&s), s.canonicalize());
     }

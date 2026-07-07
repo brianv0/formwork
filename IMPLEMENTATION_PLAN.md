@@ -6,7 +6,7 @@ to the design doc.
 
 ## 1. Language split
 
-**Rust** carries everything load-bearing: the spec types, the pure compiler, both confiners,
+**Rust** carries everything load-bearing: the blueprint types, the pure compiler, both confiners,
 the fd seam, the gateway, and the CLI. Rationale: the confiner does `pre_exec`-window syscall
 work (fork-safety matters), the gateway is the single privileged broker (memory safety
 matters), and the compiler must be deterministic (FW-FID4).
@@ -31,9 +31,9 @@ Optional later: `pyo3`-based Python bindings for embedding (`formwork.compile()`
 formwork/
 ├── Cargo.toml                    # workspace
 ├── crates/
-│   ├── formwork-spec/            # capability spec: types, serde, canonical form,
+│   ├── formwork-blueprint/            # capability blueprint: types, serde, canonical form,
 │   │                             # narrowing algebra (FW-CAP1, FW-CAP2)
-│   ├── formwork-compile/         # pure spec → {ConfinerPolicy, GatewayPolicy,
+│   ├── formwork-compile/         # pure blueprint → {ConfinerPolicy, GatewayPolicy,
 │   │                             # FidelityReport}; no kernel calls (FW-CAP5, FW-FID*)
 │   ├── formwork-detect/          # HostProfile detection (Landlock ABI, seccomp,
 │   │                             # Seatbelt, OS version) — the only impure input
@@ -62,12 +62,12 @@ formwork/
 
 ## 3. Key technical decisions
 
-### 3.1 Spec and deterministic compile
+### 3.1 Blueprint and deterministic compile
 
-- Spec is TOML on disk, `serde` in memory, with a **canonical form** (sorted keys, normalized
+- Blueprint is TOML on disk, `serde` in memory, with a **canonical form** (sorted keys, normalized
   paths, canonical JSON serialization) so FW-E2E-027's byte-identical requirement is a
   property of the encoder, not luck.
-- `compile(spec, host: &HostProfile) -> CompiledPolicy` is pure. All host facts (Landlock ABI
+- `compile(blueprint, host: &HostProfile) -> CompiledPolicy` is pure. All host facts (Landlock ABI
   level, macOS version, seccomp availability) enter through the explicit `HostProfile` value,
   produced by `formwork-detect` or supplied synthetically. That is what makes "compile a Linux
   policy on a Mac" (FW-E2E-026) trivial: pass a synthetic Linux profile.
@@ -198,10 +198,10 @@ JSONL (FW-FID3).
 
 ```
 formwork detect                             # HostProfile as JSON
-formwork compile  --spec s.toml [--host h.json]   # policy + report, no enforcement
-formwork run      --spec s.toml -- cmd args…      # spawn-confined
-formwork enforce-self --spec s.toml               # confine-self, then exec $SHELL or --exec
-formwork gateway  --spec s.toml --servers m.toml  # run broker; used by `run` internally
+formwork compile  --blueprint s.toml [--host h.json]   # policy + report, no enforcement
+formwork run      --blueprint s.toml -- cmd args…      # spawn-confined
+formwork enforce-self --blueprint s.toml               # confine-self, then exec $SHELL or --exec
+formwork gateway  --blueprint s.toml --servers m.toml  # run broker; used by `run` internally
 formwork probe    --report r.json                 # paired allow/deny probes (FW-E2E-024)
 ```
 
@@ -231,9 +231,9 @@ programs, each answering a question the whole design leans on:
 Exit: spike notes committed to `docs/spikes.md`; any design amendment fed back into
 `formwork.md`.
 
-### Phase 1 — spec, compiler, fidelity, dry-run
+### Phase 1 — blueprint, compiler, fidelity, dry-run
 
-`formwork-spec`, `formwork-compile`, `formwork-detect`, CLI `detect|compile`.
+`formwork-blueprint`, `formwork-compile`, `formwork-detect`, CLI `detect|compile`.
 Golden-file tests for canonical encoding; property test for narrowing monotonicity (FW-CAP2).
 **Exit: FW-E2E-026, FW-E2E-027 green on macOS and Linux CI; a Linux policy compiles on macOS.**
 
@@ -312,7 +312,7 @@ reproduced by `formwork detect + compile` on each CI target.**
   When the Docker VM kernel is too old for a test tier (ABI v6 socket/signal scoping needs
   6.12+), `just test-linux-full` falls back to a Lima VM with a pinned 6.12+ kernel image —
   the only local path that exercises the complete matrix.
-- **Fuzzing** (FW-INV1/2/4): `proptest` for spec/narrow sequences and spawn trees; a
+- **Fuzzing** (FW-INV1/2/4): `proptest` for blueprint/narrow sequences and spawn trees; a
   guessed-name fuzzer for shading; nightly CI job, not per-PR.
 
 ## 6. Risk register

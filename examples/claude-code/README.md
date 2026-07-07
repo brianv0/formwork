@@ -9,11 +9,11 @@ egress become OS-enforced boundaries on the `claude` process and everything it s
 the prompts is no longer what's protecting you.
 
 ```sh
-formwork run --spec ./examples/specs/agent-session.toml -- \
+formwork run --blueprint ./examples/blueprints/agent-session.toml -- \
     claude --dangerously-skip-permissions
 ```
 
-`./sandbox-agent.sh` runs exactly this (and prints the enforced-capability report first). The spec
+`./sandbox-agent.sh` runs exactly this (and prints the enforced-capability report first). The blueprint
 grants writes to `~/project` + scratch, subtracts your credential/keychain/browser paths, and allows
 only HTTPS egress so the model API still works. Narrow `writes` to your actual repo before using it.
 
@@ -35,7 +35,7 @@ gateway wraps after the `--`:
 "files": {
   "type": "stdio",
   "command": "formwork",
-  "args": ["gateway", "--spec", "./examples/specs/mcp-gateway.toml",
+  "args": ["gateway", "--blueprint", "./examples/blueprints/mcp-gateway.toml",
            "--server", "files", "--",
            "npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
 }
@@ -63,13 +63,13 @@ server command:
 
 ```sh
 claude mcp add files -- formwork gateway \
-    --spec ./examples/specs/mcp-gateway.toml --server files -- \
+    --blueprint ./examples/blueprints/mcp-gateway.toml --server files -- \
     npx -y @modelcontextprotocol/server-filesystem .
 ```
 
 To see the gateway shading a backend end to end without installing anything, run
 [`../gateway-demo.sh`](../gateway-demo.sh) (it wraps the repo's built-in fixture instead of the npx
-server). For the `npx` server specifically, pre-install it or widen the spec's `net`, since a
+server). For the `npx` server specifically, pre-install it or widen the blueprint's `net`, since a
 confined backend with `net = "deny"` cannot fetch the package on first run.
 
 ## Both at once
@@ -78,7 +78,7 @@ Run Claude confined **and** route its MCP servers through the gateway — Axis A
 Axis B walls each tool server:
 
 ```sh
-formwork run --spec ./examples/specs/agent-session.toml -- \
+formwork run --blueprint ./examples/blueprints/agent-session.toml -- \
     claude --dangerously-skip-permissions \
            --strict-mcp-config --mcp-config ./examples/claude-code/mcp.json
 ```

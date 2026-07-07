@@ -5,14 +5,14 @@ import json
 
 import pytest
 
-from helpers import write_spec
+from helpers import write_blueprint
 
 
 @pytest.mark.fw_e2e("FW-E2E-026")
 def test_dry_run_cross_platform_compile(cli, tmp_path):
-    spec = write_spec(tmp_path / "spec.toml", reads=["/work/project/**"], writes=["/work/project/**"])
+    blueprint = write_blueprint(tmp_path / "blueprint.toml", reads=["/work/project/**"], writes=["/work/project/**"])
     for target in ("macos", "linux-v6", "linux-v1"):
-        result = cli("compile", "--spec", spec, "--target", target, "--report-only")
+        result = cli("compile", "--blueprint", blueprint, "--target", target, "--report-only")
         assert result.code == 0, result.stderr
         report = json.loads(result.stdout)
         assert "per-capability" in report
@@ -22,8 +22,8 @@ def test_dry_run_cross_platform_compile(cli, tmp_path):
 
 @pytest.mark.fw_e2e("FW-E2E-026")
 def test_degraded_host_reports_unenforceable(cli, tmp_path):
-    spec = write_spec(tmp_path / "spec.toml", reads=["/work/project/**"])
-    result = cli("compile", "--spec", spec, "--target", "linux-v1", "--report-only")
+    blueprint = write_blueprint(tmp_path / "blueprint.toml", reads=["/work/project/**"])
+    result = cli("compile", "--blueprint", blueprint, "--target", "linux-v1", "--report-only")
     report = json.loads(result.stdout)
     net = report["per-capability"]["net-default-deny"]
     assert net["status"] in ("enforced", "partial"), "net must never be silently open"
@@ -31,16 +31,16 @@ def test_degraded_host_reports_unenforceable(cli, tmp_path):
 
 @pytest.mark.fw_e2e("FW-E2E-027")
 def test_deterministic_compile_byte_identical(cli, tmp_path):
-    spec = write_spec(
-        tmp_path / "spec.toml",
+    blueprint = write_blueprint(
+        tmp_path / "blueprint.toml",
         reads=["/work/**"],
         writes=["/work/project/**"],
         subtract=["/work/.ssh/**"],
     )
-    a = cli("compile", "--spec", spec, "--target", "linux-v4")
-    b = cli("compile", "--spec", spec, "--target", "linux-v4")
+    a = cli("compile", "--blueprint", blueprint, "--target", "linux-v4")
+    b = cli("compile", "--blueprint", blueprint, "--target", "linux-v4")
     assert a.code == 0 and b.code == 0
-    assert a.stdout == b.stdout, "same spec + target must compile byte-identically"
+    assert a.stdout == b.stdout, "same blueprint + target must compile byte-identically"
 
 
 @pytest.mark.fw_e2e("FW-E2E-026")

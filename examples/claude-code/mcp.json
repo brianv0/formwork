@@ -5,7 +5,7 @@
       "command": "formwork",
       "args": [
         "gateway",
-        "--spec", "./examples/specs/mcp-gateway.toml",
+        "--blueprint", "./examples/blueprints/mcp-gateway.toml",
         "--server", "files",
         "--",
         "npx", "-y", "@modelcontextprotocol/server-filesystem", "."

@@ -5,8 +5,8 @@ codex, and opencode. They compose — use either alone or both together.
 
 | Axis | What it does | Command | Where it's enforced |
 |---|---|---|---|
-| **A — confine the agent** | Run the whole agent process (and every child it spawns) behind a kernel-enforced fs/net/exec wall. | `formwork run --spec … -- <agent> <flags>` | Seatbelt (macOS) / Landlock+seccomp (Linux) |
-| **B — shade its MCP servers** | Put a policy gateway between the agent and each MCP server: only granted tools/resources/prompts are visible or callable, and the server itself runs confined. | `formwork gateway --spec … --server <name> -- <server cmd>` | The gateway is a stdio MCP server the host launches |
+| **A — confine the agent** | Run the whole agent process (and every child it spawns) behind a kernel-enforced fs/net/exec wall. | `formwork run --blueprint … -- <agent> <flags>` | Seatbelt (macOS) / Landlock+seccomp (Linux) |
+| **B — shade its MCP servers** | Put a policy gateway between the agent and each MCP server: only granted tools/resources/prompts are visible or callable, and the server itself runs confined. | `formwork gateway --blueprint … --server <name> -- <server cmd>` | The gateway is a stdio MCP server the host launches |
 
 ## Why this matters: turn off the permission prompts, safely
 
@@ -26,7 +26,7 @@ Formwork claims only what the current host can back. Check yours:
 
 ```sh
 formwork detect                                   # capabilities of this machine
-formwork compile --spec examples/specs/agent-session.toml --report-only   # per-capability fidelity
+formwork compile --blueprint examples/blueprints/agent-session.toml --report-only   # per-capability fidelity
 ```
 
 On macOS (Seatbelt) fs read/write, default-deny egress, and the direct-TCP port tier are all
@@ -39,8 +39,8 @@ enforce a capability, `formwork` reports the gap instead of pretending (it never
 
 ```
 examples/
-  specs/agent-session.toml   # Axis A: confine an agent — scoped writes, secrets subtracted, HTTPS-only egress
-  specs/mcp-gateway.toml      # Axis B: gateway policy — [mcp.files] shading + backend confinement
+  blueprints/agent-session.toml   # Axis A: confine an agent — scoped writes, secrets subtracted, HTTPS-only egress
+  blueprints/mcp-gateway.toml      # Axis B: gateway policy — [mcp.files] shading + backend confinement
   gateway-demo.sh             # runnable Axis B demo against the built-in fixture (no external deps)
   claude-code/                # per-host: sandbox-agent.sh + the MCP-override config to stage
   codex/

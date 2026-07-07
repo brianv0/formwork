@@ -1,6 +1,6 @@
 # Formwork
 
-An OS-level sandbox for agent sessions: it takes a capability spec and turns the four capabilities
+An OS-level sandbox for agent sessions: it takes a capability blueprint and turns the four capabilities
 that touch the real operating system — read, write, exec, net — into boundaries the kernel actually
 enforces, on Linux and macOS, for an agent process and every child it spawns. Plus an MCP-aware
 gateway so every tool call and every byte of egress is forced through one auditable door.
@@ -19,7 +19,7 @@ Under construction, kernel-mechanism-first (plan §4).
 
 | Phase | What | State |
 |---|---|---|
-| 1 | Spec, pure compiler, fidelity report, dry-run | **done** — `FW-E2E-026/027` + narrowing/report tests green; `detect` + degraded-host honesty verified on real Linux (Docker) |
+| 1 | Blueprint, pure compiler, fidelity report, dry-run | **done** — `FW-E2E-026/027` + narrowing/report tests green; `detect` + degraded-host honesty verified on real Linux (Docker) |
 | 3 | macOS confiner (Seatbelt) | **done** — real kernel enforcement; `FW-E2E-001..006, 024` green natively |
 | 5 | fd-injection transport (seam) | **done** — `FW-E2E-010/011/012` green; transport verified on macOS *and* Linux |
 | — | Python E2E harness | **done** — black-box CLI tests + generated traceability, `uv`-managed |
@@ -33,9 +33,9 @@ clippy is clean under `-D warnings`, and the whole workspace cross-compiles for 
 
 ## Workspace
 
-- `crates/formwork-spec` — capability spec: types, canonical form, narrowing algebra (FW-CAP*).
+- `crates/formwork-blueprint` — capability blueprint: types, canonical form, narrowing algebra (FW-CAP*).
 - `crates/formwork-detect` — `HostProfile` detection (the only impure input to compilation).
-- `crates/formwork-compile` — the pure `spec → {confiner, gateway, FidelityReport}` compiler.
+- `crates/formwork-compile` — the pure `blueprint → {confiner, gateway, FidelityReport}` compiler.
 - `crates/formwork-confine` — the confiners (Landlock+seccomp / Seatbelt), two postures.
 - `crates/formwork-seam` — the fd-injection transport: socketpair-at-spawn + `SCM_RIGHTS` minting.
 - `crates/formwork-gateway` — the MCP-aware policy proxy: shading, policing, transparent passthrough.
@@ -49,10 +49,10 @@ clippy is clean under `-D warnings`, and the whole workspace cross-compiles for 
 cargo build
 # What can this host enforce?
 cargo run -p formwork-cli -- detect
-# Compile a spec to a policy + honest fidelity report, without enforcing (works on any OS):
-cargo run -p formwork-cli -- compile --spec examples/e2e-001.toml --report-only
+# Compile a blueprint to a policy + honest fidelity report, without enforcing (works on any OS):
+cargo run -p formwork-cli -- compile --blueprint examples/e2e-001.toml --report-only
 # Cross-platform dry-run: compile a Linux policy while on a Mac (FW-E2E-026):
-cargo run -p formwork-cli -- compile --spec examples/e2e-001.toml --target linux-v6 --report-only
+cargo run -p formwork-cli -- compile --blueprint examples/e2e-001.toml --target linux-v6 --report-only
 ```
 
 ## Testing

@@ -10,10 +10,10 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use formwork_blueprint::{Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode};
 use formwork_compile::{compile, Capability, CompiledPolicy};
 use formwork_detect::detect;
 use formwork_seam::{inject, SeamPlan};
-use formwork_spec::{FsSpec, NetPosture, PathPattern, ReadMode, Spec};
 
 fn pp(dir: &Path) -> PathPattern {
     PathPattern::parse(&format!("{}/**", dir.display())).unwrap()
@@ -27,17 +27,17 @@ fn helper_dir() -> PathBuf {
 /// The only route to the "gateway" is the injected fd.
 fn net_deny_policy(read_dirs: &[&Path]) -> CompiledPolicy {
     let reads = read_dirs.iter().map(|d| pp(d)).collect();
-    let spec = Spec {
-        fs: FsSpec {
+    let blueprint = Blueprint {
+        fs: FsBlueprint {
             read_mode: ReadMode::Closed,
             reads,
             writes: vec![],
             subtract: vec![],
         },
         net: NetPosture::Deny,
-        ..Spec::empty()
+        ..Blueprint::empty()
     };
-    let policy = compile(&spec, &detect());
+    let policy = compile(&blueprint, &detect());
     assert!(
         policy.report.per_capability[&Capability::NetDefaultDeny].is_enforced(),
         "test premise: net-default-deny must be enforced on this host"

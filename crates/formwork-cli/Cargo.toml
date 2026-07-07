@@ -11,7 +11,7 @@ name = "formwork"
 path = "src/main.rs"
 
 [dependencies]
-formwork-spec = { workspace = true }
+formwork-blueprint = { workspace = true }
 formwork-detect = { workspace = true }
 formwork-compile = { workspace = true }
 formwork-confine = { workspace = true }

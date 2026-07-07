@@ -4,7 +4,7 @@ Working name. Design proposal with end-to-end test specification.
 
 Formwork is a sandboxing substrate for agent sessions. It turns the four capabilities that touch the real operating system — read, write, exec, net — into enforceable boundaries, on Linux and macOS, for an agent process and every child it spawns.
 
-Formwork is standalone. It takes a capability spec and produces an enforced sandbox plus an honest report of what it could and could not enforce. A host — Claude Code, OpenCode, or a bare shell wrapper — depends on Formwork; Formwork depends on nothing above it. The name is the metaphor: formwork is the temporary mould that contains poured concrete until it cures — a frame that constrains where the material can go. That is a sandbox around a process tree.
+Formwork is standalone. It takes a capability blueprint and produces an enforced sandbox plus an honest report of what it could and could not enforce. A host — Claude Code, OpenCode, or a bare shell wrapper — depends on Formwork; Formwork depends on nothing above it. The name is the metaphor: formwork is the temporary mould that contains poured concrete until it cures — a frame that constrains where the material can go. That is a sandbox around a process tree.
 
 ## 1. Design philosophy: good isolation, maximal reuse
 
@@ -22,12 +22,12 @@ Formwork has two enforcement arms driven by a single capability compiler, with a
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  CAPABILITY SPEC (unveil-style)                                    │
+│  CAPABILITY BLUEPRINT (unveil-style)                               │
 │  read(path) · write(path) · [exec(path)] · net-posture ·          │
 │  mcp(server → {tools, resources, prompts} visibility)             │
 ├──────────────────────────────────────────────────────────────────┤
 │  COMPILER (pure; no kernel calls)                                  │
-│  spec → { confiner policy, gateway policy } + FidelityReport      │
+│  blueprint → { confiner policy, gateway policy } + FidelityReport │
 ├───────────────────────────────┬──────────────────────────────────┤
 │  CONFINER  (hard boundary)     │  GATEWAY  (soft boundary)         │
 │  Linux: Landlock + seccomp     │  MCP-aware policy proxy           │
@@ -80,9 +80,9 @@ Naming note (open, section 11): this document uses **Formwork** for the whole sy
 - Hostile multi-tenant co-tenancy at cloud scale. Formwork is a personal/team substrate, not a hosted platform isolating mutually adversarial tenants.
 - Perfect unveil-style invisibility of the filesystem. Formwork accepts EACCES-style denial (section 4); it does not emulate ENOENT for every ungranted path.
 
-## 4. The capability spec and its interpreter
+## 4. The capability blueprint and its interpreter
 
-Formwork consumes a finite, enumerable spec — the unveil/pledge lineage, narrowed to what an OS sandbox can carry:
+Formwork consumes a finite, enumerable blueprint — the unveil/pledge lineage, narrowed to what an OS sandbox can carry:
 
 ```
 read(path-pattern)        # filesystem read
@@ -99,7 +99,7 @@ mcp(server): {            # per-MCP-server visibility policy
 }
 ```
 
-The compiler is the single authority that maps this spec to concrete mechanisms. It is pure — it never touches the kernel — so it runs in CI on any box, lets a Linux policy be compiled and inspected on a Mac, and is deterministic. It emits two policy objects (confiner, gateway) and a `FidelityReport`.
+The compiler is the single authority that maps this blueprint to concrete mechanisms. It is pure — it never touches the kernel — so it runs in CI on any box, lets a Linux policy be compiled and inspected on a Mac, and is deterministic. It emits two policy objects (confiner, gateway) and a `FidelityReport`.
 
 Two semantics choices, both settled earlier in design:
 
@@ -122,18 +122,18 @@ Two further points pin the vocabulary above down so it is unambiguous to the com
 | **FW-XR3** Fail-closed egress | Absent a working confiner, network defaults to full deny. The agent reaches the world only through the gateway fd. No configuration and no capability-detection failure produces silent open egress. |
 | **FW-XR4** Descendant inheritance | Confinement applies to the confined process and every descendant. A child cannot shed, relax, or widen it. |
 | **FW-XR5** Single privileged broker | Exactly one component (the gateway) holds real network and broad filesystem access. The agent and all stdio MCP backends are confined by the same confiner. |
-| **FW-XR6** Behavioral parity | An identical spec yields equivalent observable behavior for the enforceable intersection across Linux and macOS. Platform divergence appears only in the FidelityReport, never as a silent behavior change. |
+| **FW-XR6** Behavioral parity | An identical blueprint yields equivalent observable behavior for the enforceable intersection across Linux and macOS. Platform divergence appears only in the FidelityReport, never as a silent behavior change. |
 | **FW-XR7** fd-injection transport | The agent reaches the gateway via an inherited fd. Formwork never depends on an in-sandbox `connect()` nor on the filesystem sandbox selectively *allowing* a socket path. |
 
 ### 5.2 Capability model (FW-CAP)
 
 | Req | Requirement |
 |---|---|
-| **FW-CAP1** Enumerable vocabulary | The spec is a finite enumeration of read/write/exec/net/mcp. No mechanism accepts natural language and produces a grant. |
+| **FW-CAP1** Enumerable vocabulary | The blueprint is a finite enumeration of read/write/exec/net/mcp. No mechanism accepts natural language and produces a grant. |
 | **FW-CAP2** Monotonic narrowing | A session may narrow its own grant but never widen it. A child's grant is a subset of its parent's. |
 | **FW-CAP3** Subtractive default profile | The default profile is broad-read over the ambient environment minus a configured sensitive set, not minimal-from-empty. |
 | **FW-CAP4** Invisibility for MCP, denial for fs | Ungranted MCP tools/resources/prompts are absent from listings and non-invocable. Ungranted filesystem paths may return EACCES rather than ENOENT. |
-| **FW-CAP5** Single inspectable interpreter | The compiler is the sole spec→mechanism authority, and its output (compiled policy + report) is inspectable without enforcing. |
+| **FW-CAP5** Single inspectable interpreter | The compiler is the sole blueprint→mechanism authority, and its output (compiled policy + report) is inspectable without enforcing. |
 
 ### 5.3 OS isolation / confiner (FW-ISO)
 
@@ -181,13 +181,13 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 | **FW-FID1** Per-capability report | `compile()` returns, per capability: `Enforced \| Partial(reason) \| Unenforceable(reason)`, plus backend and semantics (hide vs deny). |
 | **FW-FID2** Dry-run / audit | Produce the compiled policy and report without enforcing (CI on non-capable boxes; cross-platform policy development). |
 | **FW-FID3** Runtime observability | Emit a structured record of grants and denials at runtime, suitable for a host's journal when embedded, or standalone logging otherwise. |
-| **FW-FID4** Deterministic compile | The same spec compiles to a byte-identical policy and report. |
+| **FW-FID4** Deterministic compile | The same blueprint compiles to a byte-identical policy and report. |
 
 ## 6. Invariants
 
 These hold for every session under every backend, and are the properties the tests in section 7 exist to falsify.
 
-**FW-INV1 — No widening.** After `enforce()`, the held capability set can only shrink. No code path widens it. Verified by fuzzing spec/narrow sequences and asserting against probes.
+**FW-INV1 — No widening.** After `enforce()`, the held capability set can only shrink. No code path widens it. Verified by fuzzing blueprint/narrow sequences and asserting against probes.
 
 **FW-INV2 — Descendant containment.** No descendant escapes or relaxes the confiner. Re-exec, setuid/setgid execution, and `prctl` attempts to clear `NO_NEW_PRIVS` do not restore access. Fuzzed over random spawn trees.
 
@@ -261,15 +261,15 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 ### 7.6 Fidelity & operability
 
-**FW-E2E-024: Report soundness.** For a rich spec, `compile()` yields a report. For every capability marked `Enforced`, a paired probe asserts the allowed operation succeeds and the denied operation fails. Pass: every `Enforced` claim survives its probe pair; nothing marked `Enforced` is bypassable by the probe suite. Fail: any `Enforced` capability is bypassable, or any probe contradicts the report.
+**FW-E2E-024: Report soundness.** For a rich blueprint, `compile()` yields a report. For every capability marked `Enforced`, a paired probe asserts the allowed operation succeeds and the denied operation fails. Pass: every `Enforced` claim survives its probe pair; nothing marked `Enforced` is bypassable by the probe suite. Fail: any `Enforced` capability is bypassable, or any probe contradicts the report.
 
-**FW-E2E-025: Report honesty on a degraded host.** On a kernel lacking Landlock network support, a spec requesting `net: Ports([...])` is compiled and enforced. Pass: the net-port capability is reported Partial/Unenforceable, the fail-closed deny still holds (no egress), and observed behavior matches the report exactly. Fail: the report claims port enforcement that does not hold, or egress leaks.
+**FW-E2E-025: Report honesty on a degraded host.** On a kernel lacking Landlock network support, a blueprint requesting `net: Ports([...])` is compiled and enforced. Pass: the net-port capability is reported Partial/Unenforceable, the fail-closed deny still holds (no egress), and observed behavior matches the report exactly. Fail: the report claims port enforcement that does not hold, or egress leaks.
 
 **FW-E2E-026: Dry-run compile without enforcement.** `compile()` runs on a host lacking Landlock, and on macOS compiling a Linux profile. Pass: a policy and report are produced and nothing is enforced on the running process. Fail: `compile()` requires kernel support, mutates the process, or crashes.
 
-**FW-E2E-027: Deterministic compile.** The same spec is compiled twice. Pass: byte-identical policy and report. Fail: any nondeterministic difference.
+**FW-E2E-027: Deterministic compile.** The same blueprint is compiled twice. Pass: byte-identical policy and report. Fail: any nondeterministic difference.
 
-**FW-E2E-028: Cross-platform equivalence.** The same spec is enforced on Linux and macOS and exercised by the section 7.1–7.5 workloads. Pass: for the enforceable intersection, observable behaviors match across platforms; all differences are reflected in the FidelityReport, not in silent behavior. Fail: an observable behavior differs across platforms without a corresponding report entry.
+**FW-E2E-028: Cross-platform equivalence.** The same blueprint is enforced on Linux and macOS and exercised by the section 7.1–7.5 workloads. Pass: for the enforceable intersection, observable behaviors match across platforms; all differences are reflected in the FidelityReport, not in silent behavior. Fail: an observable behavior differs across platforms without a corresponding report entry.
 
 ### 7.7 Adversarial
 

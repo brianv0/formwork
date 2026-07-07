@@ -5,8 +5,8 @@
 //! So it blocks a small fixed set of shedding/escalation surfaces and lets everything else through;
 //! Landlock, not seccomp, carries the filesystem boundary.
 
+use formwork_blueprint::NetPosture;
 use formwork_detect::HostProfile;
-use formwork_spec::NetPosture;
 
 use crate::policy::{LinuxNetPlan, SeccompPlan, SocketFamily};
 

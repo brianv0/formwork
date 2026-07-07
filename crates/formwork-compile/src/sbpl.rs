@@ -4,7 +4,7 @@
 //! (FW-TRA2), then `(deny network*)` + optional port re-allows, then reads, writes, exec. Subtract
 //! holes are emitted last within each section so a denied sensitive path wins over its grant.
 
-use formwork_spec::{ExecPosture, NetPosture, PathPattern, ReadMode};
+use formwork_blueprint::{ExecPosture, NetPosture, PathPattern, ReadMode};
 
 use crate::CompileInput;
 
@@ -164,7 +164,7 @@ fn escape(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::CompileInput;
-    use formwork_spec::{ExecPosture, NetPosture, ReadMode};
+    use formwork_blueprint::{ExecPosture, NetPosture, ReadMode};
 
     fn pp(s: &str) -> PathPattern {
         PathPattern::parse(s).unwrap()

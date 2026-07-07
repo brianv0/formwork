@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-formwork-spec = { workspace = true }
+formwork-blueprint = { workspace = true }
 formwork-detect = { workspace = true }
 formwork-compile = { workspace = true }
 thiserror = { workspace = true }

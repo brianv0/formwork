@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
+use formwork_blueprint::{Gate, McpPolicy};
 use formwork_compile::CompiledPolicy;
-use formwork_spec::{Gate, McpPolicy};
 
 // Bounds a single frame so a peer that never sends a newline can't make the gateway buffer without
 // limit; overflow closes the connection. A stability bound (design §3), not a DoS-resistance claim --
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn filter_list_hides_ungranted_and_keeps_granted() {
         let policy = McpPolicy {
-            tools: formwork_spec::Visibility::Allow(vec!["keep".into()]),
+            tools: formwork_blueprint::Visibility::Allow(vec!["keep".into()]),
             ..Default::default()
         };
         let resp = json!({

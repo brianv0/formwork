@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use formwork_spec::{McpPolicy, PathPattern, ReadMode};
+use formwork_blueprint::{McpPolicy, PathPattern, ReadMode};
 
 use crate::report::FidelityReport;
 
@@ -55,7 +55,7 @@ pub enum LinuxNetPlan {
     LandlockTcp { ports: Vec<u16> },
 }
 
-/// Off unless the spec asks (FW-ISO4).
+/// Off unless the blueprint asks (FW-ISO4).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ExecPlan {

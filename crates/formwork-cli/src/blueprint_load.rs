@@ -1,4 +1,4 @@
-//! Loading a spec from disk. Impure on purpose -- this is where `~` is expanded against `$HOME` and
+//! Loading a blueprint from disk. Impure on purpose -- this is where `~` is expanded against `$HOME` and
 //! where enforcement paths are canonicalized against the real filesystem -- so the compiler stays
 //! pure and takes only absolute, host-independent patterns.
 
@@ -6,16 +6,16 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use formwork_spec::{ExecPosture, PathPattern, Spec};
+use formwork_blueprint::{Blueprint, ExecPosture, PathPattern};
 
-pub fn load(path: &Path, home: &str) -> Result<Spec> {
+pub fn load(path: &Path, home: &str) -> Result<Blueprint> {
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading spec {}", path.display()))?;
+        .with_context(|| format!("reading blueprint {}", path.display()))?;
     let mut value: toml::Value =
-        toml::from_str(&text).with_context(|| format!("parsing spec {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parsing blueprint {}", path.display()))?;
     expand_tilde(&mut value, home);
-    let spec: Spec = value.try_into().context("interpreting spec")?;
-    Ok(spec)
+    let blueprint: Blueprint = value.try_into().context("interpreting blueprint")?;
+    Ok(blueprint)
 }
 
 /// Only leading tildes, so a tool name is untouched unless it literally starts with `~/`.
@@ -40,13 +40,13 @@ fn expand_tilde(value: &mut toml::Value, home: &str) {
 /// here, not in the compiler, and is not applied to dry-run compiles. Fails loud on a non-UTF-8
 /// resolved path: a lossy rule could silently fail to match, and for a `subtract` hole that is a
 /// silent fail-open (FW-INV6).
-pub fn canonicalize_for_enforcement(spec: &Spec) -> Result<Spec> {
+pub fn canonicalize_for_enforcement(blueprint: &Blueprint) -> Result<Blueprint> {
     let map = |ps: &[PathPattern]| ps.iter().map(canon_pattern).collect::<Result<Vec<_>>>();
-    let mut out = spec.clone();
-    out.fs.reads = map(&spec.fs.reads)?;
-    out.fs.writes = map(&spec.fs.writes)?;
-    out.fs.subtract = map(&spec.fs.subtract)?;
-    if let ExecPosture::Allowlist(paths) = &spec.exec {
+    let mut out = blueprint.clone();
+    out.fs.reads = map(&blueprint.fs.reads)?;
+    out.fs.writes = map(&blueprint.fs.writes)?;
+    out.fs.subtract = map(&blueprint.fs.subtract)?;
+    if let ExecPosture::Allowlist(paths) = &blueprint.exec {
         out.exec = ExecPosture::Allowlist(map(paths)?);
     }
     Ok(out)
@@ -95,7 +95,7 @@ fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use formwork_spec::PathPattern;
+    use formwork_blueprint::PathPattern;
 
     #[test]
     fn expands_leading_tilde_in_paths() {
@@ -110,23 +110,23 @@ mod tests {
         )
         .unwrap();
         expand_tilde(&mut v, "/Users/bvk");
-        let spec: Spec = v.try_into().unwrap();
+        let blueprint: Blueprint = v.try_into().unwrap();
         assert_eq!(
-            spec.fs.reads[0],
+            blueprint.fs.reads[0],
             PathPattern::parse("/Users/bvk/project/**").unwrap()
         );
-        assert!(spec
+        assert!(blueprint
             .fs
             .reads
             .contains(&PathPattern::parse("/Users/bvk").unwrap()));
         assert_eq!(
-            spec.fs.subtract[0],
+            blueprint.fs.subtract[0],
             PathPattern::parse("/Users/bvk/.ssh/**").unwrap()
         );
         // A tool name that isn't `~/`-prefixed is untouched.
         assert_eq!(
-            spec.mcp["s"].tools,
-            formwork_spec::Visibility::Allow(vec!["~weird_but_left_alone".into()])
+            blueprint.mcp["s"].tools,
+            formwork_blueprint::Visibility::Allow(vec!["~weird_but_left_alone".into()])
         );
     }
 }

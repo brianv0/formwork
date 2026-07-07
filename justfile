@@ -48,7 +48,7 @@ detect:
 
 # Compile the default profile against a synthetic target and print the fidelity report.
 compile-default target="macos":
-    cargo run -q -p formwork-cli -- compile --spec profiles/default.toml --target {{target}} --report-only
+    cargo run -q -p formwork-cli -- compile --blueprint profiles/default.toml --target {{target}} --report-only
 
 fmt:
     cargo fmt --all

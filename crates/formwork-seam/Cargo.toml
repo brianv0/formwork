@@ -17,7 +17,7 @@ libc = "0.2"
 # injected-fd transport works with zero in-sandbox network (FW-E2E-010/011/012). These are never
 # part of the crate's own dependency surface.
 [dev-dependencies]
-formwork-spec = { workspace = true }
+formwork-blueprint = { workspace = true }
 formwork-detect = { workspace = true }
 formwork-compile = { workspace = true }
 formwork-confine = { workspace = true }

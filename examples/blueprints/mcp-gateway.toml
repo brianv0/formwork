@@ -1,4 +1,4 @@
-# Spec for `formwork gateway`. One spec governs both surfaces the gateway controls:
+# Blueprint for `formwork gateway`. One blueprint governs both surfaces the gateway controls:
 #
 #   [mcp.files]   shades the MCP protocol — only `read_file` is visible and callable; every other
 #                 tool (write_file, http_fetch), plus all resources and prompts, is absent from

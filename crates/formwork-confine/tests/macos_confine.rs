@@ -9,9 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use formwork_blueprint::{Blueprint, FsBlueprint, PathPattern, ReadMode};
 use formwork_compile::compile;
 use formwork_detect::detect;
-use formwork_spec::{FsSpec, PathPattern, ReadMode, Spec};
 
 fn pp(p: &Path) -> PathPattern {
     PathPattern::parse(&format!("{}/**", p.display())).unwrap()
@@ -57,16 +57,16 @@ fn confined(
     writes: Vec<PathPattern>,
     subtract: Vec<PathPattern>,
 ) -> formwork_compile::CompiledPolicy {
-    let spec = Spec {
-        fs: FsSpec {
+    let blueprint = Blueprint {
+        fs: FsBlueprint {
             read_mode: ReadMode::Closed,
             reads,
             writes,
             subtract,
         },
-        ..Spec::empty()
+        ..Blueprint::empty()
     };
-    compile(&spec, &detect())
+    compile(&blueprint, &detect())
 }
 
 /// Outcome of a direct-connect probe. Distinguishing these matters: a probe that failed to *start*,

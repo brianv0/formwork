@@ -67,7 +67,7 @@ def _toml_array(items) -> str:
     return "[" + ", ".join(f'"{i}"' for i in items) + "]"
 
 
-def write_spec(
+def write_blueprint(
     path: Path,
     *,
     net: str = "deny",
@@ -76,7 +76,7 @@ def write_spec(
     writes=(),
     subtract=(),
 ) -> Path:
-    """Write a Formwork spec TOML."""
+    """Write a Formwork blueprint TOML."""
     body = "\n".join(
         [
             f'net = "{net}"',

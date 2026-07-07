@@ -9,18 +9,18 @@ that leaves nothing scoping the process. Run codex under `formwork run` and Form
 takes over that job:
 
 ```sh
-formwork run --spec ./examples/specs/agent-session.toml -- \
+formwork run --blueprint ./examples/blueprints/agent-session.toml -- \
     codex --dangerously-bypass-approvals-and-sandbox
 ```
 
 `./sandbox-agent.sh` runs exactly this. For a one-shot, headless run use `codex exec`:
 
 ```sh
-formwork run --spec ./examples/specs/agent-session.toml -- \
+formwork run --blueprint ./examples/blueprints/agent-session.toml -- \
     codex exec --dangerously-bypass-approvals-and-sandbox "summarize the build"
 ```
 
-The point isn't to disable safety — it's to move it down a layer. One Formwork spec then scopes
+The point isn't to disable safety — it's to move it down a layer. One Formwork blueprint then scopes
 codex, Claude Code, and opencode identically, instead of each agent's bespoke sandbox settings.
 
 ## Axis B — route MCP servers through the gateway
@@ -32,7 +32,7 @@ real backend after `--`, so codex talks to the gateway and the gateway shades + 
 ```toml
 [mcp_servers.files]
 command = "formwork"
-args = ["gateway", "--spec", "./examples/specs/mcp-gateway.toml", "--server", "files", "--",
+args = ["gateway", "--blueprint", "./examples/blueprints/mcp-gateway.toml", "--server", "files", "--",
         "npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
 ```
 
@@ -40,7 +40,7 @@ args = ["gateway", "--spec", "./examples/specs/mcp-gateway.toml", "--server", "f
 
 ```sh
 codex mcp add files -- formwork gateway \
-    --spec ./examples/specs/mcp-gateway.toml --server files -- \
+    --blueprint ./examples/blueprints/mcp-gateway.toml --server files -- \
     npx -y @modelcontextprotocol/server-filesystem .
 ```
 

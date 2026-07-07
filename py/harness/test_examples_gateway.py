@@ -1,5 +1,5 @@
 """`formwork gateway` shading E2E, driven as an MCP host would: launch it as a stdio server in front
-of the built-in fixture backend, using the shipped example spec (examples/specs/mcp-gateway.toml).
+of the built-in fixture backend, using the shipped example blueprint (examples/blueprints/mcp-gateway.toml).
 
 macOS-only: the gateway confines the spawned backend (FW-GW5), which needs the Seatbelt backend here.
 Driven interactively (Popen, not a one-shot pipe) because the gateway tears the connection down the
@@ -16,7 +16,7 @@ from helpers import REPO_ROOT
 
 pytestmark = pytest.mark.macos
 
-EXAMPLE_SPEC = REPO_ROOT / "examples" / "specs" / "mcp-gateway.toml"
+EXAMPLE_BLUEPRINT = REPO_ROOT / "examples" / "blueprints" / "mcp-gateway.toml"
 
 
 @pytest.fixture(scope="session")
@@ -40,7 +40,7 @@ def _drive(formwork_bin, backend, requests, expect, timeout=20):
     replies keyed by id. Keeps stdin open until the replies are in, so backend round-trips finish
     before the connection closes."""
     proc = subprocess.Popen(
-        [str(formwork_bin), "gateway", "--spec", str(EXAMPLE_SPEC),
+        [str(formwork_bin), "gateway", "--blueprint", str(EXAMPLE_BLUEPRINT),
          "--server", "files", "--", str(backend)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1,
