@@ -40,6 +40,8 @@ subtract = [
     "~/.codex/**",
     "~/.gemini/**",
     "~/.cursor/**",
+    # project-local secrets at any depth (a repo .env usually holds API keys)
+    "**/.env",
     # keychains (macOS)
     "~/Library/Keychains/**",
     "/Library/Keychains/**",

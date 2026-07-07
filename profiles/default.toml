@@ -59,6 +59,8 @@ subtract = [
     "~/.codex/**",
     "~/.gemini/**",
     "~/.cursor/**",
+    # project-local secrets at any depth (FW-CAP6 `**/`, FEP-1 FW-TRA8)
+    "**/.env",
     # keychains (macOS)
     "~/Library/Keychains/**",
     "/Library/Keychains/**",

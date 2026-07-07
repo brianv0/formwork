@@ -30,6 +30,11 @@ codex  = ["~/.codex/**"]
 gemini = ["~/.gemini/**"]
 cursor = ["~/.cursor/**"]
 
+# Project-local secrets that appear at any depth (FW-CAP6 `**/` form, FEP-1 FW-TRA8). Read+write
+# denied: a project `.env` typically holds API keys. A caller that needs it readable narrows it out.
+[project_secrets]
+dotenv = ["**/.env"]
+
 [keychains]
 macos_user   = ["~/Library/Keychains/**"]
 macos_system = ["/Library/Keychains/**"]
