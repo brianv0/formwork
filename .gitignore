@@ -13,3 +13,6 @@ py/.venv/
 *.log
 /scratch
 .DS_Store
+
+# constitution template (the source we materialize constitution.md from; not checked in)
+constitution.md.tpl
