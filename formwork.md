@@ -85,12 +85,17 @@ Naming note (open, section 11): this document uses **Formwork** for the whole sy
 Formwork consumes a finite, enumerable blueprint — the unveil/pledge lineage, narrowed to what an OS sandbox can carry:
 
 ```
-read(path-pattern)        # filesystem read
-write(path-pattern)       # filesystem write (implies read of the same)
-exec(path-pattern)        # OPTIONAL: execute only these binaries (off by default)
-net: Deny                 # default: no direct egress at all
-   | Ports([u16])         # optional: allow direct TCP connect to these ports
-mcp(server): {            # per-MCP-server visibility policy
+read(path-pattern)            # filesystem read
+write(path-pattern)           # filesystem write (implies read of the same)
+subtract(path-pattern)        # carve a sensitive hole out of the read+write grant (deny wins)
+write-subtract(path-pattern)  # write-deny but keep readable: tamper vectors (FW-TRA7)
+exec(path-pattern)            # OPTIONAL: execute only these binaries (off by default)
+net: Deny                     # default: no direct egress at all
+   | Ports([u16])             # optional: allow direct TCP connect to these ports
+env: Passthrough              # default: inherit the launcher's environment
+   | Allowlist([name])        # only the named vars survive
+   | Scrub({allow, deny})     # drop secret-shaped vars by name/value, minus an allowlist (FW-ENV1/2)
+mcp(server): {                # per-MCP-server visibility policy
     tools:     Allow([...]) | AllowAll | Deny,
     resources: Allow([...]) | AllowAll | Deny,
     prompts:   Allow([...]) | AllowAll | Deny,
@@ -103,13 +108,14 @@ The compiler is the single authority that maps this blueprint to concrete mechan
 
 Two semantics choices, both settled earlier in design:
 
-- **EACCES denial is acceptable; invisibility is preferred only where free.** Filesystem denials surface as the platform's natural errno (EACCES on Landlock, EPERM/EACCES on Seatbelt). Formwork does not build a mount-namespace or FUSE layer to fake ENOENT. The one place invisibility *is* cheap and *is* required is MCP tool/resource/prompt shading at the gateway, where an ungranted item is simply absent from the listing.
+- **EACCES denial is acceptable; invisibility is preferred only where free.** Filesystem denials surface as the platform's natural errno (EACCES on Landlock, EPERM/EACCES on Seatbelt). Formwork does not build a mount-namespace or FUSE layer to fake ENOENT. The one place invisibility *is* cheap and *is* required is MCP tool/resource/prompt shading at the gateway, where an ungranted item is simply absent from the listing. For the sensitive *subset*, metadata is also denied where a backend supports it (Seatbelt `file-read-metadata`), so a credential's existence, size, and mtime do not leak through `stat` (FW-CAP7); where a backend cannot (Landlock), that residual is reported Partial rather than left as a blanket concession.
 - **The default profile is subtractive, not minimal.** Rather than granting an empty world and adding paths, the default profile grants broad read over the ambient environment (system prefixes, interpreters, shared libraries, standard tool locations, language caches) and subtracts a configured sensitive set. This is the reuse principle expressed as policy.
 
-Two further points pin the vocabulary above down so it is unambiguous to the compiler and gateway:
+Three further points pin the vocabulary above down so it is unambiguous to the compiler and gateway:
 
 - **MCP item identity.** Shading matches items by their natural MCP identifier: tools and prompts by `name`, resources by `uri`, and resource templates by `uriTemplate`. A `resources` `Allow([...])` list therefore contains URIs (for concrete resources, matched on `resources/list` and `resources/read`) and/or URI templates (for `resources/templates/list`); tool and prompt lists contain names. An item that lacks its identifier field is treated as ungranted (fail-closed). This is what keeps the resource axis consistent across list, read, and templates rather than silently matching one of them on a different key.
-- **Grant paths must be representable.** Grant, write, and `subtract` paths are canonicalized against the real filesystem at enforce time (symlink and firmlink resolution) so kernel path-matching lines up. A resolved path that cannot be faithfully rendered into the backend's policy language — e.g. a non-UTF-8 byte path — makes enforcement **fail loud**, never emit a lossy rule that might silently not match. A `subtract` hole that failed to match would be a silent fail-open of the sensitive set, which FW-INV6 forbids.
+- **Grant paths must be representable.** Grant, write, and `subtract` paths are canonicalized against the real filesystem at enforce time (symlink and firmlink resolution) so kernel path-matching lines up. A resolved path that cannot be faithfully rendered into the backend's policy language — e.g. a non-UTF-8 byte path — makes enforcement **fail loud**, never emit a lossy rule that might silently not match. A `subtract` hole that failed to match would be a silent fail-open of the sensitive set, which FW-INV6 forbids. Patterns are absolute, or an any-depth basename form (`**/.env`) that matches a trailing component at any depth within a grant (FW-CAP6); no `..` traversal exists, and both forms canonicalize deterministically (FW-FID4).
+- **Environment is a capability, applied at spawn.** The `env` posture (FW-ENV1) governs what environment the confined child receives — passthrough, an allowlist of names, or a scrub of secret-shaped vars. The CLI shell, not the confiner, builds the child's environment from the filtered set before `exec`; the `FidelityReport` carries the verdict like any other capability. The default profile's scrub (FW-ENV2) is heuristic, so it is reported Partial, never a silent over-claim.
 
 ## 5. Requirements
 
@@ -124,16 +130,19 @@ Two further points pin the vocabulary above down so it is unambiguous to the com
 | **FW-XR5** Single privileged broker | Exactly one component (the gateway) holds real network and broad filesystem access. The agent and all stdio MCP backends are confined by the same confiner. |
 | **FW-XR6** Behavioral parity | An identical blueprint yields equivalent observable behavior for the enforceable intersection across Linux and macOS. Platform divergence appears only in the FidelityReport, never as a silent behavior change. |
 | **FW-XR7** fd-injection transport | The agent reaches the gateway via an inherited fd. Formwork never depends on an in-sandbox `connect()` nor on the filesystem sandbox selectively *allowing* a socket path. |
+| **FW-XR8** No agent-influenced escalation | No mechanism lets a confined process — or its instruction stream — disable, weaken, retry-outside, or reconfigure its own confinement. The policy is compiled and installed *before* the process runs (FW-CAP2: narrowing only; widening does not exist). Any escalation a host chooses to offer is an out-of-band action on an unconfined process, never a signal the confined process can emit. |
 
 ### 5.2 Capability model (FW-CAP)
 
 | Req | Requirement |
 |---|---|
-| **FW-CAP1** Enumerable vocabulary | The blueprint is a finite enumeration of read/write/exec/net/mcp. No mechanism accepts natural language and produces a grant. |
+| **FW-CAP1** Enumerable vocabulary | The blueprint is a finite enumeration of read/write/subtract/exec/net/env/mcp. No mechanism accepts natural language and produces a grant. |
 | **FW-CAP2** Monotonic narrowing | A session may narrow its own grant but never widen it. A child's grant is a subset of its parent's. |
 | **FW-CAP3** Subtractive default profile | The default profile is broad-read over the ambient environment minus a configured sensitive set, not minimal-from-empty. |
 | **FW-CAP4** Invisibility for MCP, denial for fs | Ungranted MCP tools/resources/prompts are absent from listings and non-invocable. Ungranted filesystem paths may return EACCES rather than ENOENT. |
 | **FW-CAP5** Single inspectable interpreter | The compiler is the sole blueprint→mechanism authority, and its output (compiled policy + report) is inspectable without enforcing. |
+| **FW-CAP6** Anchored & basename patterns | Beyond absolute paths, the pattern vocabulary admits an any-depth basename form (`**/.env`) that matches a trailing component at any depth within a grant. Both forms canonicalize deterministically (FW-FID4) and stay fail-loud on non-representable resolution; no relative `..` traversal is introduced. |
+| **FW-CAP7** Metadata denial for the sensitive set | Where the backend can express it (Seatbelt denies `file-read-metadata` per path), subtracted sensitive paths are denied at the metadata layer too, so existence/size/mtime of credentials do not leak via `stat`. Where it cannot (Linux/Landlock), the residual is reported Partial — narrowing the §3 EACCES-not-ENOENT concession specifically for credentials. |
 
 ### 5.3 OS isolation / confiner (FW-ISO)
 
@@ -173,6 +182,8 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 | **FW-TRA4** Graceful denial | Denials surface as standard errno, never as sandbox-specific crashes; a tool probing an optional ungranted path continues rather than aborting. |
 | **FW-TRA5** Writable working set | The project directory, a scratch/tmp area, and (optionally) build caches are writable, so the agent can do real work and persist within scope. |
 | **FW-TRA6** Low overhead | Confinement setup and per-operation overhead stay within the section 8 performance target so interactive agent loops remain responsive. |
+| **FW-TRA7** Execution-vector write protection | A default write-subtract set masks code-execution and policy-tampering vectors even inside writable grants — `.git/hooks/**`, `.git/config`, `.mcp.json`, editor/agent-config dirs (`.vscode`/`.idea`/`.claude`/…), shell rc files — so a confined agent cannot plant something that later runs unsandboxed. Deny wins over the write grant; the paths stay readable so tooling is unbroken. |
+| **FW-TRA8** Agent-state & local-secret coverage | The sensitive set covers agent-tool state holding OAuth creds/transcripts (`~/.claude*`, `~/.codex/**`, `~/.gemini/**`, `~/.cursor/**`, the whole `~/.docker/**`) and project-local secrets (`**/.env`), denied even under a broad read grant. |
 
 ### 5.6 Operability & fidelity (FW-FID)
 
@@ -182,6 +193,15 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 | **FW-FID2** Dry-run / audit | Produce the compiled policy and report without enforcing (CI on non-capable boxes; cross-platform policy development). |
 | **FW-FID3** Runtime observability | Emit a structured record of grants and denials at runtime, suitable for a host's journal when embedded, or standalone logging otherwise. |
 | **FW-FID4** Deterministic compile | The same blueprint compiles to a byte-identical policy and report. |
+
+### 5.7 Environment (FW-ENV)
+
+Applied by the CLI shell at spawn — not the confiner — and reported in the `FidelityReport` like any other capability.
+
+| Req | Requirement |
+|---|---|
+| **FW-ENV1** Environment axis | The blueprint carries an `env` posture — passthrough, allowlist (only named vars survive), or scrub (secret-shaped vars removed) — and the child's environment is built at spawn from the filtered set, not inherited wholesale. A capability axis parallel to fs/net/exec/mcp. |
+| **FW-ENV2** Default secret-shaped scrub | The default profile scrubs env vars whose *name* matches a secret shape (`TOKEN\|SECRET\|PASSWORD\|KEY\|AUTH\|CREDENTIAL\|CERT`) or whose *value* matches a high-confidence secret shape (PEM blocks, `ghp_…`, `AKIA…`, `AIza…`, JWT), minus a blueprint-named allowlist for vars the agent legitimately needs (its model API key). Transparency (FW-TRA2) is preserved by the allowlist; the scrub is heuristic, so it is reported Partial, never a silent over-claim. |
 
 ## 6. Invariants
 
@@ -214,6 +234,12 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 **FW-E2E-004: Symlink escape blocked.** Inside a writable directory the session creates a symlink pointing at `/etc/passwd` and at an ungranted sibling project, then reads and writes through the symlink. Pass: access through the symlink is denied — the target's scope governs, not the link's location. Fail: the symlink grants access to the target.
 
 **FW-E2E-005: Descendant inheritance.** The confined session spawns `bash`, which spawns a child process that attempts an out-of-scope read and attempts to relax its own sandbox. Pass: the grandchild is denied and cannot re-grant; confinement is intact across the tree. Fail: any descendant reads out of scope or widens the grant.
+
+**FW-E2E-037: Sensitive-set metadata does not leak.** A subtracted credential path is `stat()`ed under an otherwise-broad grant. Pass on macOS: existence, size, and mtime are denied (the `subtract` deny covers `file-read-metadata`), while metadata on non-sensitive ungranted paths still resolves (FW-TRA4). On Linux, where the residual is unenforceable, the capability is reported Partial and observed behavior matches the report. Fail: metadata of a sensitive path leaks on a platform that reports it denied, or the report over-claims (FW-CAP7).
+
+**FW-E2E-038: Any-depth patterns deny at real depth.** A blueprint expressing `**/.env` is compiled and enforced over a project tree containing a nested `<proj>/.env`. Pass: the nested `.env` is denied at depth while a sibling non-secret file stays readable, and the pattern compiles byte-identically twice (FW-FID4). Fail: a matching path at depth is missed (a silent fail-open of the sensitive set, FW-INV6), or compilation is nondeterministic (FW-CAP6).
+
+**FW-E2E-039: Tamper vectors are read-through, write-denied.** Under a writable project grant, a `write-subtract` set masks execution/policy-tampering vectors (`.git/hooks/**`, `.git/config`, `.mcp.json`, `.vscode/**`, shell rc). Pass: writing `<proj>/.git/config` is denied though the surrounding tree is writable, while reading it still succeeds so git and tooling keep working. Fail: any tamper path is writable under a normal project grant (FW-TRA7).
 
 ### 7.2 Network / egress
 
@@ -258,6 +284,8 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 **FW-E2E-022: git works; push gated.** The session runs `git status`, `git diff`, and `git commit` within the project (succeed) and `git push` (network). Pass: local git operations succeed within scope; `git push` is blocked unless routed through the gateway. Fail: local git is broken by confinement, or push egresses directly.
 
 **FW-E2E-023: Graceful degradation on optional paths.** A tool probes an optional, ungranted config path (e.g., `~/.config/tool/optional.toml`) as part of normal startup. Pass: the probe receives a standard errno and the tool continues with defaults. Fail: the probe crashes the tool or produces a sandbox-specific error the tool cannot handle.
+
+**FW-E2E-036: Secret-shaped environment scrub, allowlist survives.** Under the default profile, a confined child is launched via `formwork run` and its environment inspected. Pass: name- or value-secret-shaped vars (`AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, a PEM-valued variable) are absent, while a blueprint-allowlisted `ANTHROPIC_API_KEY` survives so the workload still reaches its model API. Fail: any secret-shaped var reaches the child, or an allowlisted var is stripped. The scrub is heuristic, so the capability is reported Partial (FW-INV5), never a silent over-claim (FW-ENV1/2).
 
 ### 7.6 Fidelity & operability
 
@@ -330,6 +358,8 @@ A reuse-heavy workload (FW-E2E-020/021) must complete within a small bounded ove
 | MCP tool/resource/prompt shading | Enforced (gateway) | Enforced (gateway) |
 | cross-domain UNIX socket block | Partial (recent, coarse) | Enforced (path-gated) |
 | filesystem invisibility (ENOENT) | Not provided (EACCES) | Not provided (EPERM/EACCES) |
+| sensitive-set metadata denial | Partial (stat residual) | Enforced (metadata deny) |
+| environment secret-scrub | Partial (heuristic) | Partial (heuristic) |
 
 ## 10. Requirements ↔ tests traceability
 
@@ -342,11 +372,14 @@ A reuse-heavy workload (FW-E2E-020/021) must complete within a small bounded ove
 | FW-XR5 Single privileged broker | FW-E2E-019 | 010, ADV-005 |
 | FW-XR6 Behavioral parity | FW-E2E-028 | 024 |
 | FW-XR7 fd-injection transport | FW-E2E-010, 012 | 011, ADV-006 |
+| FW-XR8 No agent-influenced escalation | FW-ADV-001 | FW-E2E-005, INV1 |
 | FW-CAP1 Enumerable vocabulary | FW-E2E-013, 001 | — |
 | FW-CAP2 Monotonic narrowing | FW-E2E-005 | INV1 |
 | FW-CAP3 Subtractive default profile | FW-E2E-003, 020 | 021, 022 |
 | FW-CAP4 Invisibility/denial split | FW-E2E-013, 014 | 001, 023 |
 | FW-CAP5 Inspectable interpreter | FW-E2E-026, 027 | 024 |
+| FW-CAP6 Anchored & basename patterns | FW-E2E-038 | FW-FID4 |
+| FW-CAP7 Metadata denial (sensitive set) | FW-E2E-037 | INV5 |
 | FW-ISO1 Read confinement | FW-E2E-001 | 003, 004 |
 | FW-ISO2 Write confinement | FW-E2E-002 | 004 |
 | FW-ISO3 Net default-deny | FW-E2E-006 | 007, 008, INV3 |
@@ -369,10 +402,14 @@ A reuse-heavy workload (FW-E2E-020/021) must complete within a small bounded ove
 | FW-TRA4 Graceful denial | FW-E2E-023 | 020, 021 |
 | FW-TRA5 Writable working set | FW-E2E-002, 022 | 020 |
 | FW-TRA6 Low overhead | §8 targets | 020, 021 |
+| FW-TRA7 Execution-vector write protection | FW-E2E-039 | — |
+| FW-TRA8 Agent-state & local-secret coverage | FW-E2E-038 | FW-E2E-003 |
 | FW-FID1 Per-capability report | FW-E2E-024 | 025 |
 | FW-FID2 Dry-run / audit | FW-E2E-026 | 027 |
 | FW-FID3 Runtime observability | FW-E2E-024 | — |
 | FW-FID4 Deterministic compile | FW-E2E-027 | 026 |
+| FW-ENV1 Environment axis | FW-E2E-036 | FW-FID1 |
+| FW-ENV2 Default secret-shaped scrub | FW-E2E-036 | FW-TRA2 |
 
 ## 11. Open questions
 
@@ -385,6 +422,8 @@ A reuse-heavy workload (FW-E2E-020/021) must complete within a small bounded ove
 **Sensitive-set discovery.** How much of the subtracted set (FW-TRA3) is auto-detected (known credential locations, cloud-config dirs, keychains, browser profiles) versus configured. Auto-detection improves safety-by-default but risks missing new locations; the fail-closed answer is to deny a broad known-sensitive superset by default and let callers narrow.
 
 **Linux gateway egress isolation build-vs-buy.** Whether the gateway's own network confinement reuses `bubblewrap`/`pasta`/`slirp4netns` for its netns setup or drives `unshare`/nftables directly. Out of the agent's confinement path (FW-XR7), but a real implementation decision for FW-GW7.
+
+**Host-scoped egress and violation streaming.** The net axis today is `Deny | Ports`. A host-allowlist posture (FW-EGR — so a blueprint can say "reach the model API and nothing else") and a real-time violation stream for embedding hosts (FW-FID5) are specified in `fep-1.md`, deferred pending the gateway forward-proxy and log-tap subsystems they require.
 
 **Windows.** Out of scope for this proposal. If needed later, the analogous primitives (AppContainer, Restricted Tokens, Named Pipes for the fd seam) would be a third backend behind the same compiler.
 
@@ -399,5 +438,6 @@ Kernel-mechanism-first, honesty-first, reuse-validated-early:
 5. **fd-injection transport** and the seam tests (FW-E2E-010, 011, 012), establishing that the agent never depends on in-sandbox connect or socket-path gating.
 6. **Gateway** (transport-agnostic backends, shading, full-surface policy, transparent passthrough, backend-confinement recursion) with FW-E2E-013..019 and ADV-003, 004, 005.
 7. **Degraded-host honesty and optional tiers** (FW-E2E-009, 025, ADV-006), confirming Formwork reports rather than pretends when a kernel cannot enforce a requested capability.
+8. **Capability-model hardening** (FEP-1): the env axis (FW-ENV1/2), execution-vector write-subtract (FW-TRA7), sensitive-set metadata denial (FW-CAP7), any-depth patterns (FW-CAP6), extended sensitive set (FW-TRA8), and the anti-escalation guarantee (FW-XR8) — landed and compiled/enforced on both backends. The fs additions are real-Seatbelt verified (FW-E2E-037..039); the env axis (a CLI-shell spawn transform, not a kernel capability) by unit tests plus the FidelityReport. Host-scoped egress (FW-EGR) and the violation stream (FW-FID5) remain deferred in `fep-1.md`.
 
 If steps 1–4 pass, Formwork is a transparent, reusable filesystem confiner that behaves the same on both platforms and tells the truth about itself. If steps 5–7 pass, it is a complete agent sandbox: one privileged broker, everything else in a mould, egress forced through a policy gateway, and every claim backed by a mechanism or reported as a gap.
