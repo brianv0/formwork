@@ -68,6 +68,15 @@ tar -xzf formwork-canary-aarch64-apple-darwin.tar.gz
 ./formwork-canary-aarch64-apple-darwin/formwork detect
 ```
 
+> **macOS Gatekeeper:** the binaries are not yet Developer-ID-signed or notarized. The terminal
+> route above just works — `curl` and `tar` never set the quarantine flag. A **browser** download
+> does get quarantined, and macOS will refuse to run the binary ("Apple could not verify 'formwork'
+> is free of malware"). If you downloaded that way, clear the flag and re-extract:
+>
+> ```sh
+> xattr -d com.apple.quarantine formwork-canary-*.tar.gz && tar -xzf formwork-canary-*.tar.gz
+> ```
+
 ## Testing
 
 `just test` (or `cargo test --workspace`) runs the pure + native-OS-backend tests on any host.
