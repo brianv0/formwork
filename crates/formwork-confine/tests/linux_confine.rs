@@ -166,6 +166,52 @@ fn landlock_write_confined_to_grant() {
     );
 }
 
+/// HARDENING (fail-open escape): a symlink among the entries of a *split* grant (one with a hole)
+/// must not grant its target. Landlock's `PathFd` follows symlinks (`O_PATH`), so the expansion must
+/// skip symlink entries or reading through them escapes the wall.
+#[test]
+fn landlock_symlink_in_grant_does_not_escape() {
+    if !have_landlock() {
+        eprintln!("skipping: no Landlock on this host");
+        return;
+    }
+    let fx = Fixture::new("symlink");
+    // A hole forces `root` to be split into its entries; a symlink to /etc rides among them.
+    std::os::unix::fs::symlink("/etc", fx.root.join("etclink")).unwrap();
+    let policy = closed_policy(
+        vec![pp(&fx.root)],
+        vec![],
+        vec![pp(&fx.root.join("secret"))],
+    );
+    assert_ne!(
+        run(&policy, cat(&fx.root.join("etclink/hostname"))),
+        0,
+        "reading /etc through an in-grant symlink must be denied (no escape)"
+    );
+    assert_eq!(
+        run(&policy, cat(&fx.granted_file())),
+        0,
+        "a real sibling of the hole stays readable"
+    );
+}
+
+/// HARDENING (transparency): a confined process must read its OWN `/proc/self` -- runtimes (Python,
+/// Go, glibc) depend on it. The essential must resolve to the child, not the launcher.
+#[test]
+fn proc_self_readable_by_child() {
+    if !have_landlock() {
+        eprintln!("skipping: no Landlock on this host");
+        return;
+    }
+    let fx = Fixture::new("procself");
+    let policy = closed_policy(vec![pp(&fx.granted())], vec![], vec![]);
+    assert_eq!(
+        run(&policy, cat(Path::new("/proc/self/status"))),
+        0,
+        "a confined process must be able to read its own /proc/self/status"
+    );
+}
+
 // --- net + seccomp baseline (run on any kernel) ---
 
 /// FW-E2E-002 (Linux): a confined process cannot reach the network. Landlock (TCP) or seccomp (inet
@@ -181,6 +227,21 @@ fn net_default_deny_blocks_egress() {
     assert_eq!(
         code, 7,
         "egress must be denied with EPERM (exit 7); got {code}"
+    );
+}
+
+/// HARDENING (Linux): net-deny covers UDP, not just TCP. Landlock net governs only TCP, so deny is
+/// carried by the seccomp inet-family filter, which rejects datagram `socket(2)` at creation. The
+/// staged probe surfaces the EPERM as exit 7 -- proving the old TCP-only gap is closed.
+#[test]
+fn net_default_deny_blocks_udp() {
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-udp-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    let policy = closed_policy(vec![pp(probe_dir)], vec![], vec![]);
+    let code = run(&policy, Command::new(&probe));
+    assert_eq!(
+        code, 7,
+        "UDP egress must be denied with EPERM (exit 7); got {code}"
     );
 }
 

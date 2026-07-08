@@ -392,11 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn linux_modern_uses_landlock_and_reports_socket_partial() {
+    fn linux_modern_uses_landlock_fs_and_seccomp_netdeny() {
         let policy = compile(&sample_blueprint(), &HostProfile::synthetic_linux(Some(6)));
+        assert!(policy.report.per_capability[&Capability::FsRead].is_enforced());
         match &policy.confiner {
             ConfinerPolicy::Linux(l) => {
-                assert!(matches!(l.net, LinuxNetPlan::LandlockTcp { .. }));
+                // net-deny is the complete seccomp inet deny (covers UDP), not Landlock's TCP-only.
+                assert!(matches!(l.net, LinuxNetPlan::SeccompDenyInet));
                 assert!(l.no_new_privs);
             }
             other => panic!("expected Linux confiner, got {other:?}"),
@@ -405,6 +407,22 @@ mod tests {
             policy.report.per_capability[&Capability::CrossDomainSocket],
             Fidelity::Partial { .. }
         ));
+    }
+
+    #[test]
+    fn linux_port_tier_uses_landlock_tcp() {
+        let blueprint = Blueprint {
+            net: NetPosture::Ports(vec![443]),
+            ..Blueprint::empty()
+        };
+        let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(6)));
+        match &policy.confiner {
+            ConfinerPolicy::Linux(l) => assert!(
+                matches!(&l.net, LinuxNetPlan::LandlockTcp { ports } if ports == &vec![443]),
+                "the TCP port tier is carried by Landlock net"
+            ),
+            other => panic!("expected Linux confiner, got {other:?}"),
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! return `EPERM`. Built in the parent; `apply()` runs in the forked child after `NO_NEW_PRIVS`.
 
 use std::collections::BTreeMap;
+use std::io;
 
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
@@ -81,9 +82,10 @@ pub fn build(plan: &SeccompPlan) -> Result<BpfProgram, ConfineError> {
 }
 
 /// Install the filter on the calling thread. Async-signal-safe (a single `seccomp(2)`), so it is
-/// legal in the post-fork `pre_exec` child. Requires `NO_NEW_PRIVS` to already be set.
-pub fn apply(prog: &BpfProgram) -> Result<(), ConfineError> {
-    seccompiler::apply_filter(prog).map_err(|e| fail(format!("seccomp apply_filter: {e}")))
+/// legal in the post-fork `pre_exec` child. Requires `NO_NEW_PRIVS` to already be set. Returns the
+/// raw OS error rather than a formatted `ConfineError` so the child path allocates nothing.
+pub fn apply(prog: &BpfProgram) -> io::Result<()> {
+    seccompiler::apply_filter(prog).map_err(|_| io::Error::last_os_error())
 }
 
 /// `(argN & mask) == mask`: true when every bit of `mask` is set in argument `N`.
@@ -140,6 +142,9 @@ fn syscall_number(name: &str) -> Option<i64> {
         "bpf" => libc::SYS_bpf,
         "finit_module" => libc::SYS_finit_module,
         "init_module" => libc::SYS_init_module,
+        "io_uring_enter" => libc::SYS_io_uring_enter,
+        "io_uring_register" => libc::SYS_io_uring_register,
+        "io_uring_setup" => libc::SYS_io_uring_setup,
         "kexec_file_load" => libc::SYS_kexec_file_load,
         "kexec_load" => libc::SYS_kexec_load,
         "keyctl" => libc::SYS_keyctl,
@@ -148,7 +153,10 @@ fn syscall_number(name: &str) -> Option<i64> {
         "move_mount" => libc::SYS_move_mount,
         "open_by_handle_at" => libc::SYS_open_by_handle_at,
         "perf_event_open" => libc::SYS_perf_event_open,
+        "pidfd_getfd" => libc::SYS_pidfd_getfd,
         "pivot_root" => libc::SYS_pivot_root,
+        "process_vm_readv" => libc::SYS_process_vm_readv,
+        "process_vm_writev" => libc::SYS_process_vm_writev,
         "ptrace" => libc::SYS_ptrace,
         "request_key" => libc::SYS_request_key,
         "setns" => libc::SYS_setns,

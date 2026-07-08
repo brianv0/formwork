@@ -27,7 +27,7 @@ fn linux_policy(policy: &CompiledPolicy) -> Result<&LinuxPolicy, ConfineError> {
 /// Finished, ready-to-apply artifacts. Owns everything the child needs so `apply` allocates nothing.
 /// `landlock` is `None` when the host carries no ABI (the seccomp half then does what it can).
 struct Plan {
-    landlock: Option<landlock::RulesetCreated>,
+    landlock: Option<landlock::Built>,
     seccomp: seccompiler::BpfProgram,
     no_new_privs: bool,
 }
@@ -40,45 +40,35 @@ fn build(policy: &LinuxPolicy) -> Result<Plan, ConfineError> {
     })
 }
 
-/// Runs in the child (or in place for confine-self). Syscalls only. Order (kernel-required):
-/// `NO_NEW_PRIVS` first, then Landlock `restrict_self`, then the seccomp filter.
-fn apply(plan: &mut Plan) -> Result<(), ConfineError> {
+/// Runs in the child (or in place for confine-self). Syscalls only, allocation-free on the success
+/// path (the allocator may be poisoned post-`fork`), so it returns raw OS errors. Order is
+/// kernel-required: `NO_NEW_PRIVS` first, then Landlock `restrict_self`, then the seccomp filter.
+fn apply(plan: &mut Plan) -> io::Result<()> {
     if plan.no_new_privs {
-        set_no_new_privs()?;
+        // SAFETY: PR_SET_NO_NEW_PRIVS takes fixed scalar args and only sets a per-thread flag.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
-    if let Some(ruleset) = plan.landlock.take() {
-        landlock::apply(ruleset)?;
+    if let Some(built) = plan.landlock.take() {
+        landlock::apply(built)?;
     }
     seccomp::apply(&plan.seccomp)
-}
-
-fn set_no_new_privs() -> Result<(), ConfineError> {
-    // SAFETY: PR_SET_NO_NEW_PRIVS takes fixed scalar args and only sets a per-thread flag.
-    let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(ConfineError::MechanismFailed(format!(
-            "prctl(NO_NEW_PRIVS) failed: {}",
-            io::Error::last_os_error()
-        )))
-    }
 }
 
 pub fn spawn_confined(command: &mut Command, policy: &CompiledPolicy) -> Result<(), ConfineError> {
     let mut plan = build(linux_policy(policy)?)?;
     // SAFETY: the closure runs in the forked child before `execve`, issuing only syscalls over
-    // artifacts built before the fork. On failure `spawn`/`status` fails -- no unconfined child.
+    // artifacts built before the fork (allocation-free). On failure `spawn`/`status` fails -- there is
+    // no unconfined child (FW-INV6).
     unsafe {
-        command.pre_exec(move || {
-            apply(&mut plan)
-                .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))
-        });
+        command.pre_exec(move || apply(&mut plan));
     }
     Ok(())
 }
 
 pub fn enforce_self(policy: &CompiledPolicy) -> Result<(), ConfineError> {
     let mut plan = build(linux_policy(policy)?)?;
-    apply(&mut plan)
+    // In-process (not forked): a formatted error is fine here.
+    apply(&mut plan).map_err(|e| ConfineError::MechanismFailed(format!("confine-self failed: {e}")))
 }

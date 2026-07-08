@@ -9,11 +9,12 @@
 //! an error, never a silent weakening.
 
 use std::collections::BTreeSet;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use landlock::{
     Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
+    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 // Re-exported so the parent module can name it (`landlock::RulesetCreated`) without colliding with
 // the external crate of the same name.
@@ -31,6 +32,10 @@ fn fail(msg: impl Into<String>) -> ConfineError {
 /// Closed-mode runtime essentials: without these an `execve` cannot load `ld.so`/libraries and every
 /// child dies before `main` (the Linux analogue of the macOS `dyld` failure). Curated literals; a
 /// broad `/dev` is deliberately avoided (it would expose block devices -- an out-of-band fs read).
+///
+/// `/proc/self` is deliberately absent: it is a per-process symlink, so a rule built here (in the
+/// parent) binds the *launcher's* `/proc/<pid>`, not the child's. The child's own `/proc/self` is
+/// added post-fork in `apply` (runtimes read `/proc/self/{maps,exe,status}` and would otherwise die).
 const READ_ESSENTIALS: &[&str] = &[
     "/usr",
     "/lib",
@@ -39,7 +44,6 @@ const READ_ESSENTIALS: &[&str] = &[
     "/sbin",
     "/etc/ld.so.cache",
     "/etc/ld.so.preload",
-    "/proc/self",
 ];
 const RW_DEVICES: &[&str] = &[
     "/dev/null",
@@ -56,7 +60,9 @@ fn abi_of(v: u32) -> ABI {
         2 => ABI::V2,
         3 => ABI::V3,
         4 => ABI::V4,
-        _ => ABI::V5, // crate 0.4 tops out at V5; a higher host ABI clamps to what we can emit
+        5 => ABI::V5,
+        6 => ABI::V6,
+        _ => ABI::V7, // crate 0.4.5 tops out at V7; a higher host ABI clamps to what we can emit
     }
 }
 
@@ -119,6 +125,14 @@ fn expand(root: &Path, holes: &[Hole]) -> Vec<PathBuf> {
         Err(_) => return out,
     };
     for entry in entries.flatten() {
+        // Skip symlinks. `PathFd` opens with `O_PATH` (no `O_NOFOLLOW`), so granting or recursing a
+        // symlink entry would bind the rule to its *target* -- an escape out of the wall. Access
+        // *through* a symlink still resolves to the real path, which is governed by whatever rule
+        // covers that path (or denied), exactly as macOS checks the resolved path. A failed type
+        // probe is treated as a symlink and skipped too (fail-closed).
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+            continue;
+        }
         let child = entry.path();
         if holes.iter().any(|h| h.covers(&child)) {
             continue; // this child is exactly a hole
@@ -132,9 +146,16 @@ fn expand(root: &Path, holes: &[Hole]) -> Vec<PathBuf> {
     out
 }
 
+/// A built ruleset plus the one thing that can only be finished in the child: whether to add the
+/// child's own `/proc/self` (Closed mode) once its pid exists.
+pub struct Built {
+    ruleset: RulesetCreated,
+    grant_proc_self: bool,
+}
+
 /// Build the ruleset in the parent. Returns `None` when the policy needs no Landlock (no ABI target),
 /// in which case the seccomp half carries whatever net-deny the host allows.
-pub fn build(policy: &LinuxPolicy) -> Result<Option<RulesetCreated>, ConfineError> {
+pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     let abi_ver = match policy.landlock_abi_target {
         Some(v) if v >= 1 => v,
         _ => return Ok(None),
@@ -160,6 +181,16 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<RulesetCreated>, ConfineErro
         ruleset = ruleset
             .handle_access(AccessNet::from_all(abi))
             .map_err(|e| fail(format!("landlock handle_access(net): {e}")))?;
+    }
+    // Abstract-unix-socket + signal scoping (ABI v6+): the confined process can neither connect to an
+    // abstract unix socket nor signal a process *outside* its Landlock domain. Abstract sockets carry
+    // no path, so the filesystem rules cannot reach them -- without scoping, a confined process could
+    // reach an unconfined sibling's abstract socket (an exfil/escape channel). This is exactly what
+    // the report calls CrossDomainSocket = Partial at abi>=6 (FW-INV5: enforce what we claim).
+    if abi_ver >= 6 {
+        ruleset = ruleset
+            .scope(Scope::from_all(abi))
+            .map_err(|e| fail(format!("landlock scope: {e}")))?;
     }
     let mut created = ruleset
         .create()
@@ -208,22 +239,49 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<RulesetCreated>, ConfineErro
         }
     }
 
-    Ok(Some(created))
+    Ok(Some(Built {
+        ruleset: created,
+        // Add the child's own /proc/self post-fork (below). Ambient mode already covers /proc via `/`.
+        grant_proc_self: policy.read_mode == ReadMode::Closed,
+    }))
 }
 
-/// Apply the built ruleset to the calling thread (child, or in place for confine-self). Asserts the
-/// kernel fully enforced it -- a downgraded apply is a failure, not a warning (FW-INV5).
-pub fn apply(ruleset: RulesetCreated) -> Result<(), ConfineError> {
+/// Apply the built ruleset to the calling thread (the forked child, or in place for confine-self).
+/// Runs post-`fork`, so it is allocation-free on the success path: it issues only syscalls and returns
+/// raw OS errors. Asserts the kernel *fully* enforced -- a downgraded apply is a failure, not a
+/// warning (FW-INV5/INV6).
+pub fn apply(built: Built) -> io::Result<()> {
+    let Built {
+        ruleset,
+        grant_proc_self,
+    } = built;
+    let ruleset = if grant_proc_self {
+        add_proc_self(ruleset)?
+    } else {
+        ruleset
+    };
     let status = ruleset
         .restrict_self()
-        .map_err(|e| fail(format!("landlock restrict_self: {e}")))?;
+        .map_err(|_| io::Error::last_os_error())?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => Ok(()),
-        RulesetStatus::PartiallyEnforced => Err(fail(
-            "landlock only partially enforced (kernel supports fewer access rights than compiled for)",
-        )),
-        RulesetStatus::NotEnforced => Err(fail("landlock ruleset was not enforced by the kernel")),
+        // PartiallyEnforced/NotEnforced carry no errno; surface a fixed EPERM. Fail-closed: the caller
+        // aborts the spawn, so there is no weakly-confined child.
+        _ => Err(io::Error::from_raw_os_error(libc::EPERM)),
     }
+}
+
+/// Grant the child read of its OWN `/proc/self`, resolved here (post-fork) so it binds the child's
+/// pid. Landlock rules are inode-keyed and `/proc/<pid>` is per-process, so this cannot be done at
+/// build time in the parent. A missing `/proc` (rare, minimal container) is not an error.
+fn add_proc_self(ruleset: RulesetCreated) -> io::Result<RulesetCreated> {
+    let fd = match PathFd::new("/proc/self") {
+        Ok(fd) => fd,
+        Err(_) => return Ok(ruleset),
+    };
+    ruleset
+        .add_rule(PathBeneath::new(fd, AccessFs::ReadFile | AccessFs::ReadDir))
+        .map_err(|_| io::Error::last_os_error())
 }
 
 fn expand_all(roots: &[PathBuf], holes: &[Hole]) -> Vec<PathBuf> {
