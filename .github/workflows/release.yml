@@ -1,8 +1,12 @@
 # Release binaries for the four supported host targets: macOS and Linux, on arm64 and x86_64.
 #
-# Trigger by pushing a version tag, e.g.  git tag v0.1.0 && git push origin v0.1.0
-# `workflow_dispatch` builds the same matrix without publishing, so the release path can be
-# dry-run from the Actions tab before cutting a real tag.
+# Three triggers, three behaviors:
+#   * Version tag push (git tag v0.1.0 && git push origin v0.1.0) -> versioned GitHub Release.
+#   * Push to main -> rolling `canary` prerelease, updated in place so every merge to main has
+#     downloadable binaries at stable URLs:
+#       https://github.com/brianv0/formwork/releases/download/canary/formwork-canary-<target>.tar.gz
+#   * `workflow_dispatch` builds the same matrix without publishing, so the release path can be
+#     dry-run from the Actions tab before cutting a real tag.
 #
 # Every target builds natively on matching hardware — no cross-compilation:
 #   * macos-14 (Apple Silicon) -> aarch64-apple-darwin ; macos-13 (Intel) -> x86_64-apple-darwin
@@ -14,6 +18,7 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -71,7 +76,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="formwork-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # Tag builds are named after the tag; main pushes (and dispatch dry-runs) after the
+          # rolling `canary` release, so its download URLs stay stable across merges.
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            label="${GITHUB_REF_NAME}"
+          else
+            label="canary"
+          fi
+          name="formwork-${label}-${{ matrix.target }}"
           staging="dist/${name}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/formwork" "$staging/"
@@ -88,8 +100,9 @@ jobs:
   release:
     name: publish release
     needs: build
-    # Only publish for real tag pushes; workflow_dispatch stops after building.
-    if: startsWith(github.ref, 'refs/tags/')
+    # Publish for real tag pushes and for merges to main (rolling `canary` prerelease);
+    # workflow_dispatch stops after building.
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -108,11 +121,30 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          # Idempotent: create the release on first run, re-upload assets on a re-run.
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/*.tar.gz dist/SHA256SUMS --clobber
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+            # Idempotent: create the release on first run, re-upload assets on a re-run.
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release upload "$tag" dist/*.tar.gz dist/SHA256SUMS --clobber
+            else
+              gh release create "$tag" --verify-tag --generate-notes \
+                dist/*.tar.gz dist/SHA256SUMS
+            fi
           else
-            gh release create "$tag" --verify-tag --generate-notes \
-              dist/*.tar.gz dist/SHA256SUMS
+            # Merge to main: upsert the rolling `canary` prerelease in place. Force-move the tag
+            # to this commit first so the release's source snapshot matches its binaries.
+            tag="canary"
+            if ! gh api "repos/${GH_REPO}/git/refs/tags/${tag}" \
+                   -X PATCH -f sha="${GITHUB_SHA}" -F force=true >/dev/null 2>&1; then
+              gh api "repos/${GH_REPO}/git/refs" \
+                -f ref="refs/tags/${tag}" -f sha="${GITHUB_SHA}" >/dev/null
+            fi
+            notes="Rolling build of the latest \`main\` (${GITHUB_SHA}). Not a stable release."
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release upload "$tag" dist/*.tar.gz dist/SHA256SUMS --clobber
+              gh release edit "$tag" --prerelease --title "canary (latest main)" --notes "$notes"
+            else
+              gh release create "$tag" --prerelease --title "canary (latest main)" --notes "$notes" \
+                dist/*.tar.gz dist/SHA256SUMS
+            fi
           fi
