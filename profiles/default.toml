@@ -8,6 +8,17 @@
 # `~` is expanded against $HOME when the CLI loads this file. Callers are expected to narrow this
 # (e.g. point writes at their actual project) — narrowing is always safe (FW-CAP2); widening is not.
 
+# Net, exec, and env are top-level keys, so they must precede the [fs] table in TOML.
+# Fail-closed egress (FW-XR3): the agent reaches the network only through the gateway fd.
+net = "deny"
+# Exec is unrestricted by default for transparency (FW-ISO4); set an allow-list to restrict.
+exec = "unrestricted"
+# Scrub secret-shaped env vars from the confined child by default (FW-ENV2). With the sensitive set
+# denied to reads and (in narrowed launchers) egress opened, env is the easiest exfil payload. `allow`
+# re-admits any a
+# workload legitimately needs. net = "deny" here already blocks exfil; this is defense in depth.
+env = { scrub = {} }
+
 # Reads: broadly allowed over the ambient environment, minus the sensitive set below. On macOS this
 # is native `(allow default)` + deny holes; on Linux it is an enumerate-and-grant expansion at
 # enforce time (Landlock is allow-list only). See the plan §3.2.
@@ -40,13 +51,21 @@ subtract = [
     "~/.config/gcloud/**",
     "~/.azure/**",
     "~/.kube/**",
-    "~/.docker/config.json",
+    "~/.docker/**",   # whole dir: ~/.docker/run/docker.sock is host-root (FEP-1 FW-TRA8)
     "~/.netrc",
     "~/.npmrc",
     "~/.pypirc",
     # shells / dotfile secrets frequently holding tokens
     "~/.config/gh/**",
     "~/.git-credentials",
+    # agent-tool state (OAuth creds, transcripts) -- protect one agent from another (FEP-1 FW-TRA8)
+    "~/.claude/**",
+    "~/.claude.json",
+    "~/.codex/**",
+    "~/.gemini/**",
+    "~/.cursor/**",
+    # project-local secrets at any depth (FW-CAP6 `**/`, FEP-1 FW-TRA8)
+    "**/.env",
     # keychains (macOS)
     "~/Library/Keychains/**",
     "/Library/Keychains/**",
@@ -61,8 +80,14 @@ subtract = [
     "/etc/sudoers.d/**",
 ]
 
-# Fail-closed egress (FW-XR3): the agent reaches the network only through the gateway fd.
-net = "deny"
-
-# Exec is unrestricted by default for transparency (FW-ISO4); set an allow-list to restrict.
-exec = "unrestricted"
+# Tamper vectors: write-denied but still READABLE (FW-TRA7). Unlike `subtract` (read+write deny for
+# secrets), these must stay readable -- git reads `.git/config` constantly, tools read `.mcp.json` --
+# while a confined agent must not be able to plant a git hook, MCP server, or IDE task that later
+# runs UNSANDBOXED when you next use the repo. `**/` matches them at any depth (FW-CAP6).
+write-subtract = [
+    "**/.git/hooks/**",
+    "**/.git/config",
+    "**/.mcp.json",
+    "**/.vscode/**",
+    "**/.idea/**",
+]

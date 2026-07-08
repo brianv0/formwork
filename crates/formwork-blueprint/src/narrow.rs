@@ -1,11 +1,12 @@
 //! Monotonic narrowing (FW-CAP2): `parent.narrow(&requested)` intersects two capability sets into a
-//! subset of both. `subtract` (sensitive holes) is the one set that grows under narrowing, so it
-//! unions. The grant intersection is conservative -- it may under-approximate but never over-
-//! approximate, so the result is always a genuine subset.
+//! subset of both. The deny-holes -- `subtract` (secrets) and `write_subtract` (tamper vectors) --
+//! grow under narrowing, so they union. The grant intersection is conservative -- it may
+//! under-approximate but never over-approximate, so the result is always a genuine subset.
 
 use crate::path::{canonicalize_set, PathPattern};
 use crate::{
-    Blueprint, ExecPosture, FsBlueprint, Gate, McpPolicy, NetPosture, ReadMode, Visibility,
+    Blueprint, EnvPosture, EnvScrub, ExecPosture, FsBlueprint, Gate, McpPolicy, NetPosture,
+    ReadMode, Visibility,
 };
 
 fn clamp_to(subject: &[PathPattern], bound: &[PathPattern]) -> Vec<PathPattern> {
@@ -36,6 +37,7 @@ impl Blueprint {
             fs: narrow_fs(&self.fs, &requested.fs),
             net: narrow_net(&self.net, &requested.net),
             exec: narrow_exec(&self.exec, &requested.exec),
+            env: narrow_env(&self.env, &requested.env),
             mcp: narrow_mcp(&self.mcp, &requested.mcp),
         }
         .canonicalize()
@@ -44,6 +46,8 @@ impl Blueprint {
 
 fn narrow_fs(parent: &FsBlueprint, req: &FsBlueprint) -> FsBlueprint {
     let subtract = union_grants(&parent.subtract, &req.subtract);
+    // Write-deny holes, like read+write holes, only ever grow under narrowing.
+    let write_subtract = union_grants(&parent.write_subtract, &req.write_subtract);
     let writes = intersect_grants(&parent.writes, &req.writes);
 
     // The narrower read mode wins (Closed < AmbientMinusSubtract).
@@ -69,6 +73,7 @@ fn narrow_fs(parent: &FsBlueprint, req: &FsBlueprint) -> FsBlueprint {
         reads: canonicalize_set(&reads),
         writes,
         subtract,
+        write_subtract,
     }
 }
 
@@ -134,6 +139,38 @@ fn narrow_visibility(parent: &Visibility, req: &Visibility) -> Visibility {
             } else {
                 Visibility::Allow(names)
             }
+        }
+    }
+}
+
+/// The result admits a subset of what either side admits (FW-CAP2). `Passthrough` admits everything,
+/// so it yields to the other side; otherwise restrictions combine (allowlists intersect, scrub denies
+/// union). For a mixed Allowlist/Scrub the only names Scrub is *guaranteed* to keep are its `allow`
+/// set (any other name may be dropped by value shape, which narrowing cannot evaluate), so the sound
+/// subset is the allowlist intersected with Scrub's `allow` -- an under-approximation, never wider
+/// than either side.
+fn narrow_env(parent: &EnvPosture, req: &EnvPosture) -> EnvPosture {
+    match (parent, req) {
+        (EnvPosture::Passthrough, other) | (other, EnvPosture::Passthrough) => other.clone(),
+        (EnvPosture::Allowlist(a), EnvPosture::Allowlist(b)) => {
+            EnvPosture::Allowlist(a.iter().filter(|n| b.contains(n)).cloned().collect())
+        }
+        (EnvPosture::Scrub(a), EnvPosture::Scrub(b)) => EnvPosture::Scrub(EnvScrub {
+            allow: a
+                .allow
+                .iter()
+                .filter(|n| b.allow.contains(n))
+                .cloned()
+                .collect(),
+            deny: {
+                let mut d = a.deny.clone();
+                d.extend(b.deny.iter().cloned());
+                d
+            },
+        }),
+        (EnvPosture::Allowlist(a), EnvPosture::Scrub(s))
+        | (EnvPosture::Scrub(s), EnvPosture::Allowlist(a)) => {
+            EnvPosture::Allowlist(a.iter().filter(|n| s.allow.contains(n)).cloned().collect())
         }
     }
 }
@@ -257,6 +294,36 @@ mod tests {
 
         let n2 = mk(Visibility::AllowAll).narrow(&mk(Visibility::Allow(vec!["x".into()])));
         assert_eq!(n2.mcp["s"].tools, Visibility::Allow(vec!["x".into()]));
+    }
+
+    #[test]
+    fn env_narrow_never_admits_more_than_either_side() {
+        // A name the *request* scrubs must not survive narrowing (FW-CAP2). Regression for the mixed
+        // Allowlist/Scrub case that previously returned the parent allowlist verbatim.
+        let parent = Blueprint {
+            env: EnvPosture::Allowlist(vec!["PATH".into(), "GH_TOKEN".into()]),
+            ..Blueprint::empty()
+        };
+        let req = Blueprint {
+            env: EnvPosture::Scrub(EnvScrub {
+                allow: vec!["PATH".into()],
+                deny: vec!["GH_TOKEN".into()],
+            }),
+            ..Blueprint::empty()
+        };
+        let admits = |bp: &Blueprint, name: &str| {
+            !bp.env
+                .apply(vec![(name.to_string(), "x".to_string())])
+                .is_empty()
+        };
+        let n = parent.narrow(&req);
+        // req keeps PATH (in its allow) and drops GH_TOKEN (in its deny); the result must not exceed that.
+        assert!(
+            !admits(&n, "GH_TOKEN"),
+            "narrow must not admit a var the request scrubbed"
+        );
+        assert!(admits(&req, "PATH") && admits(&parent, "PATH"));
+        assert_eq!(n.env, EnvPosture::Allowlist(vec!["PATH".into()]));
     }
 
     #[test]

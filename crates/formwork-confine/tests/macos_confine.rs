@@ -63,6 +63,7 @@ fn confined(
             reads,
             writes,
             subtract,
+            write_subtract: Vec::new(),
         },
         ..Blueprint::empty()
     };
@@ -130,6 +131,105 @@ fn fw_e2e_001_granted_read_succeeds_ungranted_denied() {
     assert!(
         !cat_succeeds(&policy, &fx.secret_file()),
         "out-of-scope read must be denied by Seatbelt"
+    );
+}
+
+/// FW-E2E-037 (FW-CAP7): a subtracted path leaks neither contents nor metadata. `stat` is denied,
+/// so a confined process cannot learn a credential file's existence, size, or mtime. The broad
+/// `(allow file-read-metadata)` re-admits metadata only for non-sensitive ungranted paths (FW-TRA4);
+/// the `subtract` deny of `file-read*` (which covers metadata) is emitted last and wins.
+#[test]
+fn fw_e2e_037_subtract_denies_metadata_not_only_contents() {
+    let fx = Fixture::new("e2e037");
+    let policy = confined(
+        vec![pp(&fx.root)],
+        vec![],
+        vec![pp(&fx.root.join("secret"))],
+    );
+    let secret = fx.secret_file();
+    let granted = fx.root.join("granted/ok.txt");
+
+    assert!(
+        !cat_succeeds(&policy, &secret),
+        "subtracted contents must be denied"
+    );
+    assert!(
+        !sh_succeeds(
+            &policy,
+            &format!("/usr/bin/stat -f %z '{}'", secret.display())
+        ),
+        "stat of a subtracted path must be denied -- no size/mtime oracle (FW-CAP7)"
+    );
+    assert!(
+        sh_succeeds(
+            &policy,
+            &format!("/usr/bin/stat -f %z '{}'", granted.display())
+        ),
+        "stat of a granted path must still succeed (the metadata deny is scoped to subtract)"
+    );
+}
+
+/// FW-E2E-038 (FW-CAP6): a `**/` any-depth subtract denies a matching file at real depth while a
+/// sibling stays readable. This exercises the compiled Seatbelt *regex* at the kernel boundary, not
+/// just its string form -- a wrong regex is a missed subtract hole, a fail-open (FW-INV6).
+#[test]
+fn fw_e2e_038_any_depth_subtract_denies_at_real_depth() {
+    let fx = Fixture::new("e2e038");
+    let proj = fx.root.join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    fs::write(proj.join(".env"), b"SECRET=1\n").unwrap();
+    fs::write(proj.join("ok.txt"), b"public\n").unwrap();
+    let policy = confined(
+        vec![pp(&fx.root)],
+        vec![],
+        vec![PathPattern::parse("**/.env").unwrap()],
+    );
+    assert!(
+        !cat_succeeds(&policy, &proj.join(".env")),
+        "**/.env must deny a nested .env (FW-CAP6 regex, real Seatbelt)"
+    );
+    assert!(
+        cat_succeeds(&policy, &proj.join("ok.txt")),
+        "a sibling that does not match the regex stays readable"
+    );
+}
+
+/// FW-E2E-039 (FW-TRA7): a write-subtract tamper vector is readable but not writable, even under a
+/// write grant that covers it. A confined agent cannot plant a `.git/config` that later runs
+/// unsandboxed, yet git and tooling still read it.
+#[test]
+fn fw_e2e_039_write_subtract_reads_but_denies_writes() {
+    let fx = Fixture::new("e2e039");
+    let git = fx.root.join("proj/.git");
+    fs::create_dir_all(&git).unwrap();
+    let cfg = git.join("config");
+    fs::write(&cfg, b"[core]\n").unwrap();
+    let normal = fx.root.join("proj/normal.txt");
+    fs::write(&normal, b"x\n").unwrap();
+
+    let blueprint = Blueprint {
+        fs: FsBlueprint {
+            read_mode: ReadMode::Closed,
+            reads: vec![pp(&fx.root)],
+            writes: vec![pp(&fx.root)],
+            subtract: Vec::new(),
+            write_subtract: vec![PathPattern::parse("**/.git/config").unwrap()],
+        },
+        ..Blueprint::empty()
+    };
+    let policy = compile(&blueprint, &detect());
+
+    assert!(
+        cat_succeeds(&policy, &cfg),
+        ".git/config must stay READABLE under write-subtract (FW-TRA7)"
+    );
+    assert!(
+        !sh_succeeds(&policy, &format!("echo pwned >> '{}'", cfg.display())),
+        "write-subtract must DENY writing the tamper vector despite the write grant"
+    );
+    assert!(
+        sh_succeeds(&policy, &format!("echo ok >> '{}'", normal.display())),
+        "a normal file under the same write grant stays writable (deny is scoped)"
     );
 }
 
@@ -304,7 +404,8 @@ fn fw_e2e_001_confine_self_posture() {
 }
 
 /// FW-E2E-006: under net=deny, an outbound connection fails closed at connect() (not masked by a
-/// startup failure). A python one-liner avoids depending on curl.
+/// startup failure). The staged std-only `fw-connect-probe` reports the outcome by exit code, so a
+/// policy denial is distinguishable from any other failure.
 #[test]
 fn fw_e2e_006_direct_egress_denied() {
     let fx = Fixture::new("e2e006");

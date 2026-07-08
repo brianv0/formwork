@@ -22,8 +22,10 @@ pub struct CompiledPolicy {
 pub enum ConfinerPolicy {
     Linux(LinuxPolicy),
     Macos(MacosPolicy),
-    /// No usable confiner here. Net still fails closed (the gateway is the only egress), but the
-    /// caller is told plainly that OS-level fs confinement is unavailable.
+    /// No usable confiner on this host (no Landlock, no seccomp): fs scope and net default-deny are
+    /// both reported `Unenforceable`, never silently assumed (FW-INV6). Egress containment then rests
+    /// on the seam alone -- the agent reaches the network only through the injected gateway fd
+    /// (FW-XR7) -- which this policy does not itself enforce.
     Unavailable {
         reason: String,
     },
@@ -38,6 +40,8 @@ pub struct LinuxPolicy {
     pub reads: Vec<PathPattern>,
     pub writes: Vec<PathPattern>,
     pub subtract: Vec<PathPattern>,
+    /// Write-denied but readable tamper vectors (FW-TRA7).
+    pub write_subtract: Vec<PathPattern>,
     pub exec: ExecPlan,
     pub net: LinuxNetPlan,
     pub seccomp: SeccompPlan,
@@ -48,10 +52,12 @@ pub struct LinuxPolicy {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum LinuxNetPlan {
-    /// Below Landlock net ABI (v4): deny inet `socket(2)` creation via seccomp. Inherited connected
-    /// fds still work -- that is the seam (FW-XR7).
+    /// Full inet default-deny: block inet `socket(2)` creation via seccomp -- TCP, UDP, and raw. Used
+    /// for any outright net-deny (Landlock net governs only TCP), not just a sub-ABI-v4 fallback.
+    /// Inherited connected fds still work -- that is the seam (FW-XR7).
     SeccompDenyInet,
-    /// `ports` may be empty (pure deny) or an allow-list.
+    /// The per-port TCP allow-list -- the port tier (ABI v4+). Outright deny uses `SeccompDenyInet`
+    /// instead, which also covers UDP.
     LandlockTcp { ports: Vec<u16> },
 }
 

@@ -17,7 +17,7 @@ pub use report::{Backend, Capability, DenialSemantics, Fidelity, FidelityReport}
 use std::collections::BTreeMap;
 
 use formwork_blueprint::{
-    canonicalize_set, Blueprint, ExecPosture, NetPosture, PathPattern, ReadMode,
+    canonicalize_set, Blueprint, EnvPosture, ExecPosture, NetPosture, PathPattern, ReadMode,
 };
 use formwork_detect::{HostProfile, Os};
 
@@ -30,6 +30,7 @@ pub struct CompileInput {
     pub effective_reads: Vec<PathPattern>,
     pub writes: Vec<PathPattern>,
     pub subtract: Vec<PathPattern>,
+    pub write_subtract: Vec<PathPattern>,
     pub net: NetPosture,
     pub exec: ExecPosture,
 }
@@ -43,6 +44,7 @@ impl CompileInput {
             effective_reads: canonicalize_set(&reads),
             writes: canonicalize_set(&blueprint.fs.writes),
             subtract: canonicalize_set(&blueprint.fs.subtract),
+            write_subtract: canonicalize_set(&blueprint.fs.write_subtract),
             net: blueprint.net.clone(),
             exec: blueprint.exec.clone(),
         }
@@ -83,6 +85,33 @@ pub fn compile(blueprint: &Blueprint, host: &HostProfile) -> CompiledPolicy {
         },
     );
     semantics.insert(Capability::FsInvisibility, DenialSemantics::Deny);
+
+    // Environment posture is applied at spawn by the CLI shell, independent of the OS confiner (like
+    // MCP shading below). Passthrough asks for nothing, so it earns no row. Allowlist is exact
+    // (only named vars survive); Scrub is heuristic and must SAY so -- reporting it Enforced would be
+    // the silent over-claim FW-XR1 forbids.
+    match &blueprint.env {
+        EnvPosture::Passthrough => {}
+        EnvPosture::Allowlist(_) => {
+            per_capability.insert(
+                Capability::EnvScrub,
+                Fidelity::Enforced {
+                    backend: Backend::Process,
+                },
+            );
+            semantics.insert(Capability::EnvScrub, DenialSemantics::Hide);
+        }
+        EnvPosture::Scrub(_) => {
+            per_capability.insert(
+                Capability::EnvScrub,
+                Fidelity::Partial {
+                    backend: Backend::Process,
+                    reason: "heuristic: drops secret-shaped names and values; a secret with neither a known marker name nor a recognized value shape (e.g. an inline credential in DATABASE_URL) is not caught -- pin it with an explicit deny or use an allowlist".to_string(),
+                },
+            );
+            semantics.insert(Capability::EnvScrub, DenialSemantics::Hide);
+        }
+    }
 
     // MCP shading is a gateway property, independent of the OS confiner.
     if !blueprint.mcp.is_empty() {
@@ -298,6 +327,7 @@ fn compile_linux(
         reads: input.effective_reads.clone(),
         writes: input.writes.clone(),
         subtract: input.subtract.clone(),
+        write_subtract: input.write_subtract.clone(),
         exec: exec_plan,
         net: net_plan,
         seccomp,
@@ -336,10 +366,12 @@ mod tests {
                 reads: vec![pp("/work/**")],
                 writes: vec![pp("/work/project/**")],
                 subtract: vec![pp("/work/.ssh/**")],
+                write_subtract: vec![pp("**/.git/hooks/**")],
             },
             net: NetPosture::Deny,
             exec: ExecPosture::Unrestricted,
             mcp,
+            ..Blueprint::empty()
         }
     }
 
@@ -360,11 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn linux_modern_uses_landlock_and_reports_socket_partial() {
+    fn linux_modern_uses_landlock_fs_and_seccomp_netdeny() {
         let policy = compile(&sample_blueprint(), &HostProfile::synthetic_linux(Some(6)));
+        assert!(policy.report.per_capability[&Capability::FsRead].is_enforced());
         match &policy.confiner {
             ConfinerPolicy::Linux(l) => {
-                assert!(matches!(l.net, LinuxNetPlan::LandlockTcp { .. }));
+                // net-deny is the complete seccomp inet deny (covers UDP), not Landlock's TCP-only.
+                assert!(matches!(l.net, LinuxNetPlan::SeccompDenyInet));
                 assert!(l.no_new_privs);
             }
             other => panic!("expected Linux confiner, got {other:?}"),
@@ -373,6 +407,22 @@ mod tests {
             policy.report.per_capability[&Capability::CrossDomainSocket],
             Fidelity::Partial { .. }
         ));
+    }
+
+    #[test]
+    fn linux_port_tier_uses_landlock_tcp() {
+        let blueprint = Blueprint {
+            net: NetPosture::Ports(vec![443]),
+            ..Blueprint::empty()
+        };
+        let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(6)));
+        match &policy.confiner {
+            ConfinerPolicy::Linux(l) => assert!(
+                matches!(&l.net, LinuxNetPlan::LandlockTcp { ports } if ports == &vec![443]),
+                "the TCP port tier is carried by Landlock net"
+            ),
+            other => panic!("expected Linux confiner, got {other:?}"),
+        }
     }
 
     #[test]
@@ -415,6 +465,43 @@ mod tests {
             !policy.report.net_is_fail_closed(),
             "net is genuinely unenforceable here and says so"
         );
+    }
+
+    #[test]
+    fn env_posture_reported_honestly() {
+        use formwork_blueprint::{EnvPosture, EnvScrub};
+        // Passthrough asks for nothing -> no row.
+        let pass = compile(&Blueprint::empty(), &HostProfile::synthetic_macos());
+        assert!(!pass
+            .report
+            .per_capability
+            .contains_key(&Capability::EnvScrub));
+
+        // Allowlist is exact -> Enforced.
+        let allow = compile(
+            &Blueprint {
+                env: EnvPosture::Allowlist(vec!["PATH".into()]),
+                ..Blueprint::empty()
+            },
+            &HostProfile::synthetic_macos(),
+        );
+        assert!(allow.report.per_capability[&Capability::EnvScrub].is_enforced());
+
+        // Scrub is heuristic -> Partial, never a silent Enforced over-claim (FW-XR1).
+        let scrub = compile(
+            &Blueprint {
+                env: EnvPosture::Scrub(EnvScrub::default()),
+                ..Blueprint::empty()
+            },
+            &HostProfile::synthetic_macos(),
+        );
+        assert!(matches!(
+            scrub.report.per_capability[&Capability::EnvScrub],
+            Fidelity::Partial {
+                backend: Backend::Process,
+                ..
+            }
+        ));
     }
 
     #[test]

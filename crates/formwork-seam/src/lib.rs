@@ -12,13 +12,13 @@
 //! surface is deliberately minimal: methods are added when that consumer needs them, not before
 //! (Growth). If the wiring is abandoned, delete the crate rather than let it drift.
 
-/// `Env` is a missing/invalid `FORMWORK_FD_*` advertisement (child not spawned via the seam).
 #[derive(Debug, thiserror::Error)]
 pub enum SeamError {
     #[error("i/o error on the seam: {0}")]
     Io(#[from] std::io::Error),
     #[error("control protocol error: {0}")]
     Protocol(String),
+    /// A missing/invalid `FORMWORK_FD_*` advertisement -- the child was not spawned via the seam.
     #[error("seam environment error: {0}")]
     Env(String),
 }

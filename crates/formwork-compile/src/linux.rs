@@ -20,6 +20,11 @@ const BASELINE_DENY: &[&str] = &[
     "bpf",
     "finit_module",
     "init_module",
+    // io_uring submits file/net operations through a ring that has historically bypassed seccomp and
+    // LSM checks -- a classic sandbox-escape surface, denied outright.
+    "io_uring_enter",
+    "io_uring_register",
+    "io_uring_setup",
     "kexec_file_load",
     "kexec_load",
     "keyctl",
@@ -28,7 +33,13 @@ const BASELINE_DENY: &[&str] = &[
     "move_mount",
     "open_by_handle_at",
     "perf_event_open",
+    // Cross-process reach-in: steal a live fd (e.g. a connected socket) from, or write the memory of,
+    // an *unconfined* same-uid sibling to hijack it. `ptrace` denial does not cover these -- they gate
+    // on `ptrace_may_access`, not the ptrace syscall.
+    "pidfd_getfd",
     "pivot_root",
+    "process_vm_readv",
+    "process_vm_writev",
     "ptrace",
     "request_key",
     "setns",
@@ -69,15 +80,11 @@ pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, bool, Po
     let abi = host.landlock_abi.unwrap_or(0);
     match net {
         NetPosture::Deny => {
-            if abi >= LANDLOCK_NET_ABI {
-                (
-                    LinuxNetPlan::LandlockTcp { ports: vec![] },
-                    false,
-                    PortTier::NotRequested,
-                )
-            } else {
-                (LinuxNetPlan::SeccompDenyInet, true, PortTier::NotRequested)
-            }
+            // Deny ALL inet egress via seccomp (blocks TCP, UDP, and raw at the socket-family level),
+            // matching macOS `(deny network*)`. Landlock net governs *only* TCP, so carrying deny with
+            // it would leave UDP/raw open -- an exfil channel. AF_UNIX (the injected-fd seam) stays
+            // allowed. Landlock net is reserved for the port tier, where per-port TCP allow is needed.
+            (LinuxNetPlan::SeccompDenyInet, true, PortTier::NotRequested)
         }
         NetPosture::Ports(ports) => {
             if abi >= LANDLOCK_NET_ABI {
@@ -118,23 +125,34 @@ mod tests {
         assert!(plan.deny_syscalls.windows(2).all(|w| w[0] < w[1]));
         assert!(plan.deny_syscalls.iter().any(|s| s == "bpf"));
         assert!(plan.deny_syscalls.iter().any(|s| s == "setns"));
+        // Escape surfaces added in the hardening pass: io_uring (seccomp/LSM bypass) and cross-process
+        // reach-in (fd theft / memory write into an unconfined sibling).
+        for s in [
+            "io_uring_setup",
+            "pidfd_getfd",
+            "process_vm_readv",
+            "process_vm_writev",
+        ] {
+            assert!(plan.deny_syscalls.iter().any(|d| d == s), "missing {s}");
+        }
         assert!(plan.restrict_userns);
         assert!(plan.set_no_new_privs);
         assert!(plan.deny_socket_families.is_empty());
     }
 
     #[test]
-    fn net_deny_uses_seccomp_below_abi4_landlock_above() {
-        let old = HostProfile::synthetic_linux(Some(1));
-        let (plan, via_seccomp, tier) = net_plan(&old, &NetPosture::Deny);
-        assert!(matches!(plan, LinuxNetPlan::SeccompDenyInet));
-        assert!(via_seccomp);
-        assert_eq!(tier, PortTier::NotRequested);
-
-        let new = HostProfile::synthetic_linux(Some(4));
-        let (plan, via_seccomp, _) = net_plan(&new, &NetPosture::Deny);
-        assert!(matches!(plan, LinuxNetPlan::LandlockTcp { ports } if ports.is_empty()));
-        assert!(!via_seccomp);
+    fn net_deny_always_uses_seccomp_inet_deny() {
+        // Deny is carried by seccomp at every ABI so UDP/raw are covered, not just TCP.
+        for abi in [1, 4, 6] {
+            let host = HostProfile::synthetic_linux(Some(abi));
+            let (plan, via_seccomp, tier) = net_plan(&host, &NetPosture::Deny);
+            assert!(
+                matches!(plan, LinuxNetPlan::SeccompDenyInet),
+                "abi {abi}: net-deny must be the complete seccomp inet deny"
+            );
+            assert!(via_seccomp);
+            assert_eq!(tier, PortTier::NotRequested);
+        }
     }
 
     #[test]

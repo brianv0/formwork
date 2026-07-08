@@ -1,13 +1,39 @@
-# Linux confiner backend — implementation plan (Phase 2)
+# Linux confiner backend — design + hardening notes (Phase 2)
 
-Status: **not yet implemented.** The `formwork-confine` Linux backend is an honest fail-closed stub
-(`ConfineError::Unimplemented`). This note captures the researched design and the concrete crate
-APIs so implementation is fast once a Linux kernel is available to verify against — and records the
-hazards that make blind implementation unwise (per FW-XR1/FW-INV5, Formwork must never claim
-containment it has not verified).
+Status: **implemented and kernel-verified** (Landlock fs+net+scope, seccomp baseline, subtractive
+expansion), verified against a real ABI-v6 kernel. This note keeps the researched design and crate
+APIs, and now records the **hardening decisions** that closed real escape/transparency gaps found by
+review on the kernel. Per FW-XR1/FW-INV5, Formwork never claims containment it has not verified.
 
-Verify against: `just test-linux` (Docker, first-line) / `just test-linux-full` (Lima, ABI-v6 tier).
-Exit criteria: FW-E2E-001..005, FW-ADV-001/002, FW-E2E-024 green on Linux, then FW-E2E-028 parity.
+Verify against: the `formwork-linux-dev` Docker image on an ABI-v6 kernel, `--security-opt
+seccomp=unconfined --security-opt apparmor=unconfined` so only Formwork's sandbox is under test.
+
+## Hardening decisions (verified on the kernel)
+
+- **Symlinks are skipped during subtractive expansion.** `PathFd` opens with `O_PATH` (no
+  `O_NOFOLLOW`), so granting or recursing a symlink *entry* would bind the rule to its target — a
+  fail-open escape out of a split grant. Access *through* a symlink still resolves to the real path,
+  governed by whatever rule covers it (or denied), matching macOS's resolved-path checks.
+- **`/proc/self` is granted in the child, not the parent.** It is a per-process symlink; a rule built
+  in the parent binds the *launcher's* `/proc/<pid>`. The child's own `/proc/self` is added post-fork
+  in `apply` (runtimes read `/proc/self/{maps,exe,status}` and would otherwise die under Closed mode).
+- **Net-deny is carried by seccomp, not Landlock.** Landlock net governs only TCP; carrying deny with
+  it left UDP/raw open (an exfil channel). Deny now denies inet `socket(2)` creation at the family
+  level (TCP + UDP + raw), matching macOS `(deny network*)`. Landlock net is reserved for the port
+  tier, where per-port TCP *allow* is required.
+- **Abstract-UNIX-socket + signal scoping is enforced at ABI v6+** via the `Scope` handle — closing a
+  pathless escape the fs rules cannot reach — matching the compiler's CrossDomainSocket = Partial.
+- **Device ioctls are *not* governed** (`IOCTL_DEV` excluded from `handled_fs`). Governing it denies
+  every ioctl on a device node — including the winsize/termios calls every interactive TUI makes on
+  its inherited stdio, whose controlling pty is dynamic and cannot be pre-granted. macOS has no
+  separate device-ioctl gate (parity). Residual surface is small: you can only ioctl a device you can
+  already open, and the dangerous ones (e.g. TIOCSTI injection) are CAP_SYS_ADMIN-gated, which
+  NO_NEW_PRIVS keeps unreachable.
+- **Extra baseline denies:** `io_uring_{setup,enter,register}` (a historical seccomp/LSM bypass) and
+  the cross-process reach-in surfaces `pidfd_getfd` / `process_vm_{readv,writev}` (fd theft or memory
+  write into an *unconfined* same-uid sibling; `ptrace` denial does not cover these).
+- **The child `apply` path is allocation-free on success** (only syscalls + raw-errno results), so a
+  post-`fork` allocator poisoned by a multi-threaded parent cannot deadlock it.
 
 ## Posture: build in the parent, apply in the child
 
@@ -51,14 +77,16 @@ Key decisions:
 - **Do not govern `Execute` when exec is unrestricted (the default).** Landlock denies any handled
   access that isn't granted, so if `AccessFs::Execute` is in `handled_fs`, only explicitly-granted
   paths are executable. For the transparent default, exclude `Execute` from `handled_fs` entirely so
-  `execve` is never checked. (Exec allow-list, FW-ISO4, is Phase 7: then govern `Execute` and grant
-  it only on the allow-list.)
-- **Net default-deny via Landlock (ABI ≥ v4):** `handle_access(AccessNet::from_all(abi))` with *no*
-  `NetPort` rules denies all TCP connect/bind. Below v4, net-deny is carried by seccomp instead
-  (see the socket-family rules) and this handle is omitted.
-- **UNIX-socket / signal scoping (ABI ≥ v6):** the `Scope` handle blocks abstract-UNIX-socket and
-  signal reach-out of the domain (FW-ADV-006). Coarse (domain-relative, not per-path); report
-  Partial where present, Unenforceable below v6 — matches the compiler's report today.
+  `execve` is never checked. (When the blueprint requests an exec allow-list (FW-ISO4), `Execute` is
+  governed and granted only on the allow-list -- implemented here, though not yet exercised by a
+  kernel test.)
+- **Net default-deny via seccomp (all ABIs), *not* Landlock.** Landlock net governs only TCP, so a
+  Landlock-carried deny leaves UDP/raw open. Deny denies inet `socket(2)` at the family level instead
+  (TCP + UDP + raw); Landlock net (`handle_access(AccessNet::from_all(abi))` + `NetPort` allows) is
+  reserved for the **port tier** (ABI ≥ v4), which needs per-port TCP *allow*.
+- **UNIX-socket / signal scoping (ABI ≥ v6):** the `Scope` handle (`.scope(Scope::from_all(abi))`)
+  blocks abstract-UNIX-socket and signal reach-out of the domain (FW-ADV-006). Coarse (domain-
+  relative, not per-path); reported Partial at v6+, Unenforceable below — matches the compiler.
 - **ABI negotiation vs honesty:** the compiler already accounted fidelity from `host.landlock_abi`.
   Enforce at exactly `landlock_abi_target`. Prefer `CompatLevel::HardRequirement` so a missing
   access right is an error (fail-closed), *not* `BestEffort` (which would silently drop enforcement
@@ -71,10 +99,11 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
 1. **Closed-read profiles need runtime essentials or nothing loads.** Granting only `/work/project`
    makes `ld.so`/libraries unreadable and every `execve` fails — the same class of failure the macOS
    spike hit (there it was a `dyld` SIGABRT). Linux essentials to add to the read set in Closed mode:
-   `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc/ld.so.cache`, `/etc/ld.so.preload`, `/proc/self`,
-   and the safe `/dev` nodes (`/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/random`, `/dev/tty`) —
-   as literals, never a broad `/dev` (which would expose block devices, an out-of-band filesystem
-   read). This mirrors `MACOS_READ_ESSENTIALS` / `MACOS_READ_DEVICES`.
+   `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc/ld.so.cache`, `/etc/ld.so.preload`, and the safe
+   `/dev` nodes (`/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/random`, `/dev/tty`) — as literals,
+   never a broad `/dev` (which would expose block devices, an out-of-band filesystem read). This
+   mirrors `MACOS_READ_ESSENTIALS` / `MACOS_READ_DEVICES`. `/proc/self` is *not* a parent-side
+   essential — it is per-process and must be granted in the child (see Hardening decisions above).
 2. **`subtract` can't be a deny rule** — it must be compiled into the *shape* of the grants. The
    expansion (bounded by the number of holes, not filesystem size):
 
@@ -84,6 +113,7 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
      if no subtract pattern lies strictly under root:    return [root]       # grant whole subtree
      result = []
      for child in readdir(root):
+         if child is a symlink:                          skip     # would bind the rule to its target
          if child is exactly subtracted:                 skip
          elif some subtract lies under child:            result += expand(child, subtract)
          else:                                           result.push(child)
@@ -128,23 +158,24 @@ rules.insert(libc::SYS_socket, vec![
 // AF_UNIX / socketpair are absent from the list -> allowed (the injected-fd seam is untouched).
 ```
 
-**Hazards that REQUIRE a real kernel + real toolchains to validate (do not ship blind):**
+**Hazards (status after kernel validation):**
 
-- **`clone3`.** glibc uses `clone3` for thread/process creation on recent versions and *falls back*
-  to `clone` on `ENOSYS`. A seccomp filter returning `EPERM` (not `ENOSYS`) for `clone3` does **not**
-  trigger the fallback and can break `fork`/threads across the whole toolchain — the opposite of
-  FW-TRA2. The userns restriction also can't inspect `clone3`'s flags (they sit behind a `struct
-  clone_args` pointer, unreadable by seccomp). Options to evaluate on a kernel: return `ENOSYS` for
-  `clone3` to force the `clone` fallback (then filter `clone`'s flag arg), or rely on Landlock/no-new
-  -privs + `unshare` filtering alone. Untestable here; decision deferred to Phase 2 on a kernel.
-- **netlink.** Denying non-route `AF_NETLINK` may break NSS / `getaddrinfo` / `getifaddrs` paths that
-  pytest and npm hit (Spike 3). Needs the real reuse workloads to confirm transparency.
-- **`unshare`/`clone` `CLONE_NEWUSER` flag test** (`SeccompCmpOp::MaskedEq`) is arch-order sensitive
-  and must be checked on both x86_64 and aarch64.
-- **Syscall coverage.** Some baseline names (`mount_setattr`, `move_mount`, `clone3`) may lack
-  `libc::SYS_*` constants; dropping one silently weakens the baseline — enumerate explicitly and log
-  any that can't be resolved rather than skipping quietly.
+- **`clone3` — accepted gap, mitigated.** glibc uses `clone3` for thread/process creation and *falls
+  back* to `clone` only on `ENOSYS`, not `EPERM` — so we do **not** filter `clone3` (returning `EPERM`
+  would break `fork`/threads, the opposite of FW-TRA2). Its flags sit behind a `clone_args` pointer
+  seccomp cannot read, so a `CLONE_NEWUSER` via `clone3` is not blocked at the flag level. This is
+  well-mitigated: a fresh userns is inert here — `mount`, `setns`, `pivot_root` are denied and
+  Landlock is namespace-independent, so the userns grants no reachable capability. The `unshare`/
+  `clone` `CLONE_NEWUSER` flag filter still blocks the common paths. Verified transparent to
+  fork+exec on the kernel.
+- **netlink — resolved.** Only *non-route* `AF_NETLINK` is denied; `NETLINK_ROUTE` (what NSS /
+  `getaddrinfo` / `getifaddrs` use) stays allowed. Fork+exec transparency verified; full reuse-
+  workload confirmation is still owed for pytest/npm name resolution under the *port tier*.
+- **`CLONE_NEWUSER` flag test** (`SeccompCmpOp::MaskedEq`, arg0) — verified on aarch64; the arch guard
+  (`TargetArch::try_from`) rejects any arch where `clone`'s flags are not arg0.
+- **Syscall coverage — fail-loud.** `syscall_number` is an explicit match; an unresolved baseline name
+  aborts the build (`FW-INV6`) rather than silently dropping a rule. All baseline names resolve on
+  x86_64/aarch64, including the hardening additions (`io_uring_*`, `pidfd_getfd`, `process_vm_*`).
 
-The net effect: the Linux baseline's *transparency* (FW-TRA2) and *non-breakage* can only be
-established by running the Phase-4 reuse workloads under it on a real kernel. That gate is why this
-backend is deferred rather than written speculatively.
+Still owed: the Phase-4 reuse workloads (pytest/npm/cargo) under the baseline on a real kernel to
+fully establish *transparency* (FW-TRA2) beyond the fork+exec + `/proc/self` cases already verified.

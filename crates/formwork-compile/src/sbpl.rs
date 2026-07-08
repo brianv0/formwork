@@ -22,7 +22,12 @@ pub fn render(input: &CompileInput) -> String {
         &input.effective_reads,
         &input.subtract,
     );
-    render_writes(&mut b, &input.writes, &input.subtract);
+    render_writes(
+        &mut b,
+        &input.writes,
+        &input.subtract,
+        &input.write_subtract,
+    );
     render_exec(&mut b, &input.exec);
 
     b
@@ -117,12 +122,23 @@ fn render_reads(b: &mut String, mode: ReadMode, reads: &[PathPattern], subtract:
             b.push_str(";; ambient reads (allow default); only subtract holes below\n");
         }
     }
+    // Subtract holes deny read AND metadata: a confined process must not learn a credential file's
+    // existence, size, or mtime via `stat` (FW-CAP7). The explicit metadata deny is required because
+    // Closed mode's broad `(allow file-read-metadata)` (kept for FW-TRA4) would otherwise re-admit it
+    // -- last-match-wins does not fold `file-read-metadata` into a `file-read*` deny here.
     for p in subtract {
-        b.push_str(&format!("(deny file-read* {})\n", filter(p)));
+        let f = filter(p);
+        b.push_str(&format!("(deny file-read* {f})\n"));
+        b.push_str(&format!("(deny file-read-metadata {f})\n"));
     }
 }
 
-fn render_writes(b: &mut String, writes: &[PathPattern], subtract: &[PathPattern]) {
+fn render_writes(
+    b: &mut String,
+    writes: &[PathPattern],
+    subtract: &[PathPattern],
+    write_subtract: &[PathPattern],
+) {
     b.push_str("\n;; writes: always closed (FW-ISO2, FW-TRA5)\n");
     b.push_str("(deny file-write* (subpath \"/\"))\n");
     b.push_str(";; safe writable device nodes (curated literals; e.g. `cmd > /dev/null`)\n");
@@ -134,6 +150,14 @@ fn render_writes(b: &mut String, writes: &[PathPattern], subtract: &[PathPattern
     }
     for p in subtract {
         b.push_str(&format!("(deny file-write* {})\n", filter(p)));
+    }
+    // Tamper vectors: write-denied but NOT read-denied, so tooling still reads them (FW-TRA7). These
+    // deny file-write* only; render_reads never sees write_subtract.
+    if !write_subtract.is_empty() {
+        b.push_str(";; write-only tamper-vector denials -- readable, not writable (FW-TRA7)\n");
+        for p in write_subtract {
+            b.push_str(&format!("(deny file-write* {})\n", filter(p)));
+        }
     }
 }
 
@@ -148,12 +172,60 @@ fn render_exec(b: &mut String, exec: &ExecPosture) {
 }
 
 fn filter(p: &PathPattern) -> String {
+    if p.is_any_depth() {
+        return format!("(regex #\"{}\")", any_depth_regex(p));
+    }
     let path = escape(&p.base().display().to_string());
     if p.is_subtree() {
         format!("(subpath \"{path}\")")
     } else {
         format!("(literal \"{path}\")")
     }
+}
+
+/// A `**/`-anchored pattern (FW-CAP6) matches its suffix at any depth. Seatbelt regexes are
+/// unanchored, so a leading `/` before the first component pins a component boundary and the
+/// trailing `$` (literal) or `(/|$)` (subtree) pins the end, while the start is free to match at
+/// any depth. E.g. `**/.env` -> `/\.env$`; `**/.git/hooks/**` -> `/\.git/hooks(/|$)`.
+fn any_depth_regex(p: &PathPattern) -> String {
+    let mut body = String::new();
+    for comp in p.base().components() {
+        body.push('/');
+        body.push_str(&regex_escape(&comp.as_os_str().to_string_lossy()));
+    }
+    if p.is_subtree() {
+        body.push_str("(/|$)");
+    } else {
+        body.push('$');
+    }
+    body
+}
+
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '^'
+                | '$'
+                | '*'
+                | '+'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
+                | '\\'
+                | '"'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn escape(s: &str) -> String {
@@ -176,6 +248,7 @@ mod tests {
             effective_reads: vec![pp("/work/project/**")],
             writes: vec![pp("/work/project/**")],
             subtract: vec![pp("/work/project/.git/**")],
+            write_subtract: vec![],
             net: NetPosture::Deny,
             exec: ExecPosture::Unrestricted,
         }
@@ -238,5 +311,46 @@ mod tests {
         let s = render(&i);
         assert!(s.contains("(deny process-exec* (subpath \"/\"))"));
         assert!(s.contains("(allow process-exec* (literal \"/usr/bin/git\"))"));
+    }
+
+    #[test]
+    fn write_subtract_denies_write_but_not_read() {
+        let mut i = input();
+        i.read_mode = ReadMode::AmbientMinusSubtract;
+        i.subtract = vec![];
+        i.write_subtract = vec![pp("**/.git/hooks/**"), pp("**/.mcp.json")];
+        let s = render(&i);
+        // write is denied for the tamper vectors...
+        assert!(
+            s.contains(r#"(deny file-write* (regex #"/\.git/hooks(/|$)"))"#),
+            "{s}"
+        );
+        assert!(
+            s.contains(r#"(deny file-write* (regex #"/\.mcp\.json$"))"#),
+            "{s}"
+        );
+        // ...but read is NOT denied (tooling still reads .git/config, hooks, etc.).
+        assert!(
+            !s.contains(r#"(deny file-read* (regex #"/\.git/hooks(/|$)"))"#),
+            "{s}"
+        );
+        assert!(
+            !s.contains(r#"(deny file-read* (regex #"/\.mcp\.json$"))"#),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn any_depth_subtract_renders_as_regex() {
+        let mut i = input();
+        i.read_mode = ReadMode::AmbientMinusSubtract;
+        i.subtract = vec![pp("**/.env"), pp("**/.git/hooks/**")];
+        let s = render(&i);
+        // literal suffix pins the end; subtree suffix matches the dir and anything under it.
+        assert!(s.contains(r#"(deny file-read* (regex #"/\.env$"))"#), "{s}");
+        assert!(
+            s.contains(r#"(deny file-write* (regex #"/\.git/hooks(/|$)"))"#),
+            "{s}"
+        );
     }
 }

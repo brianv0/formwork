@@ -2,8 +2,11 @@
 # `formwork run`. The kernel — not the agent's own permission prompts — is the wall, which is what
 # makes it safe to hand the agent its "skip every prompt" flag (see each host's README).
 #
-# This is profiles/default.toml narrowed to one project. `~` expands against $HOME when the CLI
-# loads the blueprint; narrowing a grant is always safe, widening is not (FW-CAP2).
+# Based on profiles/default.toml, adapted for one interactive agent: it deliberately WIDENS the
+# default in the axes this agent needs -- :443 egress for the model API, this agent's own ~/.claude
+# kept writable, and two model-API-key env vars re-admitted -- while every other secret stays denied.
+# `~` expands against $HOME when the CLI loads the blueprint. Narrowing a grant is always safe; these
+# widenings are deliberate, so review them before use (FW-CAP2).
 #
 #   reads   the whole ambient environment MINUS a sensitive set (keys, cloud creds, keychains,
 #           browser profiles). The canonical superset lives in profiles/sensitive-set.toml.
@@ -15,11 +18,15 @@
 
 net = { ports = [443] }
 exec = "unrestricted"
+# Scrub secret-shaped env vars but keep the model API key the agent needs (FW-ENV2). Egress is open
+# to any HTTPS host, so this stops e.g. AWS_SECRET_ACCESS_KEY being exfiltrated via the environment.
+env = { scrub = { allow = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] } }
 
 [fs]
 read-mode = "ambient-minus-subtract"
 reads = ["/**"]
-writes = ["~/project/**", "/tmp/**", "/private/tmp/**", "/var/tmp/**"]
+# project + scratch + this agent's own state dir, so Claude can persist history/settings/auth.
+writes = ["~/project/**", "~/.claude/**", "/tmp/**", "/private/tmp/**", "/var/tmp/**"]
 subtract = [
     # SSH / GPG / cloud + CI credentials
     "~/.ssh/**",
@@ -28,12 +35,19 @@ subtract = [
     "~/.config/gcloud/**",
     "~/.azure/**",
     "~/.kube/**",
-    "~/.docker/config.json",
+    "~/.docker/**",   # whole dir incl. run/docker.sock (host-root); no agent needs it
     "~/.netrc",
     "~/.npmrc",
     "~/.pypirc",
     "~/.config/gh/**",
     "~/.git-credentials",
+    # other agents' state: deny so this confined Claude can't read Codex/Gemini/Cursor creds.
+    # ~/.claude is intentionally NOT subtracted -- it's this agent's own config/session.
+    "~/.codex/**",
+    "~/.gemini/**",
+    "~/.cursor/**",
+    # project-local secrets at any depth (a repo .env usually holds API keys)
+    "**/.env",
     # keychains (macOS)
     "~/Library/Keychains/**",
     "/Library/Keychains/**",
@@ -46,4 +60,13 @@ subtract = [
     "/etc/shadow",
     "/etc/sudoers",
     "/etc/sudoers.d/**",
+]
+# Tamper vectors: write-denied but readable, so the agent can't plant a git hook / .mcp.json / IDE
+# task that later runs unsandboxed, yet git and tooling still read them (FW-TRA7).
+write-subtract = [
+    "**/.git/hooks/**",
+    "**/.git/config",
+    "**/.mcp.json",
+    "**/.vscode/**",
+    "**/.idea/**",
 ]

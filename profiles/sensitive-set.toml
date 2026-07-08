@@ -14,12 +14,26 @@ aws          = ["~/.aws/**"]
 gcloud       = ["~/.config/gcloud/**"]
 azure        = ["~/.azure/**"]
 kube         = ["~/.kube/**"]
-docker       = ["~/.docker/config.json"]
+docker       = ["~/.docker/**"]
 netrc        = ["~/.netrc"]
 npm          = ["~/.npmrc"]
 pypi         = ["~/.pypirc"]
 github_cli   = ["~/.config/gh/**"]
 git_creds    = ["~/.git-credentials"]
+
+# Agent-tool state: OAuth creds, API keys, and session transcripts (FEP-1 FW-TRA8). Deny by default
+# so one confined agent cannot read another's secrets. A launcher that runs a *specific* agent
+# carves out that agent's own dir (see examples/blueprints/agent-session.toml keeping ~/.claude).
+[agent_state]
+claude = ["~/.claude/**", "~/.claude.json"]
+codex  = ["~/.codex/**"]
+gemini = ["~/.gemini/**"]
+cursor = ["~/.cursor/**"]
+
+# Project-local secrets that appear at any depth (FW-CAP6 `**/` form, FEP-1 FW-TRA8). Read+write
+# denied: a project `.env` typically holds API keys. A caller that needs it readable narrows it out.
+[project_secrets]
+dotenv = ["**/.env"]
 
 [keychains]
 macos_user   = ["~/Library/Keychains/**"]

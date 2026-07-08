@@ -16,10 +16,12 @@ fn rich_blueprint() -> Blueprint {
             reads: vec![pp("/work/**")],
             writes: vec![pp("/work/project/**")],
             subtract: vec![pp("/work/project/.git/**"), pp("/work/.ssh/**")],
+            write_subtract: vec![pp("**/.mcp.json")],
         },
         net: NetPosture::Ports(vec![8080]),
         exec: formwork_blueprint::ExecPosture::Unrestricted,
         mcp: Default::default(),
+        ..Blueprint::empty()
     }
 }
 

@@ -105,6 +105,9 @@ mod linux {
         unsafe { libc::prctl(libc::PR_GET_SECCOMP) >= 0 }
     }
 
+    // `c_char` is `i8` on x86_64 but `u8` on aarch64, so `c as u8` is a genuine conversion on one
+    // arch and an identity on the other; silence the arch-dependent unnecessary-cast lint.
+    #[allow(clippy::unnecessary_cast)]
     fn kernel_version() -> String {
         // SAFETY: uname writes into a fully-owned zeroed struct.
         let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
