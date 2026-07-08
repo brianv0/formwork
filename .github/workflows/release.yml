@@ -9,7 +9,9 @@
 #     dry-run from the Actions tab before cutting a real tag.
 #
 # Every target builds natively on matching hardware — no cross-compilation:
-#   * macos-14 (Apple Silicon) -> aarch64-apple-darwin ; macos-13 (Intel) -> x86_64-apple-darwin
+#   * macos-14 (Apple Silicon) -> aarch64-apple-darwin ; macos-15-intel -> x86_64-apple-darwin
+#     (macos-13, the previous Intel image, was retired 2025-12-04; macos-15-intel is GitHub's last
+#     x86_64 macOS image, available until August 2027 — revisit the Intel slice before then).
 #   * ubuntu-22.04 (x86_64) and ubuntu-22.04-arm (arm64) build the two Linux slices.
 # Both Linux runners are 22.04 for a glibc 2.35 floor (widest downstream compatibility); 24.04 would
 # raise the required glibc. Native arm64 Linux runners are free on public repos and billed on private.
@@ -44,7 +46,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
