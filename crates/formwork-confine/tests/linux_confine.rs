@@ -1,69 +1,211 @@
-//! Phase 2 Linux backend tests -- native, Linux only, run against a real kernel (Docker/Lima with
+//! Phase 2 Linux backend tests -- native, Linux only, against a real kernel (Docker/Lima with
 //! Docker's own seccomp/AppArmor disabled, so only Formwork's sandbox is under test). Paired
-//! allow/deny probes at the real boundary (FW-INV5): egress is denied *and* an ordinary toolchain
-//! still runs. The filesystem (Landlock) half is added in Cut 2; this covers the seccomp baseline and
-//! net default-deny, which a pre-Landlock kernel (ABI absent) carries on its own.
+//! allow/deny probes at the real boundary (FW-INV5): a grant works *and* the matching deny bites.
+//! Filesystem tests need Landlock (skip cleanly on a pre-5.13 kernel); the seccomp baseline and net
+//! default-deny run everywhere.
 
 #![cfg(target_os = "linux")]
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use formwork_blueprint::Blueprint;
+use formwork_blueprint::{Blueprint, FsBlueprint, PathPattern, ReadMode};
 use formwork_compile::{compile, CompiledPolicy, ConfinerPolicy};
 use formwork_detect::detect;
 
-/// The default (net-deny) blueprint compiled against the *real* host.
-fn confined_default() -> CompiledPolicy {
-    compile(&Blueprint::empty(), &detect())
+fn have_landlock() -> bool {
+    detect().landlock_abi.is_some()
 }
 
-fn quiet(cmd: &mut Command) {
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+/// A `{path}/**` subtree pattern.
+fn pp(path: &Path) -> PathPattern {
+    PathPattern::parse(&format!("{}/**", path.display())).unwrap()
+}
+
+/// A Closed-mode policy (grants + essentials only) compiled against the real host. Net stays the
+/// `Blueprint::empty` default (Deny).
+fn closed_policy(
+    reads: Vec<PathPattern>,
+    writes: Vec<PathPattern>,
+    subtract: Vec<PathPattern>,
+) -> CompiledPolicy {
+    let blueprint = Blueprint {
+        fs: FsBlueprint {
+            read_mode: ReadMode::Closed,
+            reads,
+            writes,
+            subtract,
+            write_subtract: Vec::new(),
+        },
+        ..Blueprint::empty()
+    };
+    compile(&blueprint, &detect())
 }
 
 fn run(policy: &CompiledPolicy, mut cmd: Command) -> i32 {
-    quiet(&mut cmd);
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
     formwork_confine::spawn_confined(&mut cmd, policy).expect("confinement applies");
     cmd.status().expect("child runs").code().unwrap_or(-1)
 }
 
-/// FW-E2E-002 (Linux): a confined process cannot reach the network. On a pre-Landlock kernel this is
-/// carried by seccomp denying inet `socket(2)`; the probe surfaces the EPERM as exit 7.
+fn cat(path: &Path) -> Command {
+    let mut c = Command::new("/bin/cat");
+    c.arg(path);
+    c
+}
+
+fn sh(script: &str) -> Command {
+    let mut c = Command::new("/bin/sh");
+    c.arg("-c").arg(script);
+    c
+}
+
+struct Fixture {
+    root: PathBuf,
+}
+
+impl Fixture {
+    fn new(tag: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("fw-linux-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("granted")).unwrap();
+        fs::create_dir_all(root.join("secret")).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        fs::write(root.join("granted/ok.txt"), b"in-scope\n").unwrap();
+        fs::write(root.join("secret/secret.txt"), b"TOP SECRET\n").unwrap();
+        Fixture { root }
+    }
+    fn granted(&self) -> PathBuf {
+        self.root.join("granted")
+    }
+    fn granted_file(&self) -> PathBuf {
+        self.root.join("granted/ok.txt")
+    }
+    fn secret_file(&self) -> PathBuf {
+        self.root.join("secret/secret.txt")
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+// --- filesystem (Landlock) ---
+
+/// FW-E2E-001 (Linux/Landlock): an in-scope read succeeds, an out-of-scope read is denied.
+#[test]
+fn landlock_granted_read_ok_ungranted_denied() {
+    if !have_landlock() {
+        eprintln!("skipping: no Landlock on this host");
+        return;
+    }
+    let fx = Fixture::new("fs001");
+    let policy = closed_policy(vec![pp(&fx.granted())], vec![], vec![]);
+    assert_eq!(
+        run(&policy, cat(&fx.granted_file())),
+        0,
+        "granted read must succeed (also proves essentials load /bin/cat under Closed mode)"
+    );
+    assert_ne!(
+        run(&policy, cat(&fx.secret_file())),
+        0,
+        "out-of-scope read must be denied by Landlock"
+    );
+}
+
+/// FW-E2E-003 (Linux/Landlock): subtractive expansion -- a broad grant with a hole reads everything
+/// but the hole. Exercises the readdir walk that turns `subtract` into the shape of the grants.
+#[test]
+fn landlock_subtract_denies_within_grant() {
+    if !have_landlock() {
+        eprintln!("skipping: no Landlock on this host");
+        return;
+    }
+    let fx = Fixture::new("fs003");
+    let policy = closed_policy(
+        vec![pp(&fx.root)],
+        vec![],
+        vec![pp(&fx.root.join("secret"))],
+    );
+    assert_eq!(
+        run(&policy, cat(&fx.granted_file())),
+        0,
+        "a sibling of the hole stays readable"
+    );
+    assert_ne!(
+        run(&policy, cat(&fx.secret_file())),
+        0,
+        "the subtracted subtree must be denied"
+    );
+}
+
+/// FW-ISO2 (Linux/Landlock): writes are confined to the write grant; a readable-but-ungranted path is
+/// not writable.
+#[test]
+fn landlock_write_confined_to_grant() {
+    if !have_landlock() {
+        eprintln!("skipping: no Landlock on this host");
+        return;
+    }
+    let fx = Fixture::new("fsw");
+    let policy = closed_policy(vec![pp(&fx.root)], vec![pp(&fx.granted())], vec![]);
+    let in_grant = fx.granted().join("new.txt");
+    let outside = fx.root.join("secret/new.txt");
+    assert_eq!(
+        run(&policy, sh(&format!("echo x > '{}'", in_grant.display()))),
+        0,
+        "write inside the write grant must succeed"
+    );
+    assert_ne!(
+        run(&policy, sh(&format!("echo x > '{}'", outside.display()))),
+        0,
+        "write to a readable-but-ungranted path must be denied"
+    );
+}
+
+// --- net + seccomp baseline (run on any kernel) ---
+
+/// FW-E2E-002 (Linux): a confined process cannot reach the network. Landlock (TCP) or seccomp (inet
+/// socket) denies it; the staged probe surfaces the EPERM as exit 7.
 #[test]
 fn net_default_deny_blocks_egress() {
-    let policy = confined_default();
-    let cmd = Command::new(env!("CARGO_BIN_EXE_fw-connect-probe"));
-    let code = run(&policy, cmd);
+    // Grant the probe's own directory (read = loadable/executable) rather than copying it into a
+    // fresh dir and racing exec against the write (ETXTBSY on overlayfs).
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-connect-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    let policy = closed_policy(vec![pp(probe_dir)], vec![], vec![]);
+    let code = run(&policy, Command::new(&probe));
     assert_eq!(
         code, 7,
         "egress must be denied with EPERM (exit 7); got {code}"
     );
 }
 
-/// FW-TRA2 (Linux): the deny-list baseline is transparent. A shell that forks and execs a child runs
-/// clean -- exercising clone/clone3 + execve under the filter, which the userns rule must not break.
+/// FW-TRA2 (Linux): the sandbox is transparent -- a shell that forks and execs a child runs clean
+/// with only Closed-mode essentials, exercising clone/clone3 + execve under both mechanisms.
 #[test]
 fn baseline_is_transparent_to_fork_and_exec() {
-    let policy = confined_default();
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("/bin/echo hi | /bin/cat >/dev/null");
+    let policy = compile(&Blueprint::empty(), &detect());
     assert_eq!(
-        run(&policy, cmd),
+        run(&policy, sh("/bin/echo hi | /bin/cat >/dev/null")),
         0,
-        "an ordinary fork+exec pipeline must run"
+        "an ordinary fork+exec pipeline must run under essentials alone"
     );
 }
 
-/// FW-ADV (Linux): a confinement-shedding syscall from the baseline is denied. `unshare -U` asks for
-/// a new user namespace (CLONE_NEWUSER); the seccomp rule must reject it (nonzero exit).
+/// FW-ADV (Linux): a confinement-shedding syscall from the seccomp baseline is denied. `unshare -U`
+/// requests a new user namespace (CLONE_NEWUSER); the rule must reject it.
 #[test]
 fn baseline_denies_new_user_namespace() {
-    // Skip cleanly if util-linux `unshare` isn't installed, rather than fail for the wrong reason.
-    if !std::path::Path::new("/usr/bin/unshare").exists() {
+    if !Path::new("/usr/bin/unshare").exists() {
         eprintln!("skipping: /usr/bin/unshare not present");
         return;
     }
-    let policy = confined_default();
+    // Grant the unshare binary's tree so it loads, then confirm the syscall itself is blocked.
+    let policy = closed_policy(vec![pp(Path::new("/usr"))], vec![], vec![]);
     let mut cmd = Command::new("/usr/bin/unshare");
     cmd.arg("--user").arg("/bin/true");
     assert_ne!(
@@ -73,23 +215,12 @@ fn baseline_denies_new_user_namespace() {
     );
 }
 
-/// Sanity: on a host without Landlock the compiled net plan really is the seccomp path, so the
-/// deny above is exercising seccomp (not accidentally a no-op). Fails loud if the assumption breaks.
+/// Sanity: the confiner really is the Linux one and targets the host's ABI, so the tests above are
+/// exercising the mechanism we think they are.
 #[test]
-fn host_without_landlock_uses_seccomp_net_deny() {
-    let host = detect();
-    if host.landlock_abi.is_some() {
-        eprintln!(
-            "host has Landlock ABI {:?}; seccomp-net-deny assumption N/A",
-            host.landlock_abi
-        );
-        return;
-    }
-    match confined_default().confiner {
-        ConfinerPolicy::Linux(l) => assert!(
-            matches!(l.net, formwork_compile::LinuxNetPlan::SeccompDenyInet),
-            "pre-Landlock host must carry net-deny via seccomp"
-        ),
+fn confiner_matches_host() {
+    match compile(&Blueprint::empty(), &detect()).confiner {
+        ConfinerPolicy::Linux(l) => assert_eq!(l.landlock_abi_target, detect().landlock_abi),
         other => panic!("expected a Linux confiner, got {other:?}"),
     }
 }
