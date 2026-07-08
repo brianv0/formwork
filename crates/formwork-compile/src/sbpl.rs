@@ -122,8 +122,14 @@ fn render_reads(b: &mut String, mode: ReadMode, reads: &[PathPattern], subtract:
             b.push_str(";; ambient reads (allow default); only subtract holes below\n");
         }
     }
+    // Subtract holes deny read AND metadata: a confined process must not learn a credential file's
+    // existence, size, or mtime via `stat` (FW-CAP7). The explicit metadata deny is required because
+    // Closed mode's broad `(allow file-read-metadata)` (kept for FW-TRA4) would otherwise re-admit it
+    // -- last-match-wins does not fold `file-read-metadata` into a `file-read*` deny here.
     for p in subtract {
-        b.push_str(&format!("(deny file-read* {})\n", filter(p)));
+        let f = filter(p);
+        b.push_str(&format!("(deny file-read* {f})\n"));
+        b.push_str(&format!("(deny file-read-metadata {f})\n"));
     }
 }
 

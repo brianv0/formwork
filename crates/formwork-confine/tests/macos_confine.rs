@@ -134,6 +134,41 @@ fn fw_e2e_001_granted_read_succeeds_ungranted_denied() {
     );
 }
 
+/// FW-E2E-037 (FW-CAP7): a subtracted path leaks neither contents nor metadata. `stat` is denied,
+/// so a confined process cannot learn a credential file's existence, size, or mtime. The broad
+/// `(allow file-read-metadata)` re-admits metadata only for non-sensitive ungranted paths (FW-TRA4);
+/// the `subtract` deny of `file-read*` (which covers metadata) is emitted last and wins.
+#[test]
+fn fw_e2e_037_subtract_denies_metadata_not_only_contents() {
+    let fx = Fixture::new("e2e037");
+    let policy = confined(
+        vec![pp(&fx.root)],
+        vec![],
+        vec![pp(&fx.root.join("secret"))],
+    );
+    let secret = fx.secret_file();
+    let granted = fx.root.join("granted/ok.txt");
+
+    assert!(
+        !cat_succeeds(&policy, &secret),
+        "subtracted contents must be denied"
+    );
+    assert!(
+        !sh_succeeds(
+            &policy,
+            &format!("/usr/bin/stat -f %z '{}'", secret.display())
+        ),
+        "stat of a subtracted path must be denied -- no size/mtime oracle (FW-CAP7)"
+    );
+    assert!(
+        sh_succeeds(
+            &policy,
+            &format!("/usr/bin/stat -f %z '{}'", granted.display())
+        ),
+        "stat of a granted path must still succeed (the metadata deny is scoped to subtract)"
+    );
+}
+
 /// FW-E2E-005: a shell child, and its child, stay confined.
 #[test]
 fn fw_e2e_005_descendant_inheritance() {
