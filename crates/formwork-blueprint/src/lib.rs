@@ -21,6 +21,8 @@ pub struct Blueprint {
     #[serde(default)]
     pub exec: ExecPosture,
     #[serde(default)]
+    pub env: EnvPosture,
+    #[serde(default)]
     pub mcp: BTreeMap<String, McpPolicy>,
 }
 
@@ -70,6 +72,145 @@ pub enum ExecPosture {
     #[default]
     Unrestricted,
     Allowlist(Vec<PathPattern>),
+}
+
+/// How the confined child's environment is built (FW-ENV1). The confined child otherwise inherits
+/// the full parent environment, so `ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`, etc. would pass
+/// straight through -- with reads closed and egress host-scoped, env vars are the easiest remaining
+/// exfiltration payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnvPosture {
+    /// Inherit the whole parent environment (today's behavior).
+    #[default]
+    Passthrough,
+    /// Only these names survive; everything else is dropped.
+    Allowlist(Vec<String>),
+    /// Drop secret-shaped variables (FW-ENV2), with explicit `allow`/`deny` name overrides.
+    Scrub(EnvScrub),
+}
+
+/// Overrides for [`EnvPosture::Scrub`]: `allow` names are always kept (e.g. the model API key the
+/// agent legitimately needs), `deny` names are always dropped, and anything else is dropped only if
+/// it looks like a secret by name or value shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EnvScrub {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl EnvPosture {
+    /// Pure: given the ambient environment, return the pairs to keep. The caller (the impure CLI
+    /// shell) collects `std::env::vars()` and applies the result to the child `Command`.
+    pub fn apply(&self, vars: Vec<(String, String)>) -> Vec<(String, String)> {
+        match self {
+            EnvPosture::Passthrough => vars,
+            EnvPosture::Allowlist(names) => vars
+                .into_iter()
+                .filter(|(k, _)| names.iter().any(|n| n == k))
+                .collect(),
+            EnvPosture::Scrub(s) => vars.into_iter().filter(|(k, v)| s.keeps(k, v)).collect(),
+        }
+    }
+
+    /// Names dropped from `vars`, for telemetry. Never the values (secrets never hit logs).
+    pub fn dropped_names(&self, vars: &[(String, String)]) -> Vec<String> {
+        match self {
+            EnvPosture::Passthrough => Vec::new(),
+            EnvPosture::Allowlist(names) => vars
+                .iter()
+                .filter(|(k, _)| !names.iter().any(|n| n == k))
+                .map(|(k, _)| k.clone())
+                .collect(),
+            EnvPosture::Scrub(s) => vars
+                .iter()
+                .filter(|(k, v)| !s.keeps(k, v))
+                .map(|(k, _)| k.clone())
+                .collect(),
+        }
+    }
+
+    fn canonicalize(&self) -> EnvPosture {
+        match self {
+            EnvPosture::Passthrough => EnvPosture::Passthrough,
+            EnvPosture::Allowlist(names) => {
+                let mut n = names.clone();
+                n.sort();
+                n.dedup();
+                EnvPosture::Allowlist(n)
+            }
+            EnvPosture::Scrub(s) => EnvPosture::Scrub(s.canonicalize()),
+        }
+    }
+}
+
+impl EnvScrub {
+    fn keeps(&self, name: &str, value: &str) -> bool {
+        if self.allow.iter().any(|n| n == name) {
+            true
+        } else if self.deny.iter().any(|n| n == name) {
+            false
+        } else {
+            !env_is_secret_shaped(name, value)
+        }
+    }
+
+    fn canonicalize(&self) -> EnvScrub {
+        let dedup = |v: &[String]| {
+            let mut x = v.to_vec();
+            x.sort();
+            x.dedup();
+            x
+        };
+        EnvScrub {
+            allow: dedup(&self.allow),
+            deny: dedup(&self.deny),
+        }
+    }
+}
+
+/// A variable is secret-shaped if its NAME contains a secret marker or its VALUE matches a
+/// high-confidence secret shape (FW-ENV2). Coarse by design -- the `allow` list handles false
+/// positives; the fail-closed default is to drop.
+fn env_is_secret_shaped(name: &str, value: &str) -> bool {
+    const NAME_MARKERS: &[&str] = &[
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "APIKEY",
+        "API_KEY",
+        "ACCESS_KEY",
+        "PRIVATE_KEY",
+        "AUTH",
+        "CREDENTIAL",
+    ];
+    let upper = name.to_ascii_uppercase();
+    if NAME_MARKERS.iter().any(|m| upper.contains(m)) {
+        return true;
+    }
+    env_value_is_secret(value)
+}
+
+fn env_value_is_secret(v: &str) -> bool {
+    v.starts_with("-----BEGIN ")            // PEM private key / cert block
+        || v.starts_with("ghp_")            // GitHub personal access token
+        || v.starts_with("gho_")
+        || v.starts_with("github_pat_")
+        || v.starts_with("xoxb-")           // Slack bot token
+        || v.starts_with("xoxp-")
+        || v.starts_with("sk-")             // common API secret-key prefix
+        || (v.starts_with("AKIA") && v.len() == 20)   // AWS access key id
+        || (v.starts_with("AIza") && v.len() > 30)    // Google API key
+        || is_jwt(v)
+}
+
+/// Three base64url segments; the header almost always begins `eyJ` (base64 of `{"`).
+fn is_jwt(v: &str) -> bool {
+    v.starts_with("eyJ") && v.bytes().filter(|&b| b == b'.').count() == 2
 }
 
 /// Per-MCP-server visibility policy the gateway enforces (FW-GW2/GW3).
@@ -137,6 +278,7 @@ impl Blueprint {
             fs: FsBlueprint::default(),
             net: NetPosture::Deny,
             exec: ExecPosture::Unrestricted,
+            env: EnvPosture::Passthrough,
             mcp: BTreeMap::new(),
         }
     }
@@ -158,6 +300,7 @@ impl Blueprint {
             },
             net: self.net.canonicalize(),
             exec: self.exec.canonicalize(),
+            env: self.env.canonicalize(),
             mcp,
         }
     }
@@ -247,6 +390,44 @@ mod tests {
             s.mcp["srv"].tools,
             Visibility::Allow(vec!["a".into(), "b".into()])
         );
+    }
+
+    #[test]
+    fn env_scrub_drops_secret_shaped_keeps_allowlisted() {
+        let scrub = EnvPosture::Scrub(EnvScrub {
+            allow: vec!["ANTHROPIC_API_KEY".into()],
+            deny: vec!["EDITOR".into()],
+        });
+        let vars = vec![
+            ("PATH".into(), "/usr/bin".into()),            // ordinary -> kept
+            ("ANTHROPIC_API_KEY".into(), "sk-abc".into()), // allowlisted -> kept despite secret shape
+            ("AWS_SECRET_ACCESS_KEY".into(), "x".into()),  // name marker -> dropped
+            ("GITHUB_TOKEN".into(), "ghp_x".into()),       // name marker -> dropped
+            ("DEPLOY".into(), "ghp_realtoken".into()),     // secret VALUE shape -> dropped
+            ("EDITOR".into(), "vim".into()),               // explicit deny -> dropped
+        ];
+        let kept: Vec<String> = scrub
+            .apply(vars.clone())
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(kept, vec!["PATH", "ANTHROPIC_API_KEY"]);
+        let dropped = scrub.dropped_names(&vars);
+        assert!(dropped.contains(&"AWS_SECRET_ACCESS_KEY".to_string()));
+        assert!(dropped.contains(&"DEPLOY".to_string()));
+        assert!(dropped.contains(&"EDITOR".to_string()));
+    }
+
+    #[test]
+    fn env_allowlist_keeps_only_named() {
+        let env = EnvPosture::Allowlist(vec!["PATH".into(), "HOME".into()]);
+        let vars = vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("HOME".into(), "/home/x".into()),
+            ("SECRET".into(), "y".into()),
+        ];
+        let kept: Vec<String> = env.apply(vars).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(kept, vec!["PATH", "HOME"]);
     }
 
     #[test]

@@ -21,6 +21,7 @@ fn rich_blueprint() -> Blueprint {
         net: NetPosture::Ports(vec![8080]),
         exec: formwork_blueprint::ExecPosture::Unrestricted,
         mcp: Default::default(),
+        ..Blueprint::empty()
     }
 }
 

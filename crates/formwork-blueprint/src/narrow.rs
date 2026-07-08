@@ -5,7 +5,8 @@
 
 use crate::path::{canonicalize_set, PathPattern};
 use crate::{
-    Blueprint, ExecPosture, FsBlueprint, Gate, McpPolicy, NetPosture, ReadMode, Visibility,
+    Blueprint, EnvPosture, EnvScrub, ExecPosture, FsBlueprint, Gate, McpPolicy, NetPosture,
+    ReadMode, Visibility,
 };
 
 fn clamp_to(subject: &[PathPattern], bound: &[PathPattern]) -> Vec<PathPattern> {
@@ -36,6 +37,7 @@ impl Blueprint {
             fs: narrow_fs(&self.fs, &requested.fs),
             net: narrow_net(&self.net, &requested.net),
             exec: narrow_exec(&self.exec, &requested.exec),
+            env: narrow_env(&self.env, &requested.env),
             mcp: narrow_mcp(&self.mcp, &requested.mcp),
         }
         .canonicalize()
@@ -138,6 +140,33 @@ fn narrow_visibility(parent: &Visibility, req: &Visibility) -> Visibility {
                 Visibility::Allow(names)
             }
         }
+    }
+}
+
+/// The result admits a subset of what either side admits. `Passthrough` admits everything, so it
+/// yields to the other side; otherwise restrictions combine (allowlists intersect, scrub denies
+/// union). A mixed Allowlist/Scrub conservatively collapses to the explicit allowlist.
+fn narrow_env(parent: &EnvPosture, req: &EnvPosture) -> EnvPosture {
+    match (parent, req) {
+        (EnvPosture::Passthrough, other) | (other, EnvPosture::Passthrough) => other.clone(),
+        (EnvPosture::Allowlist(a), EnvPosture::Allowlist(b)) => {
+            EnvPosture::Allowlist(a.iter().filter(|n| b.contains(n)).cloned().collect())
+        }
+        (EnvPosture::Scrub(a), EnvPosture::Scrub(b)) => EnvPosture::Scrub(EnvScrub {
+            allow: a
+                .allow
+                .iter()
+                .filter(|n| b.allow.contains(n))
+                .cloned()
+                .collect(),
+            deny: {
+                let mut d = a.deny.clone();
+                d.extend(b.deny.iter().cloned());
+                d
+            },
+        }),
+        (EnvPosture::Allowlist(a), EnvPosture::Scrub(_))
+        | (EnvPosture::Scrub(_), EnvPosture::Allowlist(a)) => EnvPosture::Allowlist(a.clone()),
     }
 }
 

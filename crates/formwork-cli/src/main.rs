@@ -199,6 +199,7 @@ fn run(blueprint: PathBuf, argv: Vec<String>, posture: Posture) -> Result<()> {
         Posture::Spawn => {
             let mut command = Command::new(program);
             command.args(args);
+            apply_env(&mut command, &blueprint.env);
             formwork_confine::spawn_confined(&mut command, &policy)
                 .context("applying confinement")?;
             tracing::info!(program = %program, "spawning confined command");
@@ -209,9 +210,27 @@ fn run(blueprint: PathBuf, argv: Vec<String>, posture: Posture) -> Result<()> {
         Posture::Self_ => {
             formwork_confine::enforce_self(&policy).context("confining self")?;
             tracing::info!(program = %program, "exec after confine-self");
-            let err = exec_replace(program, args);
+            let err = exec_replace(program, args, &blueprint.env);
             bail!("exec failed after confine-self: {err}");
         }
+    }
+}
+
+/// Build the confined child's environment per the blueprint (FW-ENV1/2). Impure -- it reads the real
+/// process environment -- so it lives in the CLI shell, not the pure compiler. Passthrough leaves the
+/// inherited environment untouched; otherwise the child's env is rebuilt from the filtered set.
+fn apply_env(command: &mut Command, env: &formwork_blueprint::EnvPosture) {
+    use formwork_blueprint::EnvPosture;
+    if matches!(env, EnvPosture::Passthrough) {
+        return;
+    }
+    let vars: Vec<(String, String)> = std::env::vars().collect();
+    let dropped = env.dropped_names(&vars);
+    command.env_clear();
+    command.envs(env.apply(vars));
+    if !dropped.is_empty() {
+        // Names only -- never values (secrets never hit logs).
+        tracing::info!(count = dropped.len(), dropped = ?dropped, "scrubbed environment variables");
     }
 }
 
@@ -268,7 +287,14 @@ async fn proxy(backend: Command, policy: McpPolicy) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn exec_replace(program: &str, args: &[String]) -> std::io::Error {
+fn exec_replace(
+    program: &str,
+    args: &[String],
+    env: &formwork_blueprint::EnvPosture,
+) -> std::io::Error {
     use std::os::unix::process::CommandExt;
-    Command::new(program).args(args).exec()
+    let mut command = Command::new(program);
+    command.args(args);
+    apply_env(&mut command, env);
+    command.exec()
 }

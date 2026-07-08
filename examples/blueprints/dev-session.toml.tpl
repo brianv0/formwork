@@ -16,6 +16,8 @@
 # confined process opens, so :443 egress is enough for cargo to reach the network.
 net = { ports = [443] }
 exec = "unrestricted"
+# Scrub secret-shaped env vars but keep the model API key the dev agent needs (FW-ENV2).
+env = { scrub = { allow = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] } }
 
 [fs]
 read-mode = "ambient-minus-subtract"

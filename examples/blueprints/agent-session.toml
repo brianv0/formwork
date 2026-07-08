@@ -15,6 +15,9 @@
 
 net = { ports = [443] }
 exec = "unrestricted"
+# Scrub secret-shaped env vars but keep the model API key the agent needs (FW-ENV2). Egress is open
+# to any HTTPS host, so this stops e.g. AWS_SECRET_ACCESS_KEY being exfiltrated via the environment.
+env = { scrub = { allow = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] } }
 
 [fs]
 read-mode = "ambient-minus-subtract"

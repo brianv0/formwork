@@ -13,6 +13,10 @@
 net = "deny"
 # Exec is unrestricted by default for transparency (FW-ISO4); set an allow-list to restrict.
 exec = "unrestricted"
+# Scrub secret-shaped env vars from the confined child by default (FW-ENV2). With reads closed and
+# (in narrowed launchers) egress opened, env is the easiest exfil payload. `allow` re-admits any a
+# workload legitimately needs. net = "deny" here already blocks exfil; this is defense in depth.
+env = { scrub = {} }
 
 # Reads: broadly allowed over the ambient environment, minus the sensitive set below. On macOS this
 # is native `(allow default)` + deny holes; on Linux it is an enumerate-and-grant expansion at

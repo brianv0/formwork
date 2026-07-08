@@ -344,6 +344,7 @@ mod tests {
             net: NetPosture::Deny,
             exec: ExecPosture::Unrestricted,
             mcp,
+            ..Blueprint::empty()
         }
     }
 
