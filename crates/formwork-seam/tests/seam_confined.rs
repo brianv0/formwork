@@ -9,11 +9,20 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 use formwork_blueprint::{Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode};
 use formwork_compile::{compile, Capability, CompiledPolicy};
 use formwork_detect::detect;
 use formwork_seam::{inject, SeamPlan};
+
+/// Serialize the fork/exec-bearing seam tests. Each forks a confined child; on macOS `socketpair(2)`
+/// has no atomic close-on-exec, so std sets CLOEXEC in a separate `fcntl` after creating the pair. A
+/// concurrent fork in another test can catch a seam socket inside that window and leak it past
+/// `execve`, intermittently breaking the minted round-trip ("connection closed before a full
+/// response arrived"). Production spawns one child per process and never races here -- this is a
+/// test-harness artifact, serialized so the tests stay deterministic (no flaky tests).
+static SEAM_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 fn pp(dir: &Path) -> PathPattern {
     PathPattern::parse(&format!("{}/**", dir.display())).unwrap()
@@ -50,6 +59,7 @@ fn net_deny_policy(read_dirs: &[&Path]) -> CompiledPolicy {
 /// over a pre-opened inherited fd and, in the same run, proves a direct connect is denied.
 #[test]
 fn fw_e2e_010_mcp_over_injected_fd_zero_net() {
+    let _serial = SEAM_SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = helper_dir();
     let policy = net_deny_policy(&[&dir]);
 
@@ -82,6 +92,7 @@ fn fw_e2e_010_mcp_over_injected_fd_zero_net() {
 /// uses the passed fd; no in-sandbox `connect()`, and net-deny is never relaxed.
 #[test]
 fn fw_e2e_011_fd_minting_via_scm_rights() {
+    let _serial = SEAM_SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = helper_dir();
     let policy = net_deny_policy(&[&dir]);
 
@@ -117,6 +128,7 @@ fn fw_e2e_011_fd_minting_via_scm_rights() {
 /// dir granted, then denied -- and succeeds identically, because the transport is the injected fd.
 #[test]
 fn fw_e2e_012_no_dependence_on_socket_path_gating() {
+    let _serial = SEAM_SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = helper_dir();
 
     // A real pathname UNIX socket exists on disk; the workload never references it. It is here only
