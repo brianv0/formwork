@@ -169,6 +169,14 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     if !govern_exec {
         handled_fs &= !AccessFs::Execute;
     }
+    // Do not govern device ioctls (IOCTL_DEV, ABI v5+). Governing it denies *every* ioctl on a device
+    // node -- including the winsize/termios calls every interactive TUI makes on its inherited stdio,
+    // whose controlling pty is dynamic and cannot be pre-granted. macOS has no separate device-ioctl
+    // gate either (parity). The residual surface is small and well-mitigated: a process can only ioctl
+    // a device it can already open (open is gated), and the dangerous device ioctls (e.g. TIOCSTI
+    // terminal injection) are CAP_SYS_ADMIN-gated on modern kernels, which NO_NEW_PRIVS keeps out of
+    // reach. `& !IoctlDev` is a no-op below v5, where the right does not exist.
+    handled_fs &= !AccessFs::IoctlDev;
     let read_access = AccessFs::from_read(abi) & !AccessFs::Execute;
     let write_access = handled_fs; // read+write (+exec if governed); writes imply reads
 

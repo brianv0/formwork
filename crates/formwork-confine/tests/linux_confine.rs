@@ -212,6 +212,26 @@ fn proc_self_readable_by_child() {
     );
 }
 
+/// HARDENING (transparency): safe device nodes must stay fully usable, including their ioctls --
+/// interactive agents (the primary use case) ioctl their terminal for winsize/raw-mode. Landlock's
+/// IOCTL_DEV right (ABI v5+) would otherwise deny every device ioctl. The probe exits 0 when the
+/// ioctl reaches the device (ENOTTY on /dev/null), 7 when the sandbox denies it.
+#[test]
+fn device_ioctls_are_permitted() {
+    if !have_landlock() {
+        eprintln!("skipping: no Landlock on this host");
+        return;
+    }
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-ioctl-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    let policy = closed_policy(vec![pp(probe_dir)], vec![], vec![]);
+    let code = run(&policy, Command::new(&probe));
+    assert_eq!(
+        code, 0,
+        "an ioctl on a granted device must be permitted (got {code}; 7 = Landlock denied it)"
+    );
+}
+
 // --- net + seccomp baseline (run on any kernel) ---
 
 /// FW-E2E-002 (Linux): a confined process cannot reach the network. Landlock (TCP) or seccomp (inet

@@ -23,6 +23,12 @@ seccomp=unconfined --security-opt apparmor=unconfined` so only Formwork's sandbo
   tier, where per-port TCP *allow* is required.
 - **Abstract-UNIX-socket + signal scoping is enforced at ABI v6+** via the `Scope` handle — closing a
   pathless escape the fs rules cannot reach — matching the compiler's CrossDomainSocket = Partial.
+- **Device ioctls are *not* governed** (`IOCTL_DEV` excluded from `handled_fs`). Governing it denies
+  every ioctl on a device node — including the winsize/termios calls every interactive TUI makes on
+  its inherited stdio, whose controlling pty is dynamic and cannot be pre-granted. macOS has no
+  separate device-ioctl gate (parity). Residual surface is small: you can only ioctl a device you can
+  already open, and the dangerous ones (e.g. TIOCSTI injection) are CAP_SYS_ADMIN-gated, which
+  NO_NEW_PRIVS keeps unreachable.
 - **Extra baseline denies:** `io_uring_{setup,enter,register}` (a historical seccomp/LSM bypass) and
   the cross-process reach-in surfaces `pidfd_getfd` / `process_vm_{readv,writev}` (fd theft or memory
   write into an *unconfined* same-uid sibling; `ptrace` denial does not cover these).
