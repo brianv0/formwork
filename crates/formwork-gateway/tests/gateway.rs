@@ -315,6 +315,7 @@ async fn fw_e2e_019_backend_confinement_recursion() {
             reads: vec![repo_glob],
             writes: vec![],
             subtract: vec![],
+            write_subtract: vec![],
         },
         net: NetPosture::Deny,
         ..Blueprint::empty()

@@ -34,9 +34,14 @@ pub struct FsBlueprint {
     pub reads: Vec<PathPattern>,
     #[serde(default)]
     pub writes: Vec<PathPattern>,
-    /// Sensitive paths denied even under a broad grant.
+    /// Sensitive paths denied even under a broad grant (read *and* write).
     #[serde(default)]
     pub subtract: Vec<PathPattern>,
+    /// Tamper vectors denied for *write* but left readable: git hooks/config, `.mcp.json`, IDE task
+    /// files. Tooling still reads them (git reads `.git/config` constantly), but a confined agent
+    /// cannot plant one that later runs unsandboxed (FW-TRA7).
+    #[serde(default)]
+    pub write_subtract: Vec<PathPattern>,
 }
 
 /// `Closed` denies by default (only grants readable); `AmbientMinusSubtract` allows broad ambient
@@ -149,6 +154,7 @@ impl Blueprint {
                 reads: canonicalize_set(&self.fs.reads),
                 writes: canonicalize_set(&self.fs.writes),
                 subtract: canonicalize_set(&self.fs.subtract),
+                write_subtract: canonicalize_set(&self.fs.write_subtract),
             },
             net: self.net.canonicalize(),
             exec: self.exec.canonicalize(),

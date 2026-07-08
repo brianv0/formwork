@@ -38,6 +38,8 @@ pub struct LinuxPolicy {
     pub reads: Vec<PathPattern>,
     pub writes: Vec<PathPattern>,
     pub subtract: Vec<PathPattern>,
+    /// Write-denied but readable tamper vectors (FW-TRA7).
+    pub write_subtract: Vec<PathPattern>,
     pub exec: ExecPlan,
     pub net: LinuxNetPlan,
     pub seccomp: SeccompPlan,

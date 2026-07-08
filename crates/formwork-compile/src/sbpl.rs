@@ -22,7 +22,12 @@ pub fn render(input: &CompileInput) -> String {
         &input.effective_reads,
         &input.subtract,
     );
-    render_writes(&mut b, &input.writes, &input.subtract);
+    render_writes(
+        &mut b,
+        &input.writes,
+        &input.subtract,
+        &input.write_subtract,
+    );
     render_exec(&mut b, &input.exec);
 
     b
@@ -122,7 +127,12 @@ fn render_reads(b: &mut String, mode: ReadMode, reads: &[PathPattern], subtract:
     }
 }
 
-fn render_writes(b: &mut String, writes: &[PathPattern], subtract: &[PathPattern]) {
+fn render_writes(
+    b: &mut String,
+    writes: &[PathPattern],
+    subtract: &[PathPattern],
+    write_subtract: &[PathPattern],
+) {
     b.push_str("\n;; writes: always closed (FW-ISO2, FW-TRA5)\n");
     b.push_str("(deny file-write* (subpath \"/\"))\n");
     b.push_str(";; safe writable device nodes (curated literals; e.g. `cmd > /dev/null`)\n");
@@ -134,6 +144,14 @@ fn render_writes(b: &mut String, writes: &[PathPattern], subtract: &[PathPattern
     }
     for p in subtract {
         b.push_str(&format!("(deny file-write* {})\n", filter(p)));
+    }
+    // Tamper vectors: write-denied but NOT read-denied, so tooling still reads them (FW-TRA7). These
+    // deny file-write* only; render_reads never sees write_subtract.
+    if !write_subtract.is_empty() {
+        b.push_str(";; write-only tamper-vector denials -- readable, not writable (FW-TRA7)\n");
+        for p in write_subtract {
+            b.push_str(&format!("(deny file-write* {})\n", filter(p)));
+        }
     }
 }
 
@@ -224,6 +242,7 @@ mod tests {
             effective_reads: vec![pp("/work/project/**")],
             writes: vec![pp("/work/project/**")],
             subtract: vec![pp("/work/project/.git/**")],
+            write_subtract: vec![],
             net: NetPosture::Deny,
             exec: ExecPosture::Unrestricted,
         }
@@ -286,6 +305,33 @@ mod tests {
         let s = render(&i);
         assert!(s.contains("(deny process-exec* (subpath \"/\"))"));
         assert!(s.contains("(allow process-exec* (literal \"/usr/bin/git\"))"));
+    }
+
+    #[test]
+    fn write_subtract_denies_write_but_not_read() {
+        let mut i = input();
+        i.read_mode = ReadMode::AmbientMinusSubtract;
+        i.subtract = vec![];
+        i.write_subtract = vec![pp("**/.git/hooks/**"), pp("**/.mcp.json")];
+        let s = render(&i);
+        // write is denied for the tamper vectors...
+        assert!(
+            s.contains(r#"(deny file-write* (regex #"/\.git/hooks(/|$)"))"#),
+            "{s}"
+        );
+        assert!(
+            s.contains(r#"(deny file-write* (regex #"/\.mcp\.json$"))"#),
+            "{s}"
+        );
+        // ...but read is NOT denied (tooling still reads .git/config, hooks, etc.).
+        assert!(
+            !s.contains(r#"(deny file-read* (regex #"/\.git/hooks(/|$)"))"#),
+            "{s}"
+        );
+        assert!(
+            !s.contains(r#"(deny file-read* (regex #"/\.mcp\.json$"))"#),
+            "{s}"
+        );
     }
 
     #[test]

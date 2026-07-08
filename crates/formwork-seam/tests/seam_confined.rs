@@ -33,6 +33,7 @@ fn net_deny_policy(read_dirs: &[&Path]) -> CompiledPolicy {
             reads,
             writes: vec![],
             subtract: vec![],
+            write_subtract: vec![],
         },
         net: NetPosture::Deny,
         ..Blueprint::empty()

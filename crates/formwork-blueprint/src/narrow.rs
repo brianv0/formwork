@@ -44,6 +44,8 @@ impl Blueprint {
 
 fn narrow_fs(parent: &FsBlueprint, req: &FsBlueprint) -> FsBlueprint {
     let subtract = union_grants(&parent.subtract, &req.subtract);
+    // Write-deny holes, like read+write holes, only ever grow under narrowing.
+    let write_subtract = union_grants(&parent.write_subtract, &req.write_subtract);
     let writes = intersect_grants(&parent.writes, &req.writes);
 
     // The narrower read mode wins (Closed < AmbientMinusSubtract).
@@ -69,6 +71,7 @@ fn narrow_fs(parent: &FsBlueprint, req: &FsBlueprint) -> FsBlueprint {
         reads: canonicalize_set(&reads),
         writes,
         subtract,
+        write_subtract,
     }
 }
 

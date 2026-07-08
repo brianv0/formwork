@@ -63,6 +63,7 @@ fn confined(
             reads,
             writes,
             subtract,
+            write_subtract: Vec::new(),
         },
         ..Blueprint::empty()
     };

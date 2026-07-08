@@ -74,3 +74,15 @@ subtract = [
     "/etc/sudoers",
     "/etc/sudoers.d/**",
 ]
+
+# Tamper vectors: write-denied but still READABLE (FW-TRA7). Unlike `subtract` (read+write deny for
+# secrets), these must stay readable -- git reads `.git/config` constantly, tools read `.mcp.json` --
+# while a confined agent must not be able to plant a git hook, MCP server, or IDE task that later
+# runs UNSANDBOXED when you next use the repo. `**/` matches them at any depth (FW-CAP6).
+write-subtract = [
+    "**/.git/hooks/**",
+    "**/.git/config",
+    "**/.mcp.json",
+    "**/.vscode/**",
+    "**/.idea/**",
+]

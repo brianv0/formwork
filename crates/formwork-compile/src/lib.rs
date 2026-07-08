@@ -30,6 +30,7 @@ pub struct CompileInput {
     pub effective_reads: Vec<PathPattern>,
     pub writes: Vec<PathPattern>,
     pub subtract: Vec<PathPattern>,
+    pub write_subtract: Vec<PathPattern>,
     pub net: NetPosture,
     pub exec: ExecPosture,
 }
@@ -43,6 +44,7 @@ impl CompileInput {
             effective_reads: canonicalize_set(&reads),
             writes: canonicalize_set(&blueprint.fs.writes),
             subtract: canonicalize_set(&blueprint.fs.subtract),
+            write_subtract: canonicalize_set(&blueprint.fs.write_subtract),
             net: blueprint.net.clone(),
             exec: blueprint.exec.clone(),
         }
@@ -298,6 +300,7 @@ fn compile_linux(
         reads: input.effective_reads.clone(),
         writes: input.writes.clone(),
         subtract: input.subtract.clone(),
+        write_subtract: input.write_subtract.clone(),
         exec: exec_plan,
         net: net_plan,
         seccomp,
@@ -336,6 +339,7 @@ mod tests {
                 reads: vec![pp("/work/**")],
                 writes: vec![pp("/work/project/**")],
                 subtract: vec![pp("/work/.ssh/**")],
+                write_subtract: vec![pp("**/.git/hooks/**")],
             },
             net: NetPosture::Deny,
             exec: ExecPosture::Unrestricted,

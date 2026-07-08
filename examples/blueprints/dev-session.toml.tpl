@@ -78,3 +78,13 @@ subtract = [
     # execution-vector concern). cargo build doesn't write here; cargo install would.
     "~/.cargo/bin/**",
 ]
+
+# Tamper vectors: write-denied but readable (FW-TRA7). Even developing Formwork, the agent must not
+# rewrite this repo's own .git/hooks / .mcp.json / IDE tasks (they'd run unsandboxed on your machine).
+write-subtract = [
+    "@REPO@/.git/hooks/**",
+    "@REPO@/.git/config",
+    "**/.mcp.json",
+    "**/.vscode/**",
+    "**/.idea/**",
+]

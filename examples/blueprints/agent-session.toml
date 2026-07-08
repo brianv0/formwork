@@ -55,3 +55,12 @@ subtract = [
     "/etc/sudoers",
     "/etc/sudoers.d/**",
 ]
+# Tamper vectors: write-denied but readable, so the agent can't plant a git hook / .mcp.json / IDE
+# task that later runs unsandboxed, yet git and tooling still read them (FW-TRA7).
+write-subtract = [
+    "**/.git/hooks/**",
+    "**/.git/config",
+    "**/.mcp.json",
+    "**/.vscode/**",
+    "**/.idea/**",
+]
