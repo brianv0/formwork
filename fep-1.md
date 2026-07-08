@@ -10,6 +10,29 @@ all.
 Requirement/test IDs extend the existing scheme in `formwork.md` (last used:
 `FW-E2E-028`, `FW-ADV-006`). New tests here begin at `FW-E2E-029` / `FW-ADV-007`.
 
+## Implementation status (branch `fep-1-implementation`)
+
+Landed, tested, and verified end-to-end under real macOS Seatbelt (Linux carried
+symbolically by the pure compiler, enforced once the FW-ISO confiner lands):
+
+| Requirement | Status | Proof |
+|---|---|---|
+| **FW-CAP6** `**/` recursive-basename patterns | ✅ done | unit tests; `**/.env` → `(regex #"/\.env$")` in real SBPL |
+| **FW-TRA8** agent-state, whole `~/.docker`, `**/.env` | ✅ done | drift test; end-to-end SBPL |
+| **FW-TRA7** `write-subtract` (tamper vectors, write-deny/read-allow) | ✅ done | `write_subtract_denies_write_but_not_read`; SBPL shows `.git/config` write-only deny |
+| **FW-ENV1/2** env axis + secret-shaped scrub | ✅ done | unit tests; **FW-E2E-036** verified under `formwork run` |
+| **FW-CAP7** metadata denial for the sensitive set | ✅ done | **FW-E2E-037** real-Seatbelt; fixed a Closed-mode `stat` leak |
+| **FW-XR8** no agent-influenced escalation | ✅ by construction | policy compiled+applied before the process runs; Seatbelt inherited/irreversible — covered by **FW-E2E-005**, **FW-ADV-001** |
+| **Part A** host-scoped egress (**FW-EGR1–6**) | ⏳ deferred | design below; needs the gateway **forward proxy** (new subsystem + dependency, gated by the constitution) — genuinely multi-session |
+| **FW-FID5** real-time violation stream | ⏳ deferred | needs a macOS unified-log tap (a subsystem in itself) |
+
+Also fixed in passing: a latent bug where `profiles/default.toml`'s `net`/`exec`
+sat under the `[fs]` table and never parsed (`just compile-default` was broken).
+
+The deferred items are the two that require new runtime subsystems (an egress
+proxy; a log tap) rather than pure compile-side work; their designs are complete
+below. Everything that could be built and verified on the current backend is done.
+
 ## Why this FEP exists
 
 A systematic pass over the 2026 competitive landscape (Anthropic
