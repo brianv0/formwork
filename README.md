@@ -55,6 +55,19 @@ cargo run -p formwork-cli -- compile --blueprint examples/e2e-001.toml --report-
 cargo run -p formwork-cli -- compile --blueprint examples/e2e-001.toml --target linux-v6 --report-only
 ```
 
+## Download
+
+Prebuilt `formwork` binaries (macOS and Linux, arm64 and x86_64) are published on
+[GitHub Releases](https://github.com/brianv0/formwork/releases): every merge to `main` updates the
+rolling [`canary`](https://github.com/brianv0/formwork/releases/tag/canary) prerelease, and version
+tags (`v*`) cut stable releases. Each asset ships with a `SHA256SUMS` file. For example:
+
+```sh
+curl -fsSLO https://github.com/brianv0/formwork/releases/download/canary/formwork-canary-aarch64-apple-darwin.tar.gz
+tar -xzf formwork-canary-aarch64-apple-darwin.tar.gz
+./formwork-canary-aarch64-apple-darwin/formwork detect
+```
+
 ## Testing
 
 `just test` (or `cargo test --workspace`) runs the pure + native-OS-backend tests on any host.
