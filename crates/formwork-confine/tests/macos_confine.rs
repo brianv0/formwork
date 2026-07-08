@@ -169,6 +169,70 @@ fn fw_e2e_037_subtract_denies_metadata_not_only_contents() {
     );
 }
 
+/// FW-E2E-038 (FW-CAP6): a `**/` any-depth subtract denies a matching file at real depth while a
+/// sibling stays readable. This exercises the compiled Seatbelt *regex* at the kernel boundary, not
+/// just its string form -- a wrong regex is a missed subtract hole, a fail-open (FW-INV6).
+#[test]
+fn fw_e2e_038_any_depth_subtract_denies_at_real_depth() {
+    let fx = Fixture::new("e2e038");
+    let proj = fx.root.join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    fs::write(proj.join(".env"), b"SECRET=1\n").unwrap();
+    fs::write(proj.join("ok.txt"), b"public\n").unwrap();
+    let policy = confined(
+        vec![pp(&fx.root)],
+        vec![],
+        vec![PathPattern::parse("**/.env").unwrap()],
+    );
+    assert!(
+        !cat_succeeds(&policy, &proj.join(".env")),
+        "**/.env must deny a nested .env (FW-CAP6 regex, real Seatbelt)"
+    );
+    assert!(
+        cat_succeeds(&policy, &proj.join("ok.txt")),
+        "a sibling that does not match the regex stays readable"
+    );
+}
+
+/// FW-E2E-039 (FW-TRA7): a write-subtract tamper vector is readable but not writable, even under a
+/// write grant that covers it. A confined agent cannot plant a `.git/config` that later runs
+/// unsandboxed, yet git and tooling still read it.
+#[test]
+fn fw_e2e_039_write_subtract_reads_but_denies_writes() {
+    let fx = Fixture::new("e2e039");
+    let git = fx.root.join("proj/.git");
+    fs::create_dir_all(&git).unwrap();
+    let cfg = git.join("config");
+    fs::write(&cfg, b"[core]\n").unwrap();
+    let normal = fx.root.join("proj/normal.txt");
+    fs::write(&normal, b"x\n").unwrap();
+
+    let blueprint = Blueprint {
+        fs: FsBlueprint {
+            read_mode: ReadMode::Closed,
+            reads: vec![pp(&fx.root)],
+            writes: vec![pp(&fx.root)],
+            subtract: Vec::new(),
+            write_subtract: vec![PathPattern::parse("**/.git/config").unwrap()],
+        },
+        ..Blueprint::empty()
+    };
+    let policy = compile(&blueprint, &detect());
+
+    assert!(
+        cat_succeeds(&policy, &cfg),
+        ".git/config must stay READABLE under write-subtract (FW-TRA7)"
+    );
+    assert!(
+        !sh_succeeds(&policy, &format!("echo pwned >> '{}'", cfg.display())),
+        "write-subtract must DENY writing the tamper vector despite the write grant"
+    );
+    assert!(
+        sh_succeeds(&policy, &format!("echo ok >> '{}'", normal.display())),
+        "a normal file under the same write grant stays writable (deny is scoped)"
+    );
+}
+
 /// FW-E2E-005: a shell child, and its child, stay confined.
 #[test]
 fn fw_e2e_005_descendant_inheritance() {

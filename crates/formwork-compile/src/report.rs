@@ -20,6 +20,10 @@ pub enum Capability {
     /// Whether ungranted paths vanish (ENOENT) or merely deny (EACCES). Formwork never provides
     /// filesystem invisibility; this row documents that as an explicit fact.
     FsInvisibility,
+    /// The environment posture (FW-ENV1/2). Applied at spawn by the CLI shell, like MCP shading is
+    /// applied by the Gateway -- reported here so the honesty ledger is complete. Appended last to
+    /// keep the `Ord`-derived serialization order of the earlier variants stable.
+    EnvScrub,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +33,9 @@ pub enum Backend {
     Seccomp,
     Seatbelt,
     Gateway,
+    /// The CLI shell's spawn-time transformation (environment rebuild). Not a kernel confiner; the
+    /// process image is built with the filtered environment before `exec` (FW-ENV1).
+    Process,
     None,
 }
 
@@ -86,6 +93,7 @@ impl Capability {
             Capability::McpShading => "mcp-shading",
             Capability::CrossDomainSocket => "cross-domain-socket",
             Capability::FsInvisibility => "fs-invisibility",
+            Capability::EnvScrub => "env-scrub",
         }
     }
 }

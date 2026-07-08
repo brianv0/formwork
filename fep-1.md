@@ -17,10 +17,10 @@ symbolically by the pure compiler, enforced once the FW-ISO confiner lands):
 
 | Requirement | Status | Proof |
 |---|---|---|
-| **FW-CAP6** `**/` recursive-basename patterns | ✅ done | unit tests; `**/.env` → `(regex #"/\.env$")` in real SBPL |
+| **FW-CAP6** `**/` recursive-basename patterns | ✅ done | **FW-E2E-038** real-Seatbelt: `**/.env` denies a nested `.env`, sibling stays readable |
 | **FW-TRA8** agent-state, whole `~/.docker`, `**/.env` | ✅ done | drift test; end-to-end SBPL |
-| **FW-TRA7** `write-subtract` (tamper vectors, write-deny/read-allow) | ✅ done | `write_subtract_denies_write_but_not_read`; SBPL shows `.git/config` write-only deny |
-| **FW-ENV1/2** env axis + secret-shaped scrub | ✅ done | unit tests; **FW-E2E-036** verified under `formwork run` |
+| **FW-TRA7** `write-subtract` (tamper vectors, write-deny/read-allow) | ✅ done | **FW-E2E-039** real-Seatbelt: `.git/config` readable but not writable under a write grant |
+| **FW-ENV1/2** env axis + secret-shaped scrub | ✅ done | unit tests; **FW-E2E-036** verified under `formwork run`; reported in the FidelityReport (`Partial`, heuristic — never a silent over-claim) |
 | **FW-CAP7** metadata denial for the sensitive set | ✅ done | **FW-E2E-037** real-Seatbelt; fixed a Closed-mode `stat` leak |
 | **FW-XR8** no agent-influenced escalation | ✅ by construction | policy compiled+applied before the process runs; Seatbelt inherited/irreversible — covered by **FW-E2E-005**, **FW-ADV-001** |
 | **Part A** host-scoped egress (**FW-EGR1–6**) | ⏳ deferred | design below; needs the gateway **forward proxy** (new subsystem + dependency, gated by the constitution) — genuinely multi-session |

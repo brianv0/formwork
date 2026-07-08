@@ -18,8 +18,10 @@ doctrine that requires judgment.
 ## Concepts   [closed list; amendments by proposal only]
 This system has exactly these concepts, each with one name and one Rust type:
 - **Blueprint** (`formwork_blueprint::Blueprint`) — the capability grant: a finite enumeration
-  of fs read/write/subtract, net posture, exec posture, and per-server MCP
-  visibility. No mechanism turns natural language into a grant (FW-CAP1).
+  of fs read/write/subtract, net posture, exec posture, environment posture, and
+  per-server MCP visibility. No mechanism turns natural language into a grant (FW-CAP1).
+  (Environment posture — FW-ENV1/2, added by FEP-1 — is applied at spawn by the CLI shell,
+  not the Confiner; the FidelityReport carries its verdict like any other capability.)
 - **HostProfile** (`formwork_detect::HostProfile`) — what the current kernel can
   actually enforce; the one impure input to compilation.
 - **CompiledPolicy** (`formwork_compile::CompiledPolicy`) — a `ConfinerPolicy`

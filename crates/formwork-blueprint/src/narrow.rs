@@ -143,9 +143,12 @@ fn narrow_visibility(parent: &Visibility, req: &Visibility) -> Visibility {
     }
 }
 
-/// The result admits a subset of what either side admits. `Passthrough` admits everything, so it
-/// yields to the other side; otherwise restrictions combine (allowlists intersect, scrub denies
-/// union). A mixed Allowlist/Scrub conservatively collapses to the explicit allowlist.
+/// The result admits a subset of what either side admits (FW-CAP2). `Passthrough` admits everything,
+/// so it yields to the other side; otherwise restrictions combine (allowlists intersect, scrub denies
+/// union). For a mixed Allowlist/Scrub the only names Scrub is *guaranteed* to keep are its `allow`
+/// set (any other name may be dropped by value shape, which narrowing cannot evaluate), so the sound
+/// subset is the allowlist intersected with Scrub's `allow` -- an under-approximation, never wider
+/// than either side.
 fn narrow_env(parent: &EnvPosture, req: &EnvPosture) -> EnvPosture {
     match (parent, req) {
         (EnvPosture::Passthrough, other) | (other, EnvPosture::Passthrough) => other.clone(),
@@ -165,8 +168,10 @@ fn narrow_env(parent: &EnvPosture, req: &EnvPosture) -> EnvPosture {
                 d
             },
         }),
-        (EnvPosture::Allowlist(a), EnvPosture::Scrub(_))
-        | (EnvPosture::Scrub(_), EnvPosture::Allowlist(a)) => EnvPosture::Allowlist(a.clone()),
+        (EnvPosture::Allowlist(a), EnvPosture::Scrub(s))
+        | (EnvPosture::Scrub(s), EnvPosture::Allowlist(a)) => {
+            EnvPosture::Allowlist(a.iter().filter(|n| s.allow.contains(n)).cloned().collect())
+        }
     }
 }
 
@@ -289,6 +294,36 @@ mod tests {
 
         let n2 = mk(Visibility::AllowAll).narrow(&mk(Visibility::Allow(vec!["x".into()])));
         assert_eq!(n2.mcp["s"].tools, Visibility::Allow(vec!["x".into()]));
+    }
+
+    #[test]
+    fn env_narrow_never_admits_more_than_either_side() {
+        // A name the *request* scrubs must not survive narrowing (FW-CAP2). Regression for the mixed
+        // Allowlist/Scrub case that previously returned the parent allowlist verbatim.
+        let parent = Blueprint {
+            env: EnvPosture::Allowlist(vec!["PATH".into(), "GH_TOKEN".into()]),
+            ..Blueprint::empty()
+        };
+        let req = Blueprint {
+            env: EnvPosture::Scrub(EnvScrub {
+                allow: vec!["PATH".into()],
+                deny: vec!["GH_TOKEN".into()],
+            }),
+            ..Blueprint::empty()
+        };
+        let admits = |bp: &Blueprint, name: &str| {
+            !bp.env
+                .apply(vec![(name.to_string(), "x".to_string())])
+                .is_empty()
+        };
+        let n = parent.narrow(&req);
+        // req keeps PATH (in its allow) and drops GH_TOKEN (in its deny); the result must not exceed that.
+        assert!(
+            !admits(&n, "GH_TOKEN"),
+            "narrow must not admit a var the request scrubbed"
+        );
+        assert!(admits(&req, "PATH") && admits(&parent, "PATH"));
+        assert_eq!(n.env, EnvPosture::Allowlist(vec!["PATH".into()]));
     }
 
     #[test]

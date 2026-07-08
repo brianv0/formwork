@@ -17,7 +17,7 @@ pub use report::{Backend, Capability, DenialSemantics, Fidelity, FidelityReport}
 use std::collections::BTreeMap;
 
 use formwork_blueprint::{
-    canonicalize_set, Blueprint, ExecPosture, NetPosture, PathPattern, ReadMode,
+    canonicalize_set, Blueprint, EnvPosture, ExecPosture, NetPosture, PathPattern, ReadMode,
 };
 use formwork_detect::{HostProfile, Os};
 
@@ -85,6 +85,33 @@ pub fn compile(blueprint: &Blueprint, host: &HostProfile) -> CompiledPolicy {
         },
     );
     semantics.insert(Capability::FsInvisibility, DenialSemantics::Deny);
+
+    // Environment posture is applied at spawn by the CLI shell, independent of the OS confiner (like
+    // MCP shading below). Passthrough asks for nothing, so it earns no row. Allowlist is exact
+    // (only named vars survive); Scrub is heuristic and must SAY so -- reporting it Enforced would be
+    // the silent over-claim FW-XR1 forbids.
+    match &blueprint.env {
+        EnvPosture::Passthrough => {}
+        EnvPosture::Allowlist(_) => {
+            per_capability.insert(
+                Capability::EnvScrub,
+                Fidelity::Enforced {
+                    backend: Backend::Process,
+                },
+            );
+            semantics.insert(Capability::EnvScrub, DenialSemantics::Hide);
+        }
+        EnvPosture::Scrub(_) => {
+            per_capability.insert(
+                Capability::EnvScrub,
+                Fidelity::Partial {
+                    backend: Backend::Process,
+                    reason: "heuristic: drops secret-shaped names and values; a secret with neither a known marker name nor a recognized value shape (e.g. an inline credential in DATABASE_URL) is not caught -- pin it with an explicit deny or use an allowlist".to_string(),
+                },
+            );
+            semantics.insert(Capability::EnvScrub, DenialSemantics::Hide);
+        }
+    }
 
     // MCP shading is a gateway property, independent of the OS confiner.
     if !blueprint.mcp.is_empty() {
@@ -420,6 +447,43 @@ mod tests {
             !policy.report.net_is_fail_closed(),
             "net is genuinely unenforceable here and says so"
         );
+    }
+
+    #[test]
+    fn env_posture_reported_honestly() {
+        use formwork_blueprint::{EnvPosture, EnvScrub};
+        // Passthrough asks for nothing -> no row.
+        let pass = compile(&Blueprint::empty(), &HostProfile::synthetic_macos());
+        assert!(!pass
+            .report
+            .per_capability
+            .contains_key(&Capability::EnvScrub));
+
+        // Allowlist is exact -> Enforced.
+        let allow = compile(
+            &Blueprint {
+                env: EnvPosture::Allowlist(vec!["PATH".into()]),
+                ..Blueprint::empty()
+            },
+            &HostProfile::synthetic_macos(),
+        );
+        assert!(allow.report.per_capability[&Capability::EnvScrub].is_enforced());
+
+        // Scrub is heuristic -> Partial, never a silent Enforced over-claim (FW-XR1).
+        let scrub = compile(
+            &Blueprint {
+                env: EnvPosture::Scrub(EnvScrub::default()),
+                ..Blueprint::empty()
+            },
+            &HostProfile::synthetic_macos(),
+        );
+        assert!(matches!(
+            scrub.report.per_capability[&Capability::EnvScrub],
+            Fidelity::Partial {
+                backend: Backend::Process,
+                ..
+            }
+        ));
     }
 
     #[test]
