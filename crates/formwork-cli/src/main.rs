@@ -11,7 +11,7 @@
 //! The capability blueprint is passed with `--blueprint`; `--spec` is accepted as a back-compat
 //! alias.
 //!
-//! `detect`/`compile` are pure and run on any host (including compiling a Linux policy on a Mac);
+//! `detect`/`compile` don't enforce and run on any host (including compiling a Linux policy on a Mac);
 //! `run`/`enforce-self`/`gateway` need a real confiner and error honestly where the backend is
 //! unimplemented.
 

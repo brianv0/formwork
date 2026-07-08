@@ -1,7 +1,7 @@
 //! Monotonic narrowing (FW-CAP2): `parent.narrow(&requested)` intersects two capability sets into a
-//! subset of both. `subtract` (sensitive holes) is the one set that grows under narrowing, so it
-//! unions. The grant intersection is conservative -- it may under-approximate but never over-
-//! approximate, so the result is always a genuine subset.
+//! subset of both. The deny-holes -- `subtract` (secrets) and `write_subtract` (tamper vectors) --
+//! grow under narrowing, so they union. The grant intersection is conservative -- it may
+//! under-approximate but never over-approximate, so the result is always a genuine subset.
 
 use crate::path::{canonicalize_set, PathPattern};
 use crate::{

@@ -2,8 +2,8 @@
 
 Short programs answering the questions the whole design leans on, run before building on the
 assumptions (plan §4, Phase 0). Each entry records the question, the finding, and any design
-amendment. macOS spikes run natively here; Linux spikes are deferred until a Linux kernel is
-available (Docker/Lima) and are marked as such.
+amendment. macOS spikes run natively here. The Linux spikes (3 and 4) have since been implemented and
+kernel-verified (Docker, ABI-v6); their status notes below record what actually remains.
 
 ## Spike 1 — Seatbelt vs. inherited connected fds (macOS) — **load-bearing for the fd seam**
 
@@ -68,14 +68,16 @@ startup artifact.
 benign — but the default-profile/reuse work (Phase 4) must ensure the working directory is always
 within the read scope, and the CLI should default the child's cwd into the grant.
 
-## Spike 3 — seccomp `socket(2)` domain filtering vs. toolchains (Linux) — deferred
+## Spike 3 — seccomp `socket(2)` domain filtering vs. toolchains (Linux)
 
 **Question.** Does denying `AF_INET/AF_INET6/AF_PACKET` (and non-route `AF_NETLINK`) `socket(2)`
 creation break resolver/toolchain paths that pytest / npm actually hit (e.g. `getifaddrs`,
-NSS)? Net default-deny below Landlock ABI v4 depends on this being transparent enough.
+NSS)? Net default-deny is carried by this seccomp inet-family filter at every ABI, so it depends on
+this being transparent enough.
 
-**Status.** Deferred until a Linux env is wired. The compiler already encodes the plan
-(`SeccompPlan.deny_socket_families`) so the spike only needs to validate transparency.
+**Status.** Implemented and kernel-verified (ABI-v6): the plan (`SeccompPlan.deny_socket_families`)
+is enforced and transparent to fork+exec. Still owed: confirming pytest/npm name resolution
+(`getaddrinfo`/NSS) stays clean under the port tier -- see docs/linux-backend.md.
 
 ## Linux detection + degraded-host honesty — verified on real Linux (Docker, kernel 5.10)
 
@@ -93,9 +95,10 @@ kernel is `5.10.104-linuxkit`, which predates Landlock (5.13). Running the `form
 This is the honesty invariant proven on a real degraded host, not just in synthetic-profile tests.
 The Landlock *enforcement* still needs a 5.13+ kernel (Lima) to verify — see docs/linux-backend.md.
 
-## Spike 4 — Landlock subtractive-expansion cost (Linux) — deferred
+## Spike 4 — Landlock subtractive-expansion cost (Linux)
 
 **Question.** Enumerate-and-grant over a realistic `$HOME` to convert "read all minus sensitive"
 into Landlock allow rules — does it stay within the 50 ms spawn budget (design §8)?
 
-**Status.** Deferred until a Linux env is wired.
+**Status.** Subtractive expansion is implemented and kernel-verified; the 50 ms spawn-budget
+*measurement* over a realistic $HOME is still owed.

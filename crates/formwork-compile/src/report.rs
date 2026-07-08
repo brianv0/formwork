@@ -1,5 +1,5 @@
-//! The `FidelityReport` -- Formwork's honesty ledger (FW-XR1, FW-INV5). For every capability the
-//! blueprint asks for it records `Enforced`, `Partial`, or `Unenforceable`; `enforce()` may only confirm
+//! The `FidelityReport` -- Formwork's honesty ledger (FW-XR1, FW-INV5). For every capability it
+//! evaluates it records `Enforced`, `Partial`, or `Unenforceable`; `enforce()` may only confirm
 //! or degrade-loudly it, never upgrade a claim (FW-INV6).
 
 use std::collections::BTreeMap;

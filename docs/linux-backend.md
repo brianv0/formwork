@@ -77,8 +77,9 @@ Key decisions:
 - **Do not govern `Execute` when exec is unrestricted (the default).** Landlock denies any handled
   access that isn't granted, so if `AccessFs::Execute` is in `handled_fs`, only explicitly-granted
   paths are executable. For the transparent default, exclude `Execute` from `handled_fs` entirely so
-  `execve` is never checked. (Exec allow-list, FW-ISO4, is Phase 7: then govern `Execute` and grant
-  it only on the allow-list.)
+  `execve` is never checked. (When the blueprint requests an exec allow-list (FW-ISO4), `Execute` is
+  governed and granted only on the allow-list -- implemented here, though not yet exercised by a
+  kernel test.)
 - **Net default-deny via seccomp (all ABIs), *not* Landlock.** Landlock net governs only TCP, so a
   Landlock-carried deny leaves UDP/raw open. Deny denies inet `socket(2)` at the family level instead
   (TCP + UDP + raw); Landlock net (`handle_access(AccessNet::from_all(abi))` + `NetPort` allows) is

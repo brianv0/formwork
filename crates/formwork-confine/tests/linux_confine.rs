@@ -234,8 +234,8 @@ fn device_ioctls_are_permitted() {
 
 // --- net + seccomp baseline (run on any kernel) ---
 
-/// FW-E2E-002 (Linux): a confined process cannot reach the network. Landlock (TCP) or seccomp (inet
-/// socket) denies it; the staged probe surfaces the EPERM as exit 7.
+/// FW-E2E-002 (Linux): a confined process cannot reach the network. Net-deny is carried by the seccomp
+/// inet-family filter, which rejects `socket(2)` creation; the probe surfaces the EPERM as exit 7.
 #[test]
 fn net_default_deny_blocks_egress() {
     // Grant the probe's own directory (read = loadable/executable) rather than copying it into a
@@ -252,7 +252,7 @@ fn net_default_deny_blocks_egress() {
 
 /// HARDENING (Linux): net-deny covers UDP, not just TCP. Landlock net governs only TCP, so deny is
 /// carried by the seccomp inet-family filter, which rejects datagram `socket(2)` at creation. The
-/// staged probe surfaces the EPERM as exit 7 -- proving the old TCP-only gap is closed.
+/// probe surfaces the EPERM as exit 7 -- proving the old TCP-only gap is closed.
 #[test]
 fn net_default_deny_blocks_udp() {
     let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-udp-probe"));

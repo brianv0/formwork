@@ -40,8 +40,9 @@ enum ListKind {
 }
 
 /// One JSON-RPC frame reduced to what the gateway routes on. `raw` is the exact received bytes, kept
-/// so granted traffic forwards byte-for-byte (FW-GW8) with no re-serialization. [`Frame::parse`] is
-/// the single place raw JSON is inspected; the pumps then match on the variant, never on `Value`.
+/// so granted traffic forwards byte-for-byte (FW-GW8) with no re-serialization. [`Frame::parse`]
+/// classifies each frame so the pumps route on the variant, never on `Value`; the one other place raw
+/// JSON is parsed is `filter_list`, which prunes ungranted items from `*/list` responses.
 enum Frame {
     ToolCall {
         id: Value,

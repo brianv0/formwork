@@ -272,7 +272,8 @@ pub enum Gate {
 }
 
 impl Blueprint {
-    /// The fail-closed floor: nothing readable/writable, net denied, exec unrestricted, no MCP.
+    /// The fail-closed floor: nothing readable/writable, net denied, exec unrestricted, env
+    /// passthrough, no MCP.
     pub fn empty() -> Self {
         Blueprint {
             fs: FsBlueprint::default(),

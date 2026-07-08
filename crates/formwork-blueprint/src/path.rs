@@ -127,7 +127,7 @@ impl PathPattern {
     }
 }
 
-/// No filesystem access: enforcement binds to opened fds.
+/// Purely lexical (no filesystem access); real-path canonicalization is deferred to enforce time.
 fn normalize_absolute(path: &str) -> Option<PathBuf> {
     let mut out: Vec<&std::ffi::OsStr> = Vec::new();
     for comp in Path::new(path).components() {

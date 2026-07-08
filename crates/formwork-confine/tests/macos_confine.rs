@@ -404,7 +404,8 @@ fn fw_e2e_001_confine_self_posture() {
 }
 
 /// FW-E2E-006: under net=deny, an outbound connection fails closed at connect() (not masked by a
-/// startup failure). A python one-liner avoids depending on curl.
+/// startup failure). The staged std-only `fw-connect-probe` reports the outcome by exit code, so a
+/// policy denial is distinguishable from any other failure.
 #[test]
 fn fw_e2e_006_direct_egress_denied() {
     let fx = Fixture::new("e2e006");

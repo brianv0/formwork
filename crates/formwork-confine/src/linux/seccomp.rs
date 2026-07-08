@@ -1,6 +1,7 @@
 //! The seccomp baseline (FW-ISO8): a *deny-list* BPF filter. Default action is `Allow` so an ordinary
 //! toolchain is never tripped by a forgotten syscall (FW-TRA2); a small fixed set of
-//! escalation/confinement-shedding syscalls, and (below Landlock net ABI) inet `socket(2)` creation,
+//! escalation/confinement-shedding syscalls, and -- whenever net-deny is seccomp-carried -- inet
+//! `socket(2)` creation,
 //! return `EPERM`. Built in the parent; `apply()` runs in the forked child after `NO_NEW_PRIVS`.
 
 use std::collections::BTreeMap;
@@ -31,9 +32,9 @@ pub fn build(plan: &SeccompPlan) -> Result<BpfProgram, ConfineError> {
         rules.entry(nr).or_default(); // empty rule vec == unconditional match -> EPERM
     }
 
-    // Net default-deny below the Landlock net ABI: block inet/inet6/packet/non-route-netlink
-    // socket(2). AF_UNIX and socketpair are absent -> allowed, so the injected-fd seam is untouched
-    // (FW-XR7). All are conditions on socket()'s domain (arg0), unioned as separate rules (OR).
+    // Seccomp-carried net default-deny (any outright deny; Landlock net is TCP-only): block
+    // inet/inet6/packet/non-route-netlink socket(2). AF_UNIX and socketpair are absent -> allowed, so
+    // the injected-fd seam is untouched (FW-XR7). All are conditions on socket()'s domain (arg0, OR).
     if !plan.deny_socket_families.is_empty() {
         let mut socket_rules = Vec::new();
         for fam in &plan.deny_socket_families {

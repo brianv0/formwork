@@ -1,5 +1,5 @@
 //! A minimal stdio MCP backend for gateway tests: newline-delimited JSON-RPC by hand (no SDK). It
-//! exposes three tools, two resources, two prompts, and one resource template, and reacts to a few
+//! exposes three tools, two resources, two prompts, and two resource templates, and reacts to a few
 //! `trigger/*` notifications the tests use to drive runtime behavior:
 //!
 //! - `trigger/list_changed` -> add `new_tool`, emit `notifications/tools/list_changed` (FW-E2E-016).

@@ -14,11 +14,8 @@ use std::path::{Path, PathBuf};
 
 use landlock::{
     Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
+    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
-// Re-exported so the parent module can name it (`landlock::RulesetCreated`) without colliding with
-// the external crate of the same name.
-pub use landlock::RulesetCreated;
 
 use formwork_blueprint::{PathPattern, ReadMode};
 use formwork_compile::{ExecPlan, LinuxNetPlan, LinuxPolicy};
@@ -135,12 +132,12 @@ fn expand(root: &Path, holes: &[Hole]) -> Vec<PathBuf> {
         }
         let child = entry.path();
         if holes.iter().any(|h| h.covers(&child)) {
-            continue; // this child is exactly a hole
+            continue;
         }
         if holes.iter().any(|h| h.strictly_under(&child)) {
-            out.extend(expand(&child, holes)); // a hole is deeper: recurse
+            out.extend(expand(&child, holes));
         } else {
-            out.push(child); // clean subtree
+            out.push(child);
         }
     }
     out

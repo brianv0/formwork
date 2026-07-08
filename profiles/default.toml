@@ -8,13 +8,14 @@
 # `~` is expanded against $HOME when the CLI loads this file. Callers are expected to narrow this
 # (e.g. point writes at their actual project) — narrowing is always safe (FW-CAP2); widening is not.
 
-# Net and exec are top-level keys, so they must precede the [fs] table in TOML.
+# Net, exec, and env are top-level keys, so they must precede the [fs] table in TOML.
 # Fail-closed egress (FW-XR3): the agent reaches the network only through the gateway fd.
 net = "deny"
 # Exec is unrestricted by default for transparency (FW-ISO4); set an allow-list to restrict.
 exec = "unrestricted"
-# Scrub secret-shaped env vars from the confined child by default (FW-ENV2). With reads closed and
-# (in narrowed launchers) egress opened, env is the easiest exfil payload. `allow` re-admits any a
+# Scrub secret-shaped env vars from the confined child by default (FW-ENV2). With the sensitive set
+# denied to reads and (in narrowed launchers) egress opened, env is the easiest exfil payload. `allow`
+# re-admits any a
 # workload legitimately needs. net = "deny" here already blocks exfil; this is defense in depth.
 env = { scrub = {} }
 

@@ -2,8 +2,11 @@
 # `formwork run`. The kernel — not the agent's own permission prompts — is the wall, which is what
 # makes it safe to hand the agent its "skip every prompt" flag (see each host's README).
 #
-# This is profiles/default.toml narrowed to one project. `~` expands against $HOME when the CLI
-# loads the blueprint; narrowing a grant is always safe, widening is not (FW-CAP2).
+# Based on profiles/default.toml, adapted for one interactive agent: it deliberately WIDENS the
+# default in the axes this agent needs -- :443 egress for the model API, this agent's own ~/.claude
+# kept writable, and two model-API-key env vars re-admitted -- while every other secret stays denied.
+# `~` expands against $HOME when the CLI loads the blueprint. Narrowing a grant is always safe; these
+# widenings are deliberate, so review them before use (FW-CAP2).
 #
 #   reads   the whole ambient environment MINUS a sensitive set (keys, cloud creds, keychains,
 #           browser profiles). The canonical superset lives in profiles/sensitive-set.toml.
