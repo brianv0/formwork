@@ -16,7 +16,8 @@ tracing = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Phase 2 (Linux) will add `landlock` and `seccompiler` here. They are intentionally NOT wired yet:
-# the backend must be verified against a real kernel (Docker/Lima) before it can claim enforcement,
-# and adding runnable-looking code that has never touched a kernel would violate FW-XR1/FW-INV5.
-# See docs/linux-backend.md for the researched implementation plan.
+# Phase 2 Linux backend. Landlock (fs/net) + seccomp (syscall baseline), verified against a real
+# kernel before claiming enforcement (FW-XR1/FW-INV5). See docs/linux-backend.md.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { workspace = true }
+seccompiler = { workspace = true }

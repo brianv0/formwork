@@ -27,6 +27,12 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Linux confiner backends (Phase 2). Linux-only; referenced under a target cfg so the macOS build
+# never pulls them. Every crate here widens the trust base (Growth), so these two are the whole of it:
+# `landlock` carries the filesystem/net boundary, `seccompiler` the syscall baseline.
+landlock = "0.4"
+seccompiler = "0.4"
+
 formwork-blueprint = { path = "crates/formwork-blueprint" }
 formwork-detect = { path = "crates/formwork-detect" }
 formwork-compile = { path = "crates/formwork-compile" }
