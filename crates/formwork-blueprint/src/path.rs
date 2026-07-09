@@ -112,6 +112,29 @@ impl PathPattern {
     /// across the two forms only the everything-grant `/**` covers an any-depth pattern, and an
     /// any-depth pattern is conservatively taken not to cover a fixed absolute path (a redundant
     /// deny is harmless, a missed one is not -- FW-INV6).
+    /// Does this pattern match a concrete absolute path? `covers` compares pattern-to-pattern
+    /// authority; this is the match relation the kernel applies, needed when a floor row is held
+    /// against an observed, concrete denial path (FW-DISC3).
+    pub fn matches_path(&self, path: &Path) -> bool {
+        if !self.any_depth {
+            return if self.subtree {
+                path.starts_with(&self.base)
+            } else {
+                path == self.base
+            };
+        }
+        let comps: Vec<Component> = path.components().collect();
+        let suffix: Vec<Component> = self.base.components().collect();
+        if suffix.is_empty() || comps.len() < suffix.len() {
+            return false;
+        }
+        if self.subtree {
+            comps.windows(suffix.len()).any(|w| w == &suffix[..])
+        } else {
+            comps[comps.len() - suffix.len()..] == suffix[..]
+        }
+    }
+
     pub fn covers(&self, other: &PathPattern) -> bool {
         match (self.any_depth, other.any_depth) {
             (false, false) | (true, true) => {

@@ -169,9 +169,40 @@ impl ResolvedCatalog {
     /// Does any still-enforced catalog path (or backstop row) match this pattern? The discovery
     /// floor (FW-DISC3/FW-INV8): a matching denial is never proposable.
     pub fn floors(&self, allow: &[String], candidate: &PathPattern) -> bool {
-        self.denied_paths(allow)
+        self.floor_type_of(allow, candidate).is_some()
+    }
+
+    /// Which type floors this candidate (or [`BACKSTOP`]), for the operator-channel "why"
+    /// (FW-CRED7). A candidate subtree that would swallow a type's directory is floored too; a
+    /// subtree that merely *could* contain future backstop matches is not -- the backstop keeps
+    /// denying those at enforcement no matter what is granted (deny beats allow, FW-BP4).
+    pub fn floor_type_of(&self, allow: &[String], candidate: &PathPattern) -> Option<String> {
+        fn hit(floor: &PathPattern, candidate: &PathPattern) -> bool {
+            floor == candidate
+                || floor.covers(candidate)
+                || candidate.covers(floor)
+                || (!candidate.is_any_depth() && floor.matches_path(candidate.base()))
+        }
+        for (name, entry) in self.enforced_types(allow) {
+            if entry.paths.iter().any(|p| hit(p, candidate)) {
+                return Some(name.to_string());
+            }
+        }
+        // Mirror enforcement's typed exemption (FW-CRED5): inside an excluded type's own scope
+        // the backstop is lifted, so it does not floor there either.
+        let in_excluded_scope = self
+            .types
             .iter()
-            .any(|p| p.covers(candidate) || candidate.covers(p) || p == candidate)
+            .filter(|(name, _)| allow.iter().any(|a| a == name.as_str()))
+            .flat_map(|(_, entry)| entry.paths.iter())
+            .any(|p| hit(p, candidate));
+        if !in_excluded_scope
+            && !allow.iter().any(|a| a == BACKSTOP)
+            && self.backstop.iter().any(|p| hit(p, candidate))
+        {
+            return Some(BACKSTOP.to_string());
+        }
+        None
     }
 }
 

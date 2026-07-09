@@ -16,19 +16,24 @@ use crate::{Blueprint, EnvPosture, ExecPosture, McpPolicy, NetPosture, PathPatte
 pub struct BlueprintLayer {
     /// Base Blueprints this layer sits on (FW-BP3), lowest first. Paths resolve relative to the
     /// file that names them; the loader flattens the chain and empties this field before merge.
-    #[serde(default)]
+    /// The `skip_serializing_if` attributes exist because layers are also WRITTEN (the discovered
+    /// layer, FW-DISC6): TOML has no `None`, and empty sections are noise in a reviewed artifact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extends: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "FsLayer::is_empty")]
     pub fs: FsLayer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net: Option<NetPosture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec: Option<ExecPosture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<EnvPosture>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpPolicy>,
     /// Credential types deliberately let through (FW-CRED5); unions across layers.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_credentials: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "DiscoveryLayer::is_empty")]
     pub discovery: DiscoveryLayer,
 }
 
@@ -37,15 +42,26 @@ pub struct BlueprintLayer {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct FsLayer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_mode: Option<ReadMode>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reads: Vec<PathPattern>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub writes: Vec<PathPattern>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtract: Vec<PathPattern>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub write_subtract: Vec<PathPattern>,
+}
+
+impl FsLayer {
+    fn is_empty(&self) -> bool {
+        self.read_mode.is_none()
+            && self.reads.is_empty()
+            && self.writes.is_empty()
+            && self.subtract.is_empty()
+            && self.write_subtract.is_empty()
+    }
 }
 
 /// Discovery inputs a layer may carry. `auto-widen` is capability-bearing (it bounds what a
@@ -55,10 +71,16 @@ pub struct FsLayer {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct DiscoveryLayer {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_widen: Vec<PathPattern>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provenance: BTreeMap<String, ProvenanceEntry>,
+}
+
+impl DiscoveryLayer {
+    fn is_empty(&self) -> bool {
+        self.auto_widen.is_empty() && self.provenance.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

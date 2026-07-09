@@ -38,6 +38,20 @@ pub fn load_stack(
             .with_context(|| format!("interpreting --set fragment {fragment:?}"))?;
         resolve_layer(layer, &cwd, home, &mut visiting, &mut layers)?;
     }
+    // A discovered layer sits beside its blueprint and applies from the next run on
+    // (FW-DISC4/6). It loads above the file (learned refinements) and below CLI overrides, and
+    // only with valid provenance -- a grant nobody can attribute is refused loud.
+    let discovered = crate::learn::discovered_path(path);
+    if discovered.exists() {
+        let layer = parse_discovered_layer(&discovered, home)?;
+        tracing::info!(
+            file = %discovered.display(),
+            reads = layer.fs.reads.len(),
+            writes = layer.fs.writes.len(),
+            "discovered layer loaded (grants carry discovery provenance)"
+        );
+        layers.push(layer);
+    }
     resolve_layer(sugar, &cwd, home, &mut visiting, &mut layers)?;
     let blueprint = formwork_blueprint::merge(&layers);
 
@@ -151,6 +165,63 @@ pub fn canonicalize_for_enforcement(blueprint: &Blueprint) -> Result<Blueprint> 
     // needs the same firmlink/symlink resolution as the grants it may become (FW-DISC4).
     out.discovery.auto_widen = map(&blueprint.discovery.auto_widen)?;
     Ok(out)
+}
+
+/// The discovered layer is machine-written and narrowly shaped: no `extends`, and every grant
+/// must carry provenance (FW-DISC6) so audit can always distinguish learned from authored.
+fn parse_discovered_layer(path: &Path, home: &str) -> Result<BlueprintLayer> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading discovered layer {}", path.display()))?;
+    let mut value: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("parsing discovered layer {}", path.display()))?;
+    expand_tilde(&mut value, home);
+    let layer: BlueprintLayer = value
+        .try_into()
+        .with_context(|| format!("interpreting discovered layer {}", path.display()))?;
+    if !layer.extends.is_empty() {
+        bail!(
+            "discovered layer {} must not use extends; learned grants only",
+            path.display()
+        );
+    }
+    for grant in layer.fs.reads.iter().chain(layer.fs.writes.iter()) {
+        if !layer.discovery.provenance.contains_key(&grant.canonical()) {
+            bail!(
+                "discovered layer {} grants {} without provenance; refusing an unattributable                  grant (FW-DISC6)",
+                path.display(),
+                grant.canonical()
+            );
+        }
+    }
+    Ok(layer)
+}
+
+/// Write-deny the session's own policy inputs -- the blueprint, its discovered layer, and its
+/// proposal -- inside the confined tree. A confined agent must not shape its own NEXT run by
+/// editing the files this run was built from (FW-XR8 / FW-INV8). Readable stays fine (FW-TRA7
+/// semantics); only writes are denied.
+pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -> Result<()> {
+    let cwd = std::env::current_dir().context("resolving cwd to protect policy inputs")?;
+    let absolute = |p: &Path| -> PathBuf {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        }
+    };
+    let mut inputs = vec![absolute(blueprint_path)];
+    inputs.push(absolute(&crate::learn::discovered_path(blueprint_path)));
+    inputs.push(absolute(&crate::learn::proposal_path(blueprint_path)));
+    for input in inputs {
+        let rendered = input.to_str().ok_or_else(|| {
+            anyhow!("policy input path is not valid UTF-8; cannot write-protect it (FW-INV6)")
+        })?;
+        blueprint
+            .fs
+            .write_subtract
+            .push(PathPattern::parse(rendered).with_context(|| format!("protecting {rendered}"))?);
+    }
+    Ok(())
 }
 
 /// FW-CRED3: an enforced env-points-to-file credential (`GOOGLE_APPLICATION_CREDENTIALS`,

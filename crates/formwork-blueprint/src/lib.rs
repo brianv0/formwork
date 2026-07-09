@@ -2,12 +2,17 @@
 //! (`Blueprint::narrow`) can only shrink a grant, never widen it (FW-CAP2).
 
 mod catalog;
+mod discovery;
 mod launcher;
 mod layer;
 mod narrow;
 mod path;
 
 pub use catalog::{Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP};
+pub use discovery::{
+    reverse_compile, Candidate, CandidateTag, DenialAccess, DenialRecord, ProposalOutcome,
+    WithheldEntry,
+};
 pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
 pub use narrow::intersect_grants;

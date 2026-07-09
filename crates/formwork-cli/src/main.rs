@@ -18,6 +18,7 @@
 //! unimplemented.
 
 mod blueprint_load;
+mod learn;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -73,6 +74,28 @@ enum Cmd {
         blueprint: BlueprintArgs,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
+    },
+    /// Learning run (observe-then-widen, FW-DISC1): enforce exactly like `run`, record the
+    /// denials the kernel logged during the window, and reverse-compile them into a reviewable
+    /// proposal. Observation never widens the live session (FW-INV10).
+    Learn {
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Accept needs-review entries from a `formwork learn` proposal into the discovered layer,
+    /// per entry (FW-DISC5). Credential-floor matches are refused here regardless of what the
+    /// proposal claims (FW-INV8).
+    Accept {
+        #[arg(long)]
+        proposal: PathBuf,
+        /// Accept one candidate by its exact pattern (repeatable).
+        #[arg(long)]
+        entry: Vec<String>,
+        /// Accept every needs-review candidate.
+        #[arg(long)]
+        all: bool,
     },
     /// Front a stdio MCP backend with the policy gateway: shade its tools/resources/prompts per the
     /// blueprint's `[mcp.<server>]` entry and confine the spawned backend to the blueprint's fs/net grant.
@@ -241,6 +264,8 @@ fn main() -> Result<()> {
         Cmd::Compile { .. } => "compile",
         Cmd::Run { .. } => "run",
         Cmd::EnforceSelf { .. } => "enforce-self",
+        Cmd::Learn { .. } => "learn",
+        Cmd::Accept { .. } => "accept",
         Cmd::Gateway { .. } => "gateway",
     };
     // One correlation id per invocation, propagated to every layer's events via the current span.
@@ -269,6 +294,12 @@ fn main() -> Result<()> {
         }
         Cmd::Run { blueprint, argv } => run(blueprint, argv, Posture::Spawn)?,
         Cmd::EnforceSelf { blueprint, argv } => run(blueprint, argv, Posture::Self_)?,
+        Cmd::Learn { blueprint, argv } => learn_run(blueprint, argv)?,
+        Cmd::Accept {
+            proposal,
+            entry,
+            all,
+        } => learn::accept(&proposal, &entry, all, &home())?,
         Cmd::Gateway {
             blueprint,
             server,
@@ -283,8 +314,17 @@ enum Posture {
     Self_,
 }
 
-fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<()> {
-    let mut blueprint = blueprint.load(&home())?;
+/// Everything every enforcing subcommand shares: load the stack (discovered layer included),
+/// add the FW-CRED3 env-file-ref denies, write-protect the policy inputs themselves, resolve
+/// against the real filesystem, compile against the catalog, and itemize the floor.
+struct Session {
+    blueprint: Blueprint,
+    catalog: ResolvedCatalog,
+    policy: formwork_compile::CompiledPolicy,
+}
+
+fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
+    let mut blueprint = args.load(&home())?;
     let catalog =
         ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
     // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
@@ -296,6 +336,10 @@ fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<
             &catalog,
             &blueprint.allow_credentials,
         )?);
+    // The policy inputs are write-denied inside the session: a confined agent must not be able
+    // to edit the blueprint, forge the discovered layer, or doctor the proposal that shapes its
+    // own NEXT run (FW-XR8 / FW-INV8).
+    blueprint_load::protect_policy_inputs(&mut blueprint, &args.blueprint)?;
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
     // faithfully rendered (FW-INV6). The catalog's paths get the same treatment -- a floor hole
@@ -307,27 +351,84 @@ fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<
     let host = detect();
     let policy = compile(&blueprint, &host, &catalog);
     itemize_credential_floor(&policy.report);
+    Ok(Session {
+        blueprint,
+        catalog,
+        policy,
+    })
+}
 
+fn spawn_confined_child(
+    session: &Session,
+    program: &str,
+    args: &[String],
+) -> Result<std::process::ExitStatus> {
+    let mut command = Command::new(program);
+    command.args(args);
+    apply_env(&mut command, &session.blueprint, &session.catalog);
+    formwork_confine::spawn_confined(&mut command, &session.policy)
+        .context("applying confinement")?;
+    tracing::info!(program = %program, "spawning confined command");
+    let status = command.status().context("spawning confined command")?;
+    tracing::info!(exit_code = ?status.code(), "confined command exited");
+    Ok(status)
+}
+
+fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<()> {
+    let session = prepare_session(&blueprint)?;
     let (program, args) = argv.split_first().expect("argv is required");
     match posture {
         Posture::Spawn => {
-            let mut command = Command::new(program);
-            command.args(args);
-            apply_env(&mut command, &blueprint, &catalog);
-            formwork_confine::spawn_confined(&mut command, &policy)
-                .context("applying confinement")?;
-            tracing::info!(program = %program, "spawning confined command");
-            let status = command.status().context("spawning confined command")?;
-            tracing::info!(exit_code = ?status.code(), "confined command exited");
+            let status = spawn_confined_child(&session, program, args)?;
             std::process::exit(status.code().unwrap_or(1));
         }
         Posture::Self_ => {
-            formwork_confine::enforce_self(&policy).context("confining self")?;
+            formwork_confine::enforce_self(&session.policy).context("confining self")?;
             tracing::info!(program = %program, "exec after confine-self");
-            let err = exec_replace(program, args, &blueprint, &catalog);
+            let err = exec_replace(program, args, &session.blueprint, &session.catalog);
             bail!("exec failed after confine-self: {err}");
         }
     }
+}
+
+/// `formwork learn`: an enforced run bracketed by observation (FW-DISC1). Visibly distinct from
+/// a plain run, changes nothing about the live policy, and concludes by writing the proposal /
+/// self-accepting in-zone candidates for the NEXT run.
+fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>) -> Result<()> {
+    let session = prepare_session(&blueprint)?;
+    let host = detect();
+    tracing::info!(
+        "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are          recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
+    );
+    let started = std::time::Instant::now();
+    let run_id = format!(
+        "learn-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let (program, args) = argv.split_first().expect("argv is required");
+    let status = spawn_confined_child(&session, program, args)?;
+
+    if matches!(host.os, formwork_detect::Os::MacOs) {
+        // Slack covers unified-log persistence latency; over-capture within the window is safe
+        // (floored or review-gated), under-capture just means another learning run.
+        let window_secs = started.elapsed().as_secs() + 4;
+        learn::conclude_learning_run(
+            &session.blueprint,
+            &blueprint.blueprint,
+            &session.catalog,
+            &run_id,
+            window_secs,
+        )?;
+    } else {
+        tracing::warn!(
+            "learning ran enforced, but this host has no denial feed (the macOS unified-log tap              is the only wired source; Landlock audit needs kernel 6.15+ and is unwired) -- no              proposal was written (FW-INV5: reported, not pretended)"
+        );
+    }
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// The operator channel's compile-time itemization (FW-CRED7): which catalog types are enforced
