@@ -187,7 +187,7 @@ fn parse_discovered_layer(path: &Path, home: &str) -> Result<BlueprintLayer> {
     for grant in layer.fs.reads.iter().chain(layer.fs.writes.iter()) {
         if !layer.discovery.provenance.contains_key(&grant.canonical()) {
             bail!(
-                "discovered layer {} grants {} without provenance; refusing an unattributable                  grant (FW-DISC6)",
+                "discovered layer {} grants {} without provenance; refusing an unattributable grant (FW-DISC6)",
                 path.display(),
                 grant.canonical()
             );

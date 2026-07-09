@@ -183,8 +183,9 @@ def test_discovery_confused_deputy(tmp_path, cli):
     # And a forged proposal cannot push it through the accept door either (FW-INV8).
     forged = tmp_path / "forged.toml"
     forged.write_text(
-        f'run-id = "learn-evil-1"\nblueprint = "{bp.resolve()}"\n\n'
+        f'blueprint = "{bp.resolve()}"\n\n'
         f'[[candidates]]\npattern = "{key}"\naccess = "read"\ntag = "needs-review"\n'
+        f'run-id = "learn-evil-1"\n'
     )
     refused = cli("accept", "--proposal", forged, "--all", env=env)
     assert refused.code != 0

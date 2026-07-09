@@ -36,7 +36,9 @@ use formwork_detect::{detect, HostProfile};
 #[command(
     name = "formwork",
     version,
-    about = "OS-level sandbox for agent sessions"
+    about = "OS-level sandbox for agent sessions",
+    after_help = "Telemetry goes to stderr (stdout stays a clean result stream). RUST_LOG=warn \
+quiets it; RUST_LOG=debug itemizes the credential floor per type."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -77,7 +79,9 @@ enum Cmd {
     },
     /// Learning run (observe-then-widen, FW-DISC1): enforce exactly like `run`, record the
     /// denials the kernel logged during the window, and reverse-compile them into a reviewable
-    /// proposal. Observation never widens the live session (FW-INV10).
+    /// proposal. Observation never widens the live session (FW-INV10). Exits with the WORKLOAD's
+    /// status -- a first learning run usually fails on the very denials it is there to observe;
+    /// the proposal is written regardless.
     Learn {
         #[command(flatten)]
         blueprint: BlueprintArgs,
@@ -90,7 +94,8 @@ enum Cmd {
     Accept {
         #[arg(long)]
         proposal: PathBuf,
-        /// Accept one candidate by its exact pattern (repeatable).
+        /// Accept one candidate by its 1-based number or exact pattern (repeatable). With no
+        /// selection at all, lists the candidates by number.
         #[arg(long)]
         entry: Vec<String>,
         /// Accept every needs-review candidate.
@@ -247,12 +252,16 @@ fn resolve_host(host: &Option<PathBuf>, target: &Option<Target>) -> Result<HostP
 /// Libraries only emit, never configure -- so this installs the subscriber once, at the entrypoint.
 /// Telemetry goes to stderr so stdout stays a clean machine-readable result stream.
 fn init_telemetry() {
+    use std::io::IsTerminal;
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_target(false)
+        // Color codes belong to humans at terminals; a piped stderr (a host's journal, a test
+        // harness) gets clean text it can grep without stripping escapes first.
+        .with_ansi(std::io::stderr().is_terminal())
         .try_init();
 }
 
@@ -314,6 +323,17 @@ enum Posture {
     Self_,
 }
 
+/// `exit_code=1`, never Rust's `Some(1)`; a signal death is named, not `None`.
+fn log_exit(what: &'static str, status: &std::process::ExitStatus) {
+    match status.code() {
+        Some(code) => tracing::info!(exit_code = code, "{what}"),
+        None => {
+            use std::os::unix::process::ExitStatusExt;
+            tracing::info!(signal = status.signal(), "{what} (terminated by signal)");
+        }
+    }
+}
+
 /// Everything every enforcing subcommand shares: load the stack (discovered layer included),
 /// add the FW-CRED3 env-file-ref denies, write-protect the policy inputs themselves, resolve
 /// against the real filesystem, compile against the catalog, and itemize the floor.
@@ -370,7 +390,7 @@ fn spawn_confined_child(
         .context("applying confinement")?;
     tracing::info!(program = %program, "spawning confined command");
     let status = command.status().context("spawning confined command")?;
-    tracing::info!(exit_code = ?status.code(), "confined command exited");
+    log_exit("confined command exited", &status);
     Ok(status)
 }
 
@@ -398,7 +418,7 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>) -> Result<()> {
     let session = prepare_session(&blueprint)?;
     let host = detect();
     tracing::info!(
-        "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are          recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
+        "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
     );
     let started = std::time::Instant::now();
     let run_id = format!(
@@ -422,18 +442,21 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>) -> Result<()> {
             &session.catalog,
             &run_id,
             window_secs,
+            &status,
         )?;
     } else {
         tracing::warn!(
-            "learning ran enforced, but this host has no denial feed (the macOS unified-log tap              is the only wired source; Landlock audit needs kernel 6.15+ and is unwired) -- no              proposal was written (FW-INV5: reported, not pretended)"
+            "learning ran enforced, but this host has no denial feed (the macOS unified-log tap is the only wired source; Landlock audit needs kernel 6.15+ and is unwired) -- no proposal was written (FW-INV5: reported, not pretended)"
         );
     }
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// The operator channel's compile-time itemization (FW-CRED7): which catalog types are enforced
-/// and which were deliberately let through. The confined agent never sees this -- its channel is
-/// the bare EACCES / the absent variable (FW-INV9).
+/// The operator channel's compile-time itemization (FW-CRED7). The full roll-call is identical
+/// on every run, so the default (info) line is a summary whose only varying part -- the
+/// deliberate exclusions -- is spelled out; the per-type roll-call itemizes at debug
+/// (RUST_LOG=debug). The compile report stays the canonical itemized form. The confined agent
+/// never sees any of this -- its channel is the bare EACCES / the absent variable (FW-INV9).
 fn itemize_credential_floor(report: &formwork_compile::FidelityReport) {
     let creds = &report.credentials;
     let path_types: Vec<&str> = creds
@@ -449,11 +472,16 @@ fn itemize_credential_floor(report: &formwork_compile::FidelityReport) {
         .map(|(name, _)| name.as_str())
         .collect();
     tracing::info!(
+        path_types = path_types.len(),
+        env_types = env_types.len(),
         catalog_version = creds.catalog_version,
+        allowed = ?creds.allowed,
+        "credential floor active (RUST_LOG=debug itemizes per type)"
+    );
+    tracing::debug!(
         denied_path_types = ?path_types,
         stripped_env_types = ?env_types,
-        allowed = ?creds.allowed,
-        "credential catalog floor"
+        "credential catalog floor, itemized"
     );
 }
 

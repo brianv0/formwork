@@ -43,18 +43,22 @@ def _blueprint_for(fake_home, tmp_path):
 
 
 def _operator_lines(stderr: str) -> str:
-    return "\n".join(l for l in stderr.splitlines() if "credential catalog" in l)
+    """Formwork's own telemetry (the tracing span prefix marks it)."""
+    return "\n".join(l for l in stderr.splitlines() if "formwork{" in l)
 
 
 def _agent_lines(stderr: str) -> str:
-    return "\n".join(l for l in stderr.splitlines() if "credential catalog" not in l)
+    """What the confined child itself wrote to the shared stderr."""
+    return "\n".join(l for l in stderr.splitlines() if "formwork{" not in l)
 
 
 @pytest.mark.fw_e2e("FW-E2E-045")
 @pytest.mark.macos
 def test_path_credential_denied_and_itemized(cli, fake_home, tmp_path):
     bp = _blueprint_for(fake_home, tmp_path)
-    env = {"HOME": str(fake_home)}
+    # The per-type itemization is the debug tier (the default info line is a stable summary);
+    # FW-CRED7 requires the operator CAN get the naming, so the denial run asks for it.
+    env = {"HOME": str(fake_home), "RUST_LOG": "debug"}
 
     # Ordinary reads under the same broad grant succeed -- the floor is a hole, not a wall.
     ok = cli("run", "--blueprint", bp, "--", "/bin/cat", fake_home / "notes.txt",
