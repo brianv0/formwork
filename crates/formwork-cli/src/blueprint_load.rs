@@ -1,36 +1,120 @@
-//! Loading a blueprint from disk. Impure on purpose -- this is where `~` is expanded against `$HOME` and
-//! where enforcement paths are canonicalized against the real filesystem -- so the compiler stays
-//! pure and takes only absolute, host-independent patterns.
+//! Loading a blueprint from disk. Impure on purpose -- this is where `~` is expanded against `$HOME`,
+//! where the `extends` chain is resolved against real files (FW-BP3), and where enforcement paths
+//! are canonicalized against the real filesystem -- so the compiler stays pure and takes only
+//! absolute, host-independent patterns and an already-flattened layer stack.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
-use formwork_blueprint::{Blueprint, ExecPosture, PathPattern};
+use anyhow::{anyhow, bail, Context, Result};
+use formwork_blueprint::{Blueprint, BlueprintLayer, ExecPosture, PathPattern};
 
+/// Load the file's layer stack (extends chain flattened, bases first) and merge, with no CLI
+/// overrides. The single-file case degenerates to exactly the pre-layering behavior (FW-E2E-041).
+/// Production callers always pass overrides, so this exists for the tests only.
+#[cfg(test)]
 pub fn load(path: &Path, home: &str) -> Result<Blueprint> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading blueprint {}", path.display()))?;
+    load_stack(path, &[], BlueprintLayer::default(), home)
+}
+
+/// The full FW-BP2 stack: baseline (fail-closed floor) → extends chain → file → each `--set`
+/// fragment in order → sugar flags. The credential-catalog floor is the compiler's, not a layer.
+pub fn load_stack(
+    path: &Path,
+    sets: &[String],
+    sugar: BlueprintLayer,
+    home: &str,
+) -> Result<Blueprint> {
+    let mut layers = Vec::new();
+    let mut visiting = Vec::new();
+    resolve_file(path, home, &mut visiting, &mut layers)?;
+    let cwd = std::env::current_dir().context("resolving current dir for CLI overrides")?;
+    for fragment in sets {
+        let mut value: toml::Value = toml::from_str(fragment)
+            .with_context(|| format!("parsing --set fragment {fragment:?}"))?;
+        expand_tilde(&mut value, home);
+        let layer: BlueprintLayer = value
+            .try_into()
+            .with_context(|| format!("interpreting --set fragment {fragment:?}"))?;
+        resolve_layer(layer, &cwd, home, &mut visiting, &mut layers)?;
+    }
+    resolve_layer(sugar, &cwd, home, &mut visiting, &mut layers)?;
+    Ok(formwork_blueprint::merge(&layers))
+}
+
+/// Depth-first post-order: every base lands before the layer that extends it, so the extending
+/// layer's contributions sit higher in the stack (FW-BP2 as amended).
+fn resolve_file(
+    path: &Path,
+    home: &str,
+    visiting: &mut Vec<PathBuf>,
+    out: &mut Vec<BlueprintLayer>,
+) -> Result<()> {
+    let canon = std::fs::canonicalize(path)
+        .with_context(|| format!("resolving blueprint {}", path.display()))?;
+    if let Some(start) = visiting.iter().position(|p| p == &canon) {
+        let cycle: Vec<String> = visiting[start..]
+            .iter()
+            .chain(std::iter::once(&canon))
+            .map(|p| p.display().to_string())
+            .collect();
+        bail!("blueprint `extends` cycle: {}", cycle.join(" -> "));
+    }
+    let text = std::fs::read_to_string(&canon)
+        .with_context(|| format!("reading blueprint {}", canon.display()))?;
     let mut value: toml::Value =
-        toml::from_str(&text).with_context(|| format!("parsing blueprint {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parsing blueprint {}", canon.display()))?;
     expand_tilde(&mut value, home);
-    let blueprint: Blueprint = value.try_into().context("interpreting blueprint")?;
-    Ok(blueprint)
+    let layer: BlueprintLayer = value
+        .try_into()
+        .with_context(|| format!("interpreting blueprint {}", canon.display()))?;
+    let base_dir = canon.parent().map(Path::to_path_buf).unwrap_or_default();
+
+    visiting.push(canon);
+    resolve_layer(layer, &base_dir, home, visiting, out)?;
+    visiting.pop();
+    Ok(())
+}
+
+/// Resolve one layer's `extends` (relative to `base_dir`), pushing bases then the layer itself.
+fn resolve_layer(
+    mut layer: BlueprintLayer,
+    base_dir: &Path,
+    home: &str,
+    visiting: &mut Vec<PathBuf>,
+    out: &mut Vec<BlueprintLayer>,
+) -> Result<()> {
+    for base in std::mem::take(&mut layer.extends) {
+        let base_path = if Path::new(&base).is_absolute() {
+            PathBuf::from(&base)
+        } else {
+            base_dir.join(&base)
+        };
+        resolve_file(&base_path, home, visiting, out)
+            .with_context(|| format!("resolving extends {base:?}"))?;
+    }
+    out.push(layer);
+    Ok(())
 }
 
 /// Only leading tildes, so a tool name is untouched unless it literally starts with `~/`.
 fn expand_tilde(value: &mut toml::Value, home: &str) {
     match value {
-        toml::Value::String(s) => {
-            if s == "~" {
-                *s = home.to_string();
-            } else if let Some(rest) = s.strip_prefix("~/") {
-                *s = format!("{}/{}", home.trim_end_matches('/'), rest);
-            }
-        }
+        toml::Value::String(s) => *s = expand_tilde_str(s, home),
         toml::Value::Array(a) => a.iter_mut().for_each(|v| expand_tilde(v, home)),
         toml::Value::Table(t) => t.iter_mut().for_each(|(_, v)| expand_tilde(v, home)),
         _ => {}
+    }
+}
+
+/// The same expansion for CLI flag values, so both surfaces resolve `~` identically (FW-BP1).
+pub fn expand_tilde_str(s: &str, home: &str) -> String {
+    if s == "~" {
+        home.to_string()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        format!("{}/{}", home.trim_end_matches('/'), rest)
+    } else {
+        s.to_string()
     }
 }
 
@@ -49,6 +133,9 @@ pub fn canonicalize_for_enforcement(blueprint: &Blueprint) -> Result<Blueprint> 
     if let ExecPosture::Allowlist(paths) = &blueprint.exec {
         out.exec = ExecPosture::Allowlist(map(paths)?);
     }
+    // The auto-widen zone is matched against kernel-resolved denial paths at learn time, so it
+    // needs the same firmlink/symlink resolution as the grants it may become (FW-DISC4).
+    out.discovery.auto_widen = map(&blueprint.discovery.auto_widen)?;
     Ok(out)
 }
 
@@ -133,6 +220,119 @@ mod tests {
         assert_eq!(
             blueprint.mcp["s"].tools,
             formwork_blueprint::Visibility::Allow(vec!["~weird_but_left_alone".into()])
+        );
+    }
+
+    /// Repo test convention (see formwork-confine tests): a pid-tagged dir under temp_dir, no
+    /// tempfile dependency.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let root =
+                std::env::temp_dir().join(format!("formwork-load-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Scratch(root)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn extends_chain_merges_bases_under_the_extending_file() {
+        let dir = Scratch::new("chain");
+        std::fs::write(
+            dir.path().join("base.toml"),
+            r#"
+            net = { ports = [443] }
+            [fs]
+            read-mode = "ambient-minus-subtract"
+            subtract = ["/etc/shadow"]
+        "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("child.toml"),
+            r#"
+            extends = ["base.toml"]
+            net = "deny"
+            [fs]
+            writes = ["/work/project/**"]
+        "#,
+        )
+        .unwrap();
+        let bp = load(&dir.path().join("child.toml"), "/home/x").unwrap();
+        // Child's posture beats the base's; the base's contributions still union in.
+        assert_eq!(bp.net, formwork_blueprint::NetPosture::Deny);
+        assert_eq!(
+            bp.fs.read_mode,
+            formwork_blueprint::ReadMode::AmbientMinusSubtract
+        );
+        assert_eq!(bp.fs.subtract, vec![PathPattern::parse("/etc/shadow").unwrap()]);
+        assert_eq!(
+            bp.fs.writes,
+            vec![PathPattern::parse("/work/project/**").unwrap()]
+        );
+    }
+
+    #[test]
+    fn extends_cycle_fails_loud_naming_the_cycle() {
+        let dir = Scratch::new("cycle");
+        std::fs::write(dir.path().join("a.toml"), "extends = [\"b.toml\"]\n").unwrap();
+        std::fs::write(dir.path().join("b.toml"), "extends = [\"a.toml\"]\n").unwrap();
+        let err = load(&dir.path().join("a.toml"), "/home/x").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cycle"), "error should name the cycle: {msg}");
+        assert!(msg.contains("a.toml") && msg.contains("b.toml"), "{msg}");
+    }
+
+    #[test]
+    fn diamond_extends_is_not_a_cycle() {
+        let dir = Scratch::new("diamond");
+        std::fs::write(dir.path().join("d.toml"), "[fs]\nsubtract = [\"/etc/shadow\"]\n").unwrap();
+        std::fs::write(dir.path().join("b.toml"), "extends = [\"d.toml\"]\n").unwrap();
+        std::fs::write(dir.path().join("c.toml"), "extends = [\"d.toml\"]\n").unwrap();
+        std::fs::write(
+            dir.path().join("a.toml"),
+            "extends = [\"b.toml\", \"c.toml\"]\n",
+        )
+        .unwrap();
+        let bp = load(&dir.path().join("a.toml"), "/home/x").unwrap();
+        assert_eq!(bp.fs.subtract, vec![PathPattern::parse("/etc/shadow").unwrap()]);
+    }
+
+    #[test]
+    fn set_fragments_and_sugar_layer_over_the_file() {
+        let dir = Scratch::new("sets");
+        let file = dir.path().join("bp.toml");
+        std::fs::write(
+            &file,
+            r#"
+            net = { ports = [443] }
+            [fs]
+            reads = ["/work/**"]
+        "#,
+        )
+        .unwrap();
+        let sugar = BlueprintLayer {
+            fs: formwork_blueprint::FsLayer {
+                subtract: vec![PathPattern::parse("/work/secret.txt").unwrap()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bp = load_stack(&file, &["net = \"deny\"".to_string()], sugar, "/home/x").unwrap();
+        assert_eq!(bp.net, formwork_blueprint::NetPosture::Deny);
+        assert_eq!(bp.fs.reads, vec![PathPattern::parse("/work/**").unwrap()]);
+        assert_eq!(
+            bp.fs.subtract,
+            vec![PathPattern::parse("/work/secret.txt").unwrap()]
         );
     }
 

@@ -5,8 +5,8 @@
 
 use crate::path::{canonicalize_set, PathPattern};
 use crate::{
-    Blueprint, EnvPosture, EnvScrub, ExecPosture, FsBlueprint, Gate, McpPolicy, NetPosture,
-    ReadMode, Visibility,
+    Blueprint, DiscoveryBlueprint, EnvPosture, EnvScrub, ExecPosture, FsBlueprint, Gate,
+    McpPolicy, NetPosture, ReadMode, Visibility,
 };
 
 fn clamp_to(subject: &[PathPattern], bound: &[PathPattern]) -> Vec<PathPattern> {
@@ -39,6 +39,21 @@ impl Blueprint {
             exec: narrow_exec(&self.exec, &requested.exec),
             env: narrow_env(&self.env, &requested.env),
             mcp: narrow_mcp(&self.mcp, &requested.mcp),
+            // Letting a credential type through (FW-CRED5) is authority, so it intersects: a child
+            // cannot un-block a type its parent kept blocked.
+            allow_credentials: self
+                .allow_credentials
+                .iter()
+                .filter(|t| requested.allow_credentials.contains(t))
+                .cloned()
+                .collect(),
+            // The auto-widen zone (FW-DISC4) is authority to self-grant, so it intersects too.
+            discovery: DiscoveryBlueprint {
+                auto_widen: intersect_grants(
+                    &self.discovery.auto_widen,
+                    &requested.discovery.auto_widen,
+                ),
+            },
         }
         .canonicalize()
     }

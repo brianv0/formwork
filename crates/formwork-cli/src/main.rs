@@ -9,7 +9,9 @@
 //! ```
 //!
 //! The capability blueprint is passed with `--blueprint`; `--spec` is accepted as a back-compat
-//! alias.
+//! alias. Every blueprint-taking subcommand accepts the same override surface (FW-BP1/BP2):
+//! `--set '<toml>'` fragments and the sugar flags (`--read/--write/--subtract/--write-subtract/`
+//! `--allow-cred/--net/--extends`) layer over the file, additively, deny-beats-allow.
 //!
 //! `detect`/`compile` don't enforce and run on any host (including compiling a Linux policy on a Mac);
 //! `run`/`enforce-self`/`gateway` need a real confiner and error honestly where the backend is
@@ -23,7 +25,7 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use formwork_blueprint::McpPolicy;
+use formwork_blueprint::{Blueprint, BlueprintLayer, McpPolicy, NetPosture, PathPattern};
 use formwork_compile::compile;
 use formwork_detect::{detect, HostProfile};
 
@@ -44,8 +46,8 @@ enum Cmd {
     Detect,
     /// Compile a blueprint into a policy + fidelity report without enforcing (dry-run).
     Compile {
-        #[arg(long, visible_alias = "spec")]
-        blueprint: PathBuf,
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
         /// Compile against a host profile loaded from JSON (overrides --target and live detection).
         #[arg(long)]
         host: Option<PathBuf>,
@@ -58,15 +60,15 @@ enum Cmd {
     },
     /// Spawn a command under confinement (spawn-confined posture).
     Run {
-        #[arg(long, visible_alias = "spec")]
-        blueprint: PathBuf,
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
     /// Confine the current process, then exec the given command (confine-self posture).
     EnforceSelf {
-        #[arg(long, visible_alias = "spec")]
-        blueprint: PathBuf,
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
@@ -74,14 +76,107 @@ enum Cmd {
     /// blueprint's `[mcp.<server>]` entry and confine the spawned backend to the blueprint's fs/net grant.
     /// Speaks newline-delimited JSON-RPC on stdin/stdout, so an MCP host launches it as the server.
     Gateway {
-        #[arg(long, visible_alias = "spec")]
-        blueprint: PathBuf,
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
         /// Which `[mcp.<server>]` policy from the blueprint governs this connection.
         #[arg(long)]
         server: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
+}
+
+/// One blueprint, two surfaces (FW-BP1): the file plus the CLI override layer. `--set` fragments
+/// are TOML parsed by the same serde model as the file -- parity is by construction -- and the
+/// sugar flags desugar into one final layer (postures here beat `--set`, both beat the file).
+#[derive(clap::Args)]
+struct BlueprintArgs {
+    #[arg(long, visible_alias = "spec")]
+    blueprint: PathBuf,
+    /// Override layer as a TOML fragment in blueprint syntax (repeatable, applied in order),
+    /// e.g. --set 'net = "deny"' or --set '[fs]
+    /// subtract = ["~/other/**"]'.
+    #[arg(long)]
+    set: Vec<String>,
+    /// Append a read grant path pattern.
+    #[arg(long)]
+    read: Vec<String>,
+    /// Append a write grant path pattern.
+    #[arg(long)]
+    write: Vec<String>,
+    /// Append a read+write deny hole (deny beats allow at any layer).
+    #[arg(long)]
+    subtract: Vec<String>,
+    /// Append a write-deny-keep-readable hole (tamper vectors, FW-TRA7).
+    #[arg(long)]
+    write_subtract: Vec<String>,
+    /// Let one credential type through the catalog floor (FW-CRED5), e.g. --allow-cred aws.
+    /// The only mechanism that lifts a catalog entry; path grants never do.
+    #[arg(long = "allow-cred")]
+    allow_cred: Vec<String>,
+    /// Net posture: "deny" or "ports:443,8080".
+    #[arg(long)]
+    net: Option<String>,
+    /// Extra base blueprints layered under the CLI overrides (repeatable, resolved against cwd).
+    #[arg(long)]
+    extends: Vec<String>,
+}
+
+impl BlueprintArgs {
+    /// Resolve the full layer stack and merge (FW-BP2). `~` in flag values expands against the
+    /// same `$HOME` as file contents, so the two surfaces stay one model.
+    fn load(&self, home: &str) -> Result<Blueprint> {
+        blueprint_load::load_stack(&self.blueprint, &self.set, self.sugar_layer(home)?, home)
+    }
+
+    fn sugar_layer(&self, home: &str) -> Result<BlueprintLayer> {
+        let patterns = |flag: &str, values: &[String]| -> Result<Vec<PathPattern>> {
+            values
+                .iter()
+                .map(|v| {
+                    PathPattern::parse(&blueprint_load::expand_tilde_str(v, home))
+                        .with_context(|| format!("--{flag} {v:?}"))
+                })
+                .collect()
+        };
+        Ok(BlueprintLayer {
+            extends: self.extends.clone(),
+            fs: formwork_blueprint::FsLayer {
+                read_mode: None,
+                reads: patterns("read", &self.read)?,
+                writes: patterns("write", &self.write)?,
+                subtract: patterns("subtract", &self.subtract)?,
+                write_subtract: patterns("write-subtract", &self.write_subtract)?,
+            },
+            net: self.net.as_deref().map(parse_net).transpose()?,
+            exec: None,
+            env: None,
+            mcp: Default::default(),
+            allow_credentials: self.allow_cred.clone(),
+            discovery: Default::default(),
+        })
+    }
+}
+
+fn parse_net(s: &str) -> Result<NetPosture> {
+    if s == "deny" {
+        return Ok(NetPosture::Deny);
+    }
+    if let Some(list) = s.strip_prefix("ports:") {
+        let ports = list
+            .split(',')
+            .map(|p| {
+                p.trim()
+                    .parse::<u16>()
+                    .with_context(|| format!("--net port {p:?}"))
+            })
+            .collect::<Result<Vec<u16>>>()?;
+        if ports.is_empty() {
+            bail!("--net ports: requires at least one port (use \"deny\" for none)");
+        }
+        return Ok(NetPosture::Ports(ports));
+    }
+    bail!("--net accepts \"deny\" or \"ports:<p1,p2,…>\", got {s:?}")
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -159,7 +254,7 @@ fn main() -> Result<()> {
             target,
             report_only,
         } => {
-            let blueprint = blueprint_load::load(&blueprint, &home())?;
+            let blueprint = blueprint.load(&home())?;
             let host = resolve_host(&host, &target)?;
             let policy = compile(&blueprint, &host);
             if report_only {
@@ -184,8 +279,8 @@ enum Posture {
     Self_,
 }
 
-fn run(blueprint: PathBuf, argv: Vec<String>, posture: Posture) -> Result<()> {
-    let blueprint = blueprint_load::load(&blueprint, &home())?;
+fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<()> {
+    let blueprint = blueprint.load(&home())?;
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
     // faithfully rendered (FW-INV6).
@@ -238,8 +333,8 @@ fn apply_env(command: &mut Command, env: &formwork_blueprint::EnvPosture) {
 /// backend, applying the blueprint's `[mcp.<server>]` policy. One blueprint governs both surfaces: its
 /// `[mcp.<server>]` entry shades the protocol, its fs/net grant confines the backend the same way
 /// `run` confines any command (FW-GW5), so the backend spawns behind the same wall.
-fn gateway(blueprint: PathBuf, server: String, argv: Vec<String>) -> Result<()> {
-    let blueprint = blueprint_load::load(&blueprint, &home())?;
+fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Result<()> {
+    let blueprint = blueprint.load(&home())?;
     let blueprint = blueprint_load::canonicalize_for_enforcement(&blueprint)
         .context("canonicalizing grant paths")?;
 

@@ -1,9 +1,11 @@
 //! The capability blueprint: pure data describing what a confined process may touch. Narrowing
 //! (`Blueprint::narrow`) can only shrink a grant, never widen it (FW-CAP2).
 
+mod layer;
 mod narrow;
 mod path;
 
+pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
 pub use path::{canonicalize_set, PathError, PathPattern};
 
 use std::collections::BTreeMap;
@@ -12,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// `BTreeMap` keeps server order canonical for deterministic compiles.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Blueprint {
     #[serde(default)]
     pub fs: FsBlueprint,
@@ -24,6 +26,21 @@ pub struct Blueprint {
     pub env: EnvPosture,
     #[serde(default)]
     pub mcp: BTreeMap<String, McpPolicy>,
+    /// Credential types deliberately let through the catalog floor (FW-CRED5). The catalog itself
+    /// is compiled in; this is the only mechanism that lifts a typed entry -- path allows cannot.
+    #[serde(default)]
+    pub allow_credentials: Vec<String>,
+    #[serde(default)]
+    pub discovery: DiscoveryBlueprint,
+}
+
+/// The merged discovery posture (FW-DISC4): the operator-drawn zone inside which a learning run
+/// may self-grant. Empty by default -- nothing self-grants out of the box.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct DiscoveryBlueprint {
+    #[serde(default)]
+    pub auto_widen: Vec<PathPattern>,
 }
 
 /// `write` grants imply `read`; `subtract` holes win over grants (FW-TRA3).
@@ -281,6 +298,8 @@ impl Blueprint {
             exec: ExecPosture::Unrestricted,
             env: EnvPosture::Passthrough,
             mcp: BTreeMap::new(),
+            allow_credentials: Vec::new(),
+            discovery: DiscoveryBlueprint::default(),
         }
     }
 
@@ -291,6 +310,9 @@ impl Blueprint {
         for (k, v) in &self.mcp {
             mcp.insert(k.clone(), v.canonicalize());
         }
+        let mut allow_credentials = self.allow_credentials.clone();
+        allow_credentials.sort();
+        allow_credentials.dedup();
         Blueprint {
             fs: FsBlueprint {
                 read_mode: self.fs.read_mode,
@@ -303,6 +325,10 @@ impl Blueprint {
             exec: self.exec.canonicalize(),
             env: self.env.canonicalize(),
             mcp,
+            allow_credentials,
+            discovery: DiscoveryBlueprint {
+                auto_widen: canonicalize_set(&self.discovery.auto_widen),
+            },
         }
     }
 }
