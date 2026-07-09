@@ -18,10 +18,23 @@ doctrine that requires judgment.
 ## Concepts   [closed list; amendments by proposal only]
 This system has exactly these concepts, each with one name and one Rust type:
 - **Blueprint** (`formwork_blueprint::Blueprint`) — the capability grant: a finite enumeration
-  of fs read/write/subtract, net posture, exec posture, environment posture, and
-  per-server MCP visibility. No mechanism turns natural language into a grant (FW-CAP1).
-  (Environment posture — FW-ENV1/2, added by FEP-1 — is applied at spawn by the CLI shell,
-  not the Confiner; the FidelityReport carries its verdict like any other capability.)
+  of fs read/write/subtract, net posture, exec posture, environment posture, per-server MCP
+  visibility, credential exclusions (`allow-credentials`, FW-CRED5), and the discovery
+  auto-widen zone (FW-DISC4). No mechanism turns natural language into a grant (FW-CAP1).
+  Assembled by a deterministic layer merge — baseline → `extends` chain → file → CLI
+  overrides (FW-BP2, added by FEP-2); path sets merge additively and deny beats allow.
+  (Environment posture — FW-ENV1/2, added by FEP-1 — is applied at spawn by the Launcher;
+  the FidelityReport carries its verdict like any other capability.)
+- **Catalog** (`formwork_blueprint::Catalog` / `ResolvedCatalog`) — the versioned, compiled-in
+  enumeration of credential *locations* (path patterns and env-var names, FW-CRED1; the typed
+  successor to the informal sensitive set). Denied/stripped as a floor under every Blueprint
+  (FW-CRED4); lifted only by the typed exclude (FW-CRED5); the line discovery can never
+  propose across (FW-INV8).
+- **Launcher** (`formwork-cli`, pure decisions in `formwork_blueprint::construct_env`) — the
+  third enforcement arm (FEP-2 §6): the process that constructs the confined child before
+  control transfers — environment construction, credential strip, env-file-ref denies, and
+  write-protection of its own policy inputs (FW-XR8). Its guarantees are launcher-contingent
+  and the report says so (FW-CRED8).
 - **HostProfile** (`formwork_detect::HostProfile`) — what the current kernel can
   actually enforce; the one impure input to compilation.
 - **CompiledPolicy** (`formwork_compile::CompiledPolicy`) — a `ConfinerPolicy`
@@ -53,8 +66,11 @@ The durable, human-reviewed surfaces of this project are:
   (`deny_unknown_fields`, kebab-case), the published input contract;
 - the **FidelityReport** and **CompiledPolicy** shapes — what callers inspect to
   learn what is enforced, and what a dry-run emits (FW-FID1/2);
-- the **default profile** and **sensitive set** (`profiles/*.toml`) — the
-  subtractive policy that makes reuse safe by default (FW-CAP3);
+- the **default profile** and the **credential catalog** (`profiles/*.toml`; the catalog is
+  embedded at build time, FW-CRED1) — the subtractive policy that makes reuse safe by default
+  (FW-CAP3, realized by the catalog + backstop);
+- the **discovery artifacts** — the proposal (`*.proposal.toml`) and the provenance-carrying
+  discovered layer (`*.discovered.toml`, FW-DISC6) — machine-written, human-accepted;
 - the **`formwork` CLI surface** — its subcommands and their JSON output.
 
 These are designed before the code that uses them and evolve only through
@@ -79,6 +95,14 @@ compatibility discipline concentrate here.
 - **blueprint** is the input; **policy** is the compiled backend artifact — never
   call the input a "policy". **grant** is the held capability set, never
   "permissions".
+- **floor** = the catalog-derived deny/strip set under every Blueprint (FW-CRED4) · **strip**
+  = the Launcher removing an env var pre-spawn (absent, not empty — FW-INV7/9) · **exclude** =
+  the typed `allow-credentials` lift, the only un-deny (FW-CRED5) · **learn** = an enforced
+  run plus denial observation, never a live widening (FW-DISC1/FW-INV10) · **withheld** = a
+  floored denial in learning, itemized to the operator only, never proposed (FW-DISC3) ·
+  **accept** = per-entry operator approval into the discovered layer (FW-DISC5) ·
+  **provenance** = the added-via/run-id record that keeps learned grants distinguishable from
+  authored ones (FW-DISC6).
 - **Confiner** (hard OS layer), **Gateway** (soft MCP layer), and **Seam**
   (transport) are three distinct things and are never blurred. **Formwork** is
   the whole system.
@@ -153,7 +177,8 @@ the boundaries is what makes both audible.
 ## Layers   [named layers; dependency direction enforced in CI]
 Dependencies point one way, from pure core toward the impure shell:
 
-`formwork-blueprint` (pure domain: capability types + narrowing)
+`formwork-blueprint` (pure domain: capability types, layer merge, catalog, launcher/env
+decisions, discovery reverse-compile, narrowing)
 → `formwork-detect` (the only kernel-probing input)
 → `formwork-compile` (pure compiler: Blueprint + HostProfile → CompiledPolicy + report)
 → `formwork-confine` · `formwork-seam` (kernel mechanisms)

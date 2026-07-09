@@ -18,7 +18,7 @@ These two halves are in tension, and the resolution is the third principle: **ho
 
 ## 2. Architecture overview
 
-Formwork has two enforcement arms driven by a single capability compiler, with an fd seam to the agent.
+Formwork has three enforcement arms driven by a single capability compiler, with an fd seam to the agent. The diagram below shows the two OS/protocol arms; FEP-2 (`fep2.md` §6) added the **launcher** ahead of both — the pre-spawn arm that constructs the confined child's environment, strips catalog credentials (variable absent, not denied), and write-protects its own policy inputs before control transfers.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -78,6 +78,7 @@ Naming note (open, section 11): this document uses **Formwork** for the whole sy
 - Resource-exhaustion denial of service as a *security* property. Formwork may set cgroup/rlimit bounds for stability, but does not claim them as an airtight control.
 - Confining inference, GPUs, or the model itself.
 - Hostile multi-tenant co-tenancy at cloud scale. Formwork is a personal/team substrate, not a hosted platform isolating mutually adversarial tenants.
+- Credential *content* scanning. Credential coverage is location-based only — the typed catalog plus a generic backstop (FEP-2 FW-CRED); Formwork never inspects bytes to decide what is secret.
 - Perfect unveil-style invisibility of the filesystem. Formwork accepts EACCES-style denial (section 4); it does not emulate ENOENT for every ungranted path.
 
 ## 4. The capability blueprint and its interpreter
@@ -138,7 +139,7 @@ Three further points pin the vocabulary above down so it is unambiguous to the c
 |---|---|
 | **FW-CAP1** Enumerable vocabulary | The blueprint is a finite enumeration of read/write/subtract/exec/net/env/mcp. No mechanism accepts natural language and produces a grant. |
 | **FW-CAP2** Monotonic narrowing | A session may narrow its own grant but never widen it. A child's grant is a subset of its parent's. |
-| **FW-CAP3** Subtractive default profile | The default profile is broad-read over the ambient environment minus a configured sensitive set, not minimal-from-empty. |
+| **FW-CAP3** Subtractive default profile | The default profile is broad-read over the ambient environment minus a configured sensitive set, not minimal-from-empty. *(Realized concretely by FEP-2's compiled-in credential catalog + backstop, applied as a floor under every blueprint — FW-CRED4.)* |
 | **FW-CAP4** Invisibility for MCP, denial for fs | Ungranted MCP tools/resources/prompts are absent from listings and non-invocable. Ungranted filesystem paths may return EACCES rather than ENOENT. |
 | **FW-CAP5** Single inspectable interpreter | The compiler is the sole blueprint→mechanism authority, and its output (compiled policy + report) is inspectable without enforcing. |
 | **FW-CAP6** Anchored & basename patterns | Beyond absolute paths, the pattern vocabulary admits an any-depth basename form (`**/.env`) that matches a trailing component at any depth within a grant. Both forms canonicalize deterministically (FW-FID4) and stay fail-loud on non-representable resolution; no relative `..` traversal is introduced. |
@@ -178,7 +179,7 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 |---|---|
 | **FW-TRA1** Ambient reuse | The confined process reuses host interpreters, toolchains, shared libraries, and language package caches, read-only by default. |
 | **FW-TRA2** Toolchains run clean | Under the default profile, common toolchains (python/pytest, node/npm, git, a C build) run unmodified with zero denials on the happy path. |
-| **FW-TRA3** Sensitive-set subtraction | Credentials, SSH/cloud config, keychains, other projects, and browser profiles are denied/hidden by default even under broad grants. |
+| **FW-TRA3** Sensitive-set subtraction | Credentials, SSH/cloud config, keychains, other projects, and browser profiles are denied/hidden by default even under broad grants. *(Superseded and expanded by FEP-2's typed credential catalog — FW-CRED1..8, `fep2.md` §5 — which adds the env-var arm and exclude-by-type.)* |
 | **FW-TRA4** Graceful denial | Denials surface as standard errno, never as sandbox-specific crashes; a tool probing an optional ungranted path continues rather than aborting. |
 | **FW-TRA5** Writable working set | The project directory, a scratch/tmp area, and (optionally) build caches are writable, so the agent can do real work and persist within scope. |
 | **FW-TRA6** Low overhead | Confinement setup and per-operation overhead stay within the section 8 performance target so interactive agent loops remain responsive. |
@@ -189,7 +190,7 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 
 | Req | Requirement |
 |---|---|
-| **FW-FID1** Per-capability report | `compile()` returns, per capability: `Enforced \| Partial(reason) \| Unenforceable(reason)`, plus backend and semantics (hide vs deny). |
+| **FW-FID1** Per-capability report | `compile()` returns, per capability: `Enforced \| Partial(reason) \| Unenforceable(reason)`, plus backend and semantics (hide vs deny). *(Extended by FEP-2 with a per-credential-type section labeling each arm — `enforced-via-launcher` vs OS sandbox — and the launcher-contingency disclosure, FW-CRED8.)* |
 | **FW-FID2** Dry-run / audit | Produce the compiled policy and report without enforcing (CI on non-capable boxes; cross-platform policy development). |
 | **FW-FID3** Runtime observability | Emit a structured record of grants and denials at runtime, suitable for a host's journal when embedded, or standalone logging otherwise. |
 | **FW-FID4** Deterministic compile | The same blueprint compiles to a byte-identical policy and report. |
@@ -439,5 +440,7 @@ Kernel-mechanism-first, honesty-first, reuse-validated-early:
 6. **Gateway** (transport-agnostic backends, shading, full-surface policy, transparent passthrough, backend-confinement recursion) with FW-E2E-013..019 and ADV-003, 004, 005.
 7. **Degraded-host honesty and optional tiers** (FW-E2E-009, 025, ADV-006), confirming Formwork reports rather than pretends when a kernel cannot enforce a requested capability.
 8. **Capability-model hardening** (FEP-1): the env axis (FW-ENV1/2), execution-vector write-subtract (FW-TRA7), sensitive-set metadata denial (FW-CAP7), any-depth patterns (FW-CAP6), extended sensitive set (FW-TRA8), and the anti-escalation guarantee (FW-XR8) — landed and compiled/enforced on both backends. The fs additions are real-Seatbelt verified (FW-E2E-037..039); the env axis (a CLI-shell spawn transform, not a kernel capability) by unit tests plus the FidelityReport. Host-scoped egress (FW-EGR) and the violation stream (FW-FID5) remain deferred in `fep-1.md`.
+
+9. **Blueprints, the credential catalog, and discovery** (FEP-2): the layered Blueprint model with `extends` and a CLI override surface (FW-BP1–4), the typed credential catalog enforced across the confiner and the new launcher arm with per-type report labels (FW-CRED1–8), and observe-then-widen discovery bounded by the catalog floor (FW-DISC1–6; FW-INV7–10) — `fep2.md`, verified on real Seatbelt + the unified-log denial feed (FW-E2E-041..054, FW-ADV-012..014).
 
 If steps 1–4 pass, Formwork is a transparent, reusable filesystem confiner that behaves the same on both platforms and tells the truth about itself. If steps 5–7 pass, it is a complete agent sandbox: one privileged broker, everything else in a mould, egress forced through a policy gateway, and every claim backed by a mechanism or reported as a gap.

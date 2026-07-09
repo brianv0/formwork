@@ -16,8 +16,12 @@
 # confined process opens, so :443 egress is enough for cargo to reach the network.
 net = { ports = [443] }
 exec = "unrestricted"
-# Scrub secret-shaped env vars but keep the model API key the dev agent needs (FW-ENV2).
+# Scrub secret-shaped env vars but keep the model auth the dev agent needs (FW-ENV2).
 env = { scrub = { allow = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] } }
+# Deliberate widenings (FW-CRED5): the model API key through the launcher strip, and this agent's
+# own ~/.claude state. Everything else in the catalog -- including ~/.cargo/credentials.toml, the
+# crates.io publish token (type `cargo`) -- stays denied/stripped.
+allow-credentials = ["anthropic", "claude"]
 
 [fs]
 read-mode = "ambient-minus-subtract"
@@ -33,49 +37,11 @@ writes = [
     "/var/tmp/**",
 ]
 
-# Sensitive set (mirrors profiles/sensitive-set.toml) plus dev-specific holes. Deny wins over the
-# broad read and over the ~/.cargo write grant, so these stay denied even though their parents are
-# granted.
+# Credential locations (ssh, cloud, keychains, browsers, other agents' state, the crates.io
+# publish token, docker -- including run/docker.sock, which is host-root) are denied by the
+# compiled-in catalog floor (FW-CRED4); driving Docker from inside this session cannot work, run
+# `just test-linux` from an unconfined shell instead. Only the dev-specific hole remains here:
 subtract = [
-    # SSH / GPG
-    "~/.ssh/**",
-    "~/.gnupg/**",
-    # cloud + CI credentials
-    "~/.aws/**",
-    "~/.config/gcloud/**",
-    "~/.azure/**",
-    "~/.kube/**",
-    "~/.netrc",
-    "~/.npmrc",
-    "~/.pypirc",
-    "~/.config/gh/**",
-    "~/.git-credentials",
-    # keychains (macOS)
-    "~/Library/Keychains/**",
-    "/Library/Keychains/**",
-    # browser profiles
-    "~/Library/Application Support/Google/Chrome/**",
-    "~/Library/Application Support/Firefox/**",
-    "~/.config/google-chrome/**",
-    "~/.mozilla/**",
-    # system credential stores
-    "/etc/shadow",
-    "/etc/sudoers",
-    "/etc/sudoers.d/**",
-
-    # --- dev-specific subtractions ---
-    # Docker: the WHOLE dir, not just config.json — ~/.docker/run/docker.sock is a host-root socket
-    # (docker.sock = host takeover). Subtracting it is why you cannot, and must not, drive Docker
-    # from inside this confined session; run `just test-linux` from an unconfined shell instead.
-    "~/.docker/**",
-    # other agents' state: this confined session is Claude developing Formwork; deny peers' creds.
-    # ~/.claude stays readable — it's this agent's own config/session.
-    "~/.codex/**",
-    "~/.gemini/**",
-    "~/.cursor/**",
-    # crates.io publish token — deny even though ~/.cargo/** is writable.
-    "~/.cargo/credentials.toml",
-    "~/.cargo/credentials",
     # Installed binaries run UNSANDBOXED later; don't let a confined agent rewrite them (the FEP-1
     # execution-vector concern). cargo build doesn't write here; cargo install would.
     "~/.cargo/bin/**",

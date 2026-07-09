@@ -8,8 +8,8 @@
 # `~` expands against $HOME when the CLI loads the blueprint. Narrowing a grant is always safe; these
 # widenings are deliberate, so review them before use (FW-CAP2).
 #
-#   reads   the whole ambient environment MINUS a sensitive set (keys, cloud creds, keychains,
-#           browser profiles). The canonical superset lives in profiles/sensitive-set.toml.
+#   reads   the whole ambient environment MINUS the compiled-in credential floor (keys, cloud
+#           creds, keychains, browser profiles -- profiles/credential-catalog.toml, FW-CRED4).
 #   writes  one project tree + scratch. Point this at your repo.
 #   net     HTTPS egress only, so the agent still reaches its model API. This is port-scoped, not
 #           host-scoped: formwork does not (yet) allowlist egress by host, so treat :443 as "any
@@ -18,49 +18,25 @@
 
 net = { ports = [443] }
 exec = "unrestricted"
-# Scrub secret-shaped env vars but keep the model API key the agent needs (FW-ENV2). Egress is open
+# Scrub secret-shaped env vars but keep the model auth the agent needs (FW-ENV2). Egress is open
 # to any HTTPS host, so this stops e.g. AWS_SECRET_ACCESS_KEY being exfiltrated via the environment.
 env = { scrub = { allow = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] } }
+# The two DELIBERATE widenings (FW-CRED5), reviewed here so they are visible: `anthropic` lets the
+# model API key through the launcher strip (the scrub allow above alone cannot -- the catalog floor
+# partitions first), and `claude` lets THIS agent read/write its own ~/.claude state. Every other
+# catalog type -- aws, ssh, gcp, other agents' state, ... -- stays denied/stripped.
+allow-credentials = ["anthropic", "claude"]
 
 [fs]
 read-mode = "ambient-minus-subtract"
 reads = ["/**"]
 # project + scratch + this agent's own state dir, so Claude can persist history/settings/auth.
 writes = ["~/project/**", "~/.claude/**", "/tmp/**", "/private/tmp/**", "/var/tmp/**"]
-subtract = [
-    # SSH / GPG / cloud + CI credentials
-    "~/.ssh/**",
-    "~/.gnupg/**",
-    "~/.aws/**",
-    "~/.config/gcloud/**",
-    "~/.azure/**",
-    "~/.kube/**",
-    "~/.docker/**",   # whole dir incl. run/docker.sock (host-root); no agent needs it
-    "~/.netrc",
-    "~/.npmrc",
-    "~/.pypirc",
-    "~/.config/gh/**",
-    "~/.git-credentials",
-    # other agents' state: deny so this confined Claude can't read Codex/Gemini/Cursor creds.
-    # ~/.claude is intentionally NOT subtracted -- it's this agent's own config/session.
-    "~/.codex/**",
-    "~/.gemini/**",
-    "~/.cursor/**",
-    # project-local secrets at any depth (a repo .env usually holds API keys)
-    "**/.env",
-    # keychains (macOS)
-    "~/Library/Keychains/**",
-    "/Library/Keychains/**",
-    # browser profiles
-    "~/Library/Application Support/Google/Chrome/**",
-    "~/Library/Application Support/Firefox/**",
-    "~/.config/google-chrome/**",
-    "~/.mozilla/**",
-    # system credential stores
-    "/etc/shadow",
-    "/etc/sudoers",
-    "/etc/sudoers.d/**",
-]
+# Credential locations are NOT listed here: the compiled-in catalog floor denies them all under
+# every blueprint (FW-CRED4), minus exactly the `allow-credentials` above. Add project-specific
+# denies here if you need them; credential locations belong in the catalog.
+subtract = []
+
 # Tamper vectors: write-denied but readable, so the agent can't plant a git hook / .mcp.json / IDE
 # task that later runs unsandboxed, yet git and tooling still read them (FW-TRA7).
 write-subtract = [

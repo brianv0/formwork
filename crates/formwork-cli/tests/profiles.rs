@@ -1,72 +1,87 @@
-//! Profile-consistency tests. `profiles/sensitive-set.toml` is the canonical, category-grouped
-//! sensitive superset (FW-TRA3); `profiles/default.toml` mirrors it into its flat `fs.subtract`.
-//! Dropping a category from `default.toml` while it stays in `sensitive-set.toml` would silently
-//! un-deny a secret location under the broad default read grant -- this test forbids that drift.
+//! Catalog-consistency canaries. The credential catalog (profiles/credential-catalog.toml,
+//! compiled into the binary, FW-CRED1) superseded the old sensitive-set/default-profile pair;
+//! the drift these tests forbid is a core credential location silently falling OUT of the
+//! catalog -- that would un-deny a secret under every broad grant with no diff to any blueprint
+//! (fail-open of the floor, FW-INV6).
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use formwork_blueprint::{Catalog, ResolvedCatalog};
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .expect("repo root resolves")
-}
+/// Locations that must never leave the floor. Grow this list; shrinking it is a human decision
+/// with a review, which is the point.
+const CORE_LOCATIONS: &[&str] = &[
+    "/home/x/.ssh/**",
+    "/home/x/.gnupg/**",
+    "/home/x/.aws/**",
+    "/home/x/.config/gcloud/**",
+    "/home/x/.azure/**",
+    "/home/x/.kube/**",
+    "/home/x/.docker/**",
+    "/home/x/.netrc",
+    "/home/x/.npmrc",
+    "/home/x/.pypirc",
+    "/home/x/.config/gh/**",
+    "/home/x/.git-credentials",
+    "/home/x/.claude/**",
+    "/home/x/.codex/**",
+    "/home/x/.gemini/**",
+    "/home/x/.cursor/**",
+    "/home/x/Library/Keychains/**",
+    "/Library/Keychains/**",
+    "/etc/shadow",
+    "/etc/sudoers",
+    "**/.env",
+];
 
-fn read_toml(rel: &str) -> toml::Value {
-    let path = repo_root().join(rel);
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
-    toml::from_str(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
-}
-
-fn sensitive_set_paths() -> BTreeSet<String> {
-    let doc = read_toml("profiles/sensitive-set.toml");
-    let mut paths = BTreeSet::new();
-    for (_category, table) in doc.as_table().expect("sensitive-set is a table") {
-        let table = table
-            .as_table()
-            .expect("each category is a table of arrays");
-        for (_key, val) in table {
-            for entry in val.as_array().expect("each entry is an array") {
-                paths.insert(entry.as_str().expect("entries are strings").to_string());
-            }
-        }
-    }
-    paths
-}
-
-fn default_subtract_paths() -> BTreeSet<String> {
-    let doc = read_toml("profiles/default.toml");
-    doc["fs"]["subtract"]
-        .as_array()
-        .expect("default.toml [fs].subtract is an array")
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .expect("subtract entries are strings")
-                .to_string()
-        })
-        .collect()
-}
+const CORE_ENV_STRIPS: &[&str] = &[
+    "AWS_SECRET_ACCESS_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GITHUB_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "SLACK_BOT_TOKEN",
+];
 
 #[test]
-fn default_subtract_covers_the_whole_sensitive_set() {
-    let sensitive = sensitive_set_paths();
-    let subtract = default_subtract_paths();
-    let missing: Vec<&String> = sensitive.difference(&subtract).collect();
+fn catalog_floor_covers_the_core_sensitive_locations() {
+    let resolved = ResolvedCatalog::builtin_for_home("/home/x").expect("builtin catalog resolves");
+    let denied: Vec<String> = resolved
+        .denied_paths(&[])
+        .iter()
+        .map(|p| p.canonical())
+        .collect();
+    let missing: Vec<&&str> = CORE_LOCATIONS
+        .iter()
+        .filter(|loc| !denied.iter().any(|d| d == **loc))
+        .collect();
     assert!(
         missing.is_empty(),
-        "default.toml [fs].subtract is missing sensitive-set.toml paths (a secret would be readable \
-         under the broad default grant): {missing:?}"
+        "core sensitive locations fell out of the catalog floor: {missing:?}"
     );
 }
 
 #[test]
-fn sensitive_set_is_non_empty() {
-    // Guard against the sync test passing vacuously if the list is emptied or mis-parsed.
+fn catalog_floor_strips_the_core_env_credentials() {
+    let resolved = ResolvedCatalog::builtin_for_home("/home/x").expect("builtin catalog resolves");
+    let stripped: Vec<&str> = resolved
+        .enforced_types(&[])
+        .flat_map(|(_, e)| e.envs.iter().map(String::as_str))
+        .collect();
+    let missing: Vec<&&str> = CORE_ENV_STRIPS
+        .iter()
+        .filter(|v| !stripped.contains(*v))
+        .collect();
     assert!(
-        sensitive_set_paths().len() >= 10,
-        "sensitive-set.toml looks unexpectedly small"
+        missing.is_empty(),
+        "core env credentials fell out of the catalog floor: {missing:?}"
+    );
+}
+
+#[test]
+fn catalog_is_versioned_and_non_trivial() {
+    let catalog = Catalog::builtin();
+    assert!(catalog.version >= 1);
+    assert!(
+        catalog.types.len() >= 15,
+        "catalog looks unexpectedly small: {} types",
+        catalog.types.len()
     );
 }
