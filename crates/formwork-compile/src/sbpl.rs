@@ -1,10 +1,13 @@
 //! Deterministic SBPL (Seatbelt profile language) generation for the macOS confiner.
 //!
 //! SBPL is last-match-wins, so ordering encodes the policy: `(allow default)` for transparency
-//! (FW-TRA2), then `(deny network*)` + optional port re-allows, then reads, writes, exec. Subtract
-//! holes are emitted last within each section so a denied sensitive path wins over its grant.
+//! (FW-TRA2), then `(deny network*)` + optional port re-allows, then reads, writes, exec. Within
+//! each fs section the order is: grants, credential-floor denies (FW-CRED4), typed-exclusion
+//! re-allows clamped to the grant surface (FW-CRED5 -- so `--allow-cred aws` lifts the any-depth
+//! backstop inside `~/.aws/**` without widening anything), then operator subtract holes last --
+//! an operator deny is never lifted by anything.
 
-use formwork_blueprint::{ExecPosture, NetPosture, PathPattern, ReadMode};
+use formwork_blueprint::{intersect_grants, ExecPosture, NetPosture, PathPattern, ReadMode};
 
 use crate::CompileInput;
 
@@ -21,12 +24,16 @@ pub fn render(input: &CompileInput) -> String {
         input.read_mode,
         &input.effective_reads,
         &input.subtract,
+        &input.floor,
+        &input.floor_exempt,
     );
     render_writes(
         &mut b,
         &input.writes,
         &input.subtract,
         &input.write_subtract,
+        &input.floor,
+        &input.floor_exempt,
     );
     render_exec(&mut b, &input.exec);
 
@@ -94,7 +101,14 @@ const MACOS_WRITE_DEVICES: &[&str] = &[
     "/dev/fd",
 ];
 
-fn render_reads(b: &mut String, mode: ReadMode, reads: &[PathPattern], subtract: &[PathPattern]) {
+fn render_reads(
+    b: &mut String,
+    mode: ReadMode,
+    reads: &[PathPattern],
+    subtract: &[PathPattern],
+    floor: &[PathPattern],
+    floor_exempt: &[PathPattern],
+) {
     b.push_str("\n;; reads\n");
     match mode {
         ReadMode::Closed => {
@@ -122,10 +136,34 @@ fn render_reads(b: &mut String, mode: ReadMode, reads: &[PathPattern], subtract:
             b.push_str(";; ambient reads (allow default); only subtract holes below\n");
         }
     }
-    // Subtract holes deny read AND metadata: a confined process must not learn a credential file's
-    // existence, size, or mtime via `stat` (FW-CAP7). The explicit metadata deny is required because
-    // Closed mode's broad `(allow file-read-metadata)` (kept for FW-TRA4) would otherwise re-admit it
-    // -- last-match-wins does not fold `file-read-metadata` into a `file-read*` deny here.
+    // Floor and subtract holes deny read AND metadata: a confined process must not learn a
+    // credential file's existence, size, or mtime via `stat` (FW-CAP7). The explicit metadata deny
+    // is required because Closed mode's broad `(allow file-read-metadata)` (kept for FW-TRA4) would
+    // otherwise re-admit it -- last-match-wins does not fold `file-read-metadata` into a
+    // `file-read*` deny here.
+    if !floor.is_empty() {
+        b.push_str(";; credential-catalog floor (FW-CRED4)\n");
+    }
+    for p in floor {
+        let f = filter(p);
+        b.push_str(&format!("(deny file-read* {f})\n"));
+        b.push_str(&format!("(deny file-read-metadata {f})\n"));
+    }
+    // Typed exclusions re-lift the floor inside the excluded type's own scope (the any-depth
+    // backstop is what crosses in). Clamped to the grant surface in Closed mode so an exclusion
+    // never grants what the blueprint didn't.
+    let exempt = match mode {
+        ReadMode::AmbientMinusSubtract => floor_exempt.to_vec(),
+        ReadMode::Closed => intersect_grants(floor_exempt, reads),
+    };
+    if !exempt.is_empty() {
+        b.push_str(";; typed credential exclusions (FW-CRED5)\n");
+    }
+    for p in &exempt {
+        let f = filter(p);
+        b.push_str(&format!("(allow file-read* {f})\n"));
+        b.push_str(&format!("(allow file-read-metadata {f})\n"));
+    }
     for p in subtract {
         let f = filter(p);
         b.push_str(&format!("(deny file-read* {f})\n"));
@@ -138,6 +176,8 @@ fn render_writes(
     writes: &[PathPattern],
     subtract: &[PathPattern],
     write_subtract: &[PathPattern],
+    floor: &[PathPattern],
+    floor_exempt: &[PathPattern],
 ) {
     b.push_str("\n;; writes: always closed (FW-ISO2, FW-TRA5)\n");
     b.push_str("(deny file-write* (subpath \"/\"))\n");
@@ -146,6 +186,13 @@ fn render_writes(
         b.push_str(&format!("(allow file-write* (literal \"{p}\"))\n"));
     }
     for p in writes {
+        b.push_str(&format!("(allow file-write* {})\n", filter(p)));
+    }
+    for p in floor {
+        b.push_str(&format!("(deny file-write* {})\n", filter(p)));
+    }
+    // Writes are always closed, so the exclusion re-allow clamps to the write grants.
+    for p in &intersect_grants(floor_exempt, writes) {
         b.push_str(&format!("(allow file-write* {})\n", filter(p)));
     }
     for p in subtract {
@@ -244,6 +291,8 @@ mod tests {
 
     fn input() -> CompileInput {
         CompileInput {
+            floor: Vec::new(),
+            floor_exempt: Vec::new(),
             read_mode: ReadMode::Closed,
             effective_reads: vec![pp("/work/project/**")],
             writes: vec![pp("/work/project/**")],
@@ -252,6 +301,47 @@ mod tests {
             net: NetPosture::Deny,
             exec: ExecPosture::Unrestricted,
         }
+    }
+
+    #[test]
+    fn floor_denies_then_exempt_reallows_then_operator_denies() {
+        // Last-match-wins: floor < typed exemption < operator subtract (FW-CRED4/5, FW-BP4).
+        let mut i = input();
+        i.read_mode = ReadMode::AmbientMinusSubtract;
+        i.floor = vec![pp("**/credentials"), pp("/home/x/.ssh/**")];
+        i.floor_exempt = vec![pp("/home/x/.aws/**")];
+        let s = render(&i);
+        let floor_deny = s
+            .find("(deny file-read* (regex #\"/credentials$\"))")
+            .unwrap();
+        let exempt_allow = s
+            .find("(allow file-read* (subpath \"/home/x/.aws\"))")
+            .unwrap();
+        let operator_deny = s
+            .find("(deny file-read* (subpath \"/work/project/.git\"))")
+            .unwrap();
+        assert!(
+            floor_deny < exempt_allow,
+            "exemption must be able to lift the floor"
+        );
+        assert!(
+            exempt_allow < operator_deny,
+            "operator subtract must win over the exemption"
+        );
+    }
+
+    #[test]
+    fn closed_mode_clamps_exemption_to_the_grant_surface() {
+        // reads grant only /work/project; an excluded ~/.aws must NOT be re-allowed in closed
+        // mode -- the exclusion lifts the floor, it never grants (FW-CRED5).
+        let mut i = input();
+        i.floor = vec![pp("**/credentials")];
+        i.floor_exempt = vec![pp("/home/x/.aws/**")];
+        let s = render(&i);
+        assert!(
+            !s.contains("/home/x/.aws"),
+            "unclamped exemption widened a closed grant:\n{s}"
+        );
     }
 
     #[test]

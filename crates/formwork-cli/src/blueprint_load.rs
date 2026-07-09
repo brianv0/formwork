@@ -39,7 +39,21 @@ pub fn load_stack(
         resolve_layer(layer, &cwd, home, &mut visiting, &mut layers)?;
     }
     resolve_layer(sugar, &cwd, home, &mut visiting, &mut layers)?;
-    Ok(formwork_blueprint::merge(&layers))
+    let blueprint = formwork_blueprint::merge(&layers);
+
+    // A typo'd credential type would silently stay blocked -- fail-closed but intent-hiding, the
+    // same trap as a typo'd gateway server name. Validate at the edge (parse, don't validate).
+    let catalog = formwork_blueprint::Catalog::builtin();
+    for t in &blueprint.allow_credentials {
+        if !catalog.is_known_type(t) {
+            let known: Vec<&str> = catalog
+                .type_names()
+                .chain(std::iter::once(formwork_blueprint::BACKSTOP))
+                .collect();
+            bail!("unknown credential type {t:?} in allow-credentials (known: {known:?})");
+        }
+    }
+    Ok(blueprint)
 }
 
 /// Depth-first post-order: every base lands before the layer that extends it, so the extending
@@ -136,6 +150,21 @@ pub fn canonicalize_for_enforcement(blueprint: &Blueprint) -> Result<Blueprint> 
     // The auto-widen zone is matched against kernel-resolved denial paths at learn time, so it
     // needs the same firmlink/symlink resolution as the grants it may become (FW-DISC4).
     out.discovery.auto_widen = map(&blueprint.discovery.auto_widen)?;
+    Ok(out)
+}
+
+/// The catalog's floor patterns get the same enforcement-time resolution as grants: a hole that
+/// silently failed to match the kernel's resolved path would be a fail-open of the sensitive set
+/// (FW-INV6).
+pub fn canonicalize_catalog_for_enforcement(
+    catalog: &formwork_blueprint::ResolvedCatalog,
+) -> Result<formwork_blueprint::ResolvedCatalog> {
+    let map = |ps: &[PathPattern]| ps.iter().map(canon_pattern).collect::<Result<Vec<_>>>();
+    let mut out = catalog.clone();
+    for entry in out.types.values_mut() {
+        entry.paths = map(&entry.paths)?;
+    }
+    out.backstop = map(&catalog.backstop)?;
     Ok(out)
 }
 
@@ -274,7 +303,10 @@ mod tests {
             bp.fs.read_mode,
             formwork_blueprint::ReadMode::AmbientMinusSubtract
         );
-        assert_eq!(bp.fs.subtract, vec![PathPattern::parse("/etc/shadow").unwrap()]);
+        assert_eq!(
+            bp.fs.subtract,
+            vec![PathPattern::parse("/etc/shadow").unwrap()]
+        );
         assert_eq!(
             bp.fs.writes,
             vec![PathPattern::parse("/work/project/**").unwrap()]
@@ -295,7 +327,11 @@ mod tests {
     #[test]
     fn diamond_extends_is_not_a_cycle() {
         let dir = Scratch::new("diamond");
-        std::fs::write(dir.path().join("d.toml"), "[fs]\nsubtract = [\"/etc/shadow\"]\n").unwrap();
+        std::fs::write(
+            dir.path().join("d.toml"),
+            "[fs]\nsubtract = [\"/etc/shadow\"]\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("b.toml"), "extends = [\"d.toml\"]\n").unwrap();
         std::fs::write(dir.path().join("c.toml"), "extends = [\"d.toml\"]\n").unwrap();
         std::fs::write(
@@ -304,7 +340,10 @@ mod tests {
         )
         .unwrap();
         let bp = load(&dir.path().join("a.toml"), "/home/x").unwrap();
-        assert_eq!(bp.fs.subtract, vec![PathPattern::parse("/etc/shadow").unwrap()]);
+        assert_eq!(
+            bp.fs.subtract,
+            vec![PathPattern::parse("/etc/shadow").unwrap()]
+        );
     }
 
     #[test]

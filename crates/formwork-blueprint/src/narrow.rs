@@ -5,8 +5,8 @@
 
 use crate::path::{canonicalize_set, PathPattern};
 use crate::{
-    Blueprint, DiscoveryBlueprint, EnvPosture, EnvScrub, ExecPosture, FsBlueprint, Gate,
-    McpPolicy, NetPosture, ReadMode, Visibility,
+    Blueprint, DiscoveryBlueprint, EnvPosture, EnvScrub, ExecPosture, FsBlueprint, Gate, McpPolicy,
+    NetPosture, ReadMode, Visibility,
 };
 
 fn clamp_to(subject: &[PathPattern], bound: &[PathPattern]) -> Vec<PathPattern> {
@@ -17,8 +17,10 @@ fn clamp_to(subject: &[PathPattern], bound: &[PathPattern]) -> Vec<PathPattern> 
         .collect()
 }
 
-/// Subset of both inputs.
-fn intersect_grants(a: &[PathPattern], b: &[PathPattern]) -> Vec<PathPattern> {
+/// Subset of both inputs. Public because the compiler clamps the credential-floor exemption to
+/// the blueprint's own grant surface with it (FW-CRED5) -- an exemption must lift a floor hole,
+/// never widen a grant.
+pub fn intersect_grants(a: &[PathPattern], b: &[PathPattern]) -> Vec<PathPattern> {
     let mut out = clamp_to(a, b);
     out.extend(clamp_to(b, a));
     canonicalize_set(&out)

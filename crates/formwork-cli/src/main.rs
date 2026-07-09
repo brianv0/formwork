@@ -25,7 +25,9 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use formwork_blueprint::{Blueprint, BlueprintLayer, McpPolicy, NetPosture, PathPattern};
+use formwork_blueprint::{
+    Blueprint, BlueprintLayer, McpPolicy, NetPosture, PathPattern, ResolvedCatalog,
+};
 use formwork_compile::compile;
 use formwork_detect::{detect, HostProfile};
 
@@ -256,7 +258,9 @@ fn main() -> Result<()> {
         } => {
             let blueprint = blueprint.load(&home())?;
             let host = resolve_host(&host, &target)?;
-            let policy = compile(&blueprint, &host);
+            let catalog = ResolvedCatalog::builtin_for_home(&home())
+                .context("resolving credential catalog")?;
+            let policy = compile(&blueprint, &host, &catalog);
             if report_only {
                 println!("{}", serde_json::to_string_pretty(&policy.report)?);
             } else {
@@ -283,18 +287,24 @@ fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<
     let blueprint = blueprint.load(&home())?;
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
-    // faithfully rendered (FW-INV6).
+    // faithfully rendered (FW-INV6). The catalog's paths get the same treatment -- a floor hole
+    // that silently failed to match would be a fail-open of the sensitive set.
     let blueprint = blueprint_load::canonicalize_for_enforcement(&blueprint)
         .context("canonicalizing grant paths")?;
+    let catalog =
+        ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
+    let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
+        .context("canonicalizing credential catalog paths")?;
     let host = detect();
-    let policy = compile(&blueprint, &host);
+    let policy = compile(&blueprint, &host, &catalog);
+    itemize_credential_floor(&policy.report);
 
     let (program, args) = argv.split_first().expect("argv is required");
     match posture {
         Posture::Spawn => {
             let mut command = Command::new(program);
             command.args(args);
-            apply_env(&mut command, &blueprint.env);
+            apply_env(&mut command, &blueprint, &catalog);
             formwork_confine::spawn_confined(&mut command, &policy)
                 .context("applying confinement")?;
             tracing::info!(program = %program, "spawning confined command");
@@ -305,27 +315,57 @@ fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<
         Posture::Self_ => {
             formwork_confine::enforce_self(&policy).context("confining self")?;
             tracing::info!(program = %program, "exec after confine-self");
-            let err = exec_replace(program, args, &blueprint.env);
+            let err = exec_replace(program, args, &blueprint, &catalog);
             bail!("exec failed after confine-self: {err}");
         }
     }
 }
 
-/// Build the confined child's environment per the blueprint (FW-ENV1/2). Impure -- it reads the real
-/// process environment -- so it lives in the CLI shell, not the pure compiler. Passthrough leaves the
-/// inherited environment untouched; otherwise the child's env is rebuilt from the filtered set.
-fn apply_env(command: &mut Command, env: &formwork_blueprint::EnvPosture) {
-    use formwork_blueprint::EnvPosture;
-    if matches!(env, EnvPosture::Passthrough) {
-        return;
-    }
+/// The operator channel's compile-time itemization (FW-CRED7): which catalog types are enforced
+/// and which were deliberately let through. The confined agent never sees this -- its channel is
+/// the bare EACCES / the absent variable (FW-INV9).
+fn itemize_credential_floor(report: &formwork_compile::FidelityReport) {
+    let creds = &report.credentials;
+    let path_types: Vec<&str> = creds
+        .per_type
+        .iter()
+        .filter(|(_, f)| f.path.is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let env_types: Vec<&str> = creds
+        .per_type
+        .iter()
+        .filter(|(_, f)| f.env.is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    tracing::info!(
+        catalog_version = creds.catalog_version,
+        denied_path_types = ?path_types,
+        stripped_env_types = ?env_types,
+        allowed = ?creds.allowed,
+        "credential catalog floor"
+    );
+}
+
+/// The launcher arm (FEP-2 §6): build the confined child's environment -- posture first
+/// (FW-ENV1/2), then the credential-catalog strip (FW-CRED2/4). Impure -- it reads the real
+/// process environment -- so it lives in the CLI shell; the decision itself is the pure
+/// `construct_env`. Itemization is names and types only, never values (FW-CRED7).
+fn apply_env(command: &mut Command, blueprint: &Blueprint, catalog: &ResolvedCatalog) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
-    let dropped = env.dropped_names(&vars);
+    let built = formwork_blueprint::construct_env(
+        &blueprint.env,
+        catalog,
+        &blueprint.allow_credentials,
+        vars,
+    );
     command.env_clear();
-    command.envs(env.apply(vars));
-    if !dropped.is_empty() {
-        // Names only -- never values (secrets never hit logs).
-        tracing::info!(count = dropped.len(), dropped = ?dropped, "scrubbed environment variables");
+    command.envs(built.kept.iter().cloned());
+    if !built.posture_dropped.is_empty() {
+        tracing::info!(count = built.posture_dropped.len(), dropped = ?built.posture_dropped, "scrubbed environment variables");
+    }
+    if !built.stripped.is_empty() {
+        tracing::info!(stripped = ?built.stripped, "credential catalog: env vars stripped by the launcher");
     }
 }
 
@@ -337,6 +377,10 @@ fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Resul
     let blueprint = blueprint.load(&home())?;
     let blueprint = blueprint_load::canonicalize_for_enforcement(&blueprint)
         .context("canonicalizing grant paths")?;
+    let catalog =
+        ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
+    let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
+        .context("canonicalizing credential catalog paths")?;
 
     // An unlisted server is a config error, not a silent deny: a typo would otherwise masquerade as
     // a backend that legitimately exposes nothing, hiding the mistake.
@@ -345,10 +389,14 @@ fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Resul
         anyhow!("blueprint has no [mcp.{server}] policy (known servers: {known:?})")
     })?;
 
-    let backend_policy = compile(&blueprint, &detect());
+    let backend_policy = compile(&blueprint, &detect(), &catalog);
+    itemize_credential_floor(&backend_policy.report);
     let (program, args) = argv.split_first().expect("argv is required");
-    let backend = formwork_gateway::confined_command(program, args, &backend_policy)
+    let mut backend = formwork_gateway::confined_command(program, args, &backend_policy)
         .context("building confined backend command")?;
+    // The gateway is a launcher too: the backend it spawns is part of the session, so the same
+    // env construction applies (FW-CRED2 env arm; FW-INV7 covers the whole tree).
+    apply_env(&mut backend, &blueprint, &catalog);
 
     tracing::info!(server = %server, backend = %program, "starting MCP gateway");
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -385,11 +433,12 @@ async fn proxy(backend: Command, policy: McpPolicy) -> Result<()> {
 fn exec_replace(
     program: &str,
     args: &[String],
-    env: &formwork_blueprint::EnvPosture,
+    blueprint: &Blueprint,
+    catalog: &ResolvedCatalog,
 ) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(program);
     command.args(args);
-    apply_env(&mut command, env);
+    apply_env(&mut command, blueprint, catalog);
     command.exec()
 }

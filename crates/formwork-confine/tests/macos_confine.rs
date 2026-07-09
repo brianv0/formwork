@@ -9,8 +9,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use formwork_blueprint::ResolvedCatalog;
 use formwork_blueprint::{Blueprint, FsBlueprint, PathPattern, ReadMode};
-use formwork_compile::compile;
+
+/// Integration tests enforce what the product enforces: the builtin catalog resolved for the
+/// real home. The probes below touch only scratch paths, so the floor never interferes.
+fn compile(
+    blueprint: &formwork_blueprint::Blueprint,
+    host: &formwork_detect::HostProfile,
+) -> formwork_compile::CompiledPolicy {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    formwork_compile::compile(
+        blueprint,
+        host,
+        &ResolvedCatalog::builtin_for_home(&home).unwrap(),
+    )
+}
 use formwork_detect::detect;
 
 fn pp(p: &Path) -> PathPattern {

@@ -179,14 +179,19 @@ mod tests {
         let a = layer_toml(r#"net = { ports = [443] }"#);
         let b = layer_toml(r#"[fs]"#); // sets nothing
         let c = layer_toml(r#"net = "deny""#);
-        assert_eq!(merge(&[a.clone(), b.clone()]).net, NetPosture::Ports(vec![443]));
+        assert_eq!(
+            merge(&[a.clone(), b.clone()]).net,
+            NetPosture::Ports(vec![443])
+        );
         assert_eq!(merge(&[a, b, c]).net, NetPosture::Deny);
     }
 
     #[test]
     fn read_mode_unset_inherits_rather_than_meaning_closed() {
-        let base = layer_toml(r#"[fs]
-            read-mode = "ambient-minus-subtract""#);
+        let base = layer_toml(
+            r#"[fs]
+            read-mode = "ambient-minus-subtract""#,
+        );
         let over = layer_toml(
             r#"[fs]
             writes = ["/work/project/**"]"#,
@@ -258,8 +263,10 @@ mod tests {
     #[test]
     fn merge_is_deterministic_across_repeats() {
         let layers = vec![
-            layer_toml(r#"[fs]
-                reads = ["/b/**", "/a/**"]"#),
+            layer_toml(
+                r#"[fs]
+                reads = ["/b/**", "/a/**"]"#,
+            ),
             layer_toml(r#"net = { ports = [8080, 443] }"#),
         ];
         assert_eq!(merge(&layers), merge(&layers));
@@ -320,6 +327,9 @@ mod tests {
             net: NetPosture::Ports(vec![443]),
             ..Blueprint::empty()
         };
-        assert_eq!(merge(&[BlueprintLayer::from_blueprint(&bp)]), bp.canonicalize());
+        assert_eq!(
+            merge(&[BlueprintLayer::from_blueprint(&bp)]),
+            bp.canonicalize()
+        );
     }
 }

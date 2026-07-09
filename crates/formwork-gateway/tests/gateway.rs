@@ -298,6 +298,7 @@ async fn fw_e2e_019_backend_confinement_recursion() {
     use std::path::Path;
     use std::process::Stdio;
 
+    use formwork_blueprint::ResolvedCatalog;
     use formwork_blueprint::{Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode};
     use formwork_compile::compile;
     use formwork_detect::detect;
@@ -320,7 +321,12 @@ async fn fw_e2e_019_backend_confinement_recursion() {
         net: NetPosture::Deny,
         ..Blueprint::empty()
     };
-    let backend_policy = compile(&backend_blueprint, &detect());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let backend_policy = compile(
+        &backend_blueprint,
+        &detect(),
+        &ResolvedCatalog::builtin_for_home(&home).unwrap(),
+    );
 
     let std_cmd = formwork_gateway::confined_command(
         env!("CARGO_BIN_EXE_fw-mcp-fixture"),

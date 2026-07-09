@@ -11,8 +11,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
+use formwork_blueprint::ResolvedCatalog;
 use formwork_blueprint::{Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode};
-use formwork_compile::{compile, Capability, CompiledPolicy};
+use formwork_compile::{Capability, CompiledPolicy};
+
+/// Integration tests enforce what the product enforces: the builtin catalog for the real home.
+fn compile(
+    blueprint: &formwork_blueprint::Blueprint,
+    host: &formwork_detect::HostProfile,
+) -> CompiledPolicy {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    formwork_compile::compile(
+        blueprint,
+        host,
+        &ResolvedCatalog::builtin_for_home(&home).unwrap(),
+    )
+}
 use formwork_detect::detect;
 use formwork_seam::{inject, SeamPlan};
 
