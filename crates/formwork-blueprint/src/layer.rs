@@ -127,9 +127,11 @@ pub fn merge(layers: &[BlueprintLayer]) -> Blueprint {
     out.canonicalize()
 }
 
+#[cfg(test)]
 impl BlueprintLayer {
     /// A full Blueprint viewed as one layer: what a pre-layering single-file blueprint contributes.
     /// `merge(&[layer_from(bp)])` equals `bp.canonicalize()` -- the FW-E2E-041 refactor guard.
+    /// Test-only until an embedder needs it (Growth: no consumer, no API).
     pub fn from_blueprint(bp: &Blueprint) -> BlueprintLayer {
         BlueprintLayer {
             extends: Vec::new(),

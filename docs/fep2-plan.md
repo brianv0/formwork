@@ -321,3 +321,59 @@ Each phase lands compiling, clippy-clean, and green before the next begins.
 4. **Auto-widen zone: empty by default.** The operator draws it; nothing self-grants out
    of the box.
 5. **Credential brokering: deferred** to a later FEP (unchanged).
+
+## 8. Constitutional review of the execution (post-implementation)
+
+Reviewed section-by-section against `constitution.md`, over the full branch diff.
+
+- **Supremacy / mechanical.** `cargo fmt --check` clean; `clippy --workspace --all-targets
+  -D warnings` clean; 25 Rust test binaries and 32 Python E2E tests green on macOS against
+  real Seatbelt and the real unified-log feed; the workspace cross-checks for
+  `x86_64-unknown-linux-gnu`.
+- **Concepts.** Two additions (Catalog, Launcher) amended into the closed list *by this FEP* —
+  amendment-by-proposal honored. No parallel concepts: layering is how a Blueprint is
+  assembled; discovery is a workflow over launcher + confiner + report; its artifacts are
+  named Data-model surfaces. No new door for the agent: the denial feed is operator-side.
+- **Data model.** Input schema growth is additive — every pre-FEP-2 blueprint parses and
+  compiles unchanged (FW-E2E-041). The report change (credentials section, `process`→
+  `launcher` backend rename) shipped WITH the 0.2.0 bump. `deny_unknown_fields` on every new
+  input type. `sensitive-set.toml` pruned at this release (event-triggered), content migrated
+  into the catalog.
+- **Vocabulary.** floor / strip / exclude / learn / withheld / accept / provenance recorded,
+  one meaning each. A `deny` synonym for `subtract` was deliberately NOT introduced (FW-BP4
+  amended instead).
+- **Boundaries.** Each new external input parses once at its edge: layer files and `--set`
+  fragments (loader), the embedded catalog (parse-once, unit-validated), env-file-ref values
+  (loader, loud on non-UTF-8), unified-log ndjson (learn edge → `DenialRecord`), proposals
+  (accept edge). No secret values anywhere in artifacts or telemetry — names and types only,
+  asserted by FW-E2E-046 (the injected value never appears in any output).
+- **Errors.** New failure paths are closed-or-loud: unknown credential type (lists known),
+  extends cycle (names the cycle), un-renderable floor/env-file-ref path (refuses, FW-INV6),
+  provenance-less discovered grant (refused), feed-less learning (runs enforced, warns, writes
+  nothing), forged proposal (refused at the floor).
+- **Observability.** New boundary events (floor itemization, strip itemization, learning
+  banner/summary/withheld, discovered-layer load, accept) are structured tracing on stderr;
+  stdout stays a pure result stream (byte-compared by the parity/determinism tests).
+- **Layers.** Direction unchanged; pure decisions (merge, catalog resolution, `construct_env`,
+  `reverse_compile`) in the domain crate, IO/env/log/spawn in the CLI shell. `compile()`
+  stays kernel-free — the catalog became an explicit *input* precisely to keep it pure.
+- **Growth.** One dependency change: `toml` dev→regular in `formwork-blueprint` (already in
+  the binary's trust base; justified in the manifest). The pattern grammar was NOT extended
+  (glob refused, §0 C3). Three test-only APIs pruned or gated during this review
+  (`floors()`, `parse_sandbox_denial` visibility, `from_blueprint` cfg(test));
+  `gateway()` refolded onto `prepare_session` to remove a duplicated prologue.
+- **Testing.** No mocks; kernel probes are paired allow/deny against real Seatbelt; the
+  denial feed is the real unified log. The pure-input carve-out is used only for compile
+  determinism (fixed home) and unit isolation (`empty_no_floor`, loudly named). Traceability
+  is generated from markers: FW-E2E-041..054 and FW-ADV-012..014, 17/17 implemented and green.
+- **Precedence & conflicts.** The three fep2.md drafting conflicts were resolved by visible
+  amendment (§0), never silent deviation. Known, *reported* residuals — honesty-pattern gaps,
+  not suspended rules: (a) any-depth floor rows are withheld on Linux and the affected types
+  + backstop reported Partial (FW-INV5); (b) the denial feed is macOS-only, Linux learning
+  warns loud and writes nothing; (c) FW-E2E-051 exercises the learning property with a
+  hermetic scripted workload because the FW-E2E-020 reuse fixtures do not exist yet; (d) log
+  attribution is window+dedup — over-capture is floored or review-gated by design (FW-INV10).
+
+Follow-ups noted, not blocking: full `formwork.md` reintegration (FEP-1 precedent: separate
+docs PR); a Linux denial feed via Landlock audit (kernel 6.15+) when a test kernel exists;
+host-example READMEs could mention `--allow-cred` explicitly.

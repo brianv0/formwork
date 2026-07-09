@@ -2,7 +2,7 @@
 
 **Formwork Enhancement Proposal 2**
 
-- **Status:** Accepted / in implementation. Amended at execution planning: test IDs renumbered to avoid collisions with landed FW-E2E-036..039 and `fep-1.md`'s reserved blocks, FW-BP2's layer order corrected, FW-BP4 pinned to the FW-CAP6 pattern grammar. Rationale and mapping in `docs/fep2-plan.md` §0.
+- **Status:** Implemented (branch `fep-2-implementation`; verified on real Seatbelt + the unified-log denial feed). Amended at execution planning: test IDs renumbered to avoid collisions with landed FW-E2E-036..039 and `fep-1.md`'s reserved blocks, FW-BP2's layer order corrected, FW-BP4 pinned to the FW-CAP6 pattern grammar. Rationale and mapping in `docs/fep2-plan.md` §0.
 - **Depends on:** the base Formwork design document (`formwork.md`)
 - **Scope:** terminology change (spec → Blueprint), a Blueprint format/override model, a typed credential-location catalog, and an on-demand allow-listing (discovery) workflow.
 - **Introduces:** a third enforcement arm — the **launcher** — alongside the existing confiner and gateway.

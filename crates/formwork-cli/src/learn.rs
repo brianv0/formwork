@@ -44,7 +44,7 @@ pub fn discovered_path(blueprint: &Path) -> PathBuf {
 
 /// One unified-log Sandbox record: `Sandbox: cat(29810) deny(1) file-read-data /private/tmp/x`.
 /// Returns the denial with the kernel-resolved path, or None for lines that are not fs denials.
-pub fn parse_sandbox_denial(event_message: &str) -> Option<DenialRecord> {
+fn parse_sandbox_denial(event_message: &str) -> Option<DenialRecord> {
     let message = event_message
         .strip_prefix("Sandbox: ")
         .unwrap_or(event_message);

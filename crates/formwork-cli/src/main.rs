@@ -484,36 +484,21 @@ fn apply_env(command: &mut Command, blueprint: &Blueprint, catalog: &ResolvedCat
 /// `[mcp.<server>]` entry shades the protocol, its fs/net grant confines the backend the same way
 /// `run` confines any command (FW-GW5), so the backend spawns behind the same wall.
 fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Result<()> {
-    let mut blueprint = blueprint.load(&home())?;
-    let catalog =
-        ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
-    blueprint
-        .fs
-        .subtract
-        .extend(blueprint_load::env_file_ref_denies(
-            &catalog,
-            &blueprint.allow_credentials,
-        )?);
-    let blueprint = blueprint_load::canonicalize_for_enforcement(&blueprint)
-        .context("canonicalizing grant paths")?;
-    let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
-        .context("canonicalizing credential catalog paths")?;
+    let session = prepare_session(&blueprint)?;
 
     // An unlisted server is a config error, not a silent deny: a typo would otherwise masquerade as
     // a backend that legitimately exposes nothing, hiding the mistake.
-    let policy = blueprint.mcp.get(&server).cloned().ok_or_else(|| {
-        let known: Vec<&str> = blueprint.mcp.keys().map(String::as_str).collect();
+    let policy = session.blueprint.mcp.get(&server).cloned().ok_or_else(|| {
+        let known: Vec<&str> = session.blueprint.mcp.keys().map(String::as_str).collect();
         anyhow!("blueprint has no [mcp.{server}] policy (known servers: {known:?})")
     })?;
 
-    let backend_policy = compile(&blueprint, &detect(), &catalog);
-    itemize_credential_floor(&backend_policy.report);
     let (program, args) = argv.split_first().expect("argv is required");
-    let mut backend = formwork_gateway::confined_command(program, args, &backend_policy)
+    let mut backend = formwork_gateway::confined_command(program, args, &session.policy)
         .context("building confined backend command")?;
     // The gateway is a launcher too: the backend it spawns is part of the session, so the same
     // env construction applies (FW-CRED2 env arm; FW-INV7 covers the whole tree).
-    apply_env(&mut backend, &blueprint, &catalog);
+    apply_env(&mut backend, &session.blueprint, &session.catalog);
 
     tracing::info!(server = %server, backend = %program, "starting MCP gateway");
     let runtime = tokio::runtime::Builder::new_current_thread()

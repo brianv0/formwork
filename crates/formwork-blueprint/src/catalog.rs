@@ -166,12 +166,6 @@ impl ResolvedCatalog {
             .map(|(name, entry)| (name.as_str(), entry))
     }
 
-    /// Does any still-enforced catalog path (or backstop row) match this pattern? The discovery
-    /// floor (FW-DISC3/FW-INV8): a matching denial is never proposable.
-    pub fn floors(&self, allow: &[String], candidate: &PathPattern) -> bool {
-        self.floor_type_of(allow, candidate).is_some()
-    }
-
     /// Which type floors this candidate (or [`BACKSTOP`]), for the operator-channel "why"
     /// (FW-CRED7). A candidate subtree that would swallow a type's directory is floored too; a
     /// subtree that merely *could* contain future backstop matches is not -- the backstop keeps
@@ -285,15 +279,16 @@ mod tests {
     }
 
     #[test]
-    fn floors_matches_paths_under_catalog_patterns() {
+    fn floor_type_of_matches_paths_under_catalog_patterns() {
         let resolved = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
         let probe = PathPattern::parse("/home/x/.ssh/id_ed25519").unwrap();
-        assert!(resolved.floors(&[], &probe));
-        assert!(
-            !resolved.floors(&["ssh".to_string()], &probe),
-            "excluding ssh lifts its floor"
+        assert_eq!(resolved.floor_type_of(&[], &probe).as_deref(), Some("ssh"));
+        assert_eq!(
+            resolved.floor_type_of(&["ssh".to_string()], &probe),
+            None,
+            "excluding ssh lifts its floor (backstop included, mirroring enforcement)"
         );
         let ordinary = PathPattern::parse("/home/x/project/main.rs").unwrap();
-        assert!(!resolved.floors(&[], &ordinary));
+        assert_eq!(resolved.floor_type_of(&[], &ordinary), None);
     }
 }
