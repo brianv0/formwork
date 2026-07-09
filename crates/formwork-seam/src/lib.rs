@@ -533,7 +533,7 @@ mod imp {
             let got = got.expect("an fd should have been received");
 
             // SAFETY: valid fds; single-byte read/write into owned buffers.
-            let wrote = unsafe { libc::write(write_end.as_raw_fd(), [b'z'].as_ptr().cast(), 1) };
+            let wrote = unsafe { libc::write(write_end.as_raw_fd(), b"z".as_ptr().cast(), 1) };
             assert_eq!(wrote, 1);
             let mut buf = [0u8; 1];
             let read = unsafe { libc::read(got.as_raw_fd(), buf.as_mut_ptr().cast(), 1) };
