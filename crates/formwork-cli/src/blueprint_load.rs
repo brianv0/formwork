@@ -153,6 +153,48 @@ pub fn canonicalize_for_enforcement(blueprint: &Blueprint) -> Result<Blueprint> 
     Ok(out)
 }
 
+/// FW-CRED3: an enforced env-points-to-file credential (`GOOGLE_APPLICATION_CREDENTIALS`,
+/// `KUBECONFIG`) is stripped as a variable AND the file its value names is denied. The value
+/// lives in the launcher's own environment -- impure -- so this is loader-edge code; the result
+/// joins the blueprint's subtract set before enforcement-time canonicalization. A set value we
+/// cannot faithfully render into a deny fails loud: leaving the referenced file readable while
+/// claiming the type enforced would be a silent fail-open (FW-INV6).
+pub fn env_file_ref_denies(
+    catalog: &formwork_blueprint::ResolvedCatalog,
+    allow: &[String],
+) -> Result<Vec<PathPattern>> {
+    let cwd = std::env::current_dir().context("resolving cwd for env-file-ref denies")?;
+    let mut out = Vec::new();
+    for (type_name, entry) in catalog.enforced_types(allow) {
+        for var in &entry.env_file_refs {
+            let Some(raw) = std::env::var_os(var) else {
+                continue;
+            };
+            let value = raw.to_str().ok_or_else(|| {
+                anyhow!(
+                    "{var} (credential type {type_name}) holds a non-UTF-8 path; refusing to \
+                     enforce a deny that might silently not match (FW-INV6)"
+                )
+            })?;
+            if value.is_empty() {
+                continue;
+            }
+            let absolute = if Path::new(value).is_absolute() {
+                PathBuf::from(value)
+            } else {
+                cwd.join(value)
+            };
+            let pattern = absolute
+                .to_str()
+                .ok_or_else(|| anyhow!("{var} resolves to a non-UTF-8 path; refusing (FW-INV6)"))?;
+            out.push(PathPattern::parse(pattern).with_context(|| {
+                format!("{var} (credential type {type_name}) does not name a deniable path")
+            })?);
+        }
+    }
+    Ok(out)
+}
+
 /// The catalog's floor patterns get the same enforcement-time resolution as grants: a hole that
 /// silently failed to match the kernel's resolved path would be a fail-open of the sensitive set
 /// (FW-INV6).

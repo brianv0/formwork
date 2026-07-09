@@ -284,15 +284,24 @@ enum Posture {
 }
 
 fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<()> {
-    let blueprint = blueprint.load(&home())?;
+    let mut blueprint = blueprint.load(&home())?;
+    let catalog =
+        ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
+    // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
+    // blueprint's enforcement-time canonicalization resolves everything together.
+    blueprint
+        .fs
+        .subtract
+        .extend(blueprint_load::env_file_ref_denies(
+            &catalog,
+            &blueprint.allow_credentials,
+        )?);
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
     // faithfully rendered (FW-INV6). The catalog's paths get the same treatment -- a floor hole
     // that silently failed to match would be a fail-open of the sensitive set.
     let blueprint = blueprint_load::canonicalize_for_enforcement(&blueprint)
         .context("canonicalizing grant paths")?;
-    let catalog =
-        ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
     let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
         .context("canonicalizing credential catalog paths")?;
     let host = detect();
@@ -374,11 +383,18 @@ fn apply_env(command: &mut Command, blueprint: &Blueprint, catalog: &ResolvedCat
 /// `[mcp.<server>]` entry shades the protocol, its fs/net grant confines the backend the same way
 /// `run` confines any command (FW-GW5), so the backend spawns behind the same wall.
 fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Result<()> {
-    let blueprint = blueprint.load(&home())?;
-    let blueprint = blueprint_load::canonicalize_for_enforcement(&blueprint)
-        .context("canonicalizing grant paths")?;
+    let mut blueprint = blueprint.load(&home())?;
     let catalog =
         ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
+    blueprint
+        .fs
+        .subtract
+        .extend(blueprint_load::env_file_ref_denies(
+            &catalog,
+            &blueprint.allow_credentials,
+        )?);
+    let blueprint = blueprint_load::canonicalize_for_enforcement(&blueprint)
+        .context("canonicalizing grant paths")?;
     let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
         .context("canonicalizing credential catalog paths")?;
 

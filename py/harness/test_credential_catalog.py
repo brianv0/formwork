@@ -105,6 +105,32 @@ def test_env_credential_stripped_and_absent_in_tree(cli, fake_home, tmp_path):
     assert "AWS_SECRET_ACCESS_KEY" in operator and '"aws"' in operator, operator
 
 
+@pytest.mark.fw_e2e("FW-E2E-047")
+@pytest.mark.macos
+def test_env_points_to_file_dual_arm(cli, fake_home, tmp_path):
+    """GOOGLE_APPLICATION_CREDENTIALS under the default deny: the variable is stripped AND the
+    file its value names is denied -- even though the file sits inside the readable grant, so the
+    deny is FW-CRED3's, not the grant's."""
+    bp = _blueprint_for(fake_home, tmp_path)
+    sa = fake_home / "project" / "sa.json"
+    sa.write_text('{"type": "service_account", "private_key": "FAKE"}\n')
+    env = {"HOME": str(fake_home), "GOOGLE_APPLICATION_CREDENTIALS": str(sa)}
+
+    # Control: without the env var pointing at it, the file is an ordinary in-grant read.
+    control = cli("run", "--blueprint", bp, "--", "/bin/cat", sa,
+                  cwd=fake_home, env={"HOME": str(fake_home)})
+    assert control.code == 0, control.stderr
+
+    stripped = cli("run", "--blueprint", bp, "--", "/bin/sh", "-c",
+                   'echo "gac=${GOOGLE_APPLICATION_CREDENTIALS-UNSET}"',
+                   cwd=fake_home, env=env)
+    assert "gac=UNSET" in stripped.stdout, stripped.stdout
+
+    denied = cli("run", "--blueprint", bp, "--", "/bin/cat", sa, cwd=fake_home, env=env)
+    assert denied.code != 0, "the referenced file must be denied while the var is set"
+    assert "FAKE" not in denied.stdout
+
+
 @pytest.mark.fw_e2e("FW-E2E-048")
 @pytest.mark.macos
 def test_exclude_by_type_unblocks_exactly_one(cli, fake_home, tmp_path):
