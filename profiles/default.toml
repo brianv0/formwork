@@ -40,12 +40,9 @@ writes = [
     "/var/tmp/**",
 ]
 
-# The sensitive set is no longer listed here: FEP-2's credential catalog
-# (profiles/credential-catalog.toml) is compiled into the binary and denied as a floor under
-# EVERY blueprint (FW-CRED4) -- ssh/cloud/agent-state paths, keychains, browser profiles, system
-# stores, `**/.env`, plus a generic backstop. No layer can carry the floor away; the only lift is
-# the explicit typed exclude, `allow-credentials` / `--allow-cred <type>` (FW-CRED5). Add
-# project-specific denies here; credential locations belong in the catalog.
+# Credential locations live in the compiled-in catalog (profiles/credential-catalog.toml) and are
+# denied under every blueprint (FW-CRED4); only `allow-credentials` lifts a type (FW-CRED5).
+# This list is for project-specific denies.
 subtract = []
 
 # Tamper vectors: write-denied but still READABLE (FW-TRA7). Unlike `subtract` (read+write deny for

@@ -230,15 +230,36 @@ fn filter(p: &PathPattern) -> String {
     }
 }
 
-/// A `**/`-anchored pattern (FW-CAP6) matches its suffix at any depth. Seatbelt regexes are
-/// unanchored, so a leading `/` before the first component pins a component boundary and the
-/// trailing `$` (literal) or `(/|$)` (subtree) pins the end, while the start is free to match at
-/// any depth. E.g. `**/.env` -> `/\.env$`; `**/.git/hooks/**` -> `/\.git/hooks(/|$)`.
+/// An any-depth pattern (FW-CAP6) matches its suffix at any depth. Seatbelt regexes are
+/// unanchored, so for the plain form a leading `/` before the first component pins a component
+/// boundary and the trailing `$` (literal) or `(/|$)` (subtree) pins the end, while the start is
+/// free to match at any depth: `**/.env` -> `/\.env$`. The prefix-anchored form pins the start
+/// too, with zero-or-more directories between: `/home/x/**/credentials` ->
+/// `^/home/x/(.*/)?credentials$`.
 fn any_depth_regex(p: &PathPattern) -> String {
     let mut body = String::new();
-    for comp in p.base().components() {
-        body.push('/');
-        body.push_str(&regex_escape(&comp.as_os_str().to_string_lossy()));
+    if let Some(anchor) = p.anchor() {
+        body.push('^');
+        for comp in anchor.components() {
+            if let std::path::Component::Normal(c) = comp {
+                body.push('/');
+                body.push_str(&regex_escape(&c.to_string_lossy()));
+            }
+        }
+        body.push_str("/(.*/)?");
+        let mut first = true;
+        for comp in p.base().components() {
+            if !first {
+                body.push('/');
+            }
+            first = false;
+            body.push_str(&regex_escape(&comp.as_os_str().to_string_lossy()));
+        }
+    } else {
+        for comp in p.base().components() {
+            body.push('/');
+            body.push_str(&regex_escape(&comp.as_os_str().to_string_lossy()));
+        }
     }
     if p.is_subtree() {
         body.push_str("(/|$)");
@@ -327,6 +348,22 @@ mod tests {
         assert!(
             exempt_allow < operator_deny,
             "operator subtract must win over the exemption"
+        );
+    }
+
+    #[test]
+    fn anchored_any_depth_renders_a_start_pinned_regex() {
+        let mut i = input();
+        i.read_mode = ReadMode::AmbientMinusSubtract;
+        i.floor = vec![pp("/home/x/**/credentials"), pp("/home/x/**/.git/hooks/**")];
+        let s = render(&i);
+        assert!(
+            s.contains("(deny file-read* (regex #\"^/home/x/(.*/)?credentials$\"))"),
+            "{s}"
+        );
+        assert!(
+            s.contains("(deny file-read* (regex #\"^/home/x/(.*/)?\\.git/hooks(/|$)\"))"),
+            "{s}"
         );
     }
 

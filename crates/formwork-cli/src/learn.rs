@@ -336,8 +336,13 @@ pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -
         bail!("no needs-review candidate matched the selection (run with no selection to list)");
     }
 
+    // Same enforcement-time resolution as a run: proposal paths are kernel-resolved, so a
+    // catalog left unresolved (a `/tmp`-based home vs the kernel's `/private/tmp`) would let a
+    // forged entry slip past the type rows -- the floor must be held in kernel coordinates.
     let catalog = ResolvedCatalog::builtin_for_home(home)
         .context("resolving credential catalog for the acceptance floor check")?;
+    let catalog = crate::blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
+        .context("canonicalizing credential catalog paths")?;
     for entry in &selected {
         if let Some(credential_type) = catalog.floor_type_of(&[], &entry.candidate.pattern) {
             bail!(

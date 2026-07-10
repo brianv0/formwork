@@ -1,7 +1,10 @@
-//! Path patterns: normalized absolute paths with an optional `/**` subtree marker, plus a `**/`
-//! recursive-basename form that matches a suffix at any depth (FW-CAP6). Normalization (lexical
-//! `.`/`..`, collapsed slashes, no trailing slash) makes equal scopes compare equal, which keeps
-//! compilation deterministic and narrowing exact. `~` is expanded by the CLI, not here.
+//! Path patterns: normalized absolute paths with an optional `/**` subtree marker, plus two
+//! any-depth forms (FW-CAP6): the recursive-basename form `**/<suffix>` matching at any depth
+//! anywhere, and its prefix-anchored refinement `<prefix>/**/<suffix>` matching only below the
+//! absolute prefix (added at FEP-2 review so shape rules can be scoped, e.g. to `~`).
+//! Normalization (lexical `.`/`..`, collapsed slashes, no trailing slash) makes equal scopes
+//! compare equal, which keeps compilation deterministic and narrowing exact. `~` is expanded by
+//! the CLI, not here.
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -14,8 +17,11 @@ pub struct PathPattern {
     /// Absolute when `any_depth` is false; a relative suffix when it is true.
     base: PathBuf,
     subtree: bool,
-    /// A leading `**/`: match `base` as a trailing/containing component sequence at any depth.
+    /// A `**/`: match `base` as a trailing/containing component sequence at any depth.
     any_depth: bool,
+    /// Only with `any_depth`: restrict matches to paths below this absolute prefix
+    /// (`<prefix>/**/<suffix>`). `None` matches at any depth from the root (`**/<suffix>`).
+    anchor: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -50,6 +56,42 @@ impl PathPattern {
                 base,
                 subtree,
                 any_depth: true,
+                anchor: None,
+            });
+        }
+
+        // Anchored any-depth form: `<prefix>/**/<suffix>` matches the suffix at any depth BELOW
+        // the absolute prefix (including directly below it). Keeps shape rules scoped -- e.g. the
+        // credential backstop anchors under `~` instead of the whole filesystem.
+        if let Some(split_at) = input.find("/**/") {
+            if !input.starts_with('/') {
+                return Err(PathError::NotAbsolute(input.to_string()));
+            }
+            let prefix_part = &input[..split_at];
+            let rest = &input[split_at + 4..];
+            let (suffix_part, subtree) = match rest.strip_suffix("/**") {
+                Some(s) => (s, true),
+                None => (rest, false),
+            };
+            if suffix_part.is_empty() {
+                return Err(PathError::Empty);
+            }
+            let anchor = normalize_absolute(if prefix_part.is_empty() {
+                "/"
+            } else {
+                prefix_part
+            })
+            .filter(|a| !a.components().any(|c| c.as_os_str() == "**"))
+            .ok_or_else(|| PathError::EscapesRoot(input.to_string()))?;
+            let base = normalize_relative(suffix_part)
+                .ok_or_else(|| PathError::EscapesRoot(input.to_string()))?;
+            // A root anchor adds nothing over the plain form; normalize so equal scopes compare equal.
+            let anchor = (anchor != Path::new("/")).then_some(anchor);
+            return Ok(PathPattern {
+                base,
+                subtree,
+                any_depth: true,
+                anchor,
             });
         }
 
@@ -71,6 +113,7 @@ impl PathPattern {
             base,
             subtree,
             any_depth: false,
+            anchor: None,
         })
     }
 
@@ -82,19 +125,41 @@ impl PathPattern {
         self.subtree
     }
 
-    /// True for the `**/`-anchored recursive-basename form (FW-CAP6). The `base` is then a relative
-    /// suffix, and enforcement matches it at any depth (a regex on Seatbelt).
+    /// True for both any-depth forms (FW-CAP6): `**/<suffix>` and `<prefix>/**/<suffix>`. The
+    /// `base` is then a relative suffix, and enforcement matches it by regex on Seatbelt; Landlock
+    /// cannot root either form.
     pub fn is_any_depth(&self) -> bool {
         self.any_depth
+    }
+
+    /// The absolute prefix of an anchored any-depth pattern, if any.
+    pub fn anchor(&self) -> Option<&Path> {
+        self.anchor.as_deref()
+    }
+
+    /// The location-independent shape of an anchored any-depth pattern: drop the anchor so the
+    /// suffix matches at any depth from the root (`<prefix>/**/<suffix>` -> `**/<suffix>`). A
+    /// pattern with no anchor is returned unchanged. The discovery floor uses this so a credential
+    /// *shape* is classified wherever the kernel observed the denial -- even outside `$HOME`, where
+    /// the unified-log feed can surface it (FW-DISC3 over-capture) -- while enforcement keeps the
+    /// bounded, anchored row (FW-CRED6/FW-INV8).
+    pub fn unanchored(&self) -> PathPattern {
+        PathPattern {
+            base: self.base.clone(),
+            subtree: self.subtree,
+            any_depth: self.any_depth,
+            anchor: None,
+        }
     }
 
     /// Round-trips through `parse`.
     pub fn canonical(&self) -> String {
         if self.any_depth {
-            if self.subtree {
-                format!("**/{}/**", self.base.display())
-            } else {
-                format!("**/{}", self.base.display())
+            match (&self.anchor, self.subtree) {
+                (Some(a), true) => format!("{}/**/{}/**", a.display(), self.base.display()),
+                (Some(a), false) => format!("{}/**/{}", a.display(), self.base.display()),
+                (None, true) => format!("**/{}/**", self.base.display()),
+                (None, false) => format!("**/{}", self.base.display()),
             }
         } else if self.subtree {
             if self.base == Path::new("/") {
@@ -123,7 +188,16 @@ impl PathPattern {
                 path == self.base
             };
         }
-        let comps: Vec<Component> = path.components().collect();
+        // Anchored: only paths below the prefix are candidates, and the suffix is matched against
+        // the remainder (zero or more directories between -- `a/**/b` matches `a/b` too).
+        let remainder = match &self.anchor {
+            Some(anchor) => match path.strip_prefix(anchor) {
+                Ok(rest) => rest,
+                Err(_) => return false,
+            },
+            None => path,
+        };
+        let comps: Vec<Component> = remainder.components().collect();
         let suffix: Vec<Component> = self.base.components().collect();
         if suffix.is_empty() || comps.len() < suffix.len() {
             return false;
@@ -137,14 +211,38 @@ impl PathPattern {
 
     pub fn covers(&self, other: &PathPattern) -> bool {
         match (self.any_depth, other.any_depth) {
-            (false, false) | (true, true) => {
+            (false, false) => {
                 if self.subtree {
                     other.base.starts_with(&self.base)
                 } else {
                     !other.subtree && self.base == other.base
                 }
             }
-            (false, true) => self.subtree && self.base == Path::new("/"),
+            (true, true) => {
+                // Every match of `other` must be a match of `self`: the suffix relation as below,
+                // and `self`'s anchor scope must contain `other`'s (an unanchored self contains
+                // every anchor; an anchored self never contains an unanchored other).
+                let anchor_contained = match (&self.anchor, &other.anchor) {
+                    (None, _) => true,
+                    (Some(a), Some(b)) => b.starts_with(a),
+                    (Some(_), None) => false,
+                };
+                anchor_contained
+                    && if self.subtree {
+                        other.base.starts_with(&self.base)
+                    } else {
+                        !other.subtree && self.base == other.base
+                    }
+            }
+            // An absolute subtree covers an any-depth pattern only when it contains every possible
+            // match: the whole filesystem, or -- for an anchored pattern -- its anchor's subtree.
+            (false, true) => {
+                self.subtree
+                    && match &other.anchor {
+                        Some(anchor) => anchor.starts_with(&self.base),
+                        None => self.base == Path::new("/"),
+                    }
+            }
             (true, false) => false,
         }
     }
@@ -341,6 +439,70 @@ mod tests {
         assert!(!p("/work/**").covers(&p("**/.env")));
         // an any-depth pattern is conservatively not taken to cover a fixed path
         assert!(!p("**/.env").covers(&p("/work/.env")));
+    }
+
+    #[test]
+    fn anchored_any_depth_parses_matches_and_covers() {
+        let cred = p("/home/x/**/credentials");
+        assert!(cred.is_any_depth());
+        assert_eq!(cred.anchor().unwrap(), Path::new("/home/x"));
+        assert_eq!(cred.canonical(), "/home/x/**/credentials");
+
+        // Zero or more directories between anchor and suffix.
+        assert!(cred.matches_path(Path::new("/home/x/credentials")));
+        assert!(cred.matches_path(Path::new("/home/x/.someprovider/credentials")));
+        assert!(cred.matches_path(Path::new("/home/x/a/b/credentials")));
+        // Outside the anchor: no match, however well the suffix fits.
+        assert!(!cred.matches_path(Path::new("/etc/credentials")));
+        assert!(!cred.matches_path(Path::new("/home/y/credentials")));
+
+        // Subtree flavor.
+        let hooks = p("/home/x/**/.git/hooks/**");
+        assert!(hooks.is_subtree());
+        assert!(hooks.matches_path(Path::new("/home/x/proj/.git/hooks/pre-commit")));
+        assert!(!hooks.matches_path(Path::new("/srv/proj/.git/hooks/pre-commit")));
+
+        // Coverage: the unanchored form covers the anchored one, never the reverse; an absolute
+        // subtree containing the anchor covers it too.
+        assert!(p("**/credentials").covers(&cred));
+        assert!(!cred.covers(&p("**/credentials")));
+        assert!(p("/home/**").covers(&cred));
+        assert!(!p("/srv/**").covers(&cred));
+        assert!(p("/**").covers(&cred));
+
+        // A root anchor normalizes to the plain form.
+        assert_eq!(p("/**/x").canonical(), "**/x");
+
+        // Dropping the anchor yields the location-independent shape; a match under a *different*
+        // prefix that the anchored form rejects now succeeds (the discovery-floor use).
+        let shape = cred.unanchored();
+        assert_eq!(shape.canonical(), "**/credentials");
+        assert!(shape.matches_path(Path::new("/some/other/home/credentials")));
+        assert!(!cred.matches_path(Path::new("/some/other/home/credentials")));
+        // Unanchoring an already-unanchored (or fixed) pattern is a no-op.
+        assert_eq!(p("**/.env").unanchored(), p("**/.env"));
+        assert_eq!(p("/work/file").unanchored(), p("/work/file"));
+
+        // Serde round-trip.
+        let j = serde_json::to_string(&cred).unwrap();
+        assert_eq!(j, "\"/home/x/**/credentials\"");
+        assert_eq!(serde_json::from_str::<PathPattern>(&j).unwrap(), cred);
+    }
+
+    #[test]
+    fn anchored_rejects_relative_and_multi_glob() {
+        assert!(matches!(
+            PathPattern::parse("home/**/credentials"),
+            Err(PathError::NotAbsolute(_))
+        ));
+        assert!(matches!(
+            PathPattern::parse("/a/**/b/**/c"),
+            Err(PathError::EscapesRoot(_))
+        ));
+        assert!(matches!(
+            PathPattern::parse("/a/**/"),
+            Err(PathError::Empty)
+        ));
     }
 
     #[test]

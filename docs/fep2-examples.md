@@ -18,7 +18,7 @@ extends = ["base.toml"]               # base.toml: net = "deny", ambient reads, 
 
 ```console
 $ formwork run --blueprint session.toml -- /bin/cat project/src/main.py
-2026-07-09T22:22:17Z  INFO formwork{run_id=35497 cmd="run"}: credential floor active (RUST_LOG=debug itemizes per type) path_types=21 env_types=11 catalog_version=1 allowed=[]
+2026-07-09T22:22:17Z  INFO formwork{run_id=35497 cmd="run"}: credential floor active (RUST_LOG=debug itemizes per type) path_types=22 env_types=11 catalog_version=1 allowed=[]
 2026-07-09T22:22:17Z  INFO formwork{run_id=35497 cmd="run"}: configuring confinement posture="spawn" backend="seatbelt"
 2026-07-09T22:22:17Z  INFO formwork{run_id=35497 cmd="run"}: spawning confined command program=/bin/cat
 print("hello from the project")
@@ -30,7 +30,7 @@ The summary's one varying field is `allowed=` — the deliberate exclusions are 
 
 ```console
 $ RUST_LOG=debug formwork run --blueprint session.toml -- /usr/bin/true 2>&1 | grep itemized
-2026-07-09T22:22:17Z DEBUG formwork{run_id=35511 cmd="run"}: credential catalog floor, itemized denied_path_types=["anthropic", "aws", "azure", "browser", "cargo", "claude", "codex", "cursor", "docker", "dotenv", "gcp", "gemini", "github", "gpg", "keychain", "kube", "netrc", "npm", "pypi", "ssh", "system"] stripped_env_types=["anthropic", "aws", "azure", "cargo", "gcp", "github", "kube", "npm", "openai", "pypi", "slack"]
+2026-07-09T22:22:17Z DEBUG formwork{run_id=35511 cmd="run"}: credential catalog floor, itemized denied_path_types=["anthropic", "aws", "azure", "browser", "cargo", "claude", "codex", "cursor", "docker", "dotenv", "gcp", "gemini", "github", "gpg", "keychain", "kube", "netrc", "npm", "pypi", "secrets-mount", "ssh", "system"] stripped_env_types=["anthropic", "aws", "azure", "cargo", "gcp", "github", "kube", "npm", "openai", "pypi", "slack"]
 ```
 
 ## 2. A credential path under a broad grant: the agent sees only the kernel's errno
@@ -64,7 +64,7 @@ The strip is per-run news, so it itemizes at default level — names and types o
 ```console
 $ AWS_SECRET_ACCESS_KEY=super-secret formwork run --blueprint session.toml --allow-cred aws -- \
     /bin/sh -c 'echo "aws env: $AWS_SECRET_ACCESS_KEY"; head -1 ~/.aws/credentials; cat ~/.ssh/id_ed25519'
-2026-07-09T22:22:17Z  INFO formwork{...}: credential floor active (...) path_types=20 env_types=10 catalog_version=1 allowed=["aws"]
+2026-07-09T22:22:17Z  INFO formwork{...}: credential floor active (...) path_types=21 env_types=10 catalog_version=1 allowed=["aws"]
 aws env: super-secret
 [default]
 cat: /tmp/fw-doc/home/.ssh/id_ed25519: Operation not permitted
@@ -78,7 +78,7 @@ a loud config error, never a silent no-op:
 $ formwork run --blueprint session.toml --allow-cred awss -- /usr/bin/true
 Error: unknown credential type "awss" in allow-credentials (known: ["anthropic", "aws", "azure",
 "browser", "cargo", "claude", "codex", "cursor", "docker", "dotenv", "gcp", "gemini", "github",
-"gpg", "keychain", "kube", "netrc", "npm", "openai", "pypi", "slack", "ssh", "system", "backstop"])
+"gpg", "keychain", "kube", "netrc", "npm", "openai", "pypi", "secrets-mount", "slack", "ssh", "system", "backstop"])
 ```
 
 ## 5. The generic backstop covers uncatalogued shapes
@@ -131,7 +131,7 @@ cat: /tmp/fw-doc/home/.ssh/id_ed25519: Operation not permitted
 2026-07-09T22:22:17Z  INFO formwork{run_id=35516 cmd="learn"}: confined command exited exit_code=1
 2026-07-09T22:22:18Z  INFO formwork{run_id=35516 cmd="learn"}: learning: denial withheld by the credential floor (FW-DISC3); lift only via --allow-cred path=/private/tmp/fw-doc/home/.aws/credentials credential_type=aws
 2026-07-09T22:22:18Z  INFO formwork{run_id=35516 cmd="learn"}: learning: denial withheld by the credential floor (FW-DISC3); lift only via --allow-cred path=/private/tmp/fw-doc/home/.ssh/id_ed25519 credential_type=ssh
-2026-07-09T22:22:18Z  INFO formwork{run_id=35516 cmd="learn"}: learning: denial withheld by the credential floor (FW-DISC3); lift only via --allow-cred path=/private/tmp/fw-doc/project/.env.production credential_type=backstop
+2026-07-09T22:22:18Z  INFO formwork{run_id=35516 cmd="learn"}: learning: denial withheld by the credential floor (FW-DISC3); lift only via --allow-cred path=/private/tmp/fw-doc/project/.env.production credential_type=dotenv
 2026-07-09T22:22:18Z  INFO formwork{run_id=35516 cmd="learn"}: learning: in-zone candidates self-granted for the NEXT run (FW-DISC4) file=tight.toml.discovered.toml grants=1
 2026-07-09T22:22:18Z  INFO formwork{run_id=35516 cmd="learn"}: learning run complete (proposal written regardless of workload exit) workload_exit=1 proposal=tight.toml.proposal.toml candidates=2 needs_review=1 withheld=3
 ```

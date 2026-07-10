@@ -36,7 +36,7 @@ pub enum Backend {
     /// The launcher -- the third enforcement arm (FEP-2 §6): the spawn-time construction of the
     /// confined child, environment rebuild and credential strip included (FW-ENV1, FW-CRED2).
     /// Not a kernel confiner; its guarantee is contingent on Formwork being the launching
-    /// process, which the report must disclose (FW-CRED8). Renamed from `Process` in 0.2.0.
+    /// process, which the report must disclose (FW-CRED8). Renamed from `Process` by FEP-2 (pre-release; no version bump -- canary consumers only).
     Launcher,
     None,
 }

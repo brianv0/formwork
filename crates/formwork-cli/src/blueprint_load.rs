@@ -283,10 +283,27 @@ pub fn canonicalize_catalog_for_enforcement(
 
 fn canon_pattern(p: &PathPattern) -> Result<PathPattern> {
     // Any-depth (`**/`) patterns are relative match suffixes, not resolvable filesystem paths, so
-    // symlink/firmlink canonicalization does not apply -- pass them through unchanged. Resolving the
-    // relative base against cwd would wrongly re-root it (e.g. `**/.git/hooks/**` -> `<cwd>/.git/...`).
+    // symlink/firmlink canonicalization does not apply to the suffix -- but an ANCHORED form's
+    // absolute prefix must resolve like any grant (a `/tmp`-anchored rule would otherwise never
+    // match the kernel's `/private/tmp` paths -- the same FW-INV6 hazard as any subtract hole).
     if p.is_any_depth() {
-        return Ok(p.clone());
+        let Some(anchor) = p.anchor() else {
+            return Ok(p.clone());
+        };
+        let resolved = canonicalize_existing_prefix(anchor);
+        let resolved = resolved.to_str().ok_or_else(|| {
+            anyhow!(
+                "refusing to enforce: resolved anchor for {} is not valid UTF-8 (FW-INV6)",
+                p.canonical()
+            )
+        })?;
+        let rendered = format!(
+            "{}/**/{}{}",
+            resolved.trim_end_matches('/'),
+            p.base().display(),
+            if p.is_subtree() { "/**" } else { "" }
+        );
+        return Ok(PathPattern::parse(&rendered).unwrap_or_else(|_| p.clone()));
     }
     let base = canonicalize_existing_prefix(p.base());
     // `to_str`, not `to_string_lossy`: refuse to enforce a path we cannot render faithfully (FW-INV6).

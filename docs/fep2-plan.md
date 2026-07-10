@@ -66,6 +66,14 @@ basenames instead (§3 below). FW-BP4's text is amended to say "path patterns (F
 grammar)". If a future FEP shows a concrete secret shape the grammar cannot carry, that FEP
 amends FW-CAP6.
 
+*Review addendum:* PR review asked for prefix selectivity on the new any-depth rows, so the
+grammar gained the **anchored** form `<prefix>/**/<suffix>[/**]` — the plain `**/` form with an
+absolute scope — and the backstop's file-shape rows now anchor under `~`. Still no `*` glob; on
+Linux both any-depth forms remain unrootable and report Partial. The same review pass fixed a
+real floor gap it surfaced: `accept` now canonicalizes the catalog before its floor re-check, so
+type rows hold in kernel coordinates (a `/tmp`-based `$HOME` no longer lets a forged entry slip
+past them onto the backstop).
+
 ## 1. The merge algebra (FW-BP1/2/4)
 
 One model, many surfaces means one merge function. New in `formwork-blueprint`:
@@ -142,7 +150,7 @@ happens at load/compile boundary against the same `$HOME` the CLI already uses.
 carry backend `launcher` and the launcher-contingency note verbatim ("holds only while
 Formwork is the launching process"). `Backend::Process` is renamed `Backend::Launcher` —
 one arm, one name (Vocabulary) — a report-schema change shipped with the workspace version
-bump to 0.2.0 (Data model: breaking change with a version bump, expand→migrate→contract).
+rename (review decision: no version bump -- the schema is pre-release, canary consumers only).
 
 **Operator/agent split (FW-CRED7).** The operator channel is the existing stderr `tracing`
 stream: at spawn, one structured itemization event per arm (types + names/patterns — never
@@ -294,7 +302,7 @@ that must respect it):
 
 1. **FW-BP** — layer/merge/extends/CLI (tests 041–044).
 2. **FW-CRED path arm** — catalog data + compile + report `credentials` section + rename
-   `Process`→`Launcher` + 0.2.0 bump (tests 045, 049, half of 050, path half of ADV-012).
+   `Process`→`Launcher` (tests 045, 049, half of 050, path half of ADV-012).
 3. **Launcher env arm** — strip + env-file-refs + itemization (tests 046, 047, rest of
    050, ADV-012, ADV-014). FW-CRED5 `--allow-cred` lands with 2–3 (test 048).
 4. **FW-DISC** — log tap, reverse compile, zone, proposal/accept, provenance (tests
@@ -336,7 +344,8 @@ Reviewed section-by-section against `constitution.md`, over the full branch diff
   named Data-model surfaces. No new door for the agent: the denial feed is operator-side.
 - **Data model.** Input schema growth is additive — every pre-FEP-2 blueprint parses and
   compiles unchanged (FW-E2E-041). The report change (credentials section, `process`→
-  `launcher` backend rename) shipped WITH the 0.2.0 bump. `deny_unknown_fields` on every new
+  `launcher` backend rename) needs no version bump per review -- the schema is pre-release with
+  canary consumers only. `deny_unknown_fields` on every new
   input type. `sensitive-set.toml` pruned at this release (event-triggered), content migrated
   into the catalog.
 - **Vocabulary.** floor / strip / exclude / learn / withheld / accept / provenance recorded,

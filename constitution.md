@@ -30,11 +30,12 @@ This system has exactly these concepts, each with one name and one Rust type:
   successor to the informal sensitive set). Denied/stripped as a floor under every Blueprint
   (FW-CRED4); lifted only by the typed exclude (FW-CRED5); the line discovery can never
   propose across (FW-INV8).
-- **Launcher** (`formwork-cli`, pure decisions in `formwork_blueprint::construct_env`) — the
-  third enforcement arm (FEP-2 §6): the process that constructs the confined child before
-  control transfers — environment construction, credential strip, env-file-ref denies, and
-  write-protection of its own policy inputs (FW-XR8). Its guarantees are launcher-contingent
-  and the report says so (FW-CRED8).
+- **Launcher** (`formwork-cli`; pure decisions in `formwork_blueprint::construct_env`) — the
+  code that starts the confined child. Because Formwork builds the child's environment, it
+  simply doesn't pass credential variables along — the way a build tool hands its actions a
+  clean environment — and it denies the files those variables point at (FW-CRED3) and
+  write-protects the blueprint/proposal files the session was launched from (FW-XR8). All of
+  this holds only when Formwork does the launching, and the report says so (FW-CRED8).
 - **HostProfile** (`formwork_detect::HostProfile`) — what the current kernel can
   actually enforce; the one impure input to compilation.
 - **CompiledPolicy** (`formwork_compile::CompiledPolicy`) — a `ConfinerPolicy`

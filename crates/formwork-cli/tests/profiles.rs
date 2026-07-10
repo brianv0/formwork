@@ -30,10 +30,13 @@ const CORE_LOCATIONS: &[&str] = &[
     "/etc/shadow",
     "/etc/sudoers",
     "**/.env",
+    "/run/secrets/**",
+    "/var/run/secrets/**",
 ];
 
 const CORE_ENV_STRIPS: &[&str] = &[
     "AWS_SECRET_ACCESS_KEY",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
     "GOOGLE_APPLICATION_CREDENTIALS",
     "GITHUB_TOKEN",
     "ANTHROPIC_API_KEY",
