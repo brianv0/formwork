@@ -2,7 +2,7 @@
 
 **Formwork Enhancement Proposal 2**
 
-- **Status:** Implemented (branch `fep-2-implementation`; verified on real Seatbelt + the unified-log denial feed). Amended at execution planning: test IDs renumbered to avoid collisions with landed FW-E2E-036..039 and `fep-1.md`'s reserved blocks, FW-BP2's layer order corrected, FW-BP4 pinned to the FW-CAP6 pattern grammar. Rationale and mapping in `docs/fep2-plan.md` §0.
+- **Status:** Implemented (branch `fep-2-implementation`; verified on real Seatbelt + the unified-log denial feed). Amended at execution planning: test IDs renumbered to avoid collisions with landed FW-E2E-036..039 and `fep-1.md`'s reserved blocks, FW-BP2's layer order corrected, FW-BP4 pinned to the FW-CAP6 pattern grammar. Post-implementation, three requirements were made explicit from decisions the build had already proven: **FW-BP5** (path sigils, incl. `$CWD`), **FW-CRED9** (floor enforceability reported honestly per platform), and a strengthening of **FW-DISC3/FW-INV8** (the credential floor matches by shape wherever observed and is re-checked at accept). Rationale and mapping in `docs/fep2-plan.md` §0.
 - **Depends on:** the base Formwork design document (`formwork.md`)
 - **Scope:** terminology change (spec → Blueprint), a Blueprint format/override model, a typed credential-location catalog, and an on-demand allow-listing (discovery) workflow.
 - **Introduces:** a third enforcement arm — the **launcher** — alongside the existing confiner and gateway.
@@ -47,6 +47,7 @@ The Blueprint is expressed in a standard serialization, not a bespoke DSL — th
 | **FW-BP2** Override precedence | Layers merge in a fixed, documented order, lowest to highest: built-in baseline (the fail-closed empty Blueprint plus the credential-catalog floor) → `extends` chain (depth-first, bases before deriveds) → Blueprint file → CLI overrides. Postures (read-mode/net/exec/env) are last-set-wins; path sets merge additively; the result is deterministic. Overrides are an additive last layer, never a separate mechanism. *(Amended: the draft's "default profile → file → extends" order would have let a base preset override the file extending it; the broad-read default profile is a preset opted into via `extends`, not an implicit layer — FW-CAP3 is realized by the catalog + backstop, §11.)* |
 | **FW-BP3** Composition via `extends` | A Blueprint may extend one or more base Blueprints (presets/profiles). Resolution is deterministic and cycles are detected and errored. |
 | **FW-BP4** allow / deny / subtract vocabulary | First-class allow (reads/writes), deny/subtract (read+write), and write-subtract semantics over path patterns in the FW-CAP6 grammar (absolute, `/**` subtree, any-depth `**/basename`). At any layer and at equal precedence, deny/subtract wins over allow (safety bias); no allow at any layer shadows a deny at any layer — the only un-deny is the typed credential exclude (FW-CRED5). *(Amended from "glob path patterns": no general glob is introduced; review added the prefix-anchored any-depth form `<prefix>/**/<suffix>` so shape rules can be scoped, e.g. the backstop under `~`. See `docs/fep2-plan.md` §0 C3.)* |
+| **FW-BP5** Path sigils | Blueprint path patterns admit a closed set of authoring sigils, expanded at the CLI edge *before* compilation: `~` → `$HOME` and `$CWD` → the launch directory, so a grant can be written relative to the project it runs in. Fixed tokens only — never general `$VAR` interpolation, since the process environment is exactly what the launcher strips (FW-CRED2), and letting an arbitrary variable name a path would reopen that surface. An expanded sigil is an absolute path that canonicalizes like any grant (FW-CAP6/FW-FID4); an unresolvable sigil (e.g. no readable working directory) fails loud, never silently widening (FW-INV6). *(Added post-implementation: `~` was used from FEP-1 with no requirement behind it; `$CWD`, the closed token set, and the no-`$VAR` rule are new. Test FW-E2E-055.)* |
 
 **Serialization format is an open decision (§9).** The tradeoff, stated for the record: TOML is readable and strict but fights nesting exactly where Blueprints are deepest (`server → {tools, resources, prompts}`); YAML nests cleanly at the cost of well-known ambiguity footguns (dangerous in a security artifact unless schema-validated); JSON-with-schema is unambiguous at some cost to hand-authoring comfort. The decision should be made on the override-story and validation grounds above, not on expressiveness.
 
@@ -76,6 +77,7 @@ Env shading is, if anything, *stronger* than path denial: a denied path still ex
 | **FW-CRED6** Generic backstop | Beyond curated types, a generic rule denies known-sensitive shapes (any `~/.ssh`, any `.env`, credential files in known config dirs) so uncatalogued secrets remain covered. |
 | **FW-CRED7** Operator/agent channel split | The operator sees itemized "denied/stripped X (type: …)". The confined agent sees a plain EACCES / an absent variable with no catalog annotation — no oracle. |
 | **FW-CRED8** Report names the mechanism | The FidelityReport marks each covered type `enforced-via-launcher` (env) or `enforced-via-OS-sandbox` (path), and states plainly that env-shading holds only while Formwork is the launching process — the guarantee is launcher-contingent, and the report must not overclaim it as independent of the launcher. |
+| **FW-CRED9** Floor enforceability is honest per platform | Any-depth floor rows — the `**/…` form, its anchored refinement `<prefix>/**/<suffix>`, and the generic backstop (FW-CRED6) — compile to a start-pinned regex on Seatbelt but cannot be rooted by Landlock. Where a floor row is unenforceable on the host it is withheld from the compiled deny set and the affected types (and the backstop) are reported **Partial**, never silently claimed `Enforced` (FW-INV5). *(Added post-implementation: the platform split was built and reported this way, but never stated as a requirement.)* |
 
 **Detector = report enrichment.** The "ambient credentials detector" is not new enforcement; it is FW-CRED7's operator-channel itemization plus the compile-time report of which catalog entries were subtracted and why. The default posture is deny-the-superset, report-the-specifics: block everything known (so a forgotten type is still gone), and itemize what was blocked — resolving the tension between safe-by-default and legible by doing both.
 
@@ -107,7 +109,7 @@ The proposal resolves this two ways. First, **the default posture is observe-the
 |---|---|
 | **FW-DISC1** Learning mode | An explicit, non-enforcing (or permissive-logging) phase that records denials without granting them at runtime. Distinct and visibly different from an enforced run. |
 | **FW-DISC2** Reverse compile | Denials compile *backwards* into a proposed Blueprint diff. Each candidate is tagged: catalog-blocked / inside-auto-widen-zone / needs-review. |
-| **FW-DISC3** Catalog floor | A denial matching the FW-CRED catalog is **never** offered as an auto-proposable or one-click candidate grant. Lifting it requires the explicit typed exclude (FW-CRED5), never the discovery flow. *(Load-bearing safety property.)* |
+| **FW-DISC3** Catalog floor | A denial matching the FW-CRED catalog is **never** offered as an auto-proposable or one-click candidate grant. Lifting it requires the explicit typed exclude (FW-CRED5), never the discovery flow. The match is by credential *shape* wherever the kernel observed the denial — denial collection is deliberately over-capture-tolerant (a denial can surface from another process or a different `$HOME`), so a credential-shaped path is withheld regardless of location — and the floor is re-checked again at **accept**, because the proposal file is untrusted input. *(Load-bearing safety property. Amendment: the shape/location-independence and the accept-time re-check were proven in implementation — a home-anchored floor briefly let an over-captured key escape into a proposal — but were not stated here. See FW-INV8.)* |
 | **FW-DISC4** Auto-widen zone | An operator-authored scope in the Blueprint within which discovered grants may be auto-accepted (e.g. project dir, language caches, system prefixes). Outside the zone, review is required. |
 | **FW-DISC5** Review as itemized diff | Proposals surface on the operator channel as a diff showing what widens and what was withheld and why. Acceptance is per-entry. |
 | **FW-DISC6** Provenance | An accepted discovered grant is recorded in the Blueprint with provenance (added-via-discovery, run id), so audit distinguishes authored from learned grants. |
@@ -124,7 +126,7 @@ Continuing the base document's `FW-INV` sequence (base defined INV1–INV6).
 
 **FW-INV7 — Launcher-strip completeness.** A stripped env var is *absent* (not merely denied) throughout the confined process and its entire descendant tree. The confined process may still set new vars for its own children; this shades ambient inherited credentials, not values the agent synthesizes.
 
-**FW-INV8 — Credential floor.** No discovery path, no auto-widen rule, and no single-click operator action can grant access to a FW-CRED-matched location. Only the explicit typed exclude (FW-CRED5) can.
+**FW-INV8 — Credential floor.** No discovery path, no auto-widen rule, and no single-click operator action can grant access to a FW-CRED-matched location. Only the explicit typed exclude (FW-CRED5) can. A location is "matched" by credential *shape* wherever its denial was observed, and the floor is evaluated both when a candidate is proposed and again at accept (proposals are untrusted input), so neither over-capture nor a forged proposal opens a seam (FW-DISC3).
 
 **FW-INV9 — No-oracle for credentials.** Denied credential paths and stripped credential env vars are indistinguishable, to the confined agent, from genuinely absent resources — no error text, code, or timing reveals existence.
 
@@ -134,7 +136,7 @@ Continuing the base document's `FW-INV` sequence (base defined INV1–INV6).
 
 ## 9. New end-to-end tests
 
-Continuing the `FW-E2E` and `FW-ADV` sequences. Taken: the base defines FW-E2E-001–028 and FW-ADV-001–006, FEP-1 landed FW-E2E-036–039, and `fep-1.md` reserves FW-E2E-029–032 + 040 and FW-ADV-007–009 + 011 for its deferred egress/violation-stream work. FEP-2 therefore uses **FW-E2E-041–054** and **FW-ADV-012–014** (mapping from this document's draft numbering in `docs/fep2-plan.md` §0).
+Continuing the `FW-E2E` and `FW-ADV` sequences. Taken: the base defines FW-E2E-001–028 and FW-ADV-001–006, FEP-1 landed FW-E2E-036–039, and `fep-1.md` reserves FW-E2E-029–032 + 040 and FW-ADV-007–009 + 011 for its deferred egress/violation-stream work. FEP-2 therefore uses **FW-E2E-041–055** and **FW-ADV-012–014** (FW-E2E-055 was added post-implementation for the FW-BP5 path sigils; mapping from this document's draft numbering in `docs/fep2-plan.md` §0).
 
 ### 9.1 Blueprint model and format
 
@@ -145,6 +147,8 @@ Continuing the `FW-E2E` and `FW-ADV` sequences. Taken: the base defines FW-E2E-0
 **FW-E2E-043: CLI/file parity.** The same grant authored in the file and expressed via CLI flag produce identical compiled policy. Pass: byte-identical policy from both surfaces. Fail: divergence.
 
 **FW-E2E-044: `extends` composition.** A Blueprint extending a base merges deterministically; an `extends` cycle is detected. Pass: deterministic merge; cycle errors clearly. Fail: nondeterministic merge or an undetected cycle.
+
+**FW-E2E-055: Path sigils scope a grant (FW-BP5).** A blueprint grants `$CWD/**` and is run from a project directory. Pass: a file under the launch directory is readable while a sibling outside it is denied by the real kernel; `~` still expands to `$HOME`; a non-sigil path is untouched; and `$CWD` resolving to `$HOME` or `/` warns (a broad-grant nudge) rather than silently widening. Fail: a path outside `$CWD` is granted, or a sigil expands wrong.
 
 ### 9.2 Credential catalog and launcher
 
@@ -186,6 +190,7 @@ Continuing the `FW-E2E` and `FW-ADV` sequences. Taken: the base defines FW-E2E-0
 | FW-BP2 Override precedence | FW-E2E-042 | 043 |
 | FW-BP3 `extends` composition | FW-E2E-044 | — |
 | FW-BP4 allow/deny/subtract | FW-E2E-042 | 045, 049 |
+| FW-BP5 Path sigils | FW-E2E-055 | — |
 | FW-CRED1 Typed catalog | FW-E2E-045, 046 | 049 |
 | FW-CRED2 Two kinds, two arms | FW-E2E-045, 046 | 050 |
 | FW-CRED3 Env-points-to-file | FW-E2E-047 | — |
@@ -194,6 +199,7 @@ Continuing the `FW-E2E` and `FW-ADV` sequences. Taken: the base defines FW-E2E-0
 | FW-CRED6 Generic backstop | FW-E2E-049 | — |
 | FW-CRED7 Channel split | FW-E2E-045, 046 | ADV-012, INV9 |
 | FW-CRED8 Report mechanism | FW-E2E-050 | ADV-014 |
+| FW-CRED9 Floor enforceability | FW-E2E-050 | INV5; Linux kernel enforcement deferred |
 | FW-DISC1 Learning mode | FW-E2E-051 | 054 |
 | FW-DISC2 Reverse compile | FW-E2E-051 | 052, 053 |
 | FW-DISC3 Catalog floor | FW-ADV-013 | 051, INV8 |

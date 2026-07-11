@@ -143,6 +143,7 @@ def test_extends_composition_deterministic_and_cycles_error(cli, tmp_path):
     assert "x.toml" in cycle.stderr and "y.toml" in cycle.stderr
 
 
+@pytest.mark.fw_e2e("FW-E2E-055")
 @pytest.mark.macos
 def test_cwd_sigil_scopes_a_grant_to_the_launch_directory(cli, tmp_path):
     """`$CWD` is a CLI-edge sigil (like `~`): it expands to the launch directory before patterns
