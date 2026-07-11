@@ -2,6 +2,8 @@
 regression -- all black-box through the `formwork` CLI. Compile-level tests pin the host with
 --target so byte-comparisons are meaningful on any machine."""
 
+from pathlib import Path
+
 import pytest
 
 from helpers import write_blueprint
@@ -139,3 +141,37 @@ def test_extends_composition_deterministic_and_cycles_error(cli, tmp_path):
     assert cycle.code != 0, "an extends cycle must be an error"
     assert "cycle" in cycle.stderr.lower()
     assert "x.toml" in cycle.stderr and "y.toml" in cycle.stderr
+
+
+@pytest.mark.macos
+def test_cwd_sigil_scopes_a_grant_to_the_launch_directory(cli, tmp_path):
+    """`$CWD` is a CLI-edge sigil (like `~`): it expands to the launch directory before patterns
+    reach the compiler, so a grant written `$CWD/**` scopes to the project you run from. Enforced
+    by the real kernel -- a file under the launch dir is readable, a sibling outside it is not --
+    and the broad-cwd guardrail warns (not refuses) when `$CWD` is the filesystem root."""
+    root = tmp_path.resolve()
+    home = root / "home"
+    home.mkdir()
+    proj = root / "proj"
+    proj.mkdir()
+    (proj / "in.txt").write_text("in-scope\n")
+    outside = root / "outside.txt"
+    outside.write_text("out-of-scope\n")
+    bp = root / "bp.toml"
+    bp.write_text('net = "deny"\n[fs]\nread-mode = "closed"\nreads = ["$CWD/**"]\n')
+    env = {"HOME": str(home)}
+
+    # In-scope: a file under the launch directory is granted via $CWD/**, and a real project
+    # directory trips no guardrail.
+    inside = cli("run", "--blueprint", bp, "--", "/bin/cat", "in.txt", cwd=proj, env=env)
+    assert inside.code == 0, inside.stderr
+    assert "in-scope" in inside.stdout
+    assert "$CWD resolves to" not in inside.stderr
+
+    # Out-of-scope: a sibling outside the launch directory is not granted by $CWD/**.
+    out = cli("run", "--blueprint", bp, "--", "/bin/cat", str(outside), cwd=proj, env=env)
+    assert out.code != 0, "a path outside $CWD must not be granted by $CWD/**"
+
+    # Guardrail: from '/', $CWD/** would cover the whole filesystem -- a warning, not a refusal.
+    from_root = cli("run", "--blueprint", bp, "--", "/bin/echo", "ok", cwd=Path("/"), env=env)
+    assert "$CWD resolves to" in from_root.stderr

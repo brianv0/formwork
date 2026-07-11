@@ -1,6 +1,7 @@
-//! Loading a blueprint from disk. Impure on purpose -- this is where `~` is expanded against `$HOME`,
-//! where the `extends` chain is resolved against real files (FW-BP3), and where enforcement paths
-//! are canonicalized against the real filesystem -- so the compiler stays pure and takes only
+//! Loading a blueprint from disk. Impure on purpose -- this is where the CLI-edge path sigils are
+//! expanded (`~` against `$HOME`, `$CWD` against the launch directory, see [`Sigils`]), where the
+//! `extends` chain is resolved against real files (FW-BP3), and where enforcement paths are
+//! canonicalized against the real filesystem -- so the compiler stays pure and takes only
 //! absolute, host-independent patterns and an already-flattened layer stack.
 
 use std::ffi::OsString;
@@ -14,7 +15,12 @@ use formwork_blueprint::{Blueprint, BlueprintLayer, ExecPosture, PathPattern};
 /// Production callers always pass overrides, so this exists for the tests only.
 #[cfg(test)]
 pub fn load(path: &Path, home: &str) -> Result<Blueprint> {
-    load_stack(path, &[], BlueprintLayer::default(), home)
+    load_stack(
+        path,
+        &[],
+        BlueprintLayer::default(),
+        &Sigils::new(home, "/work"),
+    )
 }
 
 /// The full FW-BP2 stack: baseline (fail-closed floor) → extends chain → file → each `--set`
@@ -23,27 +29,29 @@ pub fn load_stack(
     path: &Path,
     sets: &[String],
     sugar: BlueprintLayer,
-    home: &str,
+    sigils: &Sigils,
 ) -> Result<Blueprint> {
     let mut layers = Vec::new();
     let mut visiting = Vec::new();
-    resolve_file(path, home, &mut visiting, &mut layers)?;
-    let cwd = std::env::current_dir().context("resolving current dir for CLI overrides")?;
+    resolve_file(path, sigils, &mut visiting, &mut layers)?;
+    // Relative `extends` in a CLI override (no file to sit beside) resolve against the launch
+    // directory -- the same path `$CWD` expands to.
+    let cwd = Path::new(sigils.cwd);
     for fragment in sets {
         let mut value: toml::Value = toml::from_str(fragment)
             .with_context(|| format!("parsing --set fragment {fragment:?}"))?;
-        expand_tilde(&mut value, home);
+        sigils.expand_value(&mut value);
         let layer: BlueprintLayer = value
             .try_into()
             .with_context(|| format!("interpreting --set fragment {fragment:?}"))?;
-        resolve_layer(layer, &cwd, home, &mut visiting, &mut layers)?;
+        resolve_layer(layer, cwd, sigils, &mut visiting, &mut layers)?;
     }
     // A discovered layer sits beside its blueprint and applies from the next run on
     // (FW-DISC4/6). It loads above the file (learned refinements) and below CLI overrides, and
     // only with valid provenance -- a grant nobody can attribute is refused loud.
     let discovered = crate::learn::discovered_path(path);
     if discovered.exists() {
-        let layer = parse_discovered_layer(&discovered, home)?;
+        let layer = parse_discovered_layer(&discovered, sigils)?;
         tracing::info!(
             file = %discovered.display(),
             reads = layer.fs.reads.len(),
@@ -52,7 +60,7 @@ pub fn load_stack(
         );
         layers.push(layer);
     }
-    resolve_layer(sugar, &cwd, home, &mut visiting, &mut layers)?;
+    resolve_layer(sugar, cwd, sigils, &mut visiting, &mut layers)?;
     let blueprint = formwork_blueprint::merge(&layers);
 
     // A typo'd credential type would silently stay blocked -- fail-closed but intent-hiding, the
@@ -74,7 +82,7 @@ pub fn load_stack(
 /// layer's contributions sit higher in the stack (FW-BP2 as amended).
 fn resolve_file(
     path: &Path,
-    home: &str,
+    sigils: &Sigils,
     visiting: &mut Vec<PathBuf>,
     out: &mut Vec<BlueprintLayer>,
 ) -> Result<()> {
@@ -92,14 +100,14 @@ fn resolve_file(
         .with_context(|| format!("reading blueprint {}", canon.display()))?;
     let mut value: toml::Value =
         toml::from_str(&text).with_context(|| format!("parsing blueprint {}", canon.display()))?;
-    expand_tilde(&mut value, home);
+    sigils.expand_value(&mut value);
     let layer: BlueprintLayer = value
         .try_into()
         .with_context(|| format!("interpreting blueprint {}", canon.display()))?;
     let base_dir = canon.parent().map(Path::to_path_buf).unwrap_or_default();
 
     visiting.push(canon);
-    resolve_layer(layer, &base_dir, home, visiting, out)?;
+    resolve_layer(layer, &base_dir, sigils, visiting, out)?;
     visiting.pop();
     Ok(())
 }
@@ -108,7 +116,7 @@ fn resolve_file(
 fn resolve_layer(
     mut layer: BlueprintLayer,
     base_dir: &Path,
-    home: &str,
+    sigils: &Sigils,
     visiting: &mut Vec<PathBuf>,
     out: &mut Vec<BlueprintLayer>,
 ) -> Result<()> {
@@ -118,31 +126,77 @@ fn resolve_layer(
         } else {
             base_dir.join(&base)
         };
-        resolve_file(&base_path, home, visiting, out)
+        resolve_file(&base_path, sigils, visiting, out)
             .with_context(|| format!("resolving extends {base:?}"))?;
     }
     out.push(layer);
     Ok(())
 }
 
-/// Only leading tildes, so a tool name is untouched unless it literally starts with `~/`.
-fn expand_tilde(value: &mut toml::Value, home: &str) {
-    match value {
-        toml::Value::String(s) => *s = expand_tilde_str(s, home),
-        toml::Value::Array(a) => a.iter_mut().for_each(|v| expand_tilde(v, home)),
-        toml::Value::Table(t) => t.iter_mut().for_each(|(_, v)| expand_tilde(v, home)),
-        _ => {}
-    }
+/// The CLI-edge path sigils, expanded before patterns reach the pure, absolute-only compiler:
+/// `~` -> `$HOME`, `$CWD` -> the directory `formwork` was launched from. A fixed, closed set of
+/// tokens -- deliberately NOT general `$VAR` interpolation, since the environment is exactly what
+/// the launcher scrubs (FW-CRED2), so letting arbitrary vars name paths would reopen that surface.
+/// Both tokens yield absolute paths; enforcement-time canonicalization ([`canon_pattern`]) then
+/// reconciles them with the kernel's resolved view, so an expanded sigil behaves like any absolute
+/// grant. One `Sigils` is built per invocation and shared across every surface (file, `--set`,
+/// sugar flags), so `~` and `$CWD` resolve identically everywhere (FW-BP1).
+pub struct Sigils<'a> {
+    home: &'a str,
+    cwd: &'a str,
+    warned_cwd: std::cell::Cell<bool>,
 }
 
-/// The same expansion for CLI flag values, so both surfaces resolve `~` identically (FW-BP1).
-pub fn expand_tilde_str(s: &str, home: &str) -> String {
-    if s == "~" {
-        home.to_string()
-    } else if let Some(rest) = s.strip_prefix("~/") {
-        format!("{}/{}", home.trim_end_matches('/'), rest)
-    } else {
-        s.to_string()
+impl<'a> Sigils<'a> {
+    pub fn new(home: &'a str, cwd: &'a str) -> Sigils<'a> {
+        Sigils {
+            home,
+            cwd,
+            warned_cwd: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Expand a leading sigil in one string. A value that starts with neither sigil is returned
+    /// untouched, so a tool name is only rewritten if it literally begins with `~`/`~/`/`$CWD`/`$CWD/`.
+    pub fn expand(&self, s: &str) -> String {
+        if s == "~" {
+            self.home.to_string()
+        } else if let Some(rest) = s.strip_prefix("~/") {
+            format!("{}/{}", self.home.trim_end_matches('/'), rest)
+        } else if s == "$CWD" {
+            self.warn_if_broad_cwd();
+            self.cwd.to_string()
+        } else if let Some(rest) = s.strip_prefix("$CWD/") {
+            self.warn_if_broad_cwd();
+            format!("{}/{}", self.cwd.trim_end_matches('/'), rest)
+        } else {
+            s.to_string()
+        }
+    }
+
+    /// `$CWD` is contextual where `~` is stable: launched from `$HOME` or `/`, a `$CWD/**` grant
+    /// covers the whole home or the entire filesystem rather than a project. It is operator-chosen
+    /// (an agent cannot move the launch directory) and the expanded path is visible in the
+    /// dry-run, so this warns once rather than refusing -- a nudge to launch from the project dir.
+    fn warn_if_broad_cwd(&self) {
+        if (self.cwd == self.home || self.cwd == "/") && !self.warned_cwd.replace(true) {
+            tracing::warn!(
+                cwd = %self.cwd,
+                "$CWD resolves to {} -- a grant written relative to $CWD covers your whole home or \
+                 the filesystem root; launch formwork from the project directory to scope it",
+                self.cwd
+            );
+        }
+    }
+
+    /// Walk a parsed TOML value, expanding every string leaf. Only leading sigils are touched.
+    fn expand_value(&self, value: &mut toml::Value) {
+        match value {
+            toml::Value::String(s) => *s = self.expand(s),
+            toml::Value::Array(a) => a.iter_mut().for_each(|v| self.expand_value(v)),
+            toml::Value::Table(t) => t.iter_mut().for_each(|(_, v)| self.expand_value(v)),
+            _ => {}
+        }
     }
 }
 
@@ -169,12 +223,12 @@ pub fn canonicalize_for_enforcement(blueprint: &Blueprint) -> Result<Blueprint> 
 
 /// The discovered layer is machine-written and narrowly shaped: no `extends`, and every grant
 /// must carry provenance (FW-DISC6) so audit can always distinguish learned from authored.
-fn parse_discovered_layer(path: &Path, home: &str) -> Result<BlueprintLayer> {
+fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading discovered layer {}", path.display()))?;
     let mut value: toml::Value = toml::from_str(&text)
         .with_context(|| format!("parsing discovered layer {}", path.display()))?;
-    expand_tilde(&mut value, home);
+    sigils.expand_value(&mut value);
     let layer: BlueprintLayer = value
         .try_into()
         .with_context(|| format!("interpreting discovered layer {}", path.display()))?;
@@ -361,24 +415,50 @@ mod tests {
         "#,
         )
         .unwrap();
-        expand_tilde(&mut v, "/Users/bvk");
+        Sigils::new("/home/testuser", "/work").expand_value(&mut v);
         let blueprint: Blueprint = v.try_into().unwrap();
         assert_eq!(
             blueprint.fs.reads[0],
-            PathPattern::parse("/Users/bvk/project/**").unwrap()
+            PathPattern::parse("/home/testuser/project/**").unwrap()
         );
         assert!(blueprint
             .fs
             .reads
-            .contains(&PathPattern::parse("/Users/bvk").unwrap()));
+            .contains(&PathPattern::parse("/home/testuser").unwrap()));
         assert_eq!(
             blueprint.fs.subtract[0],
-            PathPattern::parse("/Users/bvk/.ssh/**").unwrap()
+            PathPattern::parse("/home/testuser/.ssh/**").unwrap()
         );
         // A tool name that isn't `~/`-prefixed is untouched.
         assert_eq!(
             blueprint.mcp["s"].tools,
             formwork_blueprint::Visibility::Allow(vec!["~weird_but_left_alone".into()])
+        );
+    }
+
+    #[test]
+    fn expands_cwd_sigil_and_composes_with_anchored_form() {
+        let sigils = Sigils::new("/home/testuser", "/work/proj");
+        // `$CWD` alone and as a prefix, resolved against the launch directory.
+        assert_eq!(sigils.expand("$CWD"), "/work/proj");
+        assert_eq!(sigils.expand("$CWD/src/**"), "/work/proj/src/**");
+        // It composes with the anchored any-depth form: the project becomes the prefix.
+        assert_eq!(
+            sigils.expand("$CWD/**/credentials"),
+            "/work/proj/**/credentials"
+        );
+        // `~` still resolves against $HOME in the same context, and a bare word is untouched.
+        assert_eq!(sigils.expand("~/.ssh/**"), "/home/testuser/.ssh/**");
+        assert_eq!(sigils.expand("/etc/hosts"), "/etc/hosts");
+        assert_eq!(sigils.expand("$CWDISH"), "$CWDISH"); // only the exact sigil, not a prefix match
+
+        // A blueprint value goes through the same walker and parses to an absolute pattern.
+        let mut v: toml::Value = toml::from_str("[fs]\nwrites = [\"$CWD/**\"]\n").unwrap();
+        sigils.expand_value(&mut v);
+        let blueprint: Blueprint = v.try_into().unwrap();
+        assert_eq!(
+            blueprint.fs.writes,
+            vec![PathPattern::parse("/work/proj/**").unwrap()]
         );
     }
 
@@ -496,7 +576,13 @@ mod tests {
             },
             ..Default::default()
         };
-        let bp = load_stack(&file, &["net = \"deny\"".to_string()], sugar, "/home/x").unwrap();
+        let bp = load_stack(
+            &file,
+            &["net = \"deny\"".to_string()],
+            sugar,
+            &Sigils::new("/home/x", "/work"),
+        )
+        .unwrap();
         assert_eq!(bp.net, formwork_blueprint::NetPosture::Deny);
         assert_eq!(bp.fs.reads, vec![PathPattern::parse("/work/**").unwrap()]);
         assert_eq!(

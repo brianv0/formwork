@@ -37,8 +37,10 @@ use formwork_detect::{detect, HostProfile};
     name = "formwork",
     version,
     about = "OS-level sandbox for agent sessions",
-    after_help = "Telemetry goes to stderr (stdout stays a clean result stream). RUST_LOG=warn \
-quiets it; RUST_LOG=debug itemizes the credential floor per type."
+    after_help = "Path patterns (in blueprint files and flags) accept two sigils, expanded before \
+compilation: ~ for $HOME and $CWD for the launch directory -- so `--read '$CWD/**'` scopes a grant \
+to the project you run from.\n\nTelemetry goes to stderr (stdout stays a clean result stream). \
+RUST_LOG=warn quiets it; RUST_LOG=debug itemizes the credential floor per type."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -153,19 +155,22 @@ struct BlueprintArgs {
 }
 
 impl BlueprintArgs {
-    /// Resolve the full layer stack and merge (FW-BP2). `~` in flag values expands against the
-    /// same `$HOME` as file contents, so the two surfaces stay one model.
+    /// Resolve the full layer stack and merge (FW-BP2). Path sigils (`~`, `$CWD`) in flag values
+    /// expand against the same `$HOME`/launch directory as file contents, via one shared
+    /// [`blueprint_load::Sigils`], so the two surfaces stay one model.
     fn load(&self, home: &str) -> Result<Blueprint> {
-        blueprint_load::load_stack(&self.blueprint, &self.set, self.sugar_layer(home)?, home)
+        let cwd = cwd()?;
+        let sigils = blueprint_load::Sigils::new(home, &cwd);
+        let sugar = self.sugar_layer(&sigils)?;
+        blueprint_load::load_stack(&self.blueprint, &self.set, sugar, &sigils)
     }
 
-    fn sugar_layer(&self, home: &str) -> Result<BlueprintLayer> {
+    fn sugar_layer(&self, sigils: &blueprint_load::Sigils) -> Result<BlueprintLayer> {
         let patterns = |flag: &str, values: &[String]| -> Result<Vec<PathPattern>> {
             values
                 .iter()
                 .map(|v| {
-                    PathPattern::parse(&blueprint_load::expand_tilde_str(v, home))
-                        .with_context(|| format!("--{flag} {v:?}"))
+                    PathPattern::parse(&sigils.expand(v)).with_context(|| format!("--{flag} {v:?}"))
                 })
                 .collect()
         };
@@ -233,6 +238,16 @@ impl Target {
 
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+}
+
+/// The launch directory, for the `$CWD` sigil. Unlike `home()`'s "/" fallback, an unavailable or
+/// non-UTF-8 cwd fails loud: silently expanding `$CWD` to "/" would turn a `$CWD/**` grant into a
+/// filesystem-wide one -- exactly the fail-open the sensitive-set model forbids (FW-INV6).
+fn cwd() -> Result<String> {
+    let dir = std::env::current_dir().context("resolving the current directory for $CWD")?;
+    dir.into_os_string()
+        .into_string()
+        .map_err(|_| anyhow!("current directory is not valid UTF-8; cannot expand $CWD (FW-INV6)"))
 }
 
 fn resolve_host(host: &Option<PathBuf>, target: &Option<Target>) -> Result<HostProfile> {
