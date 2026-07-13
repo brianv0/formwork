@@ -175,7 +175,8 @@ impl BlueprintArgs {
                 .collect()
         };
         Ok(BlueprintLayer {
-            extends: self.extends.clone(),
+            // Sigils expand in `extends` too, matching a file's `extends` (FW-BP1/FW-BP5 parity).
+            extends: self.extends.iter().map(|e| sigils.expand(e)).collect(),
             fs: formwork_blueprint::FsLayer {
                 read_mode: None,
                 reads: patterns("read", &self.read)?,

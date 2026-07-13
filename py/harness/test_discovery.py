@@ -190,3 +190,42 @@ def test_discovery_confused_deputy(tmp_path, cli):
     refused = cli("accept", "--proposal", forged, "--all", env=env)
     assert refused.code != 0
     assert "credential floor" in refused.stderr
+
+@pytest.mark.fw_adv("FW-ADV-015")
+def test_fold_does_not_transitively_grant_a_non_home_credential(tmp_path, cli):
+    """FW-INV8 regression: a credential-shaped file OUTSIDE $HOME is withheld, but its ordinary
+    siblings must not fold into an auto-widened subtree that transitively re-grants it. The
+    enforcement floor is anchored under $HOME (it does not deny a non-$HOME key), so the fold
+    guard is the wall -- without it, `proj/**` auto-accepts and the next run reads proj/id_rsa."""
+    root = tmp_path.resolve()
+    home = root / "home"
+    home.mkdir()
+    proj = root / "proj"  # deliberately NOT under $HOME
+    proj.mkdir()
+    (proj / "id_rsa").write_text("FAKE KEY\n")
+    (proj / "a.txt").write_text("a\n")
+    (proj / "b.txt").write_text("b\n")
+    ok = root / "ok.txt"
+    ok.write_text("ok\n")
+    bp = root / "bp.toml"
+    bp.write_text(
+        f'net = "deny"\n[fs]\nread-mode = "closed"\nreads = ["{ok}"]\n'
+        f'[discovery]\nauto-widen = ["{proj}/**"]\n'
+    )
+    env = {"HOME": str(home)}
+
+    res = cli("learn", "--blueprint", bp, "--", "/bin/sh", "-c",
+              f"cat {proj / 'a.txt'} {proj / 'b.txt'} {proj / 'id_rsa'} 2>/dev/null; true",
+              env=env, timeout=120)
+    assert res.code == 0, res.stderr
+    assert any("withheld by the credential floor" in l and "id_rsa" in l
+               for l in res.stderr.splitlines()), res.stderr
+
+    discovered = root / "bp.toml.discovered.toml"
+    if discovered.exists():
+        text = discovered.read_text()
+        assert f"{proj}/**" not in text, "a fold covering the withheld key must not be granted"
+        assert "id_rsa" not in text
+
+    again = cli("run", "--blueprint", bp, "--", "/bin/cat", proj / "id_rsa", env=env)
+    assert again.code != 0, "the fold must not have re-granted the non-$HOME credential"

@@ -95,7 +95,9 @@ compatibility discipline concentrate here.
   fresh connection fd to the agent via `SCM_RIGHTS`.
 - **blueprint** is the input; **policy** is the compiled backend artifact — never
   call the input a "policy". **grant** is the held capability set, never
-  "permissions".
+  "permissions". **sigil** = a path-pattern authoring token expanded at the CLI
+  edge before compilation (`~`→`$HOME`, `$CWD`→launch dir, FW-BP5), never general
+  environment interpolation.
 - **floor** = the catalog-derived deny/strip set under every Blueprint (FW-CRED4) · **strip**
   = the Launcher removing an env var pre-spawn (absent, not empty — FW-INV7/9) · **exclude** =
   the typed `allow-credentials` lift, the only un-deny (FW-CRED5) · **learn** = an enforced

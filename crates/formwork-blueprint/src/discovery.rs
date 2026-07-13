@@ -107,7 +107,18 @@ pub fn reverse_compile(
     for ((parent, access), members) in by_parent {
         let folded = PathPattern::parse(&format!("{}/**", parent.trim_end_matches('/')));
         let fold = match folded {
-            Ok(f) if members.len() >= 2 && catalog.floor_type_of(allow, &f).is_none() => Some(f),
+            // FW-INV8: never fold into a subtree that would transitively re-grant a credential the
+            // floor just withheld. Enforcement anchors the backstop under $HOME while discovery
+            // classifies by shape anywhere (over-capture safety); without this guard a folded
+            // `proj/**` over a non-$HOME dir could cover a withheld `proj/id_rsa` that the anchored
+            // enforcement floor no longer denies -- a seam back to the credential wall.
+            Ok(f)
+                if members.len() >= 2
+                    && catalog.floor_type_of(allow, &f).is_none()
+                    && !fold_would_cover_withheld(&f, &withheld) =>
+            {
+                Some(f)
+            }
             _ => None,
         };
         match fold {
@@ -126,6 +137,14 @@ pub fn reverse_compile(
         candidates,
         withheld,
     }
+}
+
+/// FW-INV8: would this folded subtree grant cover a path the floor withheld? A `true` keeps the
+/// members granular so a withheld credential is never re-granted through a covering subtree.
+fn fold_would_cover_withheld(folded: &PathPattern, withheld: &[WithheldEntry]) -> bool {
+    withheld
+        .iter()
+        .any(|w| PathPattern::parse(&w.path).is_ok_and(|p| folded.covers(&p)))
 }
 
 fn tag_candidate(
@@ -222,6 +241,43 @@ mod tests {
             .map(|c| c.pattern.canonical())
             .collect();
         assert_eq!(patterns, vec!["/home/x/one.txt", "/home/x/two.txt"]);
+    }
+
+    #[test]
+    fn fold_never_re_grants_a_withheld_credential_outside_home() {
+        // FW-INV8 regression: a credential-shaped file OUTSIDE $HOME is withheld by the shape
+        // floor, but its ordinary siblings must not fold into a subtree that transitively
+        // re-grants it. The anchored *enforcement* floor would not deny this non-$HOME key, so the
+        // fold guard is what keeps the wall intact -- unlike the home case above, floor_type_of on
+        // the folded subtree does not flag it (a subtree base is not itself credential-shaped).
+        let records = vec![
+            read("/srv/app/id_rsa"), // credential shape, outside $HOME -> withheld (backstop)
+            read("/srv/app/a.txt"),
+            read("/srv/app/b.txt"),
+        ];
+        let zone = vec![pp("/srv/app/**")]; // drawn over the dir: a fold here would auto-accept
+        let out = reverse_compile(&records, &catalog(), &[], &zone);
+
+        assert_eq!(out.withheld.len(), 1);
+        assert_eq!(out.withheld[0].path, "/srv/app/id_rsa");
+        assert_eq!(out.withheld[0].credential_type, "backstop");
+
+        let patterns: Vec<String> = out
+            .candidates
+            .iter()
+            .map(|c| c.pattern.canonical())
+            .collect();
+        assert_eq!(
+            patterns,
+            vec!["/srv/app/a.txt", "/srv/app/b.txt"],
+            "must stay granular"
+        );
+        assert!(
+            !out.candidates
+                .iter()
+                .any(|c| c.pattern.covers(&pp("/srv/app/id_rsa"))),
+            "no candidate may cover the withheld credential"
+        );
     }
 
     #[test]

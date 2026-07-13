@@ -2,7 +2,7 @@
 
 **Formwork Enhancement Proposal 2**
 
-- **Status:** Implemented (branch `fep-2-implementation`; verified on real Seatbelt + the unified-log denial feed). Amended at execution planning: test IDs renumbered to avoid collisions with landed FW-E2E-036..039 and `fep-1.md`'s reserved blocks, FW-BP2's layer order corrected, FW-BP4 pinned to the FW-CAP6 pattern grammar. Post-implementation, three requirements were made explicit from decisions the build had already proven: **FW-BP5** (path sigils, incl. `$CWD`), **FW-CRED9** (floor enforceability reported honestly per platform), and a strengthening of **FW-DISC3/FW-INV8** (the credential floor matches by shape wherever observed and is re-checked at accept). Rationale and mapping in `docs/fep2-plan.md` §0.
+- **Status:** Implemented (branch `fep-2-implementation`; verified on real Seatbelt + the unified-log denial feed). Amended at execution planning: test IDs renumbered to avoid collisions with landed FW-E2E-036..039 and `fep-1.md`'s reserved blocks, FW-BP2's layer order corrected, FW-BP4 pinned to the FW-CAP6 pattern grammar. Post-implementation, three requirements were made explicit from decisions the build had already proven: **FW-BP5** (path sigils, incl. `$CWD`), **FW-CRED9** (floor enforceability reported honestly per platform), and a strengthening of **FW-DISC3/FW-INV8** (the credential floor matches by shape wherever observed, is re-checked at accept, and is never transitively re-granted by a discovery fold — FW-ADV-015). Rationale and mapping in `docs/fep2-plan.md` §0.
 - **Depends on:** the base Formwork design document (`formwork.md`)
 - **Scope:** terminology change (spec → Blueprint), a Blueprint format/override model, a typed credential-location catalog, and an on-demand allow-listing (discovery) workflow.
 - **Introduces:** a third enforcement arm — the **launcher** — alongside the existing confiner and gateway.
@@ -77,7 +77,7 @@ Env shading is, if anything, *stronger* than path denial: a denied path still ex
 | **FW-CRED6** Generic backstop | Beyond curated types, a generic rule denies known-sensitive shapes (any `~/.ssh`, any `.env`, credential files in known config dirs) so uncatalogued secrets remain covered. |
 | **FW-CRED7** Operator/agent channel split | The operator sees itemized "denied/stripped X (type: …)". The confined agent sees a plain EACCES / an absent variable with no catalog annotation — no oracle. |
 | **FW-CRED8** Report names the mechanism | The FidelityReport marks each covered type `enforced-via-launcher` (env) or `enforced-via-OS-sandbox` (path), and states plainly that env-shading holds only while Formwork is the launching process — the guarantee is launcher-contingent, and the report must not overclaim it as independent of the launcher. |
-| **FW-CRED9** Floor enforceability is honest per platform | Any-depth floor rows — the `**/…` form, its anchored refinement `<prefix>/**/<suffix>`, and the generic backstop (FW-CRED6) — compile to a start-pinned regex on Seatbelt but cannot be rooted by Landlock. Where a floor row is unenforceable on the host it is withheld from the compiled deny set and the affected types (and the backstop) are reported **Partial**, never silently claimed `Enforced` (FW-INV5). *(Added post-implementation: the platform split was built and reported this way, but never stated as a requirement.)* |
+| **FW-CRED9** Floor enforceability is honest per platform | Any-depth floor rows — the `**/…` form, its anchored refinement `<prefix>/**/<suffix>`, and the generic backstop (FW-CRED6) — are enforceable as a Seatbelt regex (start-pinned for the anchored form, floating for the plain `**/…`) but cannot be rooted by Landlock. Where a floor row is unenforceable on the host it is withheld from the compiled deny set and the affected types (and the backstop) are reported **Partial**, never silently claimed `Enforced` (FW-INV5). *(Added post-implementation: the platform split was built and reported this way, but never stated as a requirement.)* |
 
 **Detector = report enrichment.** The "ambient credentials detector" is not new enforcement; it is FW-CRED7's operator-channel itemization plus the compile-time report of which catalog entries were subtracted and why. The default posture is deny-the-superset, report-the-specifics: block everything known (so a forgotten type is still gone), and itemize what was blocked — resolving the tension between safe-by-default and legible by doing both.
 
@@ -136,7 +136,7 @@ Continuing the base document's `FW-INV` sequence (base defined INV1–INV6).
 
 ## 9. New end-to-end tests
 
-Continuing the `FW-E2E` and `FW-ADV` sequences. Taken: the base defines FW-E2E-001–028 and FW-ADV-001–006, FEP-1 landed FW-E2E-036–039, and `fep-1.md` reserves FW-E2E-029–032 + 040 and FW-ADV-007–009 + 011 for its deferred egress/violation-stream work. FEP-2 therefore uses **FW-E2E-041–055** and **FW-ADV-012–014** (FW-E2E-055 was added post-implementation for the FW-BP5 path sigils; mapping from this document's draft numbering in `docs/fep2-plan.md` §0).
+Continuing the `FW-E2E` and `FW-ADV` sequences. Taken: the base defines FW-E2E-001–028 and FW-ADV-001–006, FEP-1 landed FW-E2E-036–039, and `fep-1.md` reserves FW-E2E-029–032 + 040 and FW-ADV-007–009 + 011 for its deferred egress/violation-stream work. FEP-2 therefore uses **FW-E2E-041–055** and **FW-ADV-012–015** (FW-E2E-055 and FW-ADV-015 were added post-implementation — the path sigils and the discovery-fold credential seam; mapping from this document's draft numbering in `docs/fep2-plan.md` §0).
 
 ### 9.1 Blueprint model and format
 
@@ -182,6 +182,8 @@ Continuing the `FW-E2E` and `FW-ADV` sequences. Taken: the base defines FW-E2E-0
 
 **FW-ADV-014: Launcher-bypass honesty.** The agent is started *without* Formwork (bypassing the launcher). Pass: env vars are present as expected, **and** the report had already disclosed env-shading as launcher-contingent — i.e. the guarantee was never overclaimed (FW-CRED8). Fail: the documentation/report implied env-shading holds independent of the launcher.
 
+**FW-ADV-015: Discovery fold cannot re-grant a credential (FW-INV8).** A credential-shaped file *outside* `$HOME` (`/srv/app/id_rsa`) sits alongside ordinary files that a learning run touches, with the auto-widen zone drawn over the directory. Pass: the key is withheld by the shape floor, its ordinary siblings stay granular (no `…/**` fold that would cover the key), nothing auto-accepted covers it, and a subsequent run still cannot read it. Fail: a fold or auto-widen grant transitively re-grants the withheld credential — the seam where the anchored enforcement floor (FW-CRED9) does not reach a non-`$HOME` shape while discovery classifies it by shape (FW-DISC3).
+
 ## 10. Requirements ↔ tests traceability
 
 | Requirement | Primary tests | Also |
@@ -202,7 +204,7 @@ Continuing the `FW-E2E` and `FW-ADV` sequences. Taken: the base defines FW-E2E-0
 | FW-CRED9 Floor enforceability | FW-E2E-050 | INV5; Linux kernel enforcement deferred |
 | FW-DISC1 Learning mode | FW-E2E-051 | 054 |
 | FW-DISC2 Reverse compile | FW-E2E-051 | 052, 053 |
-| FW-DISC3 Catalog floor | FW-ADV-013 | 051, INV8 |
+| FW-DISC3 Catalog floor | FW-ADV-013, 015 | 051, INV8 |
 | FW-DISC4 Auto-widen zone | FW-E2E-052 | 054 |
 | FW-DISC5 Review diff | FW-E2E-051 | 053 |
 | FW-DISC6 Provenance | FW-E2E-053 | — |
