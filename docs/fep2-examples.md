@@ -41,8 +41,8 @@ cat: /tmp/fw-doc/home/.aws/credentials: Operation not permitted
 2026-07-09T22:22:17Z  INFO formwork{run_id=35499 cmd="run"}: confined command exited exit_code=1
 ```
 
-No type name, no "catalog", no oracle — indistinguishable from any other denial (FW-INV9,
-verified adversarially by FW-ADV-012).
+No type name, no "catalog", no oracle — indistinguishable from any other denial ([FW-INV9](../formwork.md#fw-inv9),
+verified adversarially by [FW-ADV-012](../formwork.md#fw-adv-012)).
 
 ## 3. An env credential: absent, not empty, through the whole tree
 
@@ -56,8 +56,8 @@ grandchild sees: <unset>
 ```
 
 The strip is per-run news, so it itemizes at default level — names and types only, never values
-(FW-CRED7). `${VAR-<unset>}` prints `<unset>` only when the variable is genuinely absent
-(FW-INV7): the launcher never passed it, so no descendant can inherit it.
+([FW-CRED7](../formwork.md#fw-cred7)). `${VAR-<unset>}` prints `<unset>` only when the variable is genuinely absent
+([FW-INV7](../formwork.md#fw-inv7)): the launcher never passed it, so no descendant can inherit it.
 
 ## 4. `--allow-cred aws` un-blocks exactly one type
 
@@ -71,7 +71,7 @@ cat: /tmp/fw-doc/home/.ssh/id_ed25519: Operation not permitted
 ```
 
 The summary shows the lift (`allowed=["aws"]`, one fewer type on each arm). This is the only
-un-deny that exists: no path grant at any layer can shadow the floor (FW-BP4/FW-INV8). A typo is
+un-deny that exists: no path grant at any layer can shadow the floor ([FW-BP4](../formwork.md#fw-bp4)/[FW-INV8](../formwork.md#fw-inv8)). A typo is
 a loud config error, never a silent no-op:
 
 ```console
@@ -88,7 +88,7 @@ $ formwork run --blueprint session.toml -- /bin/cat project/.env.production
 cat: project/.env.production: Operation not permitted
 ```
 
-No curated type names `.env.production`; the backstop's shape rules do (FW-CRED6).
+No curated type names `.env.production`; the backstop's shape rules do ([FW-CRED6](../formwork.md#fw-cred6)).
 
 ## 6. The report labels each arm and discloses the launcher contingency
 
@@ -109,8 +109,8 @@ $ formwork compile --blueprint session.toml --target macos --report-only | jq .c
 ```
 
 Env-only types claim no path arm; path-only types claim no env arm; on a `--target linux-v6`
-compile the path backend reads `landlock` and any-depth rows report `partial` (FW-INV5). The
-contingency note is FW-ADV-014's subject: started *without* formwork, the variable is present —
+compile the path backend reads `landlock` and any-depth rows report `partial` ([FW-INV5](../formwork.md#fw-inv5)). The
+contingency note is [FW-ADV-014](../formwork.md#fw-adv-014)'s subject: started *without* formwork, the variable is present —
 and the report never claimed otherwise.
 
 ## 7. A learning run: enforced, observed, reverse-compiled
@@ -144,7 +144,7 @@ Worth noticing in that transcript:
 - **Three** withheld entries, though this run only touched one credential: the collection window
   also caught the `~/.aws` and `.env.production` denials from the sessions above. Attribution is
   run-window plus dedup, deliberately tolerant of over-capture — a withheld entry is never
-  proposable and everything else waits for review (FW-INV10), so over-capture costs an extra
+  proposable and everything else waits for review ([FW-INV10](../formwork.md#fw-inv10)), so over-capture costs an extra
   line, never an extra grant.
 - The two toolchain siblings folded into one `toolchain/**` candidate.
 
@@ -199,7 +199,7 @@ $ formwork run --blueprint tight.toml -- /bin/cat /tmp/fw-doc/toolchain/helper.p
 helper one
 ```
 
-The discovered layer keeps learned grants forever distinguishable from authored ones (FW-DISC6):
+The discovered layer keeps learned grants forever distinguishable from authored ones ([FW-DISC6](../formwork.md#fw-disc6)):
 
 ```console
 $ cat tight.toml.discovered.toml
@@ -235,5 +235,5 @@ floor (type: backstop); the only lift is the explicit typed exclude, --allow-cre
 
 The fixture layout and every command above are exactly what the E2E harness drives
 (`py/harness/test_credential_catalog.py`, `test_adv_credentials.py`, `test_discovery.py` —
-FW-E2E-041..054, FW-ADV-012..014). `cd py && uv run pytest -v` runs the lot against your own
+[FW-E2E-041](../formwork.md#fw-e2e-041)..054, [FW-ADV-012](../formwork.md#fw-adv-012)..014). `cd py && uv run pytest -v` runs the lot against your own
 machine's kernel.

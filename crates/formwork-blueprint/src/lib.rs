@@ -1,5 +1,7 @@
 //! The capability blueprint: pure data describing what a confined process may touch. Narrowing
 //! (`Blueprint::narrow`) can only shrink a grant, never widen it (FW-CAP2).
+//!
+//! Requirement IDs (`FW-…`) cite `formwork.md`, the design + E2E spec at the repo root.
 
 mod catalog;
 mod discovery;

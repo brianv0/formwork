@@ -16,6 +16,8 @@
 //! `detect`/`compile` don't enforce and run on any host (including compiling a Linux policy on a Mac);
 //! `run`/`enforce-self`/`gateway` need a real confiner and error honestly where the backend is
 //! unimplemented.
+//!
+//! Requirement IDs (`FW-…`) cite `formwork.md`, the design + E2E spec at the repo root.
 
 mod blueprint_load;
 mod learn;

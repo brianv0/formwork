@@ -15,36 +15,36 @@ Planning against the current tree (post-FEP-1 main) surfaced three drafting conf
 `fep2.md`. Each is resolved by amending the FEP — visibly, per the constitution's
 Precedence & Conflicts — not by silently deviating.
 
-**C1 — Test-ID collisions.** `fep2.md` §9 assumed the base sequence ended at FW-E2E-028 /
-FW-ADV-006. In fact FEP-1 landed FW-E2E-036..039 into `formwork.md`, and `fep-1.md` reserves
-FW-E2E-029..032 + 040 and FW-ADV-007..009 + 011 for the deferred egress/violation-stream work.
+**C1 — Test-ID collisions.** `fep2.md` §9 assumed the base sequence ended at [FW-E2E-028](../formwork.md#fw-e2e-028) /
+[FW-ADV-006](../formwork.md#fw-adv-006). In fact FEP-1 landed [FW-E2E-036](../formwork.md#fw-e2e-036)..039 into `formwork.md`, and `fep-1.md` reserves
+[FW-E2E-029](../fep-1.md#fw-e2e-029)..032 + 040 and [FW-ADV-007](../fep-1.md#fw-adv-007)..009 + 011 for the deferred egress/violation-stream work.
 FEP-2's tests are renumbered to the next free contiguous blocks:
 
 | fep2.md draft | final ID | scenario |
 |---|---|---|
-| FW-E2E-029 | **FW-E2E-041** | rename regression |
-| FW-E2E-030 | **FW-E2E-042** | override precedence |
-| FW-E2E-031 | **FW-E2E-043** | CLI/file parity |
-| FW-E2E-032 | **FW-E2E-044** | `extends` composition |
-| FW-E2E-033 | **FW-E2E-045** | path credential denied + itemized |
-| FW-E2E-034 | **FW-E2E-046** | env credential stripped, absent in tree |
-| FW-E2E-035 | **FW-E2E-047** | env-points-to-file dual arm |
-| FW-E2E-036 | **FW-E2E-048** | exclude-by-type un-blocks exactly one |
-| FW-E2E-037 | **FW-E2E-049** | generic backstop |
-| FW-E2E-038 | **FW-E2E-050** | report mechanism labeling |
-| FW-E2E-039 | **FW-E2E-051** | learning proposes toolchain, omits secrets |
-| FW-E2E-040 | **FW-E2E-052** | auto-widen zone boundary |
-| FW-E2E-041 | **FW-E2E-053** | provenance recorded |
-| FW-E2E-042 | **FW-E2E-054** | discovery non-authoritative |
-| FW-ADV-007 | **FW-ADV-012** | credential oracle probe |
-| FW-ADV-008 | **FW-ADV-013** | discovery confused-deputy |
-| FW-ADV-009 | **FW-ADV-014** | launcher-bypass honesty |
+| `FW-E2E-029` | **FW-E2E-041** | rename regression |
+| `FW-E2E-030` | **FW-E2E-042** | override precedence |
+| `FW-E2E-031` | **FW-E2E-043** | CLI/file parity |
+| `FW-E2E-032` | **FW-E2E-044** | `extends` composition |
+| `FW-E2E-033` | **FW-E2E-045** | path credential denied + itemized |
+| `FW-E2E-034` | **FW-E2E-046** | env credential stripped, absent in tree |
+| `FW-E2E-035` | **FW-E2E-047** | env-points-to-file dual arm |
+| `FW-E2E-036` | **FW-E2E-048** | exclude-by-type un-blocks exactly one |
+| `FW-E2E-037` | **FW-E2E-049** | generic backstop |
+| `FW-E2E-038` | **FW-E2E-050** | report mechanism labeling |
+| `FW-E2E-039` | **FW-E2E-051** | learning proposes toolchain, omits secrets |
+| `FW-E2E-040` | **FW-E2E-052** | auto-widen zone boundary |
+| `FW-E2E-041` | **FW-E2E-053** | provenance recorded |
+| `FW-E2E-042` | **FW-E2E-054** | discovery non-authoritative |
+| `FW-ADV-007` | **FW-ADV-012** | credential oracle probe |
+| `FW-ADV-008` | **FW-ADV-013** | discovery confused-deputy |
+| `FW-ADV-009` | **FW-ADV-014** | launcher-bypass honesty |
 
-FW-ADV-010 stays unassigned (a gap `fep-1.md` left); FW-ADV-011 stays reserved for FEP-1
+`FW-ADV-010` stays unassigned (a gap `fep-1.md` left); [FW-ADV-011](../fep-1.md#fw-adv-011) stays reserved for FEP-1
 Part A. One name per idea (constitution Vocabulary) is why this is fixed now, before any
 marker exists.
 
-**C2 — FW-BP2 precedence order.** The draft listed layers as "default profile → Blueprint
+**C2 — [FW-BP2](../formwork.md#fw-bp2) precedence order.** The draft listed layers as "default profile → Blueprint
 file → `extends` chain → CLI". Read literally with last-wins, a preset a file `extends`
 would override the file that extends it — which inverts every known `extends` semantic and
 would make presets unusable. Amended to the conventional, coherent order (lowest → highest):
@@ -59,60 +59,60 @@ fail-closed floor + catalog, not `profiles/default.toml`. The broad-read subtrac
 remains a preset a Blueprint opts into via `extends` (or `--blueprint profiles/default.toml`).
 This keeps closed-mode Blueprints expressible (a union-merged implicit `reads = ["/**"]`
 would make `read-mode = "closed"` meaningless) and matches fep2.md §11's own statement that
-FW-CAP3 is "now realized concretely by the catalog + backstop".
+[FW-CAP3](../formwork.md#fw-cap3) is "now realized concretely by the catalog + backstop".
 
-**C3 — "glob path patterns" (FW-BP4) vs the FW-CAP6 grammar.** The pattern grammar stays
-exactly FW-CAP6: absolute paths, `/**` subtrees, and any-depth `**/basename` forms. No
+**C3 — "glob path patterns" ([FW-BP4](../formwork.md#fw-bp4)) vs the [FW-CAP6](../formwork.md#fw-cap6) grammar.** The pattern grammar stays
+exactly [FW-CAP6](../formwork.md#fw-cap6): absolute paths, `/**` subtrees, and any-depth `**/basename` forms. No
 general glob (`id_*`, `.env.*`) is introduced: nothing in FEP-2's tests requires it, Landlock
 cannot express it directly (it would ride on the enforce-time expansion only), and a richer
 matcher in the security-critical path-narrowing algebra is exactly what the Growth doctrine
-says no to first. The generic backstop (FW-CRED6) is expressed with curated any-depth
-basenames instead (§3 below). FW-BP4's text is amended to say "path patterns (FW-CAP6
+says no to first. The generic backstop ([FW-CRED6](../formwork.md#fw-cred6)) is expressed with curated any-depth
+basenames instead (§3 below). [FW-BP4](../formwork.md#fw-bp4)'s text is amended to say "path patterns ([FW-CAP6](../formwork.md#fw-cap6)
 grammar)". If a future FEP shows a concrete secret shape the grammar cannot carry, that FEP
-amends FW-CAP6.
+amends [FW-CAP6](../formwork.md#fw-cap6).
 
 *Review addendum:* PR review asked for prefix selectivity on the new any-depth rows, so the
 grammar gained the **anchored** form `<prefix>/**/<suffix>[/**]` — the plain `**/` form with an
 absolute scope. The backstop was briefly anchored under `~` to use it, but that was reverted:
 a catch-all is location-independent by nature and must reach uncatalogued secrets outside `$HOME`
-(FW-CRED6), and anchoring also opened an FW-INV8 seam (a non-`$HOME` credential shape the anchored
+([FW-CRED6](../formwork.md#fw-cred6)), and anchoring also opened an [FW-INV8](../formwork.md#fw-inv8) seam (a non-`$HOME` credential shape the anchored
 enforcement floor no longer denied). The backstop's file-shape rows stay filesystem-wide (`**/…`);
 the anchored grammar form remains available for future curated rows that genuinely want a prefix.
-Still no `*` glob; on Linux both any-depth forms remain unrootable and report Partial (FW-CRED9).
+Still no `*` glob; on Linux both any-depth forms remain unrootable and report Partial ([FW-CRED9](../formwork.md#fw-cred9)).
 The same review pass fixed a real floor gap it surfaced: `accept` now canonicalizes the catalog
 before its floor re-check, so type rows hold in kernel coordinates (a `/tmp`-based `$HOME` no
 longer lets a forged entry slip past them onto the backstop).
 
-## 1. The merge algebra (FW-BP1/2/4)
+## 1. The merge algebra ([FW-BP1](../formwork.md#fw-bp1)/2/4)
 
 One model, many surfaces means one merge function. New in `formwork-blueprint`:
 
 - **`BlueprintLayer`** — an all-optional mirror of `Blueprint` (every field `Option` /
   empty-default), plus the fields FEP-2 adds: `extends: Vec<String>` (only meaningful in
-  files; resolved and emptied by the loader), `allow-credentials: Vec<String>` (FW-CRED5),
+  files; resolved and emptied by the loader), `allow-credentials: Vec<String>` ([FW-CRED5](../formwork.md#fw-cred5)),
   and `[discovery]` (`auto-widen` patterns + provenance, Part D). Parsed with
   `deny_unknown_fields`, kebab-case, like `Blueprint`.
 - **`merge(layers: &[BlueprintLayer]) -> Blueprint`** — pure, deterministic:
   - **path sets** (`reads`, `writes`, `subtract`, `write-subtract`, `allow-credentials`)
     **union across layers**. Grants and denies both only accumulate; **deny/subtract beats
-    allow at match time** (the existing compile semantic). This is FW-BP2's "overrides are
-    an additive last layer" taken at its word — and it is what makes FW-BP4's tie-break a
+    allow at match time** (the existing compile semantic). This is [FW-BP2](../formwork.md#fw-bp2)'s "overrides are
+    an additive last layer" taken at its word — and it is what makes [FW-BP4](../formwork.md#fw-bp4)'s tie-break a
     structural property rather than an ordering accident: no allow at any layer can shadow
     a deny at any layer. The only un-deny that exists is the typed credential exclude
-    (FW-CRED5), which lifts catalog entries by *type*, never by pattern.
+    ([FW-CRED5](../formwork.md#fw-cred5)), which lifts catalog entries by *type*, never by pattern.
   - **postures** (`read-mode`, `net`, `exec`, `env`) — **last-set-wins**; unset inherits.
   - **mcp** — per-server key, last-set-wins (a later layer's `[mcp.foo]` replaces an
     earlier one's wholesale; servers union across layers).
 - `Blueprint` itself stays what it is; the merged result feeds the unchanged compiler. The
   existing single-file path (`Blueprint` = one layer over the baseline) keeps working —
-  every already-landed blueprint parses and compiles to the same policy (FW-E2E-041).
+  every already-landed blueprint parses and compiles to the same policy ([FW-E2E-041](../formwork.md#fw-e2e-041)).
 
 **Loading (impure, CLI `blueprint_load`):** resolve `extends` recursively relative to the
 extending file's directory, depth-first post-order, cycle-detected on the canonicalized file
 path (a cycle is a load error naming the cycle). The CLI assembles
 `[baseline, …extends…, file, cli_layer]` and calls `merge`.
 
-**CLI surface (FW-BP1/BP3):** one generic override plus sugar, all desugaring into a single
+**CLI surface ([FW-BP1](../formwork.md#fw-bp1)/BP3):** one generic override plus sugar, all desugaring into a single
 `BlueprintLayer`:
 
 - `--set '<toml>'` (repeatable) — a TOML fragment parsed by the *same* serde model as the
@@ -121,7 +121,7 @@ path (a cycle is a load error naming the cycle). The CLI assembles
   `--write-subtract`, `--allow-cred <type>`, `--net deny|ports:<p,…>`, `--extends <file>`.
 - Available uniformly on `compile`, `run`, `enforce-self`, `gateway`, `learn`.
 
-## 2. The credential catalog (FW-CRED1..8)
+## 2. The credential catalog ([FW-CRED1](../formwork.md#fw-cred1)..8)
 
 **Data.** `profiles/credential-catalog.toml`, embedded into `formwork-blueprint` via
 `include_str!` and parsed once (`OnceLock`) — data to review, not code, yet available to the
@@ -143,28 +143,28 @@ paths = ["**/.env", "**/.env.local", "**/.env.production", …, "**/credentials"
          "**/credentials.json", "**/.netrc", "**/id_rsa", "**/id_ed25519", …]
 ```
 
-The catalog absorbs `profiles/sensitive-set.toml` (fep2.md §11: FW-TRA3 is superseded);
+The catalog absorbs `profiles/sensitive-set.toml` (fep2.md §11: [FW-TRA3](../formwork.md#fw-tra3) is superseded);
 the old file is deleted and `default.toml`'s prose points at the catalog. `~` expansion
 happens at load/compile boundary against the same `$HOME` the CLI already uses.
 
-**Enforcement split (FW-CRED2):**
+**Enforcement split ([FW-CRED2](../formwork.md#fw-cred2)):**
 
 - *path arm* → compile: catalog paths for all types **minus `allow-credentials`** (plus the
   backstop, which no type lifts) are appended to the effective subtract set → confiner deny
   (EACCES). Landlock/Seatbelt carry it exactly like today's sensitive set.
 - *env arm* → launcher (§3): catalog env names minus allowed types are stripped pre-spawn.
 
-**Report (FW-CRED8).** `FidelityReport` gains a `credentials` section:
+**Report ([FW-CRED8](../formwork.md#fw-cred8)).** `FidelityReport` gains a `credentials` section:
 `BTreeMap<type, { path: Option<Fidelity>, env: Option<Fidelity>, note }>` where env entries
 carry backend `launcher` and the launcher-contingency note verbatim ("holds only while
 Formwork is the launching process"). `Backend::Process` is renamed `Backend::Launcher` —
 one arm, one name (Vocabulary) — a report-schema change shipped with the workspace version
 rename (review decision: no version bump -- the schema is pre-release, canary consumers only).
 
-**Operator/agent split (FW-CRED7).** The operator channel is the existing stderr `tracing`
+**Operator/agent split ([FW-CRED7](../formwork.md#fw-cred7)).** The operator channel is the existing stderr `tracing`
 stream: at spawn, one structured itemization event per arm (types + names/patterns — never
 values). The agent channel is the kernel's bare EACCES / the absent variable. No catalog
-annotation ever reaches the confined side (FW-INV9).
+annotation ever reaches the confined side ([FW-INV9](../formwork.md#fw-inv9)).
 
 ## 3. The launcher arm (Part C)
 
@@ -175,24 +175,24 @@ types, and the env posture → kept vars + stripped names + env-file-ref paths),
 application stays in `formwork-cli`. Ordering: **catalog strip composes on top of the env
 posture** — posture filters first (passthrough/allowlist/scrub), then catalog names minus
 allowed types are removed from whatever survived. Deny wins; `allow-credentials` is the
-only lift, and it also exempts the type's names from the FW-ENV2 scrub shapes so
+only lift, and it also exempts the type's names from the [FW-ENV2](../formwork.md#fw-env2) scrub shapes so
 `--allow-cred aws` yields a *usable* credential.
 
-FW-CRED3 (env-points-to-file): before stripping, the launcher reads each `env-file-refs`
+[FW-CRED3](../formwork.md#fw-cred3) (env-points-to-file): before stripping, the launcher reads each `env-file-refs`
 variable's value from its own environment; a non-empty value is canonicalized and appended
 to the enforcement-time subtract set (same fail-loud path rules as any grant). Compile
 stays pure — the report's `gcp.env` entry notes the referenced file is denied at spawn.
 
-FW-INV7 (absent through the tree) is inheritance: what the child never receives, no
-descendant can inherit. The test proves it at a grandchild. FW-ADV-014 (launcher-bypass
-honesty) needs no code beyond FW-CRED8's note — the test asserts the disclosure exists and
+[FW-INV7](../formwork.md#fw-inv7) (absent through the tree) is inheritance: what the child never receives, no
+descendant can inherit. The test proves it at a grandchild. [FW-ADV-014](../formwork.md#fw-adv-014) (launcher-bypass
+honesty) needs no code beyond [FW-CRED8](../formwork.md#fw-cred8)'s note — the test asserts the disclosure exists and
 that a formwork-less run indeed sees the variable.
 
 ## 4. Discovery (Part D)
 
 **Posture: observe-then-widen** (fep2.md §12.2 resolved as recommended). Learning is an
-*enforced* run plus observation — enforcement is never weakened by learning (FW-INV10;
-policy is installed pre-exec and immutable, FW-XR8). What learning adds is a denial feed
+*enforced* run plus observation — enforcement is never weakened by learning ([FW-INV10](../formwork.md#fw-inv10);
+policy is installed pre-exec and immutable, [FW-XR8](../formwork.md#fw-xr8)). What learning adds is a denial feed
 and a reverse compiler.
 
 **Denial feed.** On macOS, Seatbelt violations land in the unified log; `formwork learn`
@@ -204,14 +204,14 @@ best-effort fallback matching, then dedupes into `{path, op}` records. Post-hoc 
 Linux, per-access denial observation needs Landlock audit (kernel 6.15+) which we do not
 wire in this FEP: `learn` on Linux runs enforced but reports the observation gap loudly
 and emits an empty proposal marked unobserved — fail loud, never silently pretend
-(FW-INV5/6). Discovery E2E tests are macOS-marked, the platform honesty is asserted, and
+([FW-INV5](../formwork.md#fw-inv5)/6). Discovery E2E tests are macOS-marked, the platform honesty is asserted, and
 the Linux feed is a documented follow-up.
 
-**Reverse compile (FW-DISC2).** Pure function: denial records + effective Blueprint +
+**Reverse compile ([FW-DISC2](../formwork.md#fw-disc2)).** Pure function: denial records + effective Blueprint +
 catalog + auto-widen zone → a *proposal*:
 
 - catalog-matched denial → **withheld** (named on the operator channel with its type;
-  never a candidate — FW-DISC3/FW-INV8; the zone cannot lift it either);
+  never a candidate — [FW-DISC3](../formwork.md#fw-disc3)/[FW-INV8](../formwork.md#fw-inv8); the zone cannot lift it either);
 - denial inside the operator-authored `[discovery] auto-widen` zone → **auto-acceptable**;
 - anything else → **needs-review**.
 
@@ -223,12 +223,12 @@ run metadata) written next to the blueprint (`<name>.proposal.toml`). Accepted g
 in a *discovered layer* file (`<name>.discovered.toml`) that carries `[discovery.provenance]`
 (pattern → `{ added-via = "discovery" | "discovery-auto", run-id }`); the operator's
 blueprint `extends` it (or the CLI stacks it). Authored vs learned stays distinguishable
-by file and by provenance table (FW-DISC6). `formwork learn` auto-moves only in-zone
+by file and by provenance table ([FW-DISC6](../formwork.md#fw-disc6)). `formwork learn` auto-moves only in-zone
 candidates into the discovered layer; `formwork accept --proposal p --entry <pattern>`
-(and `--all-reviewed`) moves the rest per-entry after human review (FW-DISC5).
+(and `--all-reviewed`) moves the rest per-entry after human review ([FW-DISC5](../formwork.md#fw-disc5)).
 
-**Sequencing within a run:** observation never changes the running session (FW-DISC1,
-FW-E2E-054); the discovered layer takes effect on the *next* run (FW-E2E-052).
+**Sequencing within a run:** observation never changes the running session ([FW-DISC1](../formwork.md#fw-disc1),
+[FW-E2E-054](../formwork.md#fw-e2e-054)); the discovered layer takes effect on the *next* run ([FW-E2E-052](../formwork.md#fw-e2e-052)).
 
 ## 5. End-to-end test design
 
@@ -313,7 +313,7 @@ that must respect it):
 2. **FW-CRED path arm** — catalog data + compile + report `credentials` section + rename
    `Process`→`Launcher` (tests 045, 049, half of 050, path half of ADV-012).
 3. **Launcher env arm** — strip + env-file-refs + itemization (tests 046, 047, rest of
-   050, ADV-012, ADV-014). FW-CRED5 `--allow-cred` lands with 2–3 (test 048).
+   050, ADV-012, ADV-014). [FW-CRED5](../formwork.md#fw-cred5) `--allow-cred` lands with 2–3 (test 048).
 4. **FW-DISC** — log tap, reverse compile, zone, proposal/accept, provenance (tests
    051–054, ADV-013).
 5. **Docs** — `formwork.md` §2/§4/§5/§10 impact, constitution amendments (Concepts:
@@ -334,7 +334,7 @@ Each phase lands compiling, clippy-clean, and green before the next begins.
 2. **Discovery default: observe-then-widen.** Interactive `SECCOMP_USER_NOTIF` prompting
    stays out of scope (confirmed), documented as a Linux-only future.
 3. **Catalog v1: curated set + generic backstop** (the recommendation), absorbing the
-   whole FW-TRA3 sensitive set as types so exclude-by-type covers agent-state too.
+   whole [FW-TRA3](../formwork.md#fw-tra3) sensitive set as types so exclude-by-type covers agent-state too.
 4. **Auto-widen zone: empty by default.** The operator draws it; nothing self-grants out
    of the box.
 5. **Credential brokering: deferred** to a later FEP (unchanged).
@@ -352,21 +352,21 @@ Reviewed section-by-section against `constitution.md`, over the full branch diff
   assembled; discovery is a workflow over launcher + confiner + report; its artifacts are
   named Data-model surfaces. No new door for the agent: the denial feed is operator-side.
 - **Data model.** Input schema growth is additive — every pre-FEP-2 blueprint parses and
-  compiles unchanged (FW-E2E-041). The report change (credentials section, `process`→
+  compiles unchanged ([FW-E2E-041](../formwork.md#fw-e2e-041)). The report change (credentials section, `process`→
   `launcher` backend rename) needs no version bump per review -- the schema is pre-release with
   canary consumers only. `deny_unknown_fields` on every new
   input type. `sensitive-set.toml` pruned at this release (event-triggered), content migrated
   into the catalog.
 - **Vocabulary.** floor / strip / exclude / learn / withheld / accept / provenance recorded,
-  one meaning each. A `deny` synonym for `subtract` was deliberately NOT introduced (FW-BP4
+  one meaning each. A `deny` synonym for `subtract` was deliberately NOT introduced ([FW-BP4](../formwork.md#fw-bp4)
   amended instead).
 - **Boundaries.** Each new external input parses once at its edge: layer files and `--set`
   fragments (loader), the embedded catalog (parse-once, unit-validated), env-file-ref values
   (loader, loud on non-UTF-8), unified-log ndjson (learn edge → `DenialRecord`), proposals
   (accept edge). No secret values anywhere in artifacts or telemetry — names and types only,
-  asserted by FW-E2E-046 (the injected value never appears in any output).
+  asserted by [FW-E2E-046](../formwork.md#fw-e2e-046) (the injected value never appears in any output).
 - **Errors.** New failure paths are closed-or-loud: unknown credential type (lists known),
-  extends cycle (names the cycle), un-renderable floor/env-file-ref path (refuses, FW-INV6),
+  extends cycle (names the cycle), un-renderable floor/env-file-ref path (refuses, [FW-INV6](../formwork.md#fw-inv6)),
   provenance-less discovered grant (refused), feed-less learning (runs enforced, warns, writes
   nothing), forged proposal (refused at the floor).
 - **Observability.** New boundary events (floor itemization, strip itemization, learning
@@ -383,14 +383,14 @@ Reviewed section-by-section against `constitution.md`, over the full branch diff
 - **Testing.** No mocks; kernel probes are paired allow/deny against real Seatbelt; the
   denial feed is the real unified log. The pure-input carve-out is used only for compile
   determinism (fixed home) and unit isolation (`empty_no_floor`, loudly named). Traceability
-  is generated from markers: FW-E2E-041..054 and FW-ADV-012..014, 17/17 implemented and green.
+  is generated from markers: [FW-E2E-041](../formwork.md#fw-e2e-041)..054 and [FW-ADV-012](../formwork.md#fw-adv-012)..014, 17/17 implemented and green.
 - **Precedence & conflicts.** The three fep2.md drafting conflicts were resolved by visible
   amendment (§0), never silent deviation. Known, *reported* residuals — honesty-pattern gaps,
   not suspended rules: (a) any-depth floor rows are withheld on Linux and the affected types
-  + backstop reported Partial (FW-INV5); (b) the denial feed is macOS-only, Linux learning
-  warns loud and writes nothing; (c) FW-E2E-051 exercises the learning property with a
-  hermetic scripted workload because the FW-E2E-020 reuse fixtures do not exist yet; (d) log
-  attribution is window+dedup — over-capture is floored or review-gated by design (FW-INV10).
+  + backstop reported Partial ([FW-INV5](../formwork.md#fw-inv5)); (b) the denial feed is macOS-only, Linux learning
+  warns loud and writes nothing; (c) [FW-E2E-051](../formwork.md#fw-e2e-051) exercises the learning property with a
+  hermetic scripted workload because the [FW-E2E-020](../formwork.md#fw-e2e-020) reuse fixtures do not exist yet; (d) log
+  attribution is window+dedup — over-capture is floored or review-gated by design ([FW-INV10](../formwork.md#fw-inv10)).
 
 Follow-ups noted, not blocking: full `formwork.md` reintegration (FEP-1 precedent: separate
 docs PR); a Linux denial feed via Landlock audit (kernel 6.15+) when a test kernel exists;

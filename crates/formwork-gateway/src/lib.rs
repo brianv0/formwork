@@ -6,6 +6,8 @@
 //! so a runtime `list_changed` re-filters for free. Granted traffic forwards as the exact bytes
 //! received (FW-GW8); any `AsyncRead`/`AsyncWrite` pair works, so an http/sse backend needs only a
 //! framing adapter.
+//!
+//! Requirement IDs (`FW-…`) cite `formwork.md`, the design + E2E spec at the repo root.
 
 use std::collections::HashMap;
 use std::io;

@@ -1,6 +1,8 @@
 //! `HostProfile`: the single impure input to compilation. `detect()` probes the running kernel;
 //! profiles can also be synthesized (a Linux profile on a Mac) for cross-platform dry-run. The
 //! compiler only reads the value it is handed, which is what keeps `compile()` pure.
+//!
+//! Requirement IDs (`FW-…`) cite `formwork.md`, the design + E2E spec at the repo root.
 
 use serde::{Deserialize, Serialize};
 

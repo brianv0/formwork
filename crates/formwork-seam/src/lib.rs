@@ -11,6 +11,8 @@
 //! tests (FW-E2E-010/011/012), ahead of the CLI/gateway wiring that will connect it. The public
 //! surface is deliberately minimal: methods are added when that consumer needs them, not before
 //! (Growth). If the wiring is abandoned, delete the crate rather than let it drift.
+//!
+//! Requirement IDs (`FW-…`) cite `formwork.md`, the design + E2E spec at the repo root.
 
 #[derive(Debug, thiserror::Error)]
 pub enum SeamError {

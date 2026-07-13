@@ -9,18 +9,18 @@ to the design doc.
 **Rust** carries everything load-bearing: the blueprint types, the pure compiler, both confiners,
 the fd seam, the gateway, and the CLI. Rationale: the confiner does `pre_exec`-window syscall
 work (fork-safety matters), the gateway is the single privileged broker (memory safety
-matters), and the compiler must be deterministic (FW-FID4).
+matters), and the compiler must be deterministic ([FW-FID4](formwork.md#fw-fid4)).
 
 **Python** carries everything that sits *outside* the trust boundary:
 
 - the end-to-end / adversarial test harness (`pytest`), which orchestrates the Rust binaries
   and asserts the FW-E2E-* / FW-ADV-* pass/fail conditions;
 - probe scripts that run *inside* the sandbox (which doubles as a continuous test of ambient
-  interpreter reuse, FW-TRA1);
+  interpreter reuse, [FW-TRA1](formwork.md#fw-tra1));
 - fixture MCP servers (stdio and streamable-http, via the official `mcp` Python SDK) used by
   the gateway tests;
 - reuse-workload fixtures (a real pytest project, an npm project, a git repo, a small C build)
-  for FW-E2E-020..023.
+  for [FW-E2E-020](formwork.md#fw-e2e-020)..023.
 
 Optional later: `pyo3`-based Python bindings for embedding (`formwork.compile()`,
 `formwork.run()`). Not in v1 — the CLI is the v1 embedding surface.
@@ -65,28 +65,28 @@ formwork/
 ### 3.1 Blueprint and deterministic compile
 
 - Blueprint is TOML on disk, `serde` in memory, with a **canonical form** (sorted keys, normalized
-  paths, canonical JSON serialization) so FW-E2E-027's byte-identical requirement is a
+  paths, canonical JSON serialization) so [FW-E2E-027](formwork.md#fw-e2e-027)'s byte-identical requirement is a
   property of the encoder, not luck.
 - `compile(blueprint, host: &HostProfile) -> CompiledPolicy` is pure. All host facts (Landlock ABI
   level, macOS version, seccomp availability) enter through the explicit `HostProfile` value,
   produced by `formwork-detect` or supplied synthetically. That is what makes "compile a Linux
-  policy on a Mac" (FW-E2E-026) trivial: pass a synthetic Linux profile.
+  policy on a Mac" ([FW-E2E-026](formwork.md#fw-e2e-026)) trivial: pass a synthetic Linux profile.
 - The compiled `ConfinerPolicy` is **symbolic** (path patterns + access bits + subtract set +
   a seccomp filter description), not expanded against the live filesystem. Expansion happens
   at `enforce()` time (see 3.3). This keeps compile deterministic even though the subtractive
   profile depends on what exists under `$HOME`.
 - seccomp BPF is built with `seccompiler` (rust-vmm; pure Rust, no libseccomp C dependency,
   deterministic output). Landlock via the official `landlock` crate (ABI negotiation,
-  best-effort mode disabled — we do our own fidelity accounting instead, FW-XR1).
+  best-effort mode disabled — we do our own fidelity accounting instead, [FW-XR1](formwork.md#fw-xr1)).
 
 ### 3.2 Linux confiner
 
 Spawn-confined posture (preferred): `Command::pre_exec` hook, in order:
 
-1. `prctl(PR_SET_NO_NEW_PRIVS, 1)` (FW-ISO8);
+1. `prctl(PR_SET_NO_NEW_PRIVS, 1)` ([FW-ISO8](formwork.md#fw-iso8));
 2. apply Landlock ruleset via `landlock_restrict_self` — fs read/write/exec rights, plus
    net `ACCESS_NET_*` and scope flags where the ABI has them (survives `execve`, inherited by
-   all descendants: FW-XR4);
+   all descendants: [FW-XR4](formwork.md#fw-xr4));
 3. install the seccomp filter;
 4. `execve` the target.
 
@@ -95,16 +95,16 @@ Confine-self posture is the same sequence exposed as a library call (`enforce_se
 **Net default-deny below Landlock net ABI (v4)** is done in seccomp: deny `socket(2)` for
 `AF_INET`/`AF_INET6`/`AF_PACKET` (and `AF_NETLINK` except the route-read families toolchains
 need), allow `AF_UNIX` and `socketpair`. Denying socket *creation* still permits full use of
-inherited connected fds — exactly the seam semantics FW-XR7 wants. On ABI ≥ 4 kernels,
-Landlock TCP rules additionally enforce the optional port tier (FW-ISO5); the report states
+inherited connected fds — exactly the seam semantics [FW-XR7](formwork.md#fw-xr7) wants. On ABI ≥ 4 kernels,
+Landlock TCP rules additionally enforce the optional port tier ([FW-ISO5](formwork.md#fw-iso5)); the report states
 which mechanism carried net-deny on this host.
 
-**Seccomp baseline** (FW-ISO8) is deny-list-shaped, not allow-list-shaped, to honor
-transparency (FW-TRA2): block confinement-shedding and escalation surfaces (`ptrace` of
+**Seccomp baseline** ([FW-ISO8](formwork.md#fw-iso8)) is deny-list-shaped, not allow-list-shaped, to honor
+transparency ([FW-TRA2](formwork.md#fw-tra2)): block confinement-shedding and escalation surfaces (`ptrace` of
 non-descendants, `keyctl`, `add_key`, `bpf`, `mount`/`move_mount`/`fsmount`, `setns`,
 `unshare(CLONE_NEWUSER)`, `kexec*`, `init_module*`, `open_by_handle_at`, `userfaultfd`,
 `perf_event_open`) and the socket families above. Everything else passes. Landlock ABI v6
-scope flags add abstract-unix-socket and signal scoping where available (FW-ADV-006);
+scope flags add abstract-unix-socket and signal scoping where available ([FW-ADV-006](formwork.md#fw-adv-006));
 below v6 the gap is reported `Partial`.
 
 **Landlock is allowlist-only — the subtractive profile compiles to an expansion.** "read
@@ -128,7 +128,7 @@ calls for; it remains the mechanism under `sandbox-exec`, Chromium, and Bazel. C
   last-match-wins, so the subtractive profile is native here — no expansion step.
 - **Spawn-confined**: `fork()`, then in the child call `sandbox_init(profile, SBPL, &err)`
   and `execve` the target. Seatbelt persists across exec and is inherited by descendants
-  (FW-XR4). FFI is three symbols from `libsystem_sandbox.dylib` (`sandbox_init`,
+  ([FW-XR4](formwork.md#fw-xr4)). FFI is three symbols from `libsystem_sandbox.dylib` (`sandbox_init`,
   `sandbox_free_error`); we declare them ourselves with `#[allow(deprecated)]` semantics —
   no crate dependency needed. `sandbox-exec -p` is kept as a debugging tool only, not a
   runtime dependency.
@@ -150,31 +150,31 @@ calls for; it remains the mechanism under `sandbox-exec`, Chromium, and Bazel. C
 - On-demand minting: a 3-message protocol on the control fd (`mint {server} → fd via
   SCM_RIGHTS | error`), implemented with `sendmsg`/`recvmsg` ancillary data; identical code on
   both platforms. The gateway enforces that minting is the *only* way a new connection
-  appears (FW-ADV-005: backends can't confer fds because backends have no control fd — only
+  appears ([FW-ADV-005](formwork.md#fw-adv-005): backends can't confer fds because backends have no control fd — only
   the agent does, and the gateway never forwards ancillary data between domains).
 
 ### 3.5 Gateway (`formwork-gateway`)
 
 - tokio-based. Backends: stdio (spawned **through `formwork-confine`** with their own grant —
-  FW-GW5/FW-E2E-019) and streamable-http/SSE via `reqwest` limited to allowlisted endpoints
-  (FW-GW7). The gateway's own process is itself confined to its minimal fs scope; on Linux
+  [FW-GW5](formwork.md#fw-gw5)/[FW-E2E-019](formwork.md#fw-e2e-019)) and streamable-http/SSE via `reqwest` limited to allowlisted endpoints
+  ([FW-GW7](formwork.md#fw-gw7)). The gateway's own process is itself confined to its minimal fs scope; on Linux
   its egress confinement (netns vs nftables, §11) is deferred to Phase 7 and reported
   honestly meanwhile.
-- **Interception layer, not a re-serving SDK.** For FW-GW8 transparent passthrough, the proxy
+- **Interception layer, not a re-serving SDK.** For [FW-GW8](formwork.md#fw-gw8) transparent passthrough, the proxy
   parses only the JSON-RPC envelope plus the policed methods (`initialize`, `tools/*`,
   `resources/*`, `prompts/*`, `notifications/*/list_changed`, `sampling/createMessage`,
   `elicitation/create`) and forwards everything else, and all granted payloads, as
   `serde_json::value::RawValue` — bytes preserved, no semantic re-encoding. The official
   `rmcp` SDK is used for its protocol *types* in tests and fixtures, not in the proxy hot
   path.
-- **Oracle-free refusals (FW-ADV-004) by construction:** the gateway validates `tools/call`
+- **Oracle-free refusals ([FW-ADV-004](formwork.md#fw-adv-004)) by construction:** the gateway validates `tools/call`
   names against the *shaded* list. Any name not on it — hidden-but-real and nonexistent
   alike — takes the identical local code path: same JSON-RPC error object (MCP
   "unknown tool" shape), never consults the backend, so content, error code, and timing are
   indistinguishable because they are the same path, not because we tuned two paths to match.
   Same construction for resources (URI not in shaded list) and prompts.
 - `list_changed` handling: the gateway re-runs the shading filter on every refreshed listing
-  before forwarding the notification (FW-E2E-016); policy is static per session, listings are
+  before forwarding the notification ([FW-E2E-016](formwork.md#fw-e2e-016)); policy is static per session, listings are
   dynamic.
 
 ### 3.6 FidelityReport
@@ -191,8 +191,8 @@ struct FidelityReport { per_capability: BTreeMap<CapabilityKey, Fidelity>,
 
 `enforce()` consumes the compiled report and may only *confirm or degrade-loudly*: if a
 mechanism the report promised fails to install, `enforce()` aborts (fail-closed) rather than
-continuing with a weaker set (FW-XR1, FW-INV6). Runtime denials are logged as structured
-JSONL (FW-FID3).
+continuing with a weaker set ([FW-XR1](formwork.md#fw-xr1), [FW-INV6](formwork.md#fw-inv6)). Runtime denials are logged as structured
+JSONL ([FW-FID3](formwork.md#fw-fid3)).
 
 ### 3.7 CLI surface (v1 embedding API)
 
@@ -234,20 +234,20 @@ Exit: spike notes committed to `docs/spikes.md`; any design amendment fed back i
 ### Phase 1 — blueprint, compiler, fidelity, dry-run
 
 `formwork-blueprint`, `formwork-compile`, `formwork-detect`, CLI `detect|compile`.
-Golden-file tests for canonical encoding; property test for narrowing monotonicity (FW-CAP2).
-**Exit: FW-E2E-026, FW-E2E-027 green on macOS and Linux CI; a Linux policy compiles on macOS.**
+Golden-file tests for canonical encoding; property test for narrowing monotonicity ([FW-CAP2](formwork.md#fw-cap2)).
+**Exit: [FW-E2E-026](formwork.md#fw-e2e-026), [FW-E2E-027](formwork.md#fw-e2e-027) green on macOS and Linux CI; a Linux policy compiles on macOS.**
 
 ### Phase 2 — Linux confiner
 
 `formwork-confine` Linux backend (Landlock fs + seccomp baseline + net-deny +
 NO_NEW_PRIVS), both postures, subtractive expansion, `formwork run`/`probe`. Python harness
 bootstrapped here (probes + fixtures).
-**Exit: FW-E2E-001..005, FW-ADV-001, FW-ADV-002, FW-E2E-024 green on Linux.**
+**Exit: [FW-E2E-001](formwork.md#fw-e2e-001)..005, [FW-ADV-001](formwork.md#fw-adv-001), [FW-ADV-002](formwork.md#fw-adv-002), [FW-E2E-024](formwork.md#fw-e2e-024) green on Linux.**
 
 ### Phase 3 — macOS confiner
 
 Seatbelt backend, same test set, plus the parity suite.
-**Exit: the Phase-2 test set green on macOS; FW-E2E-028 green across both.**
+**Exit: the Phase-2 test set green on macOS; [FW-E2E-028](formwork.md#fw-e2e-028) green across both.**
 
 ### Phase 4 — reuse validation and default-profile tuning
 
@@ -255,14 +255,14 @@ Run the real workloads (`py/workloads/`) under `profiles/default.toml`; iterate 
 profile and sensitive set until zero happy-path denials. This is the philosophy checkpoint:
 if the default profile can't be made transparent, stop and rework before building the seam
 and gateway on top of it.
-**Exit: FW-E2E-020..023 green on both platforms; §8 overhead numbers recorded by a benchmark
+**Exit: [FW-E2E-020](formwork.md#fw-e2e-020)..023 green on both platforms; §8 overhead numbers recorded by a benchmark
 harness (`just bench`), within target.**
 
 ### Phase 5 — fd seam
 
 `formwork-seam`: pre-open at spawn, control protocol, SCM_RIGHTS minting; a stub echo
 "gateway" suffices for the seam tests.
-**Exit: FW-E2E-010, 011, 012 green on both platforms.**
+**Exit: [FW-E2E-010](formwork.md#fw-e2e-010), 011, 012 green on both platforms.**
 
 ### Phase 6 — gateway
 
@@ -270,15 +270,15 @@ harness (`just bench`), within target.**
 refusals, `list_changed` re-filtering, sampling/elicitation policing, transparent
 passthrough (byte-compared against direct-connection ground truth), backend-confinement
 recursion. Python MCP fixtures land here.
-**Exit: FW-E2E-013..019, FW-ADV-003, 004, 005 green.**
+**Exit: [FW-E2E-013](formwork.md#fw-e2e-013)..019, [FW-ADV-003](formwork.md#fw-adv-003), 004, 005 green.**
 
 ### Phase 7 — degraded-host honesty and optional tiers
 
-Port tier (Landlock ABI v4 / Seatbelt remote filters), optional exec allowlist (FW-ISO4,
+Port tier (Landlock ABI v4 / Seatbelt remote filters), optional exec allowlist ([FW-ISO4](formwork.md#fw-iso4),
 shipped as enabled-optional — it is nearly free once Phase 2/3 exist), ABI-v6 socket/signal
 scoping, degraded-host test matrix (old-kernel container images in CI), gateway egress
 isolation decision (netns via `pasta` vs direct nftables — decide from Phase-6 experience).
-**Exit: FW-E2E-009, FW-E2E-025, FW-ADV-006 green; fidelity matrix in §9 of the design doc
+**Exit: [FW-E2E-009](formwork.md#fw-e2e-009), [FW-E2E-025](formwork.md#fw-e2e-025), [FW-ADV-006](formwork.md#fw-adv-006) green; fidelity matrix in §9 of the design doc
 reproduced by `formwork detect + compile` on each CI target.**
 
 ## 5. Test and CI strategy
@@ -291,7 +291,7 @@ reproduced by `formwork detect + compile` on each CI target.**
   Rust helpers under `formwork-cli probe`.
 - **CI matrix:** `macos-15` (Seatbelt), `ubuntu-24.04` (kernel 6.8 → Landlock ABI v4: fs +
   net-port tests), a 6.12+ runner or container-in-VM job for ABI v6 scoping tests, and a
-  deliberately old-kernel job (no Landlock) for FW-E2E-025/026 honesty tests. Platform-gated
+  deliberately old-kernel job (no Landlock) for [FW-E2E-025](formwork.md#fw-e2e-025)/026 honesty tests. Platform-gated
   tests skip-with-reason, never silently pass.
 - **Local dev** on macOS: `just test-macos` runs natively. For Linux, Docker is the
   first-line path — `just test-linux` runs the suite in a container because it is fast,
@@ -312,7 +312,7 @@ reproduced by `formwork detect + compile` on each CI target.**
   When the Docker VM kernel is too old for a test tier (ABI v6 socket/signal scoping needs
   6.12+), `just test-linux-full` falls back to a Lima VM with a pinned 6.12+ kernel image —
   the only local path that exercises the complete matrix.
-- **Fuzzing** (FW-INV1/2/4): `proptest` for blueprint/narrow sequences and spawn trees; a
+- **Fuzzing** ([FW-INV1](formwork.md#fw-inv1)/2/4): `proptest` for blueprint/narrow sequences and spawn trees; a
   guessed-name fuzzer for shading; nightly CI job, not per-PR.
 
 ## 6. Risk register
@@ -332,7 +332,7 @@ reproduced by `formwork detect + compile` on each CI target.**
 - **fd-minting default:** pre-open at spawn; on-demand `SCM_RIGHTS` as escape hatch (3.4).
 - **Exec restriction in v1:** ships enabled-optional in Phase 7 (cheap once confiners exist).
 - **Sensitive-set discovery:** superseded by FEP-2's typed credential catalog
-  (`profiles/credential-catalog.toml`, embedded; FW-CRED1) plus the generic backstop,
+  (`profiles/credential-catalog.toml`, embedded; [FW-CRED1](formwork.md#fw-cred1)) plus the generic backstop,
   caller-narrowable — the fail-closed answer the design doc already leans toward.
 - **Naming** and **Linux gateway egress build-vs-buy** stay open; the latter is decided at
   Phase 7 with real data.

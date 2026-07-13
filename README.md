@@ -29,7 +29,7 @@ Under construction, kernel-mechanism-first (plan §4).
 65 Rust tests pass on macOS (`cargo test`), 8 Python E2E tests pass (`cd py && uv run pytest`),
 clippy is clean under `-D warnings`, and the whole workspace cross-compiles for Linux
 (`cargo check --target x86_64-unknown-linux-gnu`). On real Linux (Docker, kernel 5.10 — no Landlock)
-`formwork detect` and the degraded-host honesty path (FW-E2E-025/026, FW-INV6) are verified.
+`formwork detect` and the degraded-host honesty path ([FW-E2E-025](formwork.md#fw-e2e-025)/026, [FW-INV6](formwork.md#fw-inv6)) are verified.
 
 ## Workspace
 
