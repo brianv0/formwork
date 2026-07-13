@@ -298,8 +298,9 @@ async fn fw_e2e_019_backend_confinement_recursion() {
     use std::path::Path;
     use std::process::Stdio;
 
-    use formwork_blueprint::ResolvedCatalog;
-    use formwork_blueprint::{Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode};
+    use formwork_blueprint::{
+        Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
+    };
     use formwork_compile::compile;
     use formwork_detect::detect;
 

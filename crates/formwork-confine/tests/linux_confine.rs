@@ -16,10 +16,7 @@ use formwork_detect::detect;
 
 /// Integration tests enforce what the product enforces: the builtin catalog resolved for the
 /// real home. The probes below touch only scratch paths, so the floor never interferes.
-fn compile(
-    blueprint: &formwork_blueprint::Blueprint,
-    host: &formwork_detect::HostProfile,
-) -> CompiledPolicy {
+fn compile(blueprint: &Blueprint, host: &formwork_detect::HostProfile) -> CompiledPolicy {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     formwork_compile::compile(
         blueprint,

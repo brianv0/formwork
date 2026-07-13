@@ -1,8 +1,8 @@
 //! The launcher's environment construction (FEP-2 §6, FW-CRED2 env arm). Pure: given the ambient
 //! variables, the env posture, and the resolved catalog, decide what the confined child receives.
 //! The impure application -- reading the real environment, building the `Command` -- stays in the
-//! CLI shell. Order matters and is fixed: the posture filters first (FW-ENV1/2), then the catalog
-//! strip removes every non-excluded type's variables from whatever survived (FW-CRED4). A stripped
+//! CLI shell. Order matters and is fixed: the catalog strip partitions first (FW-CRED4), then the
+//! posture filters what remains (FW-ENV1/2) -- see [`construct_env`] for why. A stripped
 //! variable is absent, not empty -- the child and its whole descendant tree can never inherit it
 //! (FW-INV7) and cannot distinguish it from never-set (FW-INV9).
 

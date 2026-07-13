@@ -358,16 +358,18 @@ pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -
     let count = merge_into_discovered(&discovered, &selected, "discovery")?;
 
     // Rewrite the proposal without the accepted entries so acceptance is visibly consumed.
-    let accepted: Vec<String> = selected
+    // Keyed by (pattern, access), matching the merge key: a same-pattern read and write are
+    // distinct candidates, and accepting one must not consume the other unreviewed.
+    let accepted: Vec<(String, DenialAccess)> = selected
         .iter()
-        .map(|e| e.candidate.pattern.canonical())
+        .map(|e| (e.candidate.pattern.canonical(), e.candidate.access))
         .collect();
     let remaining = ProposalFile {
         blueprint: proposal.blueprint.clone(),
         candidates: proposal
             .candidates
             .iter()
-            .filter(|e| !accepted.contains(&e.candidate.pattern.canonical()))
+            .filter(|e| !accepted.contains(&(e.candidate.pattern.canonical(), e.candidate.access)))
             .cloned()
             .collect(),
     };

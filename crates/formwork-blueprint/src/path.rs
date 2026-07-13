@@ -157,14 +157,9 @@ impl PathPattern {
         }
     }
 
-    /// The primitive behind narrowing: a subtree covers any path at or below its base; a literal
-    /// covers only the identical literal. `**/` patterns compare among themselves the same way;
-    /// across the two forms only the everything-grant `/**` covers an any-depth pattern, and an
-    /// any-depth pattern is conservatively taken not to cover a fixed absolute path (a redundant
-    /// deny is harmless, a missed one is not -- FW-INV6).
-    /// Does this pattern match a concrete absolute path? `covers` compares pattern-to-pattern
-    /// authority; this is the match relation the kernel applies, needed when a floor row is held
-    /// against an observed, concrete denial path (FW-DISC3).
+    /// Does this pattern match a concrete absolute path? [`Self::covers`] compares
+    /// pattern-to-pattern authority; this is the match relation the kernel applies, needed when a
+    /// floor row is held against an observed, concrete denial path (FW-DISC3).
     pub fn matches_path(&self, path: &Path) -> bool {
         if !self.any_depth {
             return if self.subtree {
@@ -194,6 +189,12 @@ impl PathPattern {
         }
     }
 
+    /// The primitive behind narrowing: a subtree covers any path at or below its base; a literal
+    /// covers only the identical literal. Any-depth patterns compare among themselves the same
+    /// way (with the anchor scopes nesting); across the two forms only an absolute subtree
+    /// containing every possible match covers an any-depth pattern, and an any-depth pattern is
+    /// conservatively taken not to cover a fixed absolute path (a redundant deny is harmless, a
+    /// missed one is not -- FW-INV6).
     pub fn covers(&self, other: &PathPattern) -> bool {
         match (self.any_depth, other.any_depth) {
             (false, false) => {

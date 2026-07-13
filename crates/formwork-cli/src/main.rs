@@ -501,8 +501,8 @@ fn itemize_credential_floor(report: &formwork_compile::FidelityReport) {
     );
 }
 
-/// The launcher arm (FEP-2 §6): build the confined child's environment -- posture first
-/// (FW-ENV1/2), then the credential-catalog strip (FW-CRED2/4). Impure -- it reads the real
+/// The launcher arm (FEP-2 §6): build the confined child's environment -- the credential-catalog
+/// strip partitions first (FW-CRED2/4), then the posture (FW-ENV1/2). Impure -- it reads the real
 /// process environment -- so it lives in the CLI shell; the decision itself is the pure
 /// `construct_env`. Itemization is names and types only, never values (FW-CRED7).
 fn apply_env(command: &mut Command, blueprint: &Blueprint, catalog: &ResolvedCatalog) {
