@@ -171,13 +171,12 @@ impl ResolvedCatalog {
     /// subtree that merely *could* contain future backstop matches is not -- the backstop keeps
     /// denying those at enforcement no matter what is granted (deny beats allow, FW-BP4).
     ///
-    /// The backstop is matched by *shape* here (its anchor dropped), unlike enforcement, which
-    /// keeps the bounded anchored row (`denied_paths`). This is deliberate: discovery collection is
-    /// tolerant of over-capture (a denial from another process, possibly outside this run's
-    /// `$HOME`, can land in the log window), so the confused-deputy wall (FW-INV8) must classify a
-    /// credential shape wherever it was observed -- not only under `~`. A candidate never has
-    /// effect until accepted, so the cost of a shape false positive is a visible `--allow-cred
-    /// backstop`, whereas a miss would leak a secret into a proposal.
+    /// The backstop is location-independent (`**/<name>`, matched by shape), so a credential shape
+    /// is withheld wherever a denial was observed -- not only under `~`. That matters because
+    /// discovery collection is tolerant of over-capture (a denial from another process, possibly
+    /// outside this run's `$HOME`, can land in the log window), so the confused-deputy wall
+    /// (FW-INV8) must classify by shape everywhere. Enforcement denies the same shapes everywhere
+    /// too (`denied_paths`), keeping the two floors symmetric (FW-CRED6).
     pub fn floor_type_of(&self, allow: &[String], candidate: &PathPattern) -> Option<String> {
         fn hit(floor: &PathPattern, candidate: &PathPattern) -> bool {
             floor == candidate
@@ -200,10 +199,7 @@ impl ResolvedCatalog {
             .any(|p| hit(p, candidate));
         if !in_excluded_scope
             && !allow.iter().any(|a| a == BACKSTOP)
-            && self
-                .backstop
-                .iter()
-                .any(|p| hit(&p.unanchored(), candidate))
+            && self.backstop.iter().any(|p| hit(p, candidate))
         {
             return Some(BACKSTOP.to_string());
         }
@@ -237,14 +233,14 @@ mod tests {
         assert!(resolved.types["aws"]
             .paths
             .contains(&PathPattern::parse("/home/x/.aws/**").unwrap()));
-        // The .env family is one typed decision (dotenv); the backstop's shape rules are
-        // anchored under the home tree, not filesystem-wide.
+        // The .env family is one typed decision (dotenv); the backstop's shape rules match at any
+        // depth anywhere (a location-independent catch-all), not just under the home tree.
         assert!(resolved.types["dotenv"]
             .paths
             .contains(&PathPattern::parse("**/.env.production").unwrap()));
         assert!(resolved
             .backstop
-            .contains(&PathPattern::parse("/home/x/**/credentials").unwrap()));
+            .contains(&PathPattern::parse("**/credentials").unwrap()));
         assert!(resolved.types["secrets-mount"]
             .paths
             .contains(&PathPattern::parse("/run/secrets/**").unwrap()));
@@ -290,7 +286,7 @@ mod tests {
     #[test]
     fn backstop_lifts_only_by_its_own_name() {
         let resolved = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
-        let novel = PathPattern::parse("/home/x/**/credentials").unwrap();
+        let novel = PathPattern::parse("**/credentials").unwrap();
         assert!(resolved.denied_paths(&["aws".into()]).contains(&novel));
         assert!(!resolved
             .denied_paths(&[BACKSTOP.to_string()])
@@ -312,29 +308,27 @@ mod tests {
     }
 
     #[test]
-    fn discovery_floor_catches_credential_shapes_outside_home() {
-        // Discovery collection is tolerant of over-capture: the unified-log feed can surface a
-        // denial on a path outside this run's $HOME. The floor must still withhold a credential
-        // *shape* wherever observed, or the confused-deputy wall (FW-INV8) has a seam.
+    fn backstop_covers_credential_shapes_everywhere() {
+        // FW-CRED6: a catch-all is location-independent. A credential-shaped file outside $HOME is
+        // caught by the backstop at BOTH surfaces -- the discovery floor (so an over-captured
+        // denial never leaks into a proposal, FW-INV8) and enforcement (so it stays denied even
+        // under a broad grant). The two floors are symmetric.
         let resolved = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
         let foreign = PathPattern::parse("/some/other/home/.ssh/id_ed25519").unwrap();
         assert_eq!(
             resolved.floor_type_of(&[], &foreign).as_deref(),
             Some("backstop"),
-            "a credential-shaped path outside $HOME must still be floored (over-capture safety)"
+            "discovery floor must withhold a credential shape wherever observed"
         );
-
-        // Enforcement, by contrast, stays bounded to the home tree (PR-review #4): the anchored
-        // backstop row does not deny the foreign path -- only the shape-based discovery floor does.
         let denied = resolved.denied_paths(&[]);
         assert!(
-            !denied
+            denied
                 .iter()
                 .any(|p| p.matches_path(std::path::Path::new("/some/other/home/.ssh/id_ed25519"))),
-            "enforcement backstop stays anchored under ~, unlike the discovery floor"
+            "enforcement must deny a credential shape even outside $HOME"
         );
 
-        // The named lift still turns the shape floor off wholesale (FW-CRED6).
+        // The named lift turns the whole backstop off at both surfaces (FW-CRED6).
         assert_eq!(
             resolved.floor_type_of(&[BACKSTOP.to_string()], &foreign),
             None

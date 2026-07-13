@@ -107,11 +107,11 @@ pub fn reverse_compile(
     for ((parent, access), members) in by_parent {
         let folded = PathPattern::parse(&format!("{}/**", parent.trim_end_matches('/')));
         let fold = match folded {
-            // FW-INV8: never fold into a subtree that would transitively re-grant a credential the
-            // floor just withheld. Enforcement anchors the backstop under $HOME while discovery
-            // classifies by shape anywhere (over-capture safety); without this guard a folded
-            // `proj/**` over a non-$HOME dir could cover a withheld `proj/id_rsa` that the anchored
-            // enforcement floor no longer denies -- a seam back to the credential wall.
+            // FW-INV8 defense-in-depth: never fold into a subtree that would cover a path the floor
+            // just withheld. Enforcement (deny beats allow) is the primary wall -- it denies the
+            // credential shape regardless of any grant -- but keeping the fold granular means a
+            // proposal never even *lists* a grant that would re-cover a withheld credential, so the
+            // proposal itself stays honest and the wall survives a future narrowing of enforcement.
             Ok(f)
                 if members.len() >= 2
                     && catalog.floor_type_of(allow, &f).is_none()
@@ -245,11 +245,11 @@ mod tests {
 
     #[test]
     fn fold_never_re_grants_a_withheld_credential_outside_home() {
-        // FW-INV8 regression: a credential-shaped file OUTSIDE $HOME is withheld by the shape
-        // floor, but its ordinary siblings must not fold into a subtree that transitively
-        // re-grants it. The anchored *enforcement* floor would not deny this non-$HOME key, so the
-        // fold guard is what keeps the wall intact -- unlike the home case above, floor_type_of on
-        // the folded subtree does not flag it (a subtree base is not itself credential-shaped).
+        // FW-INV8 defense-in-depth: a credential-shaped file OUTSIDE $HOME is withheld by the shape
+        // floor, and its ordinary siblings must not fold into a subtree that would *list* a grant
+        // covering it -- even though enforcement (deny beats allow) would still deny the key. Unlike
+        // the home case above, floor_type_of on the folded subtree does not flag it (a subtree base
+        // is not itself credential-shaped), so the fold guard is what keeps the proposal honest.
         let records = vec![
             read("/srv/app/id_rsa"), // credential shape, outside $HOME -> withheld (backstop)
             read("/srv/app/a.txt"),

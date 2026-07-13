@@ -193,10 +193,11 @@ def test_discovery_confused_deputy(tmp_path, cli):
 
 @pytest.mark.fw_adv("FW-ADV-015")
 def test_fold_does_not_transitively_grant_a_non_home_credential(tmp_path, cli):
-    """FW-INV8 regression: a credential-shaped file OUTSIDE $HOME is withheld, but its ordinary
-    siblings must not fold into an auto-widened subtree that transitively re-grants it. The
-    enforcement floor is anchored under $HOME (it does not deny a non-$HOME key), so the fold
-    guard is the wall -- without it, `proj/**` auto-accepts and the next run reads proj/id_rsa."""
+    """FW-INV8 defense-in-depth: a credential-shaped file OUTSIDE $HOME is withheld, and its
+    ordinary siblings must not fold into an auto-widened subtree that would *list* a grant
+    covering it. Enforcement (deny beats allow) denies the key regardless of the grant, but the
+    fold guard keeps the proposal itself honest -- without it, `proj/**` auto-accepts a subtree
+    that covers the withheld id_rsa."""
     root = tmp_path.resolve()
     home = root / "home"
     home.mkdir()

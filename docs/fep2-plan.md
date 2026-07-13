@@ -68,11 +68,15 @@ amends FW-CAP6.
 
 *Review addendum:* PR review asked for prefix selectivity on the new any-depth rows, so the
 grammar gained the **anchored** form `<prefix>/**/<suffix>[/**]` — the plain `**/` form with an
-absolute scope — and the backstop's file-shape rows now anchor under `~`. Still no `*` glob; on
-Linux both any-depth forms remain unrootable and report Partial. The same review pass fixed a
-real floor gap it surfaced: `accept` now canonicalizes the catalog before its floor re-check, so
-type rows hold in kernel coordinates (a `/tmp`-based `$HOME` no longer lets a forged entry slip
-past them onto the backstop).
+absolute scope. The backstop was briefly anchored under `~` to use it, but that was reverted:
+a catch-all is location-independent by nature and must reach uncatalogued secrets outside `$HOME`
+(FW-CRED6), and anchoring also opened an FW-INV8 seam (a non-`$HOME` credential shape the anchored
+enforcement floor no longer denied). The backstop's file-shape rows stay filesystem-wide (`**/…`);
+the anchored grammar form remains available for future curated rows that genuinely want a prefix.
+Still no `*` glob; on Linux both any-depth forms remain unrootable and report Partial (FW-CRED9).
+The same review pass fixed a real floor gap it surfaced: `accept` now canonicalizes the catalog
+before its floor re-check, so type rows hold in kernel coordinates (a `/tmp`-based `$HOME` no
+longer lets a forged entry slip past them onto the backstop).
 
 ## 1. The merge algebra (FW-BP1/2/4)
 

@@ -61,8 +61,8 @@ impl PathPattern {
         }
 
         // Anchored any-depth form: `<prefix>/**/<suffix>` matches the suffix at any depth BELOW
-        // the absolute prefix (including directly below it). Keeps shape rules scoped -- e.g. the
-        // credential backstop anchors under `~` instead of the whole filesystem.
+        // the absolute prefix (including directly below it). Keeps a shape rule scoped to a
+        // subtree -- e.g. `~/**/.git/hooks/**` -- instead of matching the whole filesystem.
         if let Some(split_at) = input.find("/**/") {
             if !input.starts_with('/') {
                 return Err(PathError::NotAbsolute(input.to_string()));
@@ -135,21 +135,6 @@ impl PathPattern {
     /// The absolute prefix of an anchored any-depth pattern, if any.
     pub fn anchor(&self) -> Option<&Path> {
         self.anchor.as_deref()
-    }
-
-    /// The location-independent shape of an anchored any-depth pattern: drop the anchor so the
-    /// suffix matches at any depth from the root (`<prefix>/**/<suffix>` -> `**/<suffix>`). A
-    /// pattern with no anchor is returned unchanged. The discovery floor uses this so a credential
-    /// *shape* is classified wherever the kernel observed the denial -- even outside `$HOME`, where
-    /// the unified-log feed can surface it (FW-DISC3 over-capture) -- while enforcement keeps the
-    /// bounded, anchored row (FW-CRED6/FW-INV8).
-    pub fn unanchored(&self) -> PathPattern {
-        PathPattern {
-            base: self.base.clone(),
-            subtree: self.subtree,
-            any_depth: self.any_depth,
-            anchor: None,
-        }
     }
 
     /// Round-trips through `parse`.
@@ -472,16 +457,6 @@ mod tests {
 
         // A root anchor normalizes to the plain form.
         assert_eq!(p("/**/x").canonical(), "**/x");
-
-        // Dropping the anchor yields the location-independent shape; a match under a *different*
-        // prefix that the anchored form rejects now succeeds (the discovery-floor use).
-        let shape = cred.unanchored();
-        assert_eq!(shape.canonical(), "**/credentials");
-        assert!(shape.matches_path(Path::new("/some/other/home/credentials")));
-        assert!(!cred.matches_path(Path::new("/some/other/home/credentials")));
-        // Unanchoring an already-unanchored (or fixed) pattern is a no-op.
-        assert_eq!(p("**/.env").unanchored(), p("**/.env"));
-        assert_eq!(p("/work/file").unanchored(), p("/work/file"));
 
         // Serde round-trip.
         let j = serde_json::to_string(&cred).unwrap();
