@@ -48,7 +48,7 @@ formwork/
 │   └── formwork-cli/             # `formwork` binary: detect, compile, run, gateway, probe
 ├── profiles/
 │   ├── default.toml              # subtractive default profile (FW-CAP3)
-│   └── sensitive-set.toml        # data-driven sensitive superset (FW-TRA3)
+│   └── credential-catalog.toml   # typed credential-location catalog (FW-CRED1; embedded)
 ├── py/
 │   ├── pyproject.toml            # uv-managed; dev-only, never shipped
 │   ├── harness/                  # pytest suite, one module per §7 group, markers = test IDs
@@ -331,7 +331,8 @@ reproduced by `formwork detect + compile` on each CI target.**
 
 - **fd-minting default:** pre-open at spawn; on-demand `SCM_RIGHTS` as escape hatch (3.4).
 - **Exec restriction in v1:** ships enabled-optional in Phase 7 (cheap once confiners exist).
-- **Sensitive-set discovery:** data-driven broad superset in `profiles/sensitive-set.toml`,
+- **Sensitive-set discovery:** superseded by FEP-2's typed credential catalog
+  (`profiles/credential-catalog.toml`, embedded; FW-CRED1) plus the generic backstop,
   caller-narrowable — the fail-closed answer the design doc already leans toward.
 - **Naming** and **Linux gateway egress build-vs-buy** stay open; the latter is decided at
   Phase 7 with real data.

@@ -19,13 +19,23 @@ class CliResult:
     stderr: str
 
 
-def run_cli(binary: Path, *args, cwd: Path | None = None, timeout: int = 60) -> CliResult:
+def run_cli(
+    binary: Path,
+    *args,
+    cwd: Path | None = None,
+    timeout: int = 60,
+    env: dict[str, str] | None = None,
+) -> CliResult:
+    """`env` overlays the inherited environment -- the credential tests use it to point $HOME at
+    a fake home with planted (fake) credentials and to inject secret-shaped variables."""
+    merged = {**os.environ, **env} if env is not None else None
     proc = subprocess.run(
         [str(binary), *(str(a) for a in args)],
         cwd=str(cwd) if cwd else None,
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=merged,
     )
     return CliResult(proc.returncode, proc.stdout, proc.stderr)
 

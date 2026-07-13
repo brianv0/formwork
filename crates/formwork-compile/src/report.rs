@@ -33,9 +33,12 @@ pub enum Backend {
     Seccomp,
     Seatbelt,
     Gateway,
-    /// The CLI shell's spawn-time transformation (environment rebuild). Not a kernel confiner; the
-    /// process image is built with the filtered environment before `exec` (FW-ENV1).
-    Process,
+    /// The launcher -- the third enforcement arm (FEP-2 §6): the spawn-time construction of the
+    /// confined child, environment rebuild and credential strip included (FW-ENV1, FW-CRED2).
+    /// Not a kernel confiner; its guarantee is contingent on Formwork being the launching
+    /// process, which the report must disclose (FW-CRED8). Renamed from `Process` by FEP-2
+    /// (pre-release; no version bump -- canary consumers only).
+    Launcher,
     None,
 }
 
@@ -80,6 +83,36 @@ pub struct FidelityReport {
     pub host: formwork_detect::HostProfile,
     pub per_capability: BTreeMap<Capability, Fidelity>,
     pub semantics: BTreeMap<Capability, DenialSemantics>,
+    pub credentials: CredentialReport,
+}
+
+/// Per-credential-type honesty (FW-CRED8): which arm carries each location kind of every catalog
+/// type still enforced, plus the visible list of deliberate exclusions (FW-CRED5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CredentialReport {
+    pub catalog_version: u32,
+    /// Types deliberately let through (FW-CRED5), itemized so the lift is auditable.
+    pub allowed: Vec<String>,
+    pub per_type: BTreeMap<String, CredentialFidelity>,
+    /// The generic backstop's path fidelity (FW-CRED6); `None` when lifted by name.
+    pub backstop: Option<Fidelity>,
+    /// FW-CRED8: stated plainly with every report -- the env arm's guarantee exists only while
+    /// Formwork is the launching process. Never implied to hold independent of the launcher.
+    pub launcher_contingency: String,
+}
+
+/// One catalog type's two arms (FW-CRED2). An absent kind is absent -- nothing is claimed for a
+/// location kind the type does not have or an arm that is not applied (FW-INV5).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CredentialFidelity {
+    /// Path locations -> the OS sandbox (EACCES).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<Fidelity>,
+    /// Env-var locations -> the launcher strip (variable absent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<Fidelity>,
 }
 
 impl Capability {

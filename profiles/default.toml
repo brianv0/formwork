@@ -19,7 +19,7 @@ exec = "unrestricted"
 # workload legitimately needs. net = "deny" here already blocks exfil; this is defense in depth.
 env = { scrub = {} }
 
-# Reads: broadly allowed over the ambient environment, minus the sensitive set below. On macOS this
+# Reads: broadly allowed over the ambient environment, minus the compiled-in credential floor. On macOS this
 # is native `(allow default)` + deny holes; on Linux it is an enumerate-and-grant expansion at
 # enforce time (Landlock is allow-list only). See the plan §3.2.
 [fs]
@@ -40,45 +40,10 @@ writes = [
     "/var/tmp/**",
 ]
 
-# Sensitive set subtracted even under the broad read grant (FW-TRA3). Kept in sync with
-# sensitive-set.toml. Deny wins over any grant, so these stay unreadable/unwritable.
-subtract = [
-    # SSH / GPG
-    "~/.ssh/**",
-    "~/.gnupg/**",
-    # cloud + CI credentials
-    "~/.aws/**",
-    "~/.config/gcloud/**",
-    "~/.azure/**",
-    "~/.kube/**",
-    "~/.docker/**",   # whole dir: ~/.docker/run/docker.sock is host-root (FEP-1 FW-TRA8)
-    "~/.netrc",
-    "~/.npmrc",
-    "~/.pypirc",
-    # shells / dotfile secrets frequently holding tokens
-    "~/.config/gh/**",
-    "~/.git-credentials",
-    # agent-tool state (OAuth creds, transcripts) -- protect one agent from another (FEP-1 FW-TRA8)
-    "~/.claude/**",
-    "~/.claude.json",
-    "~/.codex/**",
-    "~/.gemini/**",
-    "~/.cursor/**",
-    # project-local secrets at any depth (FW-CAP6 `**/`, FEP-1 FW-TRA8)
-    "**/.env",
-    # keychains (macOS)
-    "~/Library/Keychains/**",
-    "/Library/Keychains/**",
-    # browser profiles
-    "~/Library/Application Support/Google/Chrome/**",
-    "~/Library/Application Support/Firefox/**",
-    "~/.config/google-chrome/**",
-    "~/.mozilla/**",
-    # system credential stores
-    "/etc/shadow",
-    "/etc/sudoers",
-    "/etc/sudoers.d/**",
-]
+# Credential locations live in the compiled-in catalog (profiles/credential-catalog.toml) and are
+# denied under every blueprint (FW-CRED4); only `allow-credentials` lifts a type (FW-CRED5).
+# This list is for project-specific denies.
+subtract = []
 
 # Tamper vectors: write-denied but still READABLE (FW-TRA7). Unlike `subtract` (read+write deny for
 # secrets), these must stay readable -- git reads `.git/config` constantly, tools read `.mcp.json` --

@@ -12,49 +12,81 @@ pub use policy::{
     CompiledPolicy, ConfinerPolicy, ExecPlan, GatewayPolicy, LinuxNetPlan, LinuxPolicy,
     MacosPolicy, SeccompPlan, SocketFamily,
 };
-pub use report::{Backend, Capability, DenialSemantics, Fidelity, FidelityReport};
+pub use report::{
+    Backend, Capability, CredentialFidelity, CredentialReport, DenialSemantics, Fidelity,
+    FidelityReport,
+};
 
 use std::collections::BTreeMap;
 
 use formwork_blueprint::{
     canonicalize_set, Blueprint, EnvPosture, ExecPosture, NetPosture, PathPattern, ReadMode,
+    ResolvedCatalog,
 };
 use formwork_detect::{HostProfile, Os};
 
 use linux::PortTier;
 
 /// The normalized intermediate both backends consume: canonicalized, with write grants folded into
-/// the read surface (writes imply reads).
+/// the read surface (writes imply reads). Operator denies (`subtract`) and the credential floor
+/// (`floor`) stay separate: the floor's typed exemption (FW-CRED5) may lift a floor hole, but an
+/// operator deny is never lifted by anything.
 pub struct CompileInput {
     pub read_mode: ReadMode,
     pub effective_reads: Vec<PathPattern>,
     pub writes: Vec<PathPattern>,
     pub subtract: Vec<PathPattern>,
     pub write_subtract: Vec<PathPattern>,
+    /// The credential floor (FW-CRED2 path arm, FW-CRED4): every non-excluded catalog type's paths
+    /// plus the backstop. Read+write denied, like `subtract`.
+    pub floor: Vec<PathPattern>,
+    /// Excluded types' scopes (FW-CRED5): where a *floor* deny (the any-depth backstop crossing
+    /// into a type's own directory, e.g. `**/credentials` inside an excluded `~/.aws/**`) is
+    /// re-lifted. Applied clamped to the grant surface, and never against `subtract`.
+    pub floor_exempt: Vec<PathPattern>,
     pub net: NetPosture,
     pub exec: ExecPosture,
 }
 
 impl CompileInput {
-    fn from_blueprint(blueprint: &Blueprint) -> Self {
+    fn from_blueprint(blueprint: &Blueprint, catalog: &ResolvedCatalog) -> Self {
         let mut reads = blueprint.fs.reads.clone();
         reads.extend(blueprint.fs.writes.iter().cloned());
+        let floor_exempt: Vec<PathPattern> = catalog
+            .types
+            .iter()
+            .filter(|(name, _)| {
+                blueprint
+                    .allow_credentials
+                    .iter()
+                    .any(|a| a == name.as_str())
+            })
+            .flat_map(|(_, entry)| entry.paths.iter().cloned())
+            .collect();
         CompileInput {
             read_mode: blueprint.fs.read_mode,
             effective_reads: canonicalize_set(&reads),
             writes: canonicalize_set(&blueprint.fs.writes),
             subtract: canonicalize_set(&blueprint.fs.subtract),
             write_subtract: canonicalize_set(&blueprint.fs.write_subtract),
+            floor: canonicalize_set(&catalog.denied_paths(&blueprint.allow_credentials)),
+            floor_exempt: canonicalize_set(&floor_exempt),
             net: blueprint.net.clone(),
             exec: blueprint.exec.clone(),
         }
     }
 }
 
-/// Pure and deterministic in `(blueprint, host)`.
-pub fn compile(blueprint: &Blueprint, host: &HostProfile) -> CompiledPolicy {
+/// Pure and deterministic in `(blueprint, host, catalog)`. The catalog is a mandatory input by
+/// design: the credential floor (FW-CRED4) cannot be forgotten, only explicitly resolved (or,
+/// in tests, explicitly emptied) at the edge that knows `$HOME`.
+pub fn compile(
+    blueprint: &Blueprint,
+    host: &HostProfile,
+    catalog: &ResolvedCatalog,
+) -> CompiledPolicy {
     let blueprint = blueprint.canonicalize();
-    let input = CompileInput::from_blueprint(&blueprint);
+    let input = CompileInput::from_blueprint(&blueprint, catalog);
 
     let mut per_capability: BTreeMap<Capability, Fidelity> = BTreeMap::new();
     let mut semantics: BTreeMap<Capability, DenialSemantics> = BTreeMap::new();
@@ -96,7 +128,7 @@ pub fn compile(blueprint: &Blueprint, host: &HostProfile) -> CompiledPolicy {
             per_capability.insert(
                 Capability::EnvScrub,
                 Fidelity::Enforced {
-                    backend: Backend::Process,
+                    backend: Backend::Launcher,
                 },
             );
             semantics.insert(Capability::EnvScrub, DenialSemantics::Hide);
@@ -105,7 +137,7 @@ pub fn compile(blueprint: &Blueprint, host: &HostProfile) -> CompiledPolicy {
             per_capability.insert(
                 Capability::EnvScrub,
                 Fidelity::Partial {
-                    backend: Backend::Process,
+                    backend: Backend::Launcher,
                     reason: "heuristic: drops secret-shaped names and values; a secret with neither a known marker name nor a recognized value shape (e.g. an inline credential in DATABASE_URL) is not caught -- pin it with an explicit deny or use an allowlist".to_string(),
                 },
             );
@@ -124,10 +156,12 @@ pub fn compile(blueprint: &Blueprint, host: &HostProfile) -> CompiledPolicy {
         semantics.insert(Capability::McpShading, DenialSemantics::Hide);
     }
 
+    let credentials = credential_report(catalog, &blueprint, host, &per_capability);
     let report = FidelityReport {
         host: host.clone(),
         per_capability,
         semantics,
+        credentials,
     };
     let gateway = GatewayPolicy {
         servers: blueprint.mcp.clone(),
@@ -138,6 +172,67 @@ pub fn compile(blueprint: &Blueprint, host: &HostProfile) -> CompiledPolicy {
         confiner,
         gateway,
         report,
+    }
+}
+
+/// The FW-CRED8 section: every still-enforced type labeled with the arm that carries each of its
+/// location kinds. The path arm rides whatever mechanism carries fs reads on this host, so its
+/// fidelity is FsRead's -- including honest degradation: no Landlock -> Unenforceable, and on
+/// Linux a type whose rows include any-depth (`**/`) patterns is Partial, because those rows
+/// cannot be rooted Landlock rules and are withheld from the policy. The env arm is the
+/// launcher's strip, absolute-but-launcher-contingent, disclosed as such.
+fn credential_report(
+    catalog: &ResolvedCatalog,
+    blueprint: &Blueprint,
+    host: &HostProfile,
+    per_capability: &BTreeMap<Capability, Fidelity>,
+) -> CredentialReport {
+    let base_fidelity =
+        per_capability
+            .get(&Capability::FsRead)
+            .cloned()
+            .unwrap_or(Fidelity::Unenforceable {
+                reason: "no filesystem confinement on this host".to_string(),
+            });
+    let linux_any_depth_gap = matches!(host.os, Os::Linux) && base_fidelity.is_enforced();
+    let path_fidelity_for = |paths: &[PathPattern]| -> Fidelity {
+        if linux_any_depth_gap && paths.iter().any(|p| p.is_any_depth()) {
+            Fidelity::Partial {
+                backend: Backend::Landlock,
+                reason: "any-depth (`**/`) rows cannot be rooted Landlock rules and are withheld \
+                         on Linux; absolute rows are enforced (see docs/linux-backend.md)"
+                    .to_string(),
+            }
+        } else {
+            base_fidelity.clone()
+        }
+    };
+    let env_fidelity = Fidelity::Enforced {
+        backend: Backend::Launcher,
+    };
+    let mut per_type = BTreeMap::new();
+    for (name, entry) in catalog.enforced_types(&blueprint.allow_credentials) {
+        per_type.insert(
+            name.to_string(),
+            CredentialFidelity {
+                path: (!entry.paths.is_empty()).then(|| path_fidelity_for(&entry.paths)),
+                env: (!entry.envs.is_empty()).then(|| env_fidelity.clone()),
+            },
+        );
+    }
+    let backstop_lifted = blueprint
+        .allow_credentials
+        .iter()
+        .any(|a| a == formwork_blueprint::BACKSTOP);
+    CredentialReport {
+        catalog_version: catalog.version,
+        allowed: blueprint.allow_credentials.clone(),
+        per_type,
+        backstop: (!backstop_lifted).then(|| path_fidelity_for(&catalog.backstop)),
+        launcher_contingency: "env-var shading is applied by the launcher at spawn; it holds only \
+                               while Formwork is the launching process and is not a kernel \
+                               guarantee (FW-CRED8)"
+            .to_string(),
     }
 }
 
@@ -321,12 +416,19 @@ fn compile_linux(
     }
 
     let seccomp = linux::seccomp_plan(net_via_seccomp);
+    // The floor's absolute rows ride the subtract holes. Any-depth (`**/`) floor rows cannot be
+    // rooted Landlock rules (formwork-confine rejects them loud); they are withheld here and the
+    // credentials report marks the affected types Partial -- reported, never silently pretended
+    // (FW-INV5/6). No exemption plumbing exists on Linux because only any-depth rows can cross
+    // into an excluded type's scope.
+    let mut subtract = input.subtract.clone();
+    subtract.extend(input.floor.iter().filter(|p| !p.is_any_depth()).cloned());
     let policy = LinuxPolicy {
         landlock_abi_target: host.landlock_abi,
         read_mode: input.read_mode,
         reads: input.effective_reads.clone(),
         writes: input.writes.clone(),
-        subtract: input.subtract.clone(),
+        subtract: canonicalize_set(&subtract),
         write_subtract: input.write_subtract.clone(),
         exec: exec_plan,
         net: net_plan,
@@ -375,9 +477,18 @@ mod tests {
         }
     }
 
+    /// These unit tests isolate non-catalog behavior, so they compile with NO credential floor;
+    /// catalog behavior has its own tests below and in the blueprint crate.
+    fn compile(blueprint: &Blueprint, host: &HostProfile) -> CompiledPolicy {
+        super::compile(blueprint, host, &ResolvedCatalog::empty_no_floor())
+    }
+
     #[test]
     fn writes_fold_into_effective_reads() {
-        let input = CompileInput::from_blueprint(&sample_blueprint().canonicalize());
+        let input = CompileInput::from_blueprint(
+            &sample_blueprint().canonicalize(),
+            &ResolvedCatalog::empty_no_floor(),
+        );
         // /work/project (write) is under /work (read) so it's canonicalized away.
         assert_eq!(input.effective_reads, vec![pp("/work/**")]);
     }
@@ -498,10 +609,64 @@ mod tests {
         assert!(matches!(
             scrub.report.per_capability[&Capability::EnvScrub],
             Fidelity::Partial {
-                backend: Backend::Process,
+                backend: Backend::Launcher,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn catalog_floor_rides_linux_subtract_absolute_rows_only() {
+        let catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let policy = super::compile(
+            &Blueprint::empty(),
+            &HostProfile::synthetic_linux(Some(6)),
+            &catalog,
+        );
+        let linux = match &policy.confiner {
+            ConfinerPolicy::Linux(p) => p,
+            other => panic!("expected linux policy, got {other:?}"),
+        };
+        assert!(linux.subtract.contains(&pp("/home/x/.ssh/**")));
+        assert!(
+            !linux.subtract.iter().any(|p| p.is_any_depth()),
+            "any-depth floor rows cannot be rooted Landlock rules and must be withheld"
+        );
+        // ...and the withholding is REPORTED, never silent (FW-INV5): the all-any-depth backstop
+        // and the dotenv type are Partial on Linux, absolute types ride Landlock.
+        let creds = &policy.report.credentials;
+        assert!(matches!(creds.backstop, Some(Fidelity::Partial { .. })));
+        assert!(matches!(
+            creds.per_type["dotenv"].path,
+            Some(Fidelity::Partial { .. })
+        ));
+        assert!(matches!(
+            creds.per_type["ssh"].path,
+            Some(Fidelity::Enforced {
+                backend: Backend::Landlock
+            })
+        ));
+    }
+
+    #[test]
+    fn excluded_type_leaves_report_per_type_and_lists_allowed() {
+        let catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let bp = Blueprint {
+            allow_credentials: vec!["aws".to_string()],
+            ..Blueprint::empty()
+        };
+        let policy = super::compile(&bp, &HostProfile::synthetic_macos(), &catalog);
+        let creds = &policy.report.credentials;
+        assert!(
+            !creds.per_type.contains_key("aws"),
+            "excluded type must not be claimed"
+        );
+        assert_eq!(creds.allowed, vec!["aws"]);
+        assert!(
+            creds.per_type.contains_key("ssh"),
+            "adjacent types stay enforced"
+        );
+        assert!(creds.launcher_contingency.contains("launching process"));
     }
 
     #[test]

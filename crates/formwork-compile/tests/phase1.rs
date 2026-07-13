@@ -1,9 +1,21 @@
 //! Phase 1 exit tests, named for the design-doc test IDs they discharge (design §7.6). They
 //! exercise the compiler as a black box the way the CLI and Python harness do.
 
-use formwork_blueprint::{Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode};
-use formwork_compile::{compile, to_canonical_json, Capability, ConfinerPolicy, Fidelity};
+use formwork_blueprint::{
+    Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
+};
+use formwork_compile::{to_canonical_json, Capability, CompiledPolicy, ConfinerPolicy, Fidelity};
 use formwork_detect::{HostProfile, Os};
+
+/// Dry-run compiles carry the credential floor like the product does; a fixed home keeps them
+/// deterministic on any machine.
+fn compile(blueprint: &Blueprint, host: &HostProfile) -> CompiledPolicy {
+    formwork_compile::compile(
+        blueprint,
+        host,
+        &ResolvedCatalog::builtin_for_home("/home/x").unwrap(),
+    )
+}
 
 fn pp(s: &str) -> PathPattern {
     PathPattern::parse(s).unwrap()

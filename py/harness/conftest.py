@@ -22,8 +22,8 @@ def formwork_bin():
 
 @pytest.fixture
 def cli(formwork_bin):
-    def _run(*args, cwd=None, timeout=60):
-        return run_cli(formwork_bin, *args, cwd=cwd, timeout=timeout)
+    def _run(*args, cwd=None, timeout=60, env=None):
+        return run_cli(formwork_bin, *args, cwd=cwd, timeout=timeout, env=env)
 
     return _run
 

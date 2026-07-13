@@ -10,9 +10,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use formwork_blueprint::{Blueprint, FsBlueprint, PathPattern, ReadMode};
-use formwork_compile::{compile, CompiledPolicy, ConfinerPolicy};
+use formwork_blueprint::{Blueprint, FsBlueprint, PathPattern, ReadMode, ResolvedCatalog};
+use formwork_compile::{CompiledPolicy, ConfinerPolicy};
 use formwork_detect::detect;
+
+/// Integration tests enforce what the product enforces: the builtin catalog resolved for the
+/// real home. The probes below touch only scratch paths, so the floor never interferes.
+fn compile(blueprint: &Blueprint, host: &formwork_detect::HostProfile) -> CompiledPolicy {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    formwork_compile::compile(
+        blueprint,
+        host,
+        &ResolvedCatalog::builtin_for_home(&home).unwrap(),
+    )
+}
 
 fn have_landlock() -> bool {
     detect().landlock_abi.is_some()

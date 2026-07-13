@@ -9,13 +9,16 @@
 //! ```
 //!
 //! The capability blueprint is passed with `--blueprint`; `--spec` is accepted as a back-compat
-//! alias.
+//! alias. Every blueprint-taking subcommand accepts the same override surface (FW-BP1/BP2):
+//! `--set '<toml>'` fragments and the sugar flags (`--read/--write/--subtract/--write-subtract/`
+//! `--allow-cred/--net/--extends`) layer over the file, additively, deny-beats-allow.
 //!
 //! `detect`/`compile` don't enforce and run on any host (including compiling a Linux policy on a Mac);
 //! `run`/`enforce-self`/`gateway` need a real confiner and error honestly where the backend is
 //! unimplemented.
 
 mod blueprint_load;
+mod learn;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -23,7 +26,9 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use formwork_blueprint::McpPolicy;
+use formwork_blueprint::{
+    Blueprint, BlueprintLayer, McpPolicy, NetPosture, PathPattern, ResolvedCatalog,
+};
 use formwork_compile::compile;
 use formwork_detect::{detect, HostProfile};
 
@@ -31,7 +36,11 @@ use formwork_detect::{detect, HostProfile};
 #[command(
     name = "formwork",
     version,
-    about = "OS-level sandbox for agent sessions"
+    about = "OS-level sandbox for agent sessions",
+    after_help = "Path patterns (in blueprint files and flags) accept two sigils, expanded before \
+compilation: ~ for $HOME and $CWD for the launch directory -- so `--read '$CWD/**'` scopes a grant \
+to the project you run from.\n\nTelemetry goes to stderr (stdout stays a clean result stream). \
+RUST_LOG=warn quiets it; RUST_LOG=debug itemizes the credential floor per type."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,8 +53,8 @@ enum Cmd {
     Detect,
     /// Compile a blueprint into a policy + fidelity report without enforcing (dry-run).
     Compile {
-        #[arg(long, visible_alias = "spec")]
-        blueprint: PathBuf,
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
         /// Compile against a host profile loaded from JSON (overrides --target and live detection).
         #[arg(long)]
         host: Option<PathBuf>,
@@ -58,30 +67,152 @@ enum Cmd {
     },
     /// Spawn a command under confinement (spawn-confined posture).
     Run {
-        #[arg(long, visible_alias = "spec")]
-        blueprint: PathBuf,
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
     /// Confine the current process, then exec the given command (confine-self posture).
     EnforceSelf {
-        #[arg(long, visible_alias = "spec")]
-        blueprint: PathBuf,
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
+    },
+    /// Learning run (observe-then-widen, FW-DISC1): enforce exactly like `run`, record the
+    /// denials the kernel logged during the window, and reverse-compile them into a reviewable
+    /// proposal. Observation never widens the live session (FW-INV10). Exits with the WORKLOAD's
+    /// status -- a first learning run usually fails on the very denials it is there to observe;
+    /// the proposal is written regardless.
+    Learn {
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Accept needs-review entries from a `formwork learn` proposal into the discovered layer,
+    /// per entry (FW-DISC5). Credential-floor matches are refused here regardless of what the
+    /// proposal claims (FW-INV8).
+    Accept {
+        #[arg(long)]
+        proposal: PathBuf,
+        /// Accept one candidate by its 1-based number or exact pattern (repeatable). With no
+        /// selection at all, lists the candidates by number.
+        #[arg(long)]
+        entry: Vec<String>,
+        /// Accept every needs-review candidate.
+        #[arg(long)]
+        all: bool,
     },
     /// Front a stdio MCP backend with the policy gateway: shade its tools/resources/prompts per the
     /// blueprint's `[mcp.<server>]` entry and confine the spawned backend to the blueprint's fs/net grant.
     /// Speaks newline-delimited JSON-RPC on stdin/stdout, so an MCP host launches it as the server.
     Gateway {
-        #[arg(long, visible_alias = "spec")]
-        blueprint: PathBuf,
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
         /// Which `[mcp.<server>]` policy from the blueprint governs this connection.
         #[arg(long)]
         server: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
+}
+
+/// One blueprint, two surfaces (FW-BP1): the file plus the CLI override layer. `--set` fragments
+/// are TOML parsed by the same serde model as the file -- parity is by construction -- and the
+/// sugar flags desugar into one final layer (postures here beat `--set`, both beat the file).
+#[derive(clap::Args)]
+struct BlueprintArgs {
+    #[arg(long, visible_alias = "spec")]
+    blueprint: PathBuf,
+    /// Override layer as a TOML fragment in blueprint syntax (repeatable, applied in order),
+    /// e.g. --set 'net = "deny"' or --set '[fs]
+    /// subtract = ["~/other/**"]'.
+    #[arg(long)]
+    set: Vec<String>,
+    /// Append a read grant path pattern.
+    #[arg(long)]
+    read: Vec<String>,
+    /// Append a write grant path pattern.
+    #[arg(long)]
+    write: Vec<String>,
+    /// Append a read+write deny hole (deny beats allow at any layer).
+    #[arg(long)]
+    subtract: Vec<String>,
+    /// Append a write-deny-keep-readable hole (tamper vectors, FW-TRA7).
+    #[arg(long)]
+    write_subtract: Vec<String>,
+    /// Let one credential type through the catalog floor (FW-CRED5), e.g. --allow-cred aws.
+    /// The only mechanism that lifts a catalog entry; path grants never do.
+    #[arg(long = "allow-cred")]
+    allow_cred: Vec<String>,
+    /// Net posture: "deny" or "ports:443,8080".
+    #[arg(long)]
+    net: Option<String>,
+    /// Extra base blueprints layered under the CLI overrides (repeatable, resolved against cwd).
+    #[arg(long)]
+    extends: Vec<String>,
+}
+
+impl BlueprintArgs {
+    /// Resolve the full layer stack and merge (FW-BP2). Path sigils (`~`, `$CWD`) in flag values
+    /// expand against the same `$HOME`/launch directory as file contents, via one shared
+    /// [`blueprint_load::Sigils`], so the two surfaces stay one model.
+    fn load(&self, home: &str) -> Result<Blueprint> {
+        let cwd = cwd()?;
+        let sigils = blueprint_load::Sigils::new(home, &cwd);
+        let sugar = self.sugar_layer(&sigils)?;
+        blueprint_load::load_stack(&self.blueprint, &self.set, sugar, &sigils)
+    }
+
+    fn sugar_layer(&self, sigils: &blueprint_load::Sigils) -> Result<BlueprintLayer> {
+        let patterns = |flag: &str, values: &[String]| -> Result<Vec<PathPattern>> {
+            values
+                .iter()
+                .map(|v| {
+                    PathPattern::parse(&sigils.expand(v)).with_context(|| format!("--{flag} {v:?}"))
+                })
+                .collect()
+        };
+        Ok(BlueprintLayer {
+            // Sigils expand in `extends` too, matching a file's `extends` (FW-BP1/FW-BP5 parity).
+            extends: self.extends.iter().map(|e| sigils.expand(e)).collect(),
+            fs: formwork_blueprint::FsLayer {
+                read_mode: None,
+                reads: patterns("read", &self.read)?,
+                writes: patterns("write", &self.write)?,
+                subtract: patterns("subtract", &self.subtract)?,
+                write_subtract: patterns("write-subtract", &self.write_subtract)?,
+            },
+            net: self.net.as_deref().map(parse_net).transpose()?,
+            exec: None,
+            env: None,
+            mcp: Default::default(),
+            allow_credentials: self.allow_cred.clone(),
+            discovery: Default::default(),
+        })
+    }
+}
+
+fn parse_net(s: &str) -> Result<NetPosture> {
+    if s == "deny" {
+        return Ok(NetPosture::Deny);
+    }
+    if let Some(list) = s.strip_prefix("ports:") {
+        let ports = list
+            .split(',')
+            .map(|p| {
+                p.trim()
+                    .parse::<u16>()
+                    .with_context(|| format!("--net port {p:?}"))
+            })
+            .collect::<Result<Vec<u16>>>()?;
+        if ports.is_empty() {
+            bail!("--net ports: requires at least one port (use \"deny\" for none)");
+        }
+        return Ok(NetPosture::Ports(ports));
+    }
+    bail!("--net accepts \"deny\" or \"ports:<p1,p2,…>\", got {s:?}")
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -110,6 +241,16 @@ fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
 }
 
+/// The launch directory, for the `$CWD` sigil. Unlike `home()`'s "/" fallback, an unavailable or
+/// non-UTF-8 cwd fails loud: silently expanding `$CWD` to "/" would turn a `$CWD/**` grant into a
+/// filesystem-wide one -- exactly the fail-open the sensitive-set model forbids (FW-INV6).
+fn cwd() -> Result<String> {
+    let dir = std::env::current_dir().context("resolving the current directory for $CWD")?;
+    dir.into_os_string()
+        .into_string()
+        .map_err(|_| anyhow!("current directory is not valid UTF-8; cannot expand $CWD (FW-INV6)"))
+}
+
 fn resolve_host(host: &Option<PathBuf>, target: &Option<Target>) -> Result<HostProfile> {
     if let Some(path) = host {
         let text = std::fs::read_to_string(path)
@@ -127,12 +268,16 @@ fn resolve_host(host: &Option<PathBuf>, target: &Option<Target>) -> Result<HostP
 /// Libraries only emit, never configure -- so this installs the subscriber once, at the entrypoint.
 /// Telemetry goes to stderr so stdout stays a clean machine-readable result stream.
 fn init_telemetry() {
+    use std::io::IsTerminal;
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_target(false)
+        // Color codes belong to humans at terminals; a piped stderr (a host's journal, a test
+        // harness) gets clean text it can grep without stripping escapes first.
+        .with_ansi(std::io::stderr().is_terminal())
         .try_init();
 }
 
@@ -144,6 +289,8 @@ fn main() -> Result<()> {
         Cmd::Compile { .. } => "compile",
         Cmd::Run { .. } => "run",
         Cmd::EnforceSelf { .. } => "enforce-self",
+        Cmd::Learn { .. } => "learn",
+        Cmd::Accept { .. } => "accept",
         Cmd::Gateway { .. } => "gateway",
     };
     // One correlation id per invocation, propagated to every layer's events via the current span.
@@ -159,9 +306,11 @@ fn main() -> Result<()> {
             target,
             report_only,
         } => {
-            let blueprint = blueprint_load::load(&blueprint, &home())?;
+            let blueprint = blueprint.load(&home())?;
             let host = resolve_host(&host, &target)?;
-            let policy = compile(&blueprint, &host);
+            let catalog = ResolvedCatalog::builtin_for_home(&home())
+                .context("resolving credential catalog")?;
+            let policy = compile(&blueprint, &host, &catalog);
             if report_only {
                 println!("{}", serde_json::to_string_pretty(&policy.report)?);
             } else {
@@ -170,6 +319,12 @@ fn main() -> Result<()> {
         }
         Cmd::Run { blueprint, argv } => run(blueprint, argv, Posture::Spawn)?,
         Cmd::EnforceSelf { blueprint, argv } => run(blueprint, argv, Posture::Self_)?,
+        Cmd::Learn { blueprint, argv } => learn_run(blueprint, argv)?,
+        Cmd::Accept {
+            proposal,
+            entry,
+            all,
+        } => learn::accept(&proposal, &entry, all, &home())?,
         Cmd::Gateway {
             blueprint,
             server,
@@ -184,53 +339,187 @@ enum Posture {
     Self_,
 }
 
-fn run(blueprint: PathBuf, argv: Vec<String>, posture: Posture) -> Result<()> {
-    let blueprint = blueprint_load::load(&blueprint, &home())?;
+/// `exit_code=1`, never Rust's `Some(1)`; a signal death is named, not `None`.
+fn log_exit(what: &'static str, status: &std::process::ExitStatus) {
+    match status.code() {
+        Some(code) => tracing::info!(exit_code = code, "{what}"),
+        None => {
+            use std::os::unix::process::ExitStatusExt;
+            tracing::info!(signal = status.signal(), "{what} (terminated by signal)");
+        }
+    }
+}
+
+/// Everything every enforcing subcommand shares: load the stack (discovered layer included),
+/// add the FW-CRED3 env-file-ref denies, write-protect the policy inputs themselves, resolve
+/// against the real filesystem, compile against the catalog, and itemize the floor.
+struct Session {
+    blueprint: Blueprint,
+    catalog: ResolvedCatalog,
+    policy: formwork_compile::CompiledPolicy,
+}
+
+fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
+    let mut blueprint = args.load(&home())?;
+    let catalog =
+        ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
+    // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
+    // blueprint's enforcement-time canonicalization resolves everything together.
+    blueprint
+        .fs
+        .subtract
+        .extend(blueprint_load::env_file_ref_denies(
+            &catalog,
+            &blueprint.allow_credentials,
+        )?);
+    // The policy inputs are write-denied inside the session: a confined agent must not be able
+    // to edit the blueprint, forge the discovered layer, or doctor the proposal that shapes its
+    // own NEXT run (FW-XR8 / FW-INV8).
+    blueprint_load::protect_policy_inputs(&mut blueprint, &args.blueprint)?;
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
-    // faithfully rendered (FW-INV6).
+    // faithfully rendered (FW-INV6). The catalog's paths get the same treatment -- a floor hole
+    // that silently failed to match would be a fail-open of the sensitive set.
     let blueprint = blueprint_load::canonicalize_for_enforcement(&blueprint)
         .context("canonicalizing grant paths")?;
+    let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
+        .context("canonicalizing credential catalog paths")?;
     let host = detect();
-    let policy = compile(&blueprint, &host);
+    let policy = compile(&blueprint, &host, &catalog);
+    itemize_credential_floor(&policy.report);
+    Ok(Session {
+        blueprint,
+        catalog,
+        policy,
+    })
+}
 
+fn spawn_confined_child(
+    session: &Session,
+    program: &str,
+    args: &[String],
+) -> Result<std::process::ExitStatus> {
+    let mut command = Command::new(program);
+    command.args(args);
+    apply_env(&mut command, &session.blueprint, &session.catalog);
+    formwork_confine::spawn_confined(&mut command, &session.policy)
+        .context("applying confinement")?;
+    tracing::info!(program = %program, "spawning confined command");
+    let status = command.status().context("spawning confined command")?;
+    log_exit("confined command exited", &status);
+    Ok(status)
+}
+
+fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<()> {
+    let session = prepare_session(&blueprint)?;
     let (program, args) = argv.split_first().expect("argv is required");
     match posture {
         Posture::Spawn => {
-            let mut command = Command::new(program);
-            command.args(args);
-            apply_env(&mut command, &blueprint.env);
-            formwork_confine::spawn_confined(&mut command, &policy)
-                .context("applying confinement")?;
-            tracing::info!(program = %program, "spawning confined command");
-            let status = command.status().context("spawning confined command")?;
-            tracing::info!(exit_code = ?status.code(), "confined command exited");
+            let status = spawn_confined_child(&session, program, args)?;
             std::process::exit(status.code().unwrap_or(1));
         }
         Posture::Self_ => {
-            formwork_confine::enforce_self(&policy).context("confining self")?;
+            formwork_confine::enforce_self(&session.policy).context("confining self")?;
             tracing::info!(program = %program, "exec after confine-self");
-            let err = exec_replace(program, args, &blueprint.env);
+            let err = exec_replace(program, args, &session.blueprint, &session.catalog);
             bail!("exec failed after confine-self: {err}");
         }
     }
 }
 
-/// Build the confined child's environment per the blueprint (FW-ENV1/2). Impure -- it reads the real
-/// process environment -- so it lives in the CLI shell, not the pure compiler. Passthrough leaves the
-/// inherited environment untouched; otherwise the child's env is rebuilt from the filtered set.
-fn apply_env(command: &mut Command, env: &formwork_blueprint::EnvPosture) {
-    use formwork_blueprint::EnvPosture;
-    if matches!(env, EnvPosture::Passthrough) {
-        return;
+/// `formwork learn`: an enforced run bracketed by observation (FW-DISC1). Visibly distinct from
+/// a plain run, changes nothing about the live policy, and concludes by writing the proposal /
+/// self-accepting in-zone candidates for the NEXT run.
+fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>) -> Result<()> {
+    let session = prepare_session(&blueprint)?;
+    let host = detect();
+    tracing::info!(
+        "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
+    );
+    let started = std::time::Instant::now();
+    let run_id = format!(
+        "learn-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let (program, args) = argv.split_first().expect("argv is required");
+    let status = spawn_confined_child(&session, program, args)?;
+
+    if matches!(host.os, formwork_detect::Os::MacOs) {
+        // Slack covers unified-log persistence latency; over-capture within the window is safe
+        // (floored or review-gated), under-capture just means another learning run.
+        let window_secs = started.elapsed().as_secs() + 4;
+        learn::conclude_learning_run(
+            &session.blueprint,
+            &blueprint.blueprint,
+            &session.catalog,
+            &run_id,
+            window_secs,
+            &status,
+        )?;
+    } else {
+        tracing::warn!(
+            "learning ran enforced, but this host has no denial feed (the macOS unified-log tap is the only wired source; Landlock audit needs kernel 6.15+ and is unwired) -- no proposal was written (FW-INV5: reported, not pretended)"
+        );
     }
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The operator channel's compile-time itemization (FW-CRED7). The full roll-call is identical
+/// on every run, so the default (info) line is a summary whose only varying part -- the
+/// deliberate exclusions -- is spelled out; the per-type roll-call itemizes at debug
+/// (RUST_LOG=debug). The compile report stays the canonical itemized form. The confined agent
+/// never sees any of this -- its channel is the bare EACCES / the absent variable (FW-INV9).
+fn itemize_credential_floor(report: &formwork_compile::FidelityReport) {
+    let creds = &report.credentials;
+    let path_types: Vec<&str> = creds
+        .per_type
+        .iter()
+        .filter(|(_, f)| f.path.is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let env_types: Vec<&str> = creds
+        .per_type
+        .iter()
+        .filter(|(_, f)| f.env.is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    tracing::info!(
+        path_types = path_types.len(),
+        env_types = env_types.len(),
+        catalog_version = creds.catalog_version,
+        allowed = ?creds.allowed,
+        "credential floor active (RUST_LOG=debug itemizes per type)"
+    );
+    tracing::debug!(
+        denied_path_types = ?path_types,
+        stripped_env_types = ?env_types,
+        "credential catalog floor, itemized"
+    );
+}
+
+/// The launcher arm (FEP-2 §6): build the confined child's environment -- the credential-catalog
+/// strip partitions first (FW-CRED2/4), then the posture (FW-ENV1/2). Impure -- it reads the real
+/// process environment -- so it lives in the CLI shell; the decision itself is the pure
+/// `construct_env`. Itemization is names and types only, never values (FW-CRED7).
+fn apply_env(command: &mut Command, blueprint: &Blueprint, catalog: &ResolvedCatalog) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
-    let dropped = env.dropped_names(&vars);
+    let built = formwork_blueprint::construct_env(
+        &blueprint.env,
+        catalog,
+        &blueprint.allow_credentials,
+        vars,
+    );
     command.env_clear();
-    command.envs(env.apply(vars));
-    if !dropped.is_empty() {
-        // Names only -- never values (secrets never hit logs).
-        tracing::info!(count = dropped.len(), dropped = ?dropped, "scrubbed environment variables");
+    command.envs(built.kept.iter().cloned());
+    if !built.posture_dropped.is_empty() {
+        tracing::info!(count = built.posture_dropped.len(), dropped = ?built.posture_dropped, "scrubbed environment variables");
+    }
+    if !built.stripped.is_empty() {
+        tracing::info!(stripped = ?built.stripped, "credential catalog: env vars stripped by the launcher");
     }
 }
 
@@ -238,22 +527,22 @@ fn apply_env(command: &mut Command, env: &formwork_blueprint::EnvPosture) {
 /// backend, applying the blueprint's `[mcp.<server>]` policy. One blueprint governs both surfaces: its
 /// `[mcp.<server>]` entry shades the protocol, its fs/net grant confines the backend the same way
 /// `run` confines any command (FW-GW5), so the backend spawns behind the same wall.
-fn gateway(blueprint: PathBuf, server: String, argv: Vec<String>) -> Result<()> {
-    let blueprint = blueprint_load::load(&blueprint, &home())?;
-    let blueprint = blueprint_load::canonicalize_for_enforcement(&blueprint)
-        .context("canonicalizing grant paths")?;
+fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Result<()> {
+    let session = prepare_session(&blueprint)?;
 
     // An unlisted server is a config error, not a silent deny: a typo would otherwise masquerade as
     // a backend that legitimately exposes nothing, hiding the mistake.
-    let policy = blueprint.mcp.get(&server).cloned().ok_or_else(|| {
-        let known: Vec<&str> = blueprint.mcp.keys().map(String::as_str).collect();
+    let policy = session.blueprint.mcp.get(&server).cloned().ok_or_else(|| {
+        let known: Vec<&str> = session.blueprint.mcp.keys().map(String::as_str).collect();
         anyhow!("blueprint has no [mcp.{server}] policy (known servers: {known:?})")
     })?;
 
-    let backend_policy = compile(&blueprint, &detect());
     let (program, args) = argv.split_first().expect("argv is required");
-    let backend = formwork_gateway::confined_command(program, args, &backend_policy)
+    let mut backend = formwork_gateway::confined_command(program, args, &session.policy)
         .context("building confined backend command")?;
+    // The gateway is a launcher too: the backend it spawns is part of the session, so the same
+    // env construction applies (FW-CRED2 env arm; FW-INV7 covers the whole tree).
+    apply_env(&mut backend, &session.blueprint, &session.catalog);
 
     tracing::info!(server = %server, backend = %program, "starting MCP gateway");
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -290,11 +579,12 @@ async fn proxy(backend: Command, policy: McpPolicy) -> Result<()> {
 fn exec_replace(
     program: &str,
     args: &[String],
-    env: &formwork_blueprint::EnvPosture,
+    blueprint: &Blueprint,
+    catalog: &ResolvedCatalog,
 ) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(program);
     command.args(args);
-    apply_env(&mut command, env);
+    apply_env(&mut command, blueprint, catalog);
     command.exec()
 }

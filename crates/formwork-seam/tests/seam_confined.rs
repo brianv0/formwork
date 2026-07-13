@@ -11,10 +11,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
-use formwork_blueprint::{Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode};
-use formwork_compile::{compile, Capability, CompiledPolicy};
+use formwork_blueprint::{
+    Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
+};
+use formwork_compile::{Capability, CompiledPolicy};
 use formwork_detect::detect;
 use formwork_seam::{inject, SeamPlan};
+
+/// Integration tests enforce what the product enforces: the builtin catalog for the real home.
+fn compile(blueprint: &Blueprint, host: &formwork_detect::HostProfile) -> CompiledPolicy {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    formwork_compile::compile(
+        blueprint,
+        host,
+        &ResolvedCatalog::builtin_for_home(&home).unwrap(),
+    )
+}
 
 /// Serialize the fork/exec-bearing seam tests. Each forks a confined child; on macOS `socketpair(2)`
 /// has no atomic close-on-exec, so std sets CLOEXEC in a separate `fcntl` after creating the pair. A
