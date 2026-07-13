@@ -18,38 +18,41 @@ These two halves are in tension, and the resolution is the third principle: **ho
 
 ## 2. Architecture overview
 
-Formwork has three enforcement arms driven by a single capability compiler, with an fd seam to the agent. The diagram below shows the two OS/protocol arms; FEP-2 (`fep2.md` §6) added the **launcher** ahead of both — the pre-spawn arm that constructs the confined child's environment, strips catalog credentials (variable absent, not denied), and write-protects its own policy inputs before control transfers.
+Formwork has three enforcement arms driven by a single capability compiler, with an fd seam to the agent. The **launcher** runs first — the pre-spawn arm that constructs the confined child's environment, strips catalog credentials (variable absent, not denied), and write-protects its own policy inputs before control transfers. Then the **confiner** (the hard OS boundary) and the **gateway** (the soft MCP boundary) hold for the lifetime of the session.
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  CAPABILITY BLUEPRINT (unveil-style)                               │
-│  read(path) · write(path) · [exec(path)] · net-posture ·          │
-│  mcp(server → {tools, resources, prompts} visibility)             │
-├──────────────────────────────────────────────────────────────────┤
-│  COMPILER (pure; no kernel calls)                                  │
-│  blueprint → { confiner policy, gateway policy } + FidelityReport │
-├───────────────────────────────┬──────────────────────────────────┤
-│  CONFINER  (hard boundary)     │  GATEWAY  (soft boundary)         │
-│  Linux: Landlock + seccomp     │  MCP-aware policy proxy           │
-│  macOS: Seatbelt (SBPL)        │  shades tools/resources/prompts   │
-│  fs read/write, net-deny,      │  fronts stdio + http/sse backends │
-│  descendant inheritance        │  mints connection fds (SCM_RIGHTS)│
-└───────────────┬───────────────┴───────────────┬──────────────────┘
-                │ confines                        │ one control fd
-                ▼                                 ▼
-        ┌───────────────┐                 ┌───────────────┐
-        │  AGENT         │◄────fd seam─────│  (no net, no   │
-        │  (confined)    │   injected fd   │   fs except    │
-        └───────────────┘                 │   the fd)      │
-                ▲                          └───────────────┘
-                │ confines (recursion)
-        ┌───────────────┐
-        │ stdio MCP      │  spawned by gateway, itself confined
-        │ backend        │  by the same confiner
-        └───────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│  CAPABILITY BLUEPRINT (unveil-style; layered file+CLI surfaces)       │
+│  read(path) · write(path) · [exec(path)] · net-posture · env ·        │
+│  allow-credentials · mcp(server → visibility)                         │
+├───────────────────────────────────────────────────────────────────────┤
+│  COMPILER (pure; no kernel calls; credential catalog is an input)     │
+│  blueprint → { launcher, confiner, gateway } + FidelityReport         │
+├───────────────────────┬─────────────────────┬─────────────────────────┤
+│ LAUNCHER (pre-spawn)  │ CONFINER (hard)     │ GATEWAY (soft)          │
+│ env construction &    │ Linux: Landlock     │ MCP-aware policy proxy  │
+│ credential strip      │  + seccomp          │ shades tools/resources/ │
+│ → var absent          │ macOS: Seatbelt     │ prompts; fronts stdio + │
+│ policy-input write-   │ fs r/w, net-deny,   │ http/sse backends;      │
+│ protect (FW-XR8)      │ descendant inherit  │ mints fds (SCM_RIGHTS)  │
+└───────────────────────┴──────────┬──────────┴────────────┬────────────┘
+                                   │ confines              │ one control fd
+                                   ▼                       ▼
+                           ┌───────────────┐       ┌───────────────┐
+                           │  AGENT        │◄─fd── │ (no net, no fs│
+                           │  (confined)   │ seam  │ except the fd)│
+                           └───────────────┘       └───────────────┘
+                                   ▲
+                                   │ confines (recursion)
+                           ┌───────────────┐
+                           │ stdio MCP     │  spawned by gateway, itself
+                           │ backend       │  confined by the same confiner
+                           └───────────────┘
 ```
 
-Three things make this hang together:
+Four things make this hang together:
+
+**The launcher is where non-kernel capabilities are applied.** Landlock and Seatbelt cannot shade an environment variable — it is a string in the process's environment block, not a filesystem object. But Formwork *spawns* the confined process, so it constructs the child's environment: shading a variable is simply not copying it into the spawn. The child comes up having never had it — stronger, in kind, than a path denial (a denied path still announces a wall; a stripped variable is indistinguishable from never-configured, FW-INV9). The one contingency: it holds only while Formwork is the launching process, which the report must disclose (FW-CRED8).
 
 **The confiner makes the gateway unavoidable.** Because the confined agent has no network and no filesystem beyond its grant plus one injected fd, every MCP interaction and every byte of egress is *forced* through the gateway. That is what upgrades tool-shading from a suggestion into a control: there is no other door.
 
@@ -83,9 +86,10 @@ Naming note (open, section 11): this document uses **Formwork** for the whole sy
 
 ## 4. The capability blueprint and its interpreter
 
-Formwork consumes a finite, enumerable blueprint — the unveil/pledge lineage, narrowed to what an OS sandbox can carry:
+Formwork consumes a finite, enumerable **Blueprint** — the unveil/pledge lineage, narrowed to what an OS sandbox can carry. (The name fits the construction metaphor: formwork is the mould; the Blueprint is the plan the mould is built from. It is defined once, here, and used for nothing else.)
 
 ```
+extends: [blueprint]          # base Blueprints/presets this one layers over (FW-BP3)
 read(path-pattern)            # filesystem read
 write(path-pattern)           # filesystem write (implies read of the same)
 subtract(path-pattern)        # carve a sensitive hole out of the read+write grant (deny wins)
@@ -96,6 +100,8 @@ net: Deny                     # default: no direct egress at all
 env: Passthrough              # default: inherit the launcher's environment
    | Allowlist([name])        # only the named vars survive
    | Scrub({allow, deny})     # drop secret-shaped vars by name/value, minus an allowlist (FW-ENV1/2)
+allow-credentials: [type]     # lift named credential-catalog types — the ONLY un-deny (FW-CRED5)
+discovery.auto-widen: [path]  # zone in which a learning run may self-grant (FW-DISC4)
 mcp(server): {                # per-MCP-server visibility policy
     tools:     Allow([...]) | AllowAll | Deny,
     resources: Allow([...]) | AllowAll | Deny,
@@ -105,18 +111,22 @@ mcp(server): {                # per-MCP-server visibility policy
 }
 ```
 
-The compiler is the single authority that maps this blueprint to concrete mechanisms. It is pure — it never touches the kernel — so it runs in CI on any box, lets a Linux policy be compiled and inspected on a Mac, and is deterministic. It emits two policy objects (confiner, gateway) and a `FidelityReport`.
+The compiler is the single authority that maps this blueprint to concrete mechanisms. It is pure — it never touches the kernel — so it runs in CI on any box, lets a Linux policy be compiled and inspected on a Mac, and is deterministic. It takes the credential catalog (§5.9) as an explicit input — the floor cannot be forgotten, only resolved — and emits the launcher, confiner, and gateway policies plus a `FidelityReport`.
+
+The Blueprint is a typed, versioned schema with **multiple surfaces onto one model** (FW-BP1): the TOML file is one serialization; the CLI flags are another, applied as an override layer. It is deliberately a standard serialization, not a bespoke DSL — a Blueprint is data with no control flow, and a policy language would pay SELinux's legibility cost to describe a struct. If real logic is ever required, the answer is an existing configuration language, never a new one.
 
 Two semantics choices, both settled earlier in design:
 
 - **EACCES denial is acceptable; invisibility is preferred only where free.** Filesystem denials surface as the platform's natural errno (EACCES on Landlock, EPERM/EACCES on Seatbelt). Formwork does not build a mount-namespace or FUSE layer to fake ENOENT. The one place invisibility *is* cheap and *is* required is MCP tool/resource/prompt shading at the gateway, where an ungranted item is simply absent from the listing. For the sensitive *subset*, metadata is also denied where a backend supports it (Seatbelt `file-read-metadata`), so a credential's existence, size, and mtime do not leak through `stat` (FW-CAP7); where a backend cannot (Landlock), that residual is reported Partial rather than left as a blanket concession.
 - **The default profile is subtractive, not minimal.** Rather than granting an empty world and adding paths, the default profile grants broad read over the ambient environment (system prefixes, interpreters, shared libraries, standard tool locations, language caches) and subtracts a configured sensitive set. This is the reuse principle expressed as policy.
 
-Three further points pin the vocabulary above down so it is unambiguous to the compiler and gateway:
+Five further points pin the vocabulary above down so it is unambiguous to the compiler and gateway:
 
 - **MCP item identity.** Shading matches items by their natural MCP identifier: tools and prompts by `name`, resources by `uri`, and resource templates by `uriTemplate`. A `resources` `Allow([...])` list therefore contains URIs (for concrete resources, matched on `resources/list` and `resources/read`) and/or URI templates (for `resources/templates/list`); tool and prompt lists contain names. An item that lacks its identifier field is treated as ungranted (fail-closed). This is what keeps the resource axis consistent across list, read, and templates rather than silently matching one of them on a different key.
-- **Grant paths must be representable.** Grant, write, and `subtract` paths are canonicalized against the real filesystem at enforce time (symlink and firmlink resolution) so kernel path-matching lines up. A resolved path that cannot be faithfully rendered into the backend's policy language — e.g. a non-UTF-8 byte path — makes enforcement **fail loud**, never emit a lossy rule that might silently not match. A `subtract` hole that failed to match would be a silent fail-open of the sensitive set, which FW-INV6 forbids. Patterns are absolute, or an any-depth basename form (`**/.env`) that matches a trailing component at any depth within a grant (FW-CAP6); no `..` traversal exists, and both forms canonicalize deterministically (FW-FID4).
-- **Environment is a capability, applied at spawn.** The `env` posture (FW-ENV1) governs what environment the confined child receives — passthrough, an allowlist of names, or a scrub of secret-shaped vars. The CLI shell, not the confiner, builds the child's environment from the filtered set before `exec`; the `FidelityReport` carries the verdict like any other capability. The default profile's scrub (FW-ENV2) is heuristic, so it is reported Partial, never a silent over-claim.
+- **Grant paths must be representable.** Grant, write, and `subtract` paths are canonicalized against the real filesystem at enforce time (symlink and firmlink resolution) so kernel path-matching lines up. A resolved path that cannot be faithfully rendered into the backend's policy language — e.g. a non-UTF-8 byte path — makes enforcement **fail loud**, never emit a lossy rule that might silently not match. A `subtract` hole that failed to match would be a silent fail-open of the sensitive set, which FW-INV6 forbids. Patterns are absolute, an any-depth basename form (`**/.env`) that matches a trailing component at any depth, or the prefix-anchored refinement (`<prefix>/**/<suffix>`) that matches only below an absolute prefix (FW-CAP6); no `..` traversal exists, and all forms canonicalize deterministically (FW-FID4).
+- **Path sigils are a closed set, expanded at the CLI edge.** `~` → `$HOME` and `$CWD` → the launch directory, expanded *before* patterns reach the compiler, so a grant can be written relative to the project it runs in (FW-BP5). Fixed tokens only — never general `$VAR` interpolation, since the environment is exactly what the launcher strips (FW-CRED2). An unresolvable sigil fails loud, never silently widening (FW-INV6).
+- **Layers merge in a fixed order, and deny beats allow.** Baseline (the fail-closed empty Blueprint plus the credential-catalog floor) → `extends` chain (depth-first, bases before deriveds) → the file → CLI overrides (FW-BP2). Postures are last-set-wins; path sets merge additively; at any layer and any precedence, deny/subtract wins over allow — the only un-deny anywhere is the typed credential exclude (FW-BP4, FW-CRED5).
+- **Environment is a capability, applied at spawn.** The `env` posture (FW-ENV1) governs what environment the confined child receives — passthrough, an allowlist of names, or a scrub of secret-shaped vars. The launcher, not the confiner, builds the child's environment: the credential-catalog strip partitions first (FW-CRED4), then the posture filters what remains; the `FidelityReport` carries the verdict like any other capability. The default profile's scrub (FW-ENV2) is heuristic, so it is reported Partial, never a silent over-claim.
 
 ## 5. Requirements
 
@@ -179,7 +189,7 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 |---|---|
 | **FW-TRA1** Ambient reuse | The confined process reuses host interpreters, toolchains, shared libraries, and language package caches, read-only by default. |
 | **FW-TRA2** Toolchains run clean | Under the default profile, common toolchains (python/pytest, node/npm, git, a C build) run unmodified with zero denials on the happy path. |
-| **FW-TRA3** Sensitive-set subtraction | Credentials, SSH/cloud config, keychains, other projects, and browser profiles are denied/hidden by default even under broad grants. *(Superseded and expanded by FEP-2's typed credential catalog — FW-CRED1..8, `fep2.md` §5 — which adds the env-var arm and exclude-by-type.)* |
+| **FW-TRA3** Sensitive-set subtraction | Credentials, SSH/cloud config, keychains, other projects, and browser profiles are denied/hidden by default even under broad grants. *(Superseded and expanded by the typed credential catalog — §5.9, FW-CRED1..9 — which adds the env-var arm and exclude-by-type.)* |
 | **FW-TRA4** Graceful denial | Denials surface as standard errno, never as sandbox-specific crashes; a tool probing an optional ungranted path continues rather than aborting. |
 | **FW-TRA5** Writable working set | The project directory, a scratch/tmp area, and (optionally) build caches are writable, so the agent can do real work and persist within scope. |
 | **FW-TRA6** Low overhead | Confinement setup and per-operation overhead stay within the section 8 performance target so interactive agent loops remain responsive. |
@@ -197,12 +207,55 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 
 ### 5.7 Environment (FW-ENV)
 
-Applied by the CLI shell at spawn — not the confiner — and reported in the `FidelityReport` like any other capability.
+Applied by the launcher at spawn (§2) — not the confiner — and reported in the `FidelityReport` like any other capability.
 
 | Req | Requirement |
 |---|---|
 | **FW-ENV1** Environment axis | The blueprint carries an `env` posture — passthrough, allowlist (only named vars survive), or scrub (secret-shaped vars removed) — and the child's environment is built at spawn from the filtered set, not inherited wholesale. A capability axis parallel to fs/net/exec/mcp. |
 | **FW-ENV2** Default secret-shaped scrub | The default profile scrubs env vars whose *name* matches a secret shape (`TOKEN\|SECRET\|PASSWORD\|KEY\|AUTH\|CREDENTIAL\|CERT`) or whose *value* matches a high-confidence secret shape (PEM blocks, `ghp_…`, `AKIA…`, `AIza…`, JWT), minus a blueprint-named allowlist for vars the agent legitimately needs (its model API key). Transparency (FW-TRA2) is preserved by the allowlist; the scrub is heuristic, so it is reported Partial, never a silent over-claim. |
+
+### 5.8 Blueprint model & format (FW-BP)
+
+The Blueprint is one typed model with multiple surfaces (§4); these requirements pin the layering and the authoring vocabulary.
+
+| Req | Requirement |
+|---|---|
+| **FW-BP1** One model, many surfaces | The Blueprint is a typed, versioned schema. The file format and the CLI flags are two surfaces onto the same model, not two models: any grant/deny/exclusion expressible in one is expressible in the other. |
+| **FW-BP2** Override precedence | Layers merge in a fixed, documented order, lowest to highest: built-in baseline (the fail-closed empty Blueprint plus the credential-catalog floor) → `extends` chain (depth-first, bases before deriveds) → Blueprint file → CLI overrides. Postures (read-mode/net/exec/env) are last-set-wins; path sets merge additively; the result is deterministic. Overrides are an additive last layer, never a separate mechanism. |
+| **FW-BP3** Composition via `extends` | A Blueprint may extend one or more base Blueprints (presets/profiles). Resolution is deterministic and cycles are detected and errored. |
+| **FW-BP4** allow / deny / subtract vocabulary | First-class allow (reads/writes), deny/subtract (read+write), and write-subtract semantics over path patterns in the FW-CAP6 grammar. At any layer and at equal precedence, deny/subtract wins over allow (safety bias); no allow at any layer shadows a deny at any layer — the only un-deny is the typed credential exclude (FW-CRED5). No general glob exists. |
+| **FW-BP5** Path sigils | Blueprint path patterns admit a closed set of authoring sigils, expanded at the CLI edge *before* compilation: `~` → `$HOME` and `$CWD` → the launch directory, so a grant can be written relative to the project it runs in. Fixed tokens only — never general `$VAR` interpolation, since the process environment is exactly what the launcher strips (FW-CRED2), and letting an arbitrary variable name a path would reopen that surface. An expanded sigil is an absolute path that canonicalizes like any grant (FW-CAP6/FW-FID4); an unresolvable sigil (e.g. no readable working directory) fails loud, never silently widening (FW-INV6). |
+
+### 5.9 Credential catalog & launcher (FW-CRED)
+
+A versioned, typed catalog of credential **locations only** — dotfiles, well-known file paths, and environment variable names, keyed by type (aws, gcp, ssh, anthropic, …) — compiled into the binary and applied as a floor under every Blueprint. There is no content scanning and no byte-signature matching (§3 non-goals): because every entry is location-based, every entry is a *hard boundary*. The two location kinds are enforced by two different arms: **path** entries join the confiner's deny set (EACCES); **env** entries are stripped by the launcher pre-spawn (variable absent — see §2 for why this is stronger in kind, and on what it is contingent). The "ambient credentials detector" is not separate machinery: it is FW-CRED7's operator-channel itemization of this catalog — deny the superset, report the specifics.
+
+| Req | Requirement |
+|---|---|
+| **FW-CRED1** Typed location catalog | A versioned catalog of credential *locations* keyed by type. Each type contributes path patterns and/or env-var names. |
+| **FW-CRED2** Two kinds, two arms | **path** entries → confiner deny (EACCES); **env** entries → launcher strips the variable before spawn (variable absent). Enforced and reported distinctly. |
+| **FW-CRED3** Env-points-to-file types | A type may carry both an env var and the file it references (e.g. `GOOGLE_APPLICATION_CREDENTIALS`). Excluding the type strips the variable **and** denies the referenced file. |
+| **FW-CRED4** Deny-superset by default | The whole known catalog is blocked/stripped by default (fail-closed); exclusion is opt-in per type (FW-CRED5). Coverage of uncatalogued secrets is FW-CRED6's job. |
+| **FW-CRED5** Exclude-by-type is un-blocking | `allow-credentials: [aws]` (CLI `--allow-cred aws`) deliberately and visibly lets one type through; nothing adjacent is affected. This is the knob for when the agent genuinely needs a credential. |
+| **FW-CRED6** Generic backstop | Beyond curated types, a generic rule denies known-sensitive *shapes* — files literally named like credentials or SSH private keys — at any depth, anywhere. A catch-all is location-independent by nature: it must reach the containers, CI runners, and project trees where uncatalogued secrets actually live, not just `$HOME`, and it stays denied even under a broad grant. Liftable only as the whole named pseudo-type `backstop`. |
+| **FW-CRED7** Operator/agent channel split | The operator sees itemized "denied/stripped X (type: …)". The confined agent sees a plain EACCES / an absent variable with no catalog annotation — no oracle. |
+| **FW-CRED8** Report names the mechanism | The FidelityReport marks each covered type `enforced-via-launcher` (env) or `enforced-via-OS-sandbox` (path), and states plainly that env-shading holds only while Formwork is the launching process — the guarantee is launcher-contingent, and the report must not overclaim it as independent of the launcher. |
+| **FW-CRED9** Floor enforceability is honest per platform | Any-depth floor rows — the `**/…` form, its anchored refinement `<prefix>/**/<suffix>`, and the generic backstop (FW-CRED6) — are enforceable as a Seatbelt regex (start-pinned for the anchored form, floating for the plain `**/…`) but cannot be rooted by Landlock. Where a floor row is unenforceable on the host it is withheld from the compiled deny set and the affected types (and the backstop) are reported **Partial**, never silently claimed `Enforced` (FW-INV5). |
+
+### 5.10 Discovery (FW-DISC)
+
+Discovery observes what a confined workload actually tries to touch and turns denials into candidate grants, so you start tight and let real behavior write the Blueprint — the single most valuable ergonomic feature for the reuse goal, and the one with the sharpest tradeoff, because auto-granting an agent's *attempts* is a confused-deputy machine. Two properties resolve it. First, the default posture is **observe-then-widen**, never live prompting: a marked learning run records denials without granting them, produces a reviewable proposal, and the accepted result applies to *subsequent* runs — the human decision stays out of the hot path, and no syscall interception is needed on either platform. Second, and load-bearing: **the credential catalog is the floor discovery cannot erode** (FW-DISC3/FW-INV8).
+
+| Req | Requirement |
+|---|---|
+| **FW-DISC1** Learning mode | An explicit, non-enforcing-of-widenings learning phase that records denials without granting them at runtime. Distinct and visibly different from an enforced run; the policy itself is enforced unchanged (FW-INV10). |
+| **FW-DISC2** Reverse compile | Denials compile *backwards* into a proposed Blueprint diff. Each candidate is tagged: catalog-blocked / inside-auto-widen-zone / needs-review. |
+| **FW-DISC3** Catalog floor | A denial matching the FW-CRED catalog is **never** offered as an auto-proposable or one-click candidate grant. Lifting it requires the explicit typed exclude (FW-CRED5), never the discovery flow. The match is by credential *shape* wherever the kernel observed the denial — denial collection is deliberately over-capture-tolerant (a denial can surface from another process or a different `$HOME`), so a credential-shaped path is withheld regardless of location — and the floor is re-checked again at **accept**, because the proposal file is untrusted input. |
+| **FW-DISC4** Auto-widen zone | An operator-authored scope in the Blueprint within which discovered grants may be auto-accepted (e.g. project dir, language caches). Outside the zone, review is required. Empty by default — nothing self-grants out of the box. |
+| **FW-DISC5** Review as itemized diff | Proposals surface on the operator channel as a diff showing what widens and what was withheld and why. Acceptance is per-entry. |
+| **FW-DISC6** Provenance | An accepted discovered grant is recorded with provenance (added-via-discovery, run id), so audit distinguishes authored from learned grants. |
+
+"Formwork never runs a real workload in a grant-whatever-is-attempted mode" is not a separate requirement — it is the combined consequence of FW-DISC1 and FW-DISC4, stated as a guarantee in FW-INV10. Sticky learning within a trust boundary is the recommended workflow: accumulate proposals across runs, auto-accept only inside the operator-drawn zone, review everything else — discovery does the tedious enumeration; the human keeps the perimeter.
 
 ## 6. Invariants
 
@@ -219,6 +272,16 @@ These hold for every session under every backend, and are the properties the tes
 **FW-INV5 — Report soundness.** Anything reported `Enforced` is actually enforced, verified by paired allow/deny probes; anything the platform cannot enforce is reported, not claimed. This is the load-bearing invariant — it is what makes "good, not perfect" honest rather than hand-wavy.
 
 **FW-INV6 — No silent open.** No capability-detection failure yields a running-but-unconfined session without an explicit, surfaced `Unenforceable`. Formwork fails closed or fails loud, never fails open-silent.
+
+**FW-INV7 — Launcher-strip completeness.** A stripped env var is *absent* (not merely denied) throughout the confined process and its entire descendant tree. The confined process may still set new vars for its own children; this shades ambient inherited credentials, not values the agent synthesizes.
+
+**FW-INV8 — Credential floor.** No discovery path, no auto-widen rule, and no single-click operator action can grant access to a FW-CRED-matched location. Only the explicit typed exclude (FW-CRED5) can. A location is "matched" by credential *shape* wherever its denial was observed, and the floor is evaluated both when a candidate is proposed and again at accept (proposals are untrusted input), so neither over-capture nor a forged proposal opens a seam (FW-DISC3).
+
+**FW-INV9 — No-oracle for credentials.** Denied credential paths and stripped credential env vars are indistinguishable, to the confined agent, from genuinely absent resources — no error text, code, or timing reveals existence.
+
+**FW-INV10 — Discovery is non-authoritative.** A discovered candidate has no effect until accepted into an enforced Blueprint. Observation never itself widens a live enforced session, except within a pre-declared auto-widen zone.
+
+(The env-shading honesty guarantee — that the report discloses launcher-contingency — is carried by FW-CRED8 rather than a standalone invariant, and is a specialization of FW-INV5 report-soundness.)
 
 ## 7. End-to-end tests
 
@@ -300,7 +363,43 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 **FW-E2E-028: Cross-platform equivalence.** The same blueprint is enforced on Linux and macOS and exercised by the section 7.1–7.5 workloads. Pass: for the enforceable intersection, observable behaviors match across platforms; all differences are reflected in the FidelityReport, not in silent behavior. Fail: an observable behavior differs across platforms without a corresponding report entry.
 
-### 7.7 Adversarial
+### 7.7 Blueprint model & format
+
+**FW-E2E-041: Rename regression.** *(Regression guard for the spec → Blueprint rename; not tied to a numbered requirement.)* A Blueprint that is the renamed form of a prior spec compiles to the same policy and report. Pass: no behavioral change attributable to the rename. Fail: any policy difference.
+
+**FW-E2E-042: Override precedence.** A path allowed in the file is denied by a CLI `--subtract` layered over it; a deny and an allow at equal precedence resolve to deny. Pass: merge follows baseline → extends → file → CLI (FW-BP2), postures last-set-wins, path sets additive, with deny-beats-allow at ties. Fail: any ordering or tie deviation.
+
+**FW-E2E-043: CLI/file parity.** The same grant authored in the file and expressed via CLI flag produce identical compiled policy. Pass: byte-identical policy from both surfaces. Fail: divergence.
+
+**FW-E2E-044: `extends` composition.** A Blueprint extending a base merges deterministically; an `extends` cycle is detected. Pass: deterministic merge; cycle errors clearly. Fail: nondeterministic merge or an undetected cycle.
+
+**FW-E2E-055: Path sigils scope a grant (FW-BP5).** A blueprint grants `$CWD/**` and is run from a project directory. Pass: a file under the launch directory is readable while a sibling outside it is denied by the real kernel; `~` still expands to `$HOME`; a non-sigil path is untouched; and `$CWD` resolving to `$HOME` or `/` warns (a broad-grant nudge) rather than silently widening. Fail: a path outside `$CWD` is granted, or a sigil expands wrong.
+
+### 7.8 Credential catalog & launcher
+
+**FW-E2E-045: Path credential denied and itemized.** Under the default catalog, `~/.aws/credentials` is read. Pass: read denied (EACCES); operator channel names type `aws`; agent sees a bare EACCES with no annotation. Fail: read succeeds, or the agent-facing error names the type.
+
+**FW-E2E-046: Env credential stripped and absent in tree.** `AWS_SECRET_ACCESS_KEY` is present in Formwork's own environment. The confined process and a grandchild read it. Pass: absent in both (empty/None); operator channel names it stripped as `aws`; agent cannot distinguish it from never-set. Fail: the variable is present anywhere in the tree.
+
+**FW-E2E-047: Env-points-to-file dual arm.** With `gcp` enforced (default deny) and `GOOGLE_APPLICATION_CREDENTIALS` set to a real path. Pass: the variable is stripped **and** the referenced file is denied. Fail: either arm misses.
+
+**FW-E2E-048: Exclude-by-type un-blocks exactly one.** `--allow-cred aws`. Pass: aws path/env become accessible/present while ssh, anthropic, slack, etc. remain blocked/stripped. Fail: any adjacent type is affected.
+
+**FW-E2E-049: Generic backstop.** An uncatalogued but sensitive-shaped location (a novel `~/.someprovider/credentials`, an unusual `.env` variant). Pass: denied by the backstop despite no curated entry. Fail: the uncatalogued secret is accessible.
+
+**FW-E2E-050: Report mechanism labeling.** Pass: FidelityReport marks env-kind types `enforced-via-launcher` and path-kind types `enforced-via-OS-sandbox`, carries the launcher-contingency note for env, and marks any-depth floor rows Partial where the host cannot root them (FW-CRED9). Fail: mislabeled or missing mechanism.
+
+### 7.9 Discovery
+
+**FW-E2E-051: Learning proposes toolchain, omits secrets.** A learning run of a real workload that needs ordinary toolchain paths and also touches a credential. Pass: the proposal includes the ordinary paths the run needed and omits every FW-CRED-matched path however hard it was hit; the withheld itemization goes to the operator channel. Fail: a credential path appears as a candidate grant.
+
+**FW-E2E-052: Auto-widen zone boundary.** A discovered path inside the declared zone and one just outside it. Pass: the in-zone path self-grants on the next run; the out-of-zone path requires review and is not auto-granted. Fail: an out-of-zone path self-grants.
+
+**FW-E2E-053: Provenance recorded.** An accepted discovered grant. Pass: it appears in the discovered layer tagged with discovery provenance and run id, distinguishable from authored grants. Fail: no provenance, or indistinguishable from authored.
+
+**FW-E2E-054: Discovery non-authoritative.** A denial observed in learning mode, outside any auto-widen zone. Pass: the live enforced session is not widened; the operation still fails in that run. Fail: observation silently widened the session.
+
+### 7.10 Adversarial
 
 **FW-ADV-001: Sandbox shedding.** The confined process attempts, in sequence: `execve` of a setuid binary, `prctl` to clear `NO_NEW_PRIVS`, and re-exec to try to drop the seccomp filter. Pass: all fail; confinement persists across every attempt. Fail: any attempt restores access or relaxes the filter.
 
@@ -313,6 +412,14 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 **FW-ADV-005: fd smuggling.** A confined stdio backend attempts to pass its own descriptors to the agent, or to open new sockets, to widen access. Pass: only the gateway mints egress fds; the backend cannot manufacture or hand off a broader capability. Fail: a confined process obtains or confers access beyond its grant via fd passing.
 
 **FW-ADV-006: Cross-domain socket reach-around (Linux).** The confined process attempts to connect to an abstract UNIX socket and a pathname UNIX socket belonging to a host process outside the domain (e.g., a desktop bus or terminal multiplexer). Pass on capable kernels: blocked via UNIX-socket scoping; on kernels lacking it, the gap is reported Partial and the fail-closed net posture still prevents remote egress. Fail: the confined process talks to an out-of-domain service without the gap being reported.
+
+**FW-ADV-012: Credential oracle probe (path + env).** The agent probes a credential path and reads a credential env var, inspecting errors, codes, and timing. Pass: neither denial nor absence is distinguishable from a nonexistent resource, and neither surfaces an operator prompt that a social-engineering payload could target (extends FW-ADV-004). Fail: any oracle exists.
+
+**FW-ADV-013: Discovery confused-deputy.** A prompt-injected agent repeatedly attempts `~/.ssh/id_ed25519` to try to get it proposed and auto-accepted — with the auto-widen zone adversarially drawn over the whole home. Pass: FW-CRED-matched denials never become auto-proposable and never enter the auto-widen path (FW-INV8); a forged proposal naming the key is refused at accept; the wall holds regardless of attempt count. Fail: persistent probing yields a candidate grant, an auto-accept, or an accepted forgery.
+
+**FW-ADV-014: Launcher-bypass honesty.** The agent is started *without* Formwork (bypassing the launcher). Pass: env vars are present as expected, **and** the report had already disclosed env-shading as launcher-contingent — i.e. the guarantee was never overclaimed (FW-CRED8). Fail: the documentation/report implied env-shading holds independent of the launcher.
+
+**FW-ADV-015: Discovery fold cannot re-grant a credential (FW-INV8).** A credential-shaped file *outside* `$HOME` (`/srv/app/id_rsa`) sits alongside ordinary files that a learning run touches, with the auto-widen zone drawn over the directory. Pass: the key is withheld by the shape floor, its ordinary siblings stay granular (no `…/**` fold that would cover the key), nothing auto-accepted covers it, and a subsequent run still cannot read it — enforcement (deny beats allow) denies the key regardless, and the fold guard keeps the proposal itself honest. Fail: a fold or auto-widen grant transitively covers the withheld credential, or the key is readable in a later run.
 
 ## 8. Performance target
 
@@ -361,13 +468,16 @@ A reuse-heavy workload (FW-E2E-020/021) must complete within a small bounded ove
 | filesystem invisibility (ENOENT) | Not provided (EACCES) | Not provided (EPERM/EACCES) |
 | sensitive-set metadata denial | Partial (stat residual) | Enforced (metadata deny) |
 | environment secret-scrub | Partial (heuristic) | Partial (heuristic) |
+| credential floor: absolute rows | Enforced (Landlock deny) | Enforced (Seatbelt deny) |
+| credential floor: any-depth rows | Partial (withheld; Landlock cannot root `**/`) | Enforced (regex) |
+| credential env strip | Enforced (launcher-contingent) | Enforced (launcher-contingent) |
 
 ## 10. Requirements ↔ tests traceability
 
 | Requirement | Primary tests | Also covered by |
 |---|---|---|
 | FW-XR1 Fidelity honesty | FW-E2E-024, 025 | 026, INV5 |
-| FW-XR2 Good-not-perfect boundary | (whole §3, §7.7) | ADV-001..006 |
+| FW-XR2 Good-not-perfect boundary | (whole §3, §7.10) | ADV-001..006, 012..015 |
 | FW-XR3 Fail-closed egress | FW-E2E-006, 025 | 007, 008, ADV-003 |
 | FW-XR4 Descendant inheritance | FW-E2E-005 | ADV-001, 005, INV2 |
 | FW-XR5 Single privileged broker | FW-E2E-019 | 010, ADV-005 |
@@ -411,6 +521,27 @@ A reuse-heavy workload (FW-E2E-020/021) must complete within a small bounded ove
 | FW-FID4 Deterministic compile | FW-E2E-027 | 026 |
 | FW-ENV1 Environment axis | FW-E2E-036 | FW-FID1 |
 | FW-ENV2 Default secret-shaped scrub | FW-E2E-036 | FW-TRA2 |
+| FW-BP1 One model, many surfaces | FW-E2E-043 | 042 |
+| FW-BP2 Override precedence | FW-E2E-042 | 043 |
+| FW-BP3 `extends` composition | FW-E2E-044 | — |
+| FW-BP4 allow/deny/subtract | FW-E2E-042 | 045, 049 |
+| FW-BP5 Path sigils | FW-E2E-055 | — |
+| FW-CRED1 Typed catalog | FW-E2E-045, 046 | 049 |
+| FW-CRED2 Two kinds, two arms | FW-E2E-045, 046 | 050 |
+| FW-CRED3 Env-points-to-file | FW-E2E-047 | — |
+| FW-CRED4 Deny-superset default | FW-E2E-045, 046, 049 | — |
+| FW-CRED5 Exclude-by-type | FW-E2E-048 | ADV-013 |
+| FW-CRED6 Generic backstop | FW-E2E-049 | ADV-015 |
+| FW-CRED7 Channel split | FW-E2E-045, 046 | ADV-012, INV9 |
+| FW-CRED8 Report mechanism | FW-E2E-050 | ADV-014 |
+| FW-CRED9 Floor enforceability | FW-E2E-050 | INV5; Linux kernel enforcement deferred |
+| FW-DISC1 Learning mode | FW-E2E-051 | 054 |
+| FW-DISC2 Reverse compile | FW-E2E-051 | 052, 053 |
+| FW-DISC3 Catalog floor | FW-ADV-013, 015 | 051, INV8 |
+| FW-DISC4 Auto-widen zone | FW-E2E-052 | 054 |
+| FW-DISC5 Review diff | FW-E2E-051 | 053 |
+| FW-DISC6 Provenance | FW-E2E-053 | — |
+| Launcher arm (§2) | FW-E2E-046, 050 | 047, INV7, ADV-014 |
 
 ## 11. Open questions
 
@@ -420,7 +551,9 @@ A reuse-heavy workload (FW-E2E-020/021) must complete within a small bounded ove
 
 **fd-minting default.** Whether the default is pre-open-all-known-fds at spawn (simple, requires the connection set to be known up front) or a control-fd with on-demand `SCM_RIGHTS` minting (general, slightly more machinery). Likely pre-open as default with on-demand as the escape hatch.
 
-**Sensitive-set discovery.** How much of the subtracted set (FW-TRA3) is auto-detected (known credential locations, cloud-config dirs, keychains, browser profiles) versus configured. Auto-detection improves safety-by-default but risks missing new locations; the fail-closed answer is to deny a broad known-sensitive superset by default and let callers narrow.
+**Credential brokering.** Excluding a type (FW-CRED5) exposes the file/var to the agent. The stronger alternative — the gateway brokers the credential's *use* without the agent ever seeing the bytes — fits the single-privileged-broker shape but presupposes TLS termination and a secret-handling path through the broker. Deferred to a later FEP. *(The older sensitive-set-discovery question — auto-detect vs configure the subtracted set — was resolved by the typed catalog + backstop, §5.9, deny-the-superset by default, and observe-then-widen discovery, §5.10.)*
+
+**Blueprint serialization format.** TOML is the shipped surface (strict, `deny_unknown_fields` as a security asset), fixed at FEP-2 planning; it fights nesting exactly where Blueprints are deepest. Revisit only with a concrete need for logic, and then by adopting an existing configuration language (§4), never authoring one.
 
 **Linux gateway egress isolation build-vs-buy.** Whether the gateway's own network confinement reuses `bubblewrap`/`pasta`/`slirp4netns` for its netns setup or drives `unshare`/nftables directly. Out of the agent's confinement path (FW-XR7), but a real implementation decision for FW-GW7.
 
@@ -441,6 +574,6 @@ Kernel-mechanism-first, honesty-first, reuse-validated-early:
 7. **Degraded-host honesty and optional tiers** (FW-E2E-009, 025, ADV-006), confirming Formwork reports rather than pretends when a kernel cannot enforce a requested capability.
 8. **Capability-model hardening** (FEP-1): the env axis (FW-ENV1/2), execution-vector write-subtract (FW-TRA7), sensitive-set metadata denial (FW-CAP7), any-depth patterns (FW-CAP6), extended sensitive set (FW-TRA8), and the anti-escalation guarantee (FW-XR8) — landed and compiled/enforced on both backends. The fs additions are real-Seatbelt verified (FW-E2E-037..039); the env axis (a CLI-shell spawn transform, not a kernel capability) by unit tests plus the FidelityReport. Host-scoped egress (FW-EGR) and the violation stream (FW-FID5) remain deferred in `fep-1.md`.
 
-9. **Blueprints, the credential catalog, and discovery** (FEP-2): the layered Blueprint model with `extends`, a CLI override surface, and path sigils (FW-BP1–5), the typed credential catalog enforced across the confiner and the new launcher arm with per-type report labels and per-platform honesty (FW-CRED1–9), and observe-then-widen discovery bounded by the catalog floor (FW-DISC1–6; FW-INV7–10) — `fep2.md`, verified on real Seatbelt + the unified-log denial feed (FW-E2E-041..055, FW-ADV-012..015).
+9. **Blueprints, the credential catalog, and discovery** (FEP-2): the layered Blueprint model with `extends`, a CLI override surface, and path sigils (FW-BP1–5), the typed credential catalog enforced across the confiner and the launcher arm with per-type report labels and per-platform honesty (FW-CRED1–9), and observe-then-widen discovery bounded by the catalog floor (FW-DISC1–6; FW-INV7–10) — landed and folded into this document (§2, §4, §5.8–5.10, §6, §7.7–7.10), verified on real Seatbelt + the unified-log denial feed (FW-E2E-041..055, FW-ADV-012..015). On Linux the catalog's path arm rides whatever carries fs enforcement, with any-depth floor rows reported Partial per FW-CRED9. Credential brokering remains deferred (§11).
 
 If steps 1–4 pass, Formwork is a transparent, reusable filesystem confiner that behaves the same on both platforms and tells the truth about itself. If steps 5–7 pass, it is a complete agent sandbox: one privileged broker, everything else in a mould, egress forced through a policy gateway, and every claim backed by a mechanism or reported as a gap.

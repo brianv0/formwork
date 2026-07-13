@@ -4,6 +4,11 @@ Companion to `fep2.md` (what and why). This says how, in what order, with which 
 the same role `IMPLEMENTATION_PLAN.md` plays for `formwork.md`. Requirement IDs refer to
 `fep2.md`; test IDs use the **renumbered** scheme below.
 
+> **Historical record.** FEP-2 landed in full and its requirements were reintegrated into
+> `formwork.md` (§2, §4, §5.8–5.10, §6, §7.7–7.10); `fep2.md` is now a short landed-and-folded
+> pointer. Section references to `fep2.md` below resolve against the proposal as adopted —
+> `git log -- fep2.md`, prior to the reintegration commit.
+
 ## 0. Conflicts found during planning, and their resolutions
 
 Planning against the current tree (post-FEP-1 main) surfaced three drafting conflicts in
