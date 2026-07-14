@@ -6,7 +6,10 @@ enforces, on Linux and macOS, for an agent process and every child it spawns. Pl
 gateway so every tool call and every byte of egress is forced through one auditable door.
 
 See [`formwork.md`](formwork.md) for the design and end-to-end test spec, and
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for how it is being built.
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for how it is being built. Identifiers like
+`FW-CAP2` — in code, docs, and test names — cite requirements defined in `formwork.md`
+(anchored, so `formwork.md#fw-cap2` jumps to the definition; see the constitution's
+*Requirements & identifiers*).
 
 Formwork targets **good isolation, not perfect isolation** (design §1, §3): a hard wall against
 accidental, careless, and prompt-injected overreach and against untrusted code the agent runs — not

@@ -3,8 +3,6 @@
 //! child between fork and exec; preferred) and confine-self (a process restricts itself in place).
 //! Backends are selected at compile time: Landlock+seccomp on Linux, Seatbelt on macOS. Honesty
 //! (FW-INV6): if a promised mechanism fails to install, this aborts rather than running weakly.
-//!
-//! Requirement IDs (`FW-…`) cite `formwork.md`, the design + E2E spec at the repo root.
 
 use std::process::Command;
 

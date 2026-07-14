@@ -2,8 +2,6 @@
 //! it never touches the kernel -- so it runs anywhere, is inspectable without enforcing (FW-FID2),
 //! and is deterministic in `(blueprint, host)` (FW-FID4). Impurity is confined to the [`HostProfile`]
 //! the caller passes in; a synthetic profile compiles a policy for a platform you are not on.
-//!
-//! Requirement IDs (`FW-…`) cite `formwork.md`, the design + E2E spec at the repo root.
 
 mod linux;
 mod policy;
