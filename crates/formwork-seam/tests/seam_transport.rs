@@ -6,12 +6,18 @@
 mod common;
 
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 use formwork_seam::{inject, SeamPlan};
+
+/// Serialize the fork/exec-bearing tests: macOS's non-atomic socketpair CLOEXEC lets a
+/// concurrent fork leak a sibling's seam socket past `execve` (see the deflake commits).
+static SEAM_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// FW-E2E-010 (transport half): a full round-trip over a pre-opened inherited fd; no `connect()`.
 #[test]
 fn fw_e2e_010_roundtrip_over_preopened_fd() {
+    let _serial = SEAM_SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(common::helper_path());
     cmd.arg("preopen").arg("gateway").arg("hello");
     cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
@@ -37,6 +43,7 @@ fn fw_e2e_010_roundtrip_over_preopened_fd() {
 /// connected fd and passes it via `SCM_RIGHTS`; the child uses it. No in-sandbox `connect()`.
 #[test]
 fn fw_e2e_011_mint_via_scm_rights() {
+    let _serial = SEAM_SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(common::helper_path());
     cmd.arg("mint").arg("backend").arg("ping");
     cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
@@ -65,6 +72,7 @@ fn fw_e2e_011_mint_via_scm_rights() {
 /// transport is the inherited socketpair, which has no filesystem name.
 #[test]
 fn fw_e2e_012_transport_uses_no_socket_path() {
+    let _serial = SEAM_SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sock_path =
         std::env::temp_dir().join(format!("formwork-seam-e2e012-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock_path);
@@ -94,6 +102,7 @@ fn fw_e2e_012_transport_uses_no_socket_path() {
 /// Fail-closed: a child spawned without the seam finds no `FORMWORK_FD_*` and errors honestly.
 #[test]
 fn missing_seam_env_fails_honestly() {
+    let _serial = SEAM_SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(common::helper_path());
     cmd.arg("preopen").arg("gateway").arg("hello");
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
