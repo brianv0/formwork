@@ -10,12 +10,8 @@ use std::sync::Mutex;
 
 use formwork_seam::{inject, SeamPlan};
 
-/// Serialize the fork/exec-bearing seam tests, exactly like `seam_confined.rs`: on macOS
-/// `socketpair(2)` has no atomic close-on-exec, so std sets CLOEXEC in a separate `fcntl` after
-/// creating the pair. A concurrent fork in a sibling test can catch a seam socket inside that
-/// window and leak it past `execve`, intermittently breaking the minted round-trip. Production
-/// spawns one child per process and never races here -- this is a test-harness artifact,
-/// serialized so the tests stay deterministic (no flaky tests).
+/// Serialize the fork/exec-bearing tests: macOS's non-atomic socketpair CLOEXEC lets a
+/// concurrent fork leak a sibling's seam socket past `execve` (see the deflake commits).
 static SEAM_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// FW-E2E-010 (transport half): a full round-trip over a pre-opened inherited fd; no `connect()`.

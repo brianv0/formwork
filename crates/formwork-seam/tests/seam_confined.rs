@@ -28,12 +28,8 @@ fn compile(blueprint: &Blueprint, host: &formwork_detect::HostProfile) -> Compil
     )
 }
 
-/// Serialize the fork/exec-bearing seam tests. Each forks a confined child; on macOS `socketpair(2)`
-/// has no atomic close-on-exec, so std sets CLOEXEC in a separate `fcntl` after creating the pair. A
-/// concurrent fork in another test can catch a seam socket inside that window and leak it past
-/// `execve`, intermittently breaking the minted round-trip ("connection closed before a full
-/// response arrived"). Production spawns one child per process and never races here -- this is a
-/// test-harness artifact, serialized so the tests stay deterministic (no flaky tests).
+/// Serialize the fork/exec-bearing tests: macOS's non-atomic socketpair CLOEXEC lets a
+/// concurrent fork leak a sibling's seam socket past `execve` (see the deflake commits).
 static SEAM_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 fn pp(dir: &Path) -> PathPattern {
