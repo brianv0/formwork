@@ -1,0 +1,74 @@
+# Formwork strict profile — closed reads, explicit grants (FW-CAP3, design §4).
+#
+# The counterpart to profiles/default.toml. Where the default starts from the ambient filesystem
+# and *subtracts* a sensitive set, this starts from nothing and *grants* exactly the read scope a
+# workload needs: the OS runtime (tools, interpreters, shared libraries) read-only, plus the
+# project you launch from. Nothing else is readable — a secret location added to the host tomorrow
+# is denied by construction because it was never granted (FW-CAP1: grants are authored, not
+# inferred). Use this when the read surface is known and you want deny to be the default rather
+# than the exception; narrow further or widen with `--read` (narrowing is always safe, FW-CAP2).
+#
+# `~` expands against $HOME and `$CWD` against the launch directory when the CLI loads this file,
+# so launch formwork from the project directory — a startup warning fires if cwd is unreadable.
+
+# Net, exec, and env are top-level keys, so they must precede the [fs] table in TOML.
+# Fail-closed egress (FW-XR3): the agent reaches the network only through the gateway fd.
+net = "deny"
+# Unrestricted for transparency (FW-ISO4); a stricter deployment sets an exec allow-list.
+exec = "unrestricted"
+# Scrub secret-shaped env vars (FW-ENV2). With reads closed and egress gateway-only, env vars are
+# the easiest remaining exfil payload. Add the workload's own model API key to `allow` so it still
+# reaches its API (the default admits ANTHROPIC_API_KEY; replace with yours).
+env = { scrub = { allow = ["ANTHROPIC_API_KEY"] } }
+
+[fs]
+# Closed: only the grants below are readable. This is the strict half of read-mode (FW-CAP3); the
+# default profile is "ambient-minus-subtract".
+read-mode = "closed"
+
+# Explicit read grants: the OS runtime needed to actually start a program (dynamic loader, shared
+# libraries, interpreters, CA bundle), read-only, plus the project. Everything omitted is denied.
+# Sensitive paths that fall inside these roots (/etc/shadow, keychains under /Library) are still
+# denied by the compiled-in credential floor (FW-CRED4) — deny wins over any grant.
+reads = [
+    # POSIX / toolchain runtime (Linux + macOS)
+    "/bin/**",
+    "/sbin/**",
+    "/usr/**",
+    "/lib/**",
+    "/lib64/**",
+    "/etc/**",
+    "/opt/**",
+    # macOS system + frameworks
+    "/System/**",
+    "/Library/**",
+    "/private/etc/**",
+    # Nix / alternative toolchains, if present
+    "/nix/**",
+    # The project you launch from (FW-BP5). Launch formwork from the project directory.
+    "$CWD/**",
+]
+
+# Writable working set (FW-TRA5): the project and scratch only. Everything else is read-only.
+writes = [
+    "$CWD/**",
+    "/tmp/**",
+    "/private/tmp/**",   # macOS real path behind /tmp
+    "/var/tmp/**",
+]
+
+# Under closed reads a location not granted above is already unreadable, so no per-secret subtract
+# is needed here; the credential catalog floors secrets under every blueprint (FW-CRED4). `subtract`
+# is for carving a hole *inside* a grant — add project-specific ones as needed.
+subtract = []
+
+# Tamper vectors: write-denied but left READABLE (FW-TRA7). The project IS a grant even under closed
+# reads, so a confined agent could otherwise plant a git hook / .mcp.json / IDE task that later runs
+# UNSANDBOXED when you next open the repo. `**/` matches them at any depth (FW-CAP6).
+write-subtract = [
+    "**/.git/hooks/**",
+    "**/.git/config",
+    "**/.mcp.json",
+    "**/.vscode/**",
+    "**/.idea/**",
+]
