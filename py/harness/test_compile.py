@@ -29,6 +29,17 @@ def test_degraded_host_reports_unenforceable(cli, tmp_path):
     assert net["status"] in ("enforced", "partial"), "net must never be silently open"
 
 
+def test_home_unset_fails_loud(cli, tmp_path):
+    """FW-INV6 / FW-BP5: an unset $HOME must fail loud, never silently expand the `~`-rooted
+    credential-floor rows against "/". Silently using "/" would collapse every `~/.ssh`, `~/.aws`
+    deny to a path that matches nothing -- a silent fail-open of exactly the sensitive set the
+    floor exists to hold. The `$CWD` sigil already fails loud the same way (FW-E2E-055)."""
+    blueprint = write_blueprint(tmp_path / "blueprint.toml", reads=["/work/**"])
+    result = cli("compile", "--blueprint", blueprint, "--target", "macos", env={"HOME": None})
+    assert result.code != 0, "compile with $HOME unset must fail, not silently expand ~ against /"
+    assert "HOME" in result.stderr and "FW-INV6" in result.stderr, result.stderr
+
+
 @pytest.mark.fw_e2e("FW-E2E-027")
 def test_deterministic_compile_byte_identical(cli, tmp_path):
     blueprint = write_blueprint(

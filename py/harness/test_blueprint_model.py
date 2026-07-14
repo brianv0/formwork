@@ -176,3 +176,32 @@ def test_cwd_sigil_scopes_a_grant_to_the_launch_directory(cli, tmp_path):
     # Guardrail: from '/', $CWD/** would cover the whole filesystem -- a warning, not a refusal.
     from_root = cli("run", "--blueprint", bp, "--", "/bin/echo", "ok", cwd=Path("/"), env=env)
     assert "$CWD resolves to" in from_root.stderr
+
+
+@pytest.mark.macos
+def test_cwd_outside_read_scope_warns_not_silently_widens(cli, tmp_path):
+    """FW-CAP1: grants are authored, never inferred -- the launch directory is not folded into the
+    read grant. Rather than silently widen (or silently break), formwork warns loudly when cwd is
+    unreadable under the policy, so a workload whose interpreter scans its cwd gets a diagnosis
+    instead of a mystery EACCES. The complement of FW-E2E-055's broad-cwd guardrail."""
+    root = tmp_path.resolve()
+    proj = root / "proj"
+    proj.mkdir()
+    env = {"HOME": str(root)}
+
+    # cwd carved out of an otherwise-broad grant: the warning must fire, and a workload that does
+    # NOT touch cwd (echo) still runs -- the warning is a nudge, not a refusal.
+    carved = root / "carved.toml"
+    carved.write_text(
+        f'net = "deny"\n[fs]\nread-mode = "ambient-minus-subtract"\n'
+        f'reads = ["/**"]\nsubtract = ["{proj}/**"]\n'
+    )
+    warned = cli("run", "--blueprint", carved, "--", "/bin/echo", "ok", cwd=proj, env=env)
+    assert "launch directory is not readable" in warned.stderr, warned.stderr
+    assert "ok" in warned.stdout
+
+    # Control: when cwd is readable, no such warning appears.
+    open_bp = root / "open.toml"
+    open_bp.write_text('net = "deny"\n[fs]\nread-mode = "ambient-minus-subtract"\nreads = ["/**"]\n')
+    quiet = cli("run", "--blueprint", open_bp, "--", "/bin/echo", "ok", cwd=proj, env=env)
+    assert "launch directory is not readable" not in quiet.stderr, quiet.stderr
