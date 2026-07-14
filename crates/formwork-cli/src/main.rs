@@ -27,7 +27,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use formwork_blueprint::{
-    Blueprint, BlueprintLayer, McpPolicy, NetPosture, PathPattern, ResolvedCatalog,
+    Blueprint, BlueprintLayer, McpPolicy, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
 };
 use formwork_compile::compile;
 use formwork_detect::{detect, HostProfile};
@@ -237,13 +237,26 @@ impl Target {
     }
 }
 
-fn home() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+/// `$HOME`, for the `~` sigil and the credential catalog's `~`-rooted rows. Unlike a silent "/"
+/// fallback, an unset, empty, or non-UTF-8 `$HOME` fails loud: expanding `~/.ssh/**` against "/"
+/// yields `/.ssh/**`, collapsing every `~`-rooted credential-floor row to a path that matches
+/// nothing -- a silent fail-open of exactly the sensitive set the floor exists to hold (FW-INV6).
+/// This mirrors `cwd()`'s refusal to silently widen the `$CWD` sigil (FW-BP5).
+fn home() -> Result<String> {
+    const FIX: &str = "set HOME or author absolute grant paths (FW-INV6)";
+    match std::env::var_os("HOME").map(std::ffi::OsString::into_string) {
+        None => bail!("$HOME is unset; refusing to expand ~ against \"/\": {FIX}"),
+        Some(Err(_)) => bail!("$HOME is not valid UTF-8; refusing to expand ~: {FIX}"),
+        Some(Ok(h)) if h.is_empty() => {
+            bail!("$HOME is empty; refusing to expand ~ against \"/\": {FIX}")
+        }
+        Some(Ok(h)) => Ok(h),
+    }
 }
 
-/// The launch directory, for the `$CWD` sigil. Unlike `home()`'s "/" fallback, an unavailable or
-/// non-UTF-8 cwd fails loud: silently expanding `$CWD` to "/" would turn a `$CWD/**` grant into a
-/// filesystem-wide one -- exactly the fail-open the sensitive-set model forbids (FW-INV6).
+/// The launch directory, for the `$CWD` sigil. Like `home()`, an unavailable or non-UTF-8 cwd
+/// fails loud: silently expanding `$CWD` to "/" would turn a `$CWD/**` grant into a filesystem-wide
+/// one -- exactly the fail-open the sensitive-set model forbids (FW-INV6).
 fn cwd() -> Result<String> {
     let dir = std::env::current_dir().context("resolving the current directory for $CWD")?;
     dir.into_os_string()
@@ -306,10 +319,11 @@ fn main() -> Result<()> {
             target,
             report_only,
         } => {
-            let blueprint = blueprint.load(&home())?;
+            let home = home()?;
+            let blueprint = blueprint.load(&home)?;
             let host = resolve_host(&host, &target)?;
-            let catalog = ResolvedCatalog::builtin_for_home(&home())
-                .context("resolving credential catalog")?;
+            let catalog =
+                ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
             let policy = compile(&blueprint, &host, &catalog);
             if report_only {
                 println!("{}", serde_json::to_string_pretty(&policy.report)?);
@@ -324,7 +338,7 @@ fn main() -> Result<()> {
             proposal,
             entry,
             all,
-        } => learn::accept(&proposal, &entry, all, &home())?,
+        } => learn::accept(&proposal, &entry, all, &home()?)?,
         Cmd::Gateway {
             blueprint,
             server,
@@ -359,10 +373,38 @@ struct Session {
     policy: formwork_compile::CompiledPolicy,
 }
 
+/// Formwork never folds the launch directory into the read grant -- grants are authored, not
+/// inferred (FW-CAP1). But a workload started outside its own read scope fails confusingly (an
+/// interpreter's cwd/`sys.path` scan hits EACCES before the program's first line runs), so this
+/// warns loudly at startup rather than silently widening. The fix the message names --
+/// `--read '$CWD/**'` -- is the cheap authored form (FW-BP5). Heuristic and non-fatal: an
+/// unresolvable cwd is skipped here (it surfaces loudly elsewhere if a `$CWD` sigil needs it).
+fn warn_if_cwd_unreadable(blueprint: &Blueprint) {
+    // Kernel-resolved coordinates, matching the already-canonicalized grants this runs after.
+    let Ok(cwd) = std::env::current_dir().and_then(std::fs::canonicalize) else {
+        return;
+    };
+    let granted = match blueprint.fs.read_mode {
+        ReadMode::AmbientMinusSubtract => true,
+        ReadMode::Closed => blueprint.fs.reads.iter().any(|p| p.matches_path(&cwd)),
+    };
+    let denied_hole = blueprint.fs.subtract.iter().any(|p| p.matches_path(&cwd));
+    if !granted || denied_hole {
+        tracing::warn!(
+            cwd = %cwd.display(),
+            "the launch directory is not readable under this blueprint's read grant; a workload \
+             that scans its cwd (interpreter sys.path, shell globbing) may fail before it starts. \
+             Grants are authored, not inferred (FW-CAP1) -- add `--read '$CWD/**'` to scope one to \
+             the project you run from (FW-BP5)"
+        );
+    }
+}
+
 fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
-    let mut blueprint = args.load(&home())?;
+    let home = home()?;
+    let mut blueprint = args.load(&home)?;
     let catalog =
-        ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
+        ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
     // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
     // blueprint's enforcement-time canonicalization resolves everything together.
     blueprint
@@ -384,6 +426,7 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
         .context("canonicalizing grant paths")?;
     let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
         .context("canonicalizing credential catalog paths")?;
+    warn_if_cwd_unreadable(&blueprint);
     let host = detect();
     let policy = compile(&blueprint, &host, &catalog);
     itemize_credential_floor(&policy.report);

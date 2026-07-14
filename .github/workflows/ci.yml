@@ -58,8 +58,13 @@ jobs:
       matrix:
         # Native OS backends differ (Seatbelt on macOS; Landlock/seccomp stub on Linux), so the
         # suite must run on both. Integration tests that need a real kernel mechanism are cfg-gated
-        # to their OS, so a stock runner exercises exactly what it can enforce.
-        os: [ubuntu-22.04, macos-14]
+        # to their OS AND to the kernel's Landlock ABI, so a stock runner exercises exactly what it
+        # can enforce. Two Linux runners on purpose: ubuntu-22.04 is kernel 5.15 (Landlock ABI v1,
+        # no net) -- the degraded host FW-E2E-025 needs; ubuntu-24.04 is kernel 6.8+ (ABI v4+, net)
+        # -- the capable host FW-E2E-009's port-tier enforcement needs. Landlock ABI is a property of
+        # the runner's kernel, not the container image (containers share the host kernel), so this is
+        # how you get "an older/newer kernel" in CI. Each net test skips cleanly off its ABI tier.
+        os: [ubuntu-22.04, ubuntu-24.04, macos-14]
     steps:
       - uses: actions/checkout@v4
 
@@ -79,6 +84,12 @@ jobs:
 
       - name: Build
         run: cargo build --workspace --locked
+
+      # Surfaces the runner's real enforcement profile (Landlock ABI, seccomp, backend) in the log,
+      # so the ABI-gated net tests' skip/run decisions are visible and verifiable -- e.g. confirming
+      # ubuntu-24.04 reports landlock_abi >= 4 (net) and ubuntu-22.04 reports v1 (degraded).
+      - name: Host capability profile
+        run: cargo run -q -p formwork-cli --locked -- detect
 
       - name: Test
         run: cargo test --workspace --locked

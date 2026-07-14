@@ -5,6 +5,53 @@ Companion to `formwork.md` (the canonical spec), `fep-1.md` (the declared remain
 point-in-time survey of everything the spec promises that the tree does not yet deliver, and
 the order in which to deliver it. Snapshot: main @ b2d25fa (FEP-2 reintegrated), 2026-07-13.
 
+## 0. Progress (branch `implement-gaps`)
+
+Execution step 1 (cluster B + the today-viable half of C) is **landed**; the rest is unchanged
+from the analysis below.
+
+- **B — hardening + defaults: done.**
+  - `$HOME` unset/empty/non-UTF-8 now **fails loud** (`main.rs::home()` returns `Result`), so a
+    `~`-rooted credential-floor row can never silently expand against `/` (FW-INV6). Regression:
+    `test_compile.py::test_home_unset_fails_loud`.
+  - The cwd decision is **warn, never infer**: a loud startup warning fires when the launch
+    directory is unreadable under the policy (`main.rs::warn_if_cwd_unreadable`, FW-CAP1/FW-BP5),
+    rather than folding cwd into the grant. Regression:
+    `test_blueprint_model.py::test_cwd_outside_read_scope_warns_not_silently_widens`.
+  - **`profiles/strict.toml`** ships the closed-read, explicit-grant counterpart to the default
+    profile. Coverage: `test_profiles.py` (cross-platform compile + macOS closed-read enforcement).
+  - **FW-E2E-036** now exists end to end (`test_env_posture.py`): the FW-ENV2 heuristic scrub drops
+    secret-shaped vars by name and by value (PEM), the catalogued model key survives via
+    `--allow-cred`, and the capability reports `Partial`.
+- **C — today-viable half: done.** FW-E2E-007 (direct DNS transport denied), FW-E2E-008 (raw
+  socket denied despite proxy env), FW-ADV-002 (TOCTOU/symlink race never leaks the target),
+  FW-ADV-003 (direct egress to a metadata-derived endpoint denied — the positive gateway-fd half
+  stays with cluster A). All macOS, all green.
+- **C — FW-E2E-025 enforce-side: done, as a Rust integration test.** A degraded host needs a real
+  kernel below Landlock ABI v4 (Linux < 6.7), which the **ubuntu-22.04 CI runner already is**
+  (kernel 5.15, ABI v1) — a Docker image can't supply an older kernel (containers share the host
+  kernel), so this is a runner fact, not a container trick. The test
+  (`linux_confine.rs::degraded_host_port_tier_fails_closed_matching_the_report`, gated on
+  `landlock_abi < 4`) compiles `net = Ports([443])` against the real degraded host and asserts the
+  enforced behavior matches the report: egress is actually denied at the kernel (exit 7), the net
+  capability stays fail-closed, and the port tier is reported unenforceable, never claimed enforced.
+  It runs under `cargo test` (the only suite CI runs) and skips cleanly on ABI v4+ (that is
+  FW-E2E-009's enforce case).
+- **C — FW-E2E-009 enforce-side: done, with a capable runner.** The complement: on Linux ≥ 6.7
+  (Landlock ABI v4+, which has net), the port tier genuinely enforces. Added
+  `linux_confine.rs::port_tier_allows_listed_denies_unlisted_on_capable_kernel` (gated on
+  `landlock_abi >= 4`): with `net = Ports([p])` and two loopback services, the confined probe
+  connects to the allow-listed port and is denied at connect() on the other, and the report says
+  Enforced. To give it a home, **`ubuntu-24.04` (kernel 6.8+, ABI v4+) was added to the CI test
+  matrix** alongside `ubuntu-22.04` (5.15, the degraded host), plus a `formwork detect` diagnostic
+  step so each runner's real Landlock ABI is visible in the log. Landlock ABI is a kernel property,
+  not a container-image one (containers share the host kernel), so the runner *is* the knob — no
+  Docker-kernel trick, and 24.04 already clears 6.7 (no need for a 26.04 image). `fw-connect-probe`
+  gained an optional `IP:PORT` argv (default unchanged) so it can aim at a specific port.
+- **Still open** (unchanged): FW-ADV-005 needs the seam (its load-bearing fd-hand-off half has no
+  shipped product surface to attack yet — cluster A); clusters A, D, E and the rest of C are as
+  scoped below.
+
 ## 1. The gap inventory
 
 Measured, not remembered: 42 of 66 spec-defined tests are implemented (counting only real

@@ -10,8 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use formwork_blueprint::{Blueprint, FsBlueprint, PathPattern, ReadMode, ResolvedCatalog};
-use formwork_compile::{CompiledPolicy, ConfinerPolicy};
+use formwork_blueprint::{
+    Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
+};
+use formwork_compile::{Capability, CompiledPolicy, ConfinerPolicy};
 use formwork_detect::detect;
 
 /// Integration tests enforce what the product enforces: the builtin catalog resolved for the
@@ -273,6 +275,131 @@ fn net_default_deny_blocks_udp() {
     assert_eq!(
         code, 7,
         "UDP egress must be denied with EPERM (exit 7); got {code}"
+    );
+}
+
+/// FW-E2E-025 (Linux, enforce-side): report honesty on a degraded host. On a kernel without
+/// Landlock net (ABI < 4), a `net = Ports([...])` blueprint cannot honor the port tier, so the
+/// compiler falls back to the full seccomp inet-deny (fail-closed) and reports the tier
+/// Unenforceable. The compile side of that is unit-tested in `formwork-compile::linux`; this pins
+/// the half that needs a real degraded kernel: that the *enforced behavior matches the report* --
+/// egress is actually denied at the kernel (exit 7), never silently opened to satisfy the
+/// unenforceable port request, while the net capability stays fail-closed and the port tier is not
+/// claimed enforced. On an ABI v4+ kernel the tier IS enforced (that is FW-E2E-009's case), so the
+/// degraded scenario does not exist there -- skip cleanly rather than pass on the wrong path.
+///
+/// This runs for real on the ubuntu-22.04 CI runner (kernel 5.15, Landlock ABI v1) with no special
+/// setup: Docker/VMs share the host kernel, so the "old kernel" is simply a runner below 6.7.
+#[test]
+fn degraded_host_port_tier_fails_closed_matching_the_report() {
+    let host = detect();
+    let abi = host.landlock_abi.unwrap_or(0);
+    if abi >= 4 {
+        eprintln!(
+            "skipping FW-E2E-025 enforce-side: host has Landlock net (ABI {abi} >= 4); \
+             the port tier is genuinely enforced here, so there is no degraded case to observe"
+        );
+        return;
+    }
+
+    // Request a TCP port allow-list the degraded kernel cannot enforce.
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-connect-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    let blueprint = Blueprint {
+        net: NetPosture::Ports(vec![443]),
+        fs: FsBlueprint {
+            read_mode: ReadMode::Closed,
+            reads: vec![pp(probe_dir)],
+            ..Default::default()
+        },
+        ..Blueprint::empty()
+    };
+    let policy = compile(&blueprint, &host);
+
+    // Report honesty: net stays fail-closed (never a bare Unenforceable that signals a silent open),
+    // and the port tier is explicitly NOT claimed enforced on this host (FW-INV6 / FW-INV5).
+    assert!(
+        policy.report.net_is_fail_closed(),
+        "net must stay fail-closed on a degraded host, never silently open"
+    );
+    let tier = policy.report.per_capability.get(&Capability::NetPortTier);
+    assert!(
+        matches!(tier, Some(f) if !f.is_enforced()),
+        "the unenforceable port tier must be reported (Partial/Unenforceable), not claimed \
+         enforced; got {tier:?}"
+    );
+
+    // Behavior matches the report: the confined probe cannot egress -- not even to the requested
+    // :443 -- because the fallback is the same complete seccomp inet-deny as `net = "deny"`.
+    let code = run(&policy, Command::new(&probe));
+    assert_eq!(
+        code, 7,
+        "degraded host must fail closed: egress denied with EPERM (exit 7), got {code}"
+    );
+}
+
+/// FW-E2E-009 (Linux, enforce-side, capable kernel): the optional TCP port tier genuinely enforces
+/// on Landlock net (ABI v4+). With `net = Ports([allowed])` and loopback services on an allowed and
+/// a denied port, the confined probe connects to the allowed one and is denied at connect() on the
+/// other -- the positive+negative pair the tier promises. Below ABI v4 the tier can't enforce, so
+/// that is the FW-E2E-025 degraded case instead; skip cleanly rather than pass on the wrong path.
+///
+/// Needs a runner at Linux >= 6.7 (Landlock ABI v4). GitHub's ubuntu-24.04 image (kernel 6.8+)
+/// clears it; ubuntu-22.04 (5.15) does not, and this skips there -- honestly, never a silent pass.
+#[test]
+fn port_tier_allows_listed_denies_unlisted_on_capable_kernel() {
+    let host = detect();
+    let abi = host.landlock_abi.unwrap_or(0);
+    if abi < 4 {
+        eprintln!(
+            "skipping FW-E2E-009: host lacks Landlock net (ABI {abi} < 4); \
+             the degraded-host case is covered by FW-E2E-025"
+        );
+        return;
+    }
+
+    // Loopback services on two ephemeral ports. Keep both listeners bound for the probe's connects:
+    // the kernel completes the handshake from the listen backlog even with no explicit accept, so a
+    // connect to an allowed port returns success without a serving thread.
+    let allowed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind allowed port");
+    let denied = std::net::TcpListener::bind("127.0.0.1:0").expect("bind denied port");
+    let allowed_port = allowed.local_addr().unwrap().port();
+    let denied_port = denied.local_addr().unwrap().port();
+
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-connect-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    let blueprint = Blueprint {
+        net: NetPosture::Ports(vec![allowed_port]),
+        fs: FsBlueprint {
+            read_mode: ReadMode::Closed,
+            reads: vec![pp(probe_dir)],
+            ..Default::default()
+        },
+        ..Blueprint::empty()
+    };
+    let policy = compile(&blueprint, &host);
+
+    // Report honesty: on a capable kernel the tier is genuinely Enforced, not merely fail-closed.
+    let tier = policy.report.per_capability.get(&Capability::NetPortTier);
+    assert!(
+        matches!(tier, Some(f) if f.is_enforced()),
+        "the port tier must report Enforced on an ABI v4+ host; got {tier:?}"
+    );
+
+    let target = |port| {
+        let mut c = Command::new(&probe);
+        c.arg(format!("127.0.0.1:{port}"));
+        c
+    };
+    assert_eq!(
+        run(&policy, target(allowed_port)),
+        0,
+        "connect to the allow-listed port must succeed (exit 0)"
+    );
+    assert_eq!(
+        run(&policy, target(denied_port)),
+        7,
+        "connect to a non-allow-listed port must be denied at connect() (EPERM, exit 7)"
     );
 }
 

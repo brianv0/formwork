@@ -27,8 +27,13 @@ def run_cli(
     env: dict[str, str] | None = None,
 ) -> CliResult:
     """`env` overlays the inherited environment -- the credential tests use it to point $HOME at
-    a fake home with planted (fake) credentials and to inject secret-shaped variables."""
-    merged = {**os.environ, **env} if env is not None else None
+    a fake home with planted (fake) credentials and to inject secret-shaped variables. A value of
+    None *unsets* that variable (removes it from the child's environment), which the fail-loud
+    tests use to run with $HOME absent."""
+    if env is not None:
+        merged = {k: v for k, v in {**os.environ, **env}.items() if v is not None}
+    else:
+        merged = None
     proc = subprocess.run(
         [str(binary), *(str(a) for a in args)],
         cwd=str(cwd) if cwd else None,
