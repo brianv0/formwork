@@ -3,7 +3,7 @@
 Status: **implemented and kernel-verified** (Landlock fs+net+scope, seccomp baseline, subtractive
 expansion), verified against a real ABI-v6 kernel. This note keeps the researched design and crate
 APIs, and now records the **hardening decisions** that closed real escape/transparency gaps found by
-review on the kernel. Per FW-XR1/FW-INV5, Formwork never claims containment it has not verified.
+review on the kernel. Per [FW-XR1](../formwork.md#fw-xr1)/[FW-INV5](../formwork.md#fw-inv5), Formwork never claims containment it has not verified.
 
 Verify against: the `formwork-linux-dev` Docker image on an ABI-v6 kernel, `--security-opt
 seccomp=unconfined --security-opt apparmor=unconfined` so only Formwork's sandbox is under test.
@@ -77,7 +77,7 @@ Key decisions:
 - **Do not govern `Execute` when exec is unrestricted (the default).** Landlock denies any handled
   access that isn't granted, so if `AccessFs::Execute` is in `handled_fs`, only explicitly-granted
   paths are executable. For the transparent default, exclude `Execute` from `handled_fs` entirely so
-  `execve` is never checked. (When the blueprint requests an exec allow-list (FW-ISO4), `Execute` is
+  `execve` is never checked. (When the blueprint requests an exec allow-list ([FW-ISO4](../formwork.md#fw-iso4)), `Execute` is
   governed and granted only on the allow-list -- implemented here, though not yet exercised by a
   kernel test.)
 - **Net default-deny via seccomp (all ABIs), *not* Landlock.** Landlock net governs only TCP, so a
@@ -85,7 +85,7 @@ Key decisions:
   (TCP + UDP + raw); Landlock net (`handle_access(AccessNet::from_all(abi))` + `NetPort` allows) is
   reserved for the **port tier** (ABI ≥ v4), which needs per-port TCP *allow*.
 - **UNIX-socket / signal scoping (ABI ≥ v6):** the `Scope` handle (`.scope(Scope::from_all(abi))`)
-  blocks abstract-UNIX-socket and signal reach-out of the domain (FW-ADV-006). Coarse (domain-
+  blocks abstract-UNIX-socket and signal reach-out of the domain ([FW-ADV-006](../formwork.md#fw-adv-006)). Coarse (domain-
   relative, not per-path); reported Partial at v6+, Unenforceable below — matches the compiler.
 - **ABI negotiation vs honesty:** the compiler already accounted fidelity from `host.landlock_abi`.
   Enforce at exactly `landlock_abi_target`. Prefer `CompatLevel::HardRequirement` so a missing
@@ -162,7 +162,7 @@ rules.insert(libc::SYS_socket, vec![
 
 - **`clone3` — accepted gap, mitigated.** glibc uses `clone3` for thread/process creation and *falls
   back* to `clone` only on `ENOSYS`, not `EPERM` — so we do **not** filter `clone3` (returning `EPERM`
-  would break `fork`/threads, the opposite of FW-TRA2). Its flags sit behind a `clone_args` pointer
+  would break `fork`/threads, the opposite of [FW-TRA2](../formwork.md#fw-tra2)). Its flags sit behind a `clone_args` pointer
   seccomp cannot read, so a `CLONE_NEWUSER` via `clone3` is not blocked at the flag level. This is
   well-mitigated: a fresh userns is inert here — `mount`, `setns`, `pivot_root` are denied and
   Landlock is namespace-independent, so the userns grants no reachable capability. The `unshare`/
@@ -178,4 +178,4 @@ rules.insert(libc::SYS_socket, vec![
   x86_64/aarch64, including the hardening additions (`io_uring_*`, `pidfd_getfd`, `process_vm_*`).
 
 Still owed: the Phase-4 reuse workloads (pytest/npm/cargo) under the baseline on a real kernel to
-fully establish *transparency* (FW-TRA2) beyond the fork+exec + `/proc/self` cases already verified.
+fully establish *transparency* ([FW-TRA2](../formwork.md#fw-tra2)) beyond the fork+exec + `/proc/self` cases already verified.

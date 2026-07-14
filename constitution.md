@@ -19,30 +19,30 @@ doctrine that requires judgment.
 This system has exactly these concepts, each with one name and one Rust type:
 - **Blueprint** (`formwork_blueprint::Blueprint`) — the capability grant: a finite enumeration
   of fs read/write/subtract, net posture, exec posture, environment posture, per-server MCP
-  visibility, credential exclusions (`allow-credentials`, FW-CRED5), and the discovery
-  auto-widen zone (FW-DISC4). No mechanism turns natural language into a grant (FW-CAP1).
+  visibility, credential exclusions (`allow-credentials`, [FW-CRED5](formwork.md#fw-cred5)), and the discovery
+  auto-widen zone ([FW-DISC4](formwork.md#fw-disc4)). No mechanism turns natural language into a grant ([FW-CAP1](formwork.md#fw-cap1)).
   Assembled by a deterministic layer merge — baseline → `extends` chain → file → CLI
-  overrides (FW-BP2, added by FEP-2); path sets merge additively and deny beats allow.
-  (Environment posture — FW-ENV1/2, added by FEP-1 — is applied at spawn by the Launcher;
+  overrides ([FW-BP2](formwork.md#fw-bp2), added by FEP-2); path sets merge additively and deny beats allow.
+  (Environment posture — [FW-ENV1](formwork.md#fw-env1)/2, added by FEP-1 — is applied at spawn by the Launcher;
   the FidelityReport carries its verdict like any other capability.)
 - **Catalog** (`formwork_blueprint::Catalog` / `ResolvedCatalog`) — the versioned, compiled-in
-  enumeration of credential *locations* (path patterns and env-var names, FW-CRED1; the typed
+  enumeration of credential *locations* (path patterns and env-var names, [FW-CRED1](formwork.md#fw-cred1); the typed
   successor to the informal sensitive set). Denied/stripped as a floor under every Blueprint
-  (FW-CRED4); lifted only by the typed exclude (FW-CRED5); the line discovery can never
-  propose across (FW-INV8).
+  ([FW-CRED4](formwork.md#fw-cred4)); lifted only by the typed exclude ([FW-CRED5](formwork.md#fw-cred5)); the line discovery can never
+  propose across ([FW-INV8](formwork.md#fw-inv8)).
 - **Launcher** (`formwork-cli`; pure decisions in `formwork_blueprint::construct_env`) — the
   code that starts the confined child. Because Formwork builds the child's environment, it
   simply doesn't pass credential variables along — the way a build tool hands its actions a
-  clean environment — and it denies the files those variables point at (FW-CRED3) and
-  write-protects the blueprint/proposal files the session was launched from (FW-XR8). All of
-  this holds only when Formwork does the launching, and the report says so (FW-CRED8).
+  clean environment — and it denies the files those variables point at ([FW-CRED3](formwork.md#fw-cred3)) and
+  write-protects the blueprint/proposal files the session was launched from ([FW-XR8](formwork.md#fw-xr8)). All of
+  this holds only when Formwork does the launching, and the report says so ([FW-CRED8](formwork.md#fw-cred8)).
 - **HostProfile** (`formwork_detect::HostProfile`) — what the current kernel can
   actually enforce; the one impure input to compilation.
 - **CompiledPolicy** (`formwork_compile::CompiledPolicy`) — a `ConfinerPolicy`
   plus a `GatewayPolicy`, produced purely from a Blueprint and a HostProfile.
 - **FidelityReport** (`formwork_compile::FidelityReport`) — per-`Capability`
   verdict `Enforced | Partial | Unenforceable`, with backend and denial
-  semantics. The honesty contract (FW-INV5).
+  semantics. The honesty contract ([FW-INV5](formwork.md#fw-inv5)).
 - **Confiner** (`formwork-confine`) — the hard OS boundary (Landlock+seccomp /
   Seatbelt) applied to a process and every descendant.
 - **Gateway** (`formwork-gateway`) — the single privileged broker; the one door
@@ -66,19 +66,19 @@ The durable, human-reviewed surfaces of this project are:
 - the **capability Blueprint** schema — the serde/TOML types in `formwork-blueprint`
   (`deny_unknown_fields`, kebab-case), the published input contract;
 - the **FidelityReport** and **CompiledPolicy** shapes — what callers inspect to
-  learn what is enforced, and what a dry-run emits (FW-FID1/2);
+  learn what is enforced, and what a dry-run emits ([FW-FID1](formwork.md#fw-fid1)/2);
 - the **default profile** and the **credential catalog** (`profiles/*.toml`; the catalog is
-  embedded at build time, FW-CRED1) — the subtractive policy that makes reuse safe by default
-  (FW-CAP3, realized by the catalog + backstop);
+  embedded at build time, [FW-CRED1](formwork.md#fw-cred1)) — the subtractive policy that makes reuse safe by default
+  ([FW-CAP3](formwork.md#fw-cap3), realized by the catalog + backstop);
 - the **discovery artifacts** — the proposal (`*.proposal.toml`) and the provenance-carrying
-  discovered layer (`*.discovered.toml`, FW-DISC6) — machine-written, human-accepted;
+  discovered layer (`*.discovered.toml`, [FW-DISC6](formwork.md#fw-disc6)) — machine-written, human-accepted;
 - the **`formwork` CLI surface** — its subcommands and their JSON output.
 
 These are designed before the code that uses them and evolve only through
 human-reviewed change. Changes to a published surface follow
 expand → migrate → contract; a breaking change without a version
 bump is forbidden; migrations run forward only. Compilation is
-byte-deterministic (FW-FID4), so a serialization change *is* a contract
+byte-deterministic ([FW-FID4](formwork.md#fw-fid4)), so a serialization change *is* a contract
 change. The MCP JSON-RPC wire format is a *foreign* schema (Boundaries), not
 one we own.
 Rationale: this is the costliest thing to change later; everything
@@ -89,23 +89,23 @@ compatibility discipline concentrate here.
 - **detect** = probe the host (impure) · **compile** = pure blueprint→policy+report,
   no kernel calls · **enforce** = install the mechanism into the kernel (impure,
   irreversible) · **narrow** = shrink a grant (never *widen* — widening does not
-  exist, FW-CAP2) · **confine** / **spawn_confined** / **confine_self** = apply
+  exist, [FW-CAP2](formwork.md#fw-cap2)) · **confine** / **spawn_confined** / **confine_self** = apply
   the Confiner · **shade** = hide-and-refuse an MCP item at the Gateway ·
   **subtract** = remove a sensitive path from a broad grant · **mint** = hand a
   fresh connection fd to the agent via `SCM_RIGHTS`.
 - **blueprint** is the input; **policy** is the compiled backend artifact — never
   call the input a "policy". **grant** is the held capability set, never
   "permissions". **sigil** = a path-pattern authoring token expanded at the CLI
-  edge before compilation (`~`→`$HOME`, `$CWD`→launch dir, FW-BP5), never general
+  edge before compilation (`~`→`$HOME`, `$CWD`→launch dir, [FW-BP5](formwork.md#fw-bp5)), never general
   environment interpolation.
-- **floor** = the catalog-derived deny/strip set under every Blueprint (FW-CRED4) · **strip**
-  = the Launcher removing an env var pre-spawn (absent, not empty — FW-INV7/9) · **exclude** =
-  the typed `allow-credentials` lift, the only un-deny (FW-CRED5) · **learn** = an enforced
-  run plus denial observation, never a live widening (FW-DISC1/FW-INV10) · **withheld** = a
-  floored denial in learning, itemized to the operator only, never proposed (FW-DISC3) ·
-  **accept** = per-entry operator approval into the discovered layer (FW-DISC5) ·
+- **floor** = the catalog-derived deny/strip set under every Blueprint ([FW-CRED4](formwork.md#fw-cred4)) · **strip**
+  = the Launcher removing an env var pre-spawn (absent, not empty — [FW-INV7](formwork.md#fw-inv7)/9) · **exclude** =
+  the typed `allow-credentials` lift, the only un-deny ([FW-CRED5](formwork.md#fw-cred5)) · **learn** = an enforced
+  run plus denial observation, never a live widening ([FW-DISC1](formwork.md#fw-disc1)/[FW-INV10](formwork.md#fw-inv10)) · **withheld** = a
+  floored denial in learning, itemized to the operator only, never proposed ([FW-DISC3](formwork.md#fw-disc3)) ·
+  **accept** = per-entry operator approval into the discovered layer ([FW-DISC5](formwork.md#fw-disc5)) ·
   **provenance** = the added-via/run-id record that keeps learned grants distinguishable from
-  authored ones (FW-DISC6).
+  authored ones ([FW-DISC6](formwork.md#fw-disc6)).
 - **Confiner** (hard OS layer), **Gateway** (soft MCP layer), and **Seam**
   (transport) are three distinct things and are never blurred. **Formwork** is
   the whole system.
@@ -113,9 +113,48 @@ compatibility discipline concentrate here.
   Denial semantics are **hide** (MCP items, absent from listings) vs **deny**
   (fs paths, EACCES-class errno) — never mixed up.
 - **fail-closed** (deny on absence), **fail-loud** (surface an error/report),
-  **fail-open-silent** (forbidden, FW-INV6) are precise, non-interchangeable.
+  **fail-open-silent** (forbidden, [FW-INV6](formwork.md#fw-inv6)) are precise, non-interchangeable.
 Rationale: literate code depends on one name per idea; naming drift
 across sessions is a bug, and the fix is an entry here, not a lecture.
+
+## Requirements & identifiers   [stable IDs; minted once; links are checked]
+Every normative statement — requirement, invariant, end-to-end or adversarial
+test — carries a stable unique identifier: `FW-<FAMILY><n>` for requirements
+(the family list is closed: XR, CAP, ISO, GW, TRA, FID, ENV, BP, CRED, DISC,
+EGR — a new family is a Concepts-grade amendment), `FW-INV<n>` for invariants,
+`FW-E2E-<nnn>` / `FW-ADV-<nnn>` for tests. The rules:
+- **Minted once, in the defining document.** `formwork.md` once landed; an
+  FEP's remainder document until then (`fep-1.md` holds FW-EGR1–6 and FW-FID5
+  today). Exactly one definition per ID, and each definition site carries an
+  HTML anchor named for the lowercase ID (`<a id="fw-cap2">`).
+- **Never renumbered, never reused.** Sequences are monotonic and shared
+  across documents; an FEP continues them and reserves blocks at adoption. A
+  collision discovered at planning is resolved by renumbering the *unlanded*
+  draft, never the landed spec (precedent: FEP-2, `docs/fep2-plan.md` §0). A
+  retired requirement's number stays retired.
+- **Citations link in markdown, stay bare in code.** A markdown file cites an
+  ID as a relative link to its defining anchor —
+  `[FW-CAP2](formwork.md#fw-cap2)` — so a reviewer reaches the definition in
+  one click. Rust, Python, and TOML cite the bare ID: it is the greppable
+  currency, and it is what Comments means by the durable "why". (Rustdoc
+  hyperlinking was evaluated and declined: most citations live in non-doc
+  comments rustdoc never renders, and rustdoc cannot express repo-relative
+  links. The convention is stated once, here and in the README — never as
+  per-file boilerplate.)
+- **Drift fails CI.** The harness canary (`py/harness/test_requirements.py`)
+  fails when a cited ID has no definition, a definition lacks its anchor or is
+  duplicated, or a requirement link points at the wrong file or a dead anchor
+  — the same canary pattern as the catalog tests in
+  `crates/formwork-cli/tests/profiles.rs`. Historical or draft numbering that
+  deliberately does not resolve (a renumbering table) is quoted as inline
+  code, which the canary and the linking rule both skip.
+- Tests are named for the requirements they discharge, and the `formwork.md`
+  §10 traceability table is the requirement→test map; a new requirement lands
+  with its row.
+Rationale: requirement IDs are the review currency of this repo — a reviewer
+following FW-CRED6 from a diff to its definition should be one click, not a
+grep expedition — and identifiers that can silently dangle, fork, or get
+renumbered are worse than prose.
 
 ## Boundaries   [parse, don't validate]
 External data — the blueprint file, the host probe, MCP JSON-RPC from the agent and
@@ -129,7 +168,7 @@ once, at the edge where it enters:
   and canonicalize against the real filesystem at enforce time; a path that
   cannot be faithfully rendered into the backend's language **fails loud**,
   never a lossy rule that might silently not match (a missed `subtract` hole is
-  a fail-open of the sensitive set — FW-INV6 forbids it);
+  a fail-open of the sensitive set — [FW-INV6](formwork.md#fw-inv6) forbids it);
 - **MCP JSON-RPC** from the agent and stdio backends is foreign and less-trusted:
   parsed at the Gateway edge as newline-delimited frames bounded to a fixed
   maximum (fail the connection closed on overflow), and never leaked inward as
@@ -143,10 +182,10 @@ type system the durable record of what is known.
 ## Errors   [invariant fixed; doctrine is a slot]
 Invariant: every failure is either handled at a named boundary or
 terminates the program. No failure is silently absorbed.
-Doctrine: **fail closed or fail loud, never fail-open-silent (FW-INV6).**
+Doctrine: **fail closed or fail loud, never fail-open-silent ([FW-INV6](formwork.md#fw-inv6)).**
 This is the load-bearing rule of a sandboxing tool: a capability that cannot be
 faithfully enforced is reported `Partial`/`Unenforceable` or errors — it is
-never silently downgraded (FW-XR1). Named boundaries where failure is handled:
+never silently downgraded ([FW-XR1](formwork.md#fw-xr1)). Named boundaries where failure is handled:
 the CLI shell (`formwork-cli`), the `enforce` install, and the Gateway
 connection. In Rust terms:
 - typed errors (`thiserror`) at the library/domain layers — `PathError`,
@@ -169,7 +208,7 @@ where errors are handled — one span per boundary crossing (compile, enforce,
 each Gateway request), structured fields rather than formatted strings.
 Libraries only *emit*; the subscriber is installed exactly once, at the CLI
 entrypoint — no library crate installs a subscriber or configures logging.
-Runtime grants and denials are emitted as structured records (FW-FID3), and the
+Runtime grants and denials are emitted as structured records ([FW-FID3](formwork.md#fw-fid3)), and the
 FidelityReport is the compile-time telemetry. No print debugging in committed
 code — the only `println!` is the CLI writing its own JSON result to stdout,
 which is product output, not logging.
@@ -188,7 +227,7 @@ decisions, discovery reverse-compile, narrowing)
 → `formwork-gateway` (the broker; the async layer)
 → `formwork-cli` (application shell; `anyhow`, entrypoint, subscriber)
 
-`formwork-compile` is pure and never calls the kernel (FW-CAP5/FW-E2E-026);
+`formwork-compile` is pure and never calls the kernel ([FW-CAP5](formwork.md#fw-cap5)/[FW-E2E-026](formwork.md#fw-e2e-026));
 `formwork-detect` and `formwork-confine` are the only layers that touch it. The
 one async runtime is **tokio**, and it lives only in `formwork-gateway`; there
 is no sync-in-async bridging outside named adapter modules. A change that needs
@@ -202,7 +241,7 @@ is wrong, not the checker.
 The default answer to any new capability axis, blueprint field, CLI flag or
 subcommand, entry point, or dependency is no — first search for the existing
 concept, function, or module that already expresses it, then show
-that it can't. The Blueprint vocabulary is a *closed* enumeration (FW-CAP1); adding a
+that it can't. The Blueprint vocabulary is a *closed* enumeration ([FW-CAP1](formwork.md#fw-cap1)); adding a
 capability axis is a Concepts amendment, not a casual field. Dependencies get
 the hardest no: this is a sandboxing tool, so every crate added widens its trust
 base — the CI uses only first-party actions for the same reason, and the Phase-2
@@ -218,7 +257,8 @@ thesis (§1): isolation the agent constantly trips over gets turned off.
 ## Comments   [why-only; prefer renaming over commenting]
 No comments that describe what the code does. Only why, and only
 when non-obvious. The repo convention is to cite the governing requirement
-(e.g. `FW-INV6`, `FW-CAP2`) as the durable "why".
+(e.g. `FW-INV6`, `FW-CAP2`) as the durable "why" — bare in code, linked in
+markdown (Requirements & identifiers).
 Rationale: comments that restate code rot and clutter; names carry
 meaning durably, and a needed "what" comment signals a naming failure.
 
@@ -226,7 +266,7 @@ meaning durably, and a needed "what" comment signals a naming failure.
 Tests exercise behavior at the system's real boundary:
 - **Rust integration tests** spawn a confined child and probe allow *and* deny
   against the real kernel mechanism (Seatbelt on macOS, Landlock on Linux);
-  report soundness (FW-INV5 / FW-E2E-024) is paired allow/deny probes, never an
+  report soundness ([FW-INV5](formwork.md#fw-inv5) / [FW-E2E-024](formwork.md#fw-e2e-024)) is paired allow/deny probes, never an
   assertion that the report agrees with itself.
 - the **Python E2E harness** (`py/`, uv-managed) drives the `formwork` binary as
   a black-box subprocess CLI with generated traceability — the outermost real
@@ -235,12 +275,12 @@ Tests exercise behavior at the system's real boundary:
   disabled, so only Formwork's sandbox is under test.
 
 Mock allowlist: **empty for behavior.** The kernel boundary is never mocked — a
-mocked sandbox proves nothing, which is the whole point of FW-INV5. The one
+mocked sandbox proves nothing, which is the whole point of [FW-INV5](formwork.md#fw-inv5). The one
 defensible substitution is feeding the *pure* compiler a synthesized
-`HostProfile` (e.g. compiling a Linux policy on a Mac, FW-E2E-026): that
+`HostProfile` (e.g. compiling a Linux policy on a Mac, [FW-E2E-026](formwork.md#fw-e2e-026)): that
 exercises a pure function on a chosen input, not a mock of enforcement. MCP
 fixtures are real subprocess servers, not mocks. Tests are deterministic; a
-flaky test is a bug in the test, and FW-FID4 (byte-identical compile) is the
+flaky test is a bug in the test, and [FW-FID4](formwork.md#fw-fid4) (byte-identical compile) is the
 strict form of that.
 Rationale: a fully mocked test verifies that the code does what the
 code does; only behavior exercised at the real boundary catches

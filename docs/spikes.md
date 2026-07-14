@@ -8,7 +8,7 @@ kernel-verified (Docker, ABI-v6); their status notes below record what actually 
 ## Spike 1 — Seatbelt vs. inherited connected fds (macOS) — **load-bearing for the fd seam**
 
 **Question.** Under an SBPL profile with `(deny network*)`, does read/write on an *already
-connected* inherited socket still work? The entire fd-seam design (FW-XR7) assumes yes: the gateway
+connected* inherited socket still work? The entire fd-seam design ([FW-XR7](../formwork.md#fw-xr7)) assumes yes: the gateway
 connects outside the sandbox and hands the agent a connected fd, and the agent never calls
 `connect()`. If Seatbelt re-checks data transfer (not just `connect`/`bind`) against `network*`,
 the seam needs a scoped allowance and we must find that out now, not in Phase 5.
@@ -46,7 +46,7 @@ closed read profile, and are now emitted by the SBPL generator:
 2. a fixed allowlist of system runtime dirs (`/System`, `/usr/lib`, `/usr/bin`, `/bin`, …).
 
 `(allow file-read-metadata)` is also emitted so `stat` stays broadly available (consistent with
-"deny, not ENOENT", FW-CAP4). With these, an in-scope read succeeds, an out-of-scope read returns
+"deny, not ENOENT", [FW-CAP4](../formwork.md#fw-cap4)). With these, an in-scope read succeeds, an out-of-scope read returns
 EPERM, and `/etc/passwd` is denied.
 
 **Discovery — macOS firmlinks.** Grant paths under `/var`, `/tmp`, `/etc` must be canonicalized to
@@ -88,7 +88,7 @@ kernel is `5.10.104-linuxkit`, which predates Landlock (5.13). Running the `form
 - **`formwork-detect` works** — the `landlock_create_ruleset(NULL,0,VERSION)` probe and
   `prctl(PR_GET_SECCOMP)` check (written on macOS, never before run on Linux) correctly report
   `landlock-abi: null, seccomp: true, os-version: 5.10.104-linuxkit`.
-- **Degraded-host honesty holds (FW-E2E-025/026, FW-INV6)** — compiling a normal blueprint on this host
+- **Degraded-host honesty holds ([FW-E2E-025](../formwork.md#fw-e2e-025)/026, [FW-INV6](../formwork.md#fw-inv6))** — compiling a normal blueprint on this host
   reports `fs-read`/`fs-write` as `Unenforceable` (Landlock absent), while `net-default-deny` stays
   `Enforced` via seccomp. The report does not lie, and net fails closed rather than silently open.
 

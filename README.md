@@ -6,7 +6,10 @@ enforces, on Linux and macOS, for an agent process and every child it spawns. Pl
 gateway so every tool call and every byte of egress is forced through one auditable door.
 
 See [`formwork.md`](formwork.md) for the design and end-to-end test spec, and
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for how it is being built.
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for how it is being built. Identifiers like
+`FW-CAP2` — in code, docs, and test names — cite requirements defined in `formwork.md`
+(anchored, so `formwork.md#fw-cap2` jumps to the definition; see the constitution's
+*Requirements & identifiers*).
 
 Formwork targets **good isolation, not perfect isolation** (design §1, §3): a hard wall against
 accidental, careless, and prompt-injected overreach and against untrusted code the agent runs — not
@@ -29,7 +32,7 @@ Under construction, kernel-mechanism-first (plan §4).
 65 Rust tests pass on macOS (`cargo test`), 8 Python E2E tests pass (`cd py && uv run pytest`),
 clippy is clean under `-D warnings`, and the whole workspace cross-compiles for Linux
 (`cargo check --target x86_64-unknown-linux-gnu`). On real Linux (Docker, kernel 5.10 — no Landlock)
-`formwork detect` and the degraded-host honesty path (FW-E2E-025/026, FW-INV6) are verified.
+`formwork detect` and the degraded-host honesty path ([FW-E2E-025](formwork.md#fw-e2e-025)/026, [FW-INV6](formwork.md#fw-inv6)) are verified.
 
 ## Workspace
 

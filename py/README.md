@@ -31,11 +31,11 @@ Each scenario carries its design-doc ID and its platform requirement:
 
 ## Coverage today
 
-- `test_fs_confinement.py` — FW-E2E-001/002/003 (macOS): granted vs. ungranted reads, write scope,
+- `test_fs_confinement.py` — [FW-E2E-001](../formwork.md#fw-e2e-001)/002/003 (macOS): granted vs. ungranted reads, write scope,
   sensitive-set subtraction under a broad grant.
-- `test_net_egress.py` — FW-E2E-006 (macOS): direct egress denied at `connect()` (not a startup
+- `test_net_egress.py` — [FW-E2E-006](../formwork.md#fw-e2e-006) (macOS): direct egress denied at `connect()` (not a startup
   artifact — the interpreter runs and the syscall is what fails).
-- `test_compile.py` — FW-E2E-026/027 (any host): cross-platform dry-run compile, degraded-host
+- `test_compile.py` — [FW-E2E-026](../formwork.md#fw-e2e-026)/027 (any host): cross-platform dry-run compile, degraded-host
   honesty, deterministic byte-identical compile, and `formwork detect`.
 
-MCP fixture servers and the gateway shading tests (FW-E2E-013..019) land with Phase 6.
+MCP fixture servers and the gateway shading tests ([FW-E2E-013](../formwork.md#fw-e2e-013)..019) land with Phase 6.
