@@ -41,10 +41,41 @@ enforce a capability, `formwork` reports the gap instead of pretending (it never
 examples/
   blueprints/agent-session.toml   # Axis A: confine an agent — scoped writes, secrets subtracted, HTTPS-only egress
   blueprints/mcp-gateway.toml      # Axis B: gateway policy — [mcp.files] shading + backend confinement
+  blueprints/rules-demo.toml       # the flat verb surface (rules/mode) — same model, terser authoring
   gateway-demo.sh             # runnable Axis B demo against the built-in fixture (no external deps)
   claude-code/                # per-host: sandbox-agent.sh + the MCP-override config to stage
   codex/
   opencode/
+```
+
+## Two ways to author the same policy
+
+The blueprints above use the nested `[fs]` table. The same filesystem grants can be written as a
+flat list of **verb rules** — one `"<verb>:<path>"` string per rule — which is the *same vocabulary*
+on a `--rule` flag and a file line, so a policy reads the same however you author it (`FW-BP1`). See
+`blueprints/rules-demo.toml` and [`fep-3.md`](../fep-3.md) for the full grammar.
+
+| Verb | Grants | Nested-`[fs]` equivalent |
+|---|---|---|
+| `read` / `readonly` | read | `reads` |
+| `write` | read + modify, **no create** | `writes-no-create` |
+| `readwrite` | read + write + create | `writes` |
+| `allow` | read + write + create + exec | `writes` + `exec` allow-list |
+| `readexec` | read + execute | `reads` + `exec` allow-list |
+| `exec` | execute only | `exec` allow-list |
+| `deny` | nothing (terminal) | `subtract` |
+
+`--mode strict-unveil` (empty universe) or `--mode subtractive` (ambient minus the credential floor)
+is a friendlier spelling of `[fs] read-mode`. `deny` is terminal — no allow overrides it — and the
+credential floor compiles into that same deny layer, so it can never be punched through. Example:
+
+```sh
+# The file form (verbs in a `rules` list):
+formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos --report-only
+
+# The same vocabulary on the CLI, layered over any base blueprint — a deny narrows from anywhere:
+formwork run --blueprint examples/blueprints/agent-session.toml \
+  --rule "deny:$CWD/secrets" -- <agent> <flags>
 ```
 
 ## Install `formwork`

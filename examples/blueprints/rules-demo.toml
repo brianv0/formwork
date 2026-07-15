@@ -1,0 +1,34 @@
+# Authoring with the flat verb surface (FEP-3): one "<verb>:<path>" string per rule, the same
+# vocabulary on a `--rule` flag and this file line. Verbs desugar into the one Blueprint model at
+# the CLI edge (FW-BP1) -- the compiler and merge never see verbs -- so this compiles to the same
+# kind of policy as the nested `[fs]` form. The full grammar and the verb table live in fep-3.md.
+#
+# Try it:
+#   formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos --report-only
+# The same rules on the CLI (identical vocabulary, FW-BP1):
+#   formwork compile --blueprint examples/blueprints/rules-demo.toml \
+#       --rule "deny:~/.aws" --target macos --report-only
+
+net = "deny"
+
+# `mode` is a friendlier spelling of `[fs] read-mode`: `strict-unveil` starts from an empty universe
+# (only grants are readable); `subtractive` starts from ambient reads minus the credential floor.
+mode = "strict-unveil"
+
+rules = [
+    # Read-only ambient toolchain (interpreters, system libs).
+    "readonly:/usr/**",
+    # Read AND execute the system tools (rx).
+    "readexec:/bin/**",
+    # The project tree: full read + write + create (rwc).
+    "readwrite:$CWD/**",
+    # A log directory the agent may modify existing files in but NOT create new entries under --
+    # the create/write split (FW-CAP9). Useful when an agent should edit configs but not plant files.
+    "write:$CWD/var/log",
+    # `deny` is terminal: it wins even inside the `readwrite:$CWD/**` grant above (FW-CAP8). In the
+    # unveil lineage this is a tombstone -- an additive override to zero permissions, not merely a
+    # narrower allow. The credential catalog compiles into this same deny layer, so `~/.ssh` here is
+    # belt-and-suspenders on top of the floor.
+    "deny:$CWD/.env",
+    "deny:~/.ssh",
+]
