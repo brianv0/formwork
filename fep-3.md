@@ -31,13 +31,20 @@ document until the FEP lands and folds into `formwork.md`, mirroring `fep-1.md` 
 | <a id="fw-fid7"></a>**FW-FID7** Per-deny mechanism labels | The FidelityReport labels each deny by mechanism (`enforced-via-LSM` / `enforced-via-enumeration` / `enforced-via-overmount` / `partial`) and discloses the Linux snapshot asymmetry (allows may go stale post-spawn; denies cannot) and hole-ancestor over-breadth. Extends [FW-XR1](formwork.md#fw-xr1)/[FW-XR6](formwork.md#fw-xr6). |
 | <a id="fw-inv11"></a>**FW-INV11** Structural floor | Because the credential catalog compiles into the deny layer and deny is terminal ([FW-CAP8](#fw-cap8)), no allow, no rule order, no profile, and no discovery path can produce access to a floored location; the sole removal is [FW-CRED5](formwork.md#fw-cred5). The structural form of [FW-INV8](formwork.md#fw-inv8). |
 
-## Reserved test identifiers
+## Tests
 
-Reserved (minted with the tests as they land, continuing past the landed `FW-E2E-055` /
-`FW-ADV-015`): `FW-E2E-056` verb round-trip + create/write split · `FW-E2E-057` mode switch
-determinism · `FW-E2E-058` order-independent profile stacking · `FW-E2E-059` explain provenance ·
-`FW-E2E-060` any-depth rule platform-conditional · `FW-E2E-061` flat-vs-nested surface parity ·
-`FW-ADV-016` allow-cannot-override-deny · `FW-ADV-017` post-spawn create under a split dir denied.
+Landed (black-box `formwork` CLI, compile-level so they run on any host):
+
+| Test | Scenario |
+|---|---|
+| <a id="fw-e2e-056"></a>**FW-E2E-056** create/write split | The `write` verb renders every `file-write-*` op except `file-write-create` on its path ([FW-CAP9](#fw-cap9)). |
+| <a id="fw-e2e-057"></a>**FW-E2E-057** mode posture | `mode` compiles identically to the equivalent `[fs] read-mode`, for both values ([FW-BP7](#fw-bp7)). |
+| <a id="fw-e2e-058"></a>**FW-E2E-058** order independence | Rule order does not change the compiled policy; deny beats allow regardless ([FW-BP6](#fw-bp6)/[FW-CAP8](#fw-cap8)). |
+| <a id="fw-e2e-061"></a>**FW-E2E-061** surface parity | The flat rule surface and the nested `[fs]` table compile byte-identically ([FW-BP1](formwork.md#fw-bp1)). |
+
+Reserved (minted with the tests as they land): `FW-E2E-059` explain provenance · `FW-E2E-060`
+any-depth rule platform-conditional · `FW-ADV-016` allow-cannot-override-deny · `FW-ADV-017`
+post-spawn create under a split dir denied.
 
 ## Status
 

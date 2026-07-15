@@ -2,6 +2,7 @@
 regression -- all black-box through the `formwork` CLI. Compile-level tests pin the host with
 --target so byte-comparisons are meaningful on any machine."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -176,3 +177,67 @@ def test_cwd_sigil_scopes_a_grant_to_the_launch_directory(cli, tmp_path):
     # Guardrail: from '/', $CWD/** would cover the whole filesystem -- a warning, not a refusal.
     from_root = cli("run", "--blueprint", bp, "--", "/bin/echo", "ok", cwd=Path("/"), env=env)
     assert "$CWD resolves to" in from_root.stderr
+
+
+# --- FEP-3: the verb-based evaluation model (compile-level; enforcement is macOS/Landlock-gated) ---
+
+
+@pytest.mark.fw_e2e("FW-E2E-056")
+def test_write_verb_splits_create_from_modify(cli, tmp_path):
+    """FW-CAP9: the `write` verb grants modify/unlink/chmod on a path but never create."""
+    bp = tmp_path / "s.toml"
+    bp.write_text('net = "deny"\nmode = "strict-unveil"\nrules = ["readonly:/usr/**", "write:/data/logs"]\n')
+    r = cli("compile", "--blueprint", bp, "--target", "macos")
+    assert r.code == 0, r.stderr
+    sbpl = json.loads(r.stdout)["confiner"]["sbpl"]
+    assert '(allow file-write-data (literal "/data/logs"))' in sbpl
+    assert '(allow file-write-unlink (literal "/data/logs"))' in sbpl
+    # Create is never granted; no blanket file-write* that would re-admit it.
+    assert 'file-write-create (literal "/data/logs")' not in sbpl
+    assert '(allow file-write* (literal "/data/logs"))' not in sbpl
+
+
+@pytest.mark.fw_e2e("FW-E2E-057")
+def test_mode_posture_aliases_read_mode(cli, tmp_path):
+    """FW-BP7: `mode` is a friendlier spelling of `[fs] read-mode`; both values compile identically."""
+    for mode, read_mode in (("strict-unveil", "closed"), ("subtractive", "ambient-minus-subtract")):
+        flat = tmp_path / f"flat-{mode}.toml"
+        flat.write_text(f'net = "deny"\nmode = "{mode}"\nrules = ["readonly:/usr/**"]\n')
+        nested = tmp_path / f"nested-{mode}.toml"
+        nested.write_text(f'net = "deny"\n[fs]\nread-mode = "{read_mode}"\nreads = ["/usr/**"]\n')
+        a = cli("compile", "--blueprint", flat, "--target", "linux-v6")
+        b = cli("compile", "--blueprint", nested, "--target", "linux-v6")
+        assert a.code == 0 and b.code == 0, (a.stderr, b.stderr)
+        assert a.stdout == b.stdout, f"mode {mode} must equal read-mode {read_mode}"
+
+
+@pytest.mark.fw_e2e("FW-E2E-058")
+def test_rules_are_order_independent_and_deny_terminal(cli, tmp_path):
+    """FW-BP6/FW-CAP8: rule sets union order-independently and deny beats allow regardless of order."""
+    base = tmp_path / "base.toml"
+    base.write_text('net = "deny"\n')
+    order1 = cli("compile", "--blueprint", base, "--target", "macos", "--mode", "subtractive",
+                 "--rule", "readwrite:/work/**", "--rule", "deny:/work/secret")
+    order2 = cli("compile", "--blueprint", base, "--target", "macos", "--mode", "subtractive",
+                 "--rule", "deny:/work/secret", "--rule", "readwrite:/work/**")
+    assert order1.code == 0 and order2.code == 0, (order1.stderr, order2.stderr)
+    assert order1.stdout == order2.stdout, "rule order must not change the compiled policy"
+
+
+@pytest.mark.fw_e2e("FW-E2E-061")
+def test_flat_rule_surface_equals_nested_fs(cli, tmp_path):
+    """FW-BP1: the flat rule surface and the nested [fs] table are one model (byte-identical)."""
+    flat = tmp_path / "flat.toml"
+    flat.write_text(
+        'net = "deny"\nmode = "strict-unveil"\n'
+        'rules = ["readonly:/usr/**", "readwrite:/work/p/**", "deny:/work/p/secret"]\n'
+    )
+    nested = tmp_path / "nested.toml"
+    nested.write_text(
+        'net = "deny"\n[fs]\nread-mode = "closed"\n'
+        'reads = ["/usr/**"]\nwrites = ["/work/p/**"]\nsubtract = ["/work/p/secret"]\n'
+    )
+    a = cli("compile", "--blueprint", flat, "--target", "linux-v6")
+    b = cli("compile", "--blueprint", nested, "--target", "linux-v6")
+    assert a.code == 0 and b.code == 0, (a.stderr, b.stderr)
+    assert a.stdout == b.stdout, "flat rules must compile identically to the nested [fs] form"
