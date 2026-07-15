@@ -1,6 +1,6 @@
 # Filesystem grants as flat verb rules (FEP-3): one "<verb>:<path>" string per rule, the same on a
 # `--rule` flag or a file line. Verbs desugar into the Blueprint at the CLI edge, so this compiles
-# like the nested `[fs]` form. Full grammar: fep-3.md.
+# like the nested `[fs]` form. Full grammar: formwork.md (§4, §5).
 #
 #   formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos --report-only
 

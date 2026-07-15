@@ -53,7 +53,7 @@ examples/
 The blueprints above use the nested `[fs]` table. The same filesystem grants can be written as a
 flat list of **verb rules** — one `"<verb>:<path>"` string per rule — which is the *same vocabulary*
 on a `--rule` flag and a file line, so a policy reads the same however you author it (`FW-BP1`). See
-`blueprints/rules-demo.toml` and [`fep-3.md`](../fep-3.md) for the full grammar.
+`blueprints/rules-demo.toml` and `formwork.md` (§4, §5) for the full grammar.
 
 | Verb | Grants | Nested-`[fs]` equivalent |
 |---|---|---|

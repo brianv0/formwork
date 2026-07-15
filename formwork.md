@@ -91,7 +91,8 @@ Formwork consumes a finite, enumerable **Blueprint** — the unveil/pledge linea
 ```
 extends: [blueprint]          # base Blueprints/presets this one layers over (FW-BP3)
 read(path-pattern)            # filesystem read
-write(path-pattern)           # filesystem write (implies read of the same)
+write(path-pattern)           # filesystem write + create (implies read of the same)
+write-no-create(path-pattern) # write existing files but NOT create new ones — the split (FW-CAP9)
 subtract(path-pattern)        # carve a sensitive hole out of the read+write grant (deny wins)
 write-subtract(path-pattern)  # write-deny but keep readable: tamper vectors (FW-TRA7)
 exec(path-pattern)            # OPTIONAL: execute only these binaries (off by default)
@@ -115,7 +116,7 @@ The compiler is the single authority that maps this blueprint to concrete mechan
 
 The Blueprint is a typed, versioned schema with **multiple surfaces onto one model** ([FW-BP1](#fw-bp1)): the TOML file is one serialization; the CLI flags are another, applied as an override layer. It is deliberately a standard serialization, not a bespoke DSL — a Blueprint is data with no control flow, and a policy language would pay SELinux's legibility cost to describe a struct. If real logic is ever required, the answer is an existing configuration language, never a new one.
 
-FEP-3 adds a third way to write the same grants: flat **verb** rules (`"<verb>:<path>"`, e.g. `deny:~/.ssh`) and a `mode` posture ([FW-BP6](fep-3.md#fw-bp6)/[FW-BP7](fep-3.md#fw-bp7)), plus the create/write split they make expressible ([FW-CAP9](fep-3.md#fw-cap9)). Verbs desugar into the fields above at the CLI edge; the grammar lives in `fep-3.md`.
+A third way to write the same grants (FEP-3): flat **verb** rules (`"<verb>:<path>"`, e.g. `deny:~/.ssh`) and a `mode` posture ([FW-BP6](#fw-bp6)/[FW-BP7](#fw-bp7)), evaluated **hide → allow → deny-terminal** ([FW-CAP8](#fw-cap8)). Verbs desugar into the fields above at the CLI edge — `read`/`readwrite`/`write`/`allow`/`readexec`/`exec`/`deny`, where `write` is the create/write split ([FW-CAP9](#fw-cap9)) — and `mode` (`unveil`/`subtractive`) aliases `[fs] read-mode`.
 
 Two semantics choices, both settled earlier in design:
 
@@ -151,13 +152,15 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 
 | Req | Requirement |
 |---|---|
-| <a id="fw-cap1"></a>**FW-CAP1** Enumerable vocabulary | The blueprint is a finite enumeration of read/write/subtract/exec/net/env/mcp. No mechanism accepts natural language and produces a grant. |
+| <a id="fw-cap1"></a>**FW-CAP1** Enumerable vocabulary | The blueprint is a finite enumeration of read/write/subtract/exec/net/env/mcp — the fs write grade admits a create/write split ([FW-CAP9](#fw-cap9)). No mechanism accepts natural language and produces a grant. It is authored as typed fields or, equivalently, as flat verb rules ([FW-BP6](#fw-bp6)). |
 | <a id="fw-cap2"></a>**FW-CAP2** Monotonic narrowing | A session may narrow its own grant but never widen it. A child's grant is a subset of its parent's. |
 | <a id="fw-cap3"></a>**FW-CAP3** Subtractive default profile | The default profile is broad-read over the ambient environment minus a configured sensitive set, not minimal-from-empty. *(Realized concretely by FEP-2's compiled-in credential catalog + backstop, applied as a floor under every blueprint — [FW-CRED4](#fw-cred4).)* |
 | <a id="fw-cap4"></a>**FW-CAP4** Invisibility for MCP, denial for fs | Ungranted MCP tools/resources/prompts are absent from listings and non-invocable. Ungranted filesystem paths may return EACCES rather than ENOENT. |
 | <a id="fw-cap5"></a>**FW-CAP5** Single inspectable interpreter | The compiler is the sole blueprint→mechanism authority, and its output (compiled policy + report) is inspectable without enforcing. |
 | <a id="fw-cap6"></a>**FW-CAP6** Anchored & basename patterns | Beyond absolute paths, the pattern vocabulary admits an any-depth basename form (`**/.env`) that matches a trailing component at any depth within a grant, and (FEP-2) its prefix-anchored refinement `<prefix>/**/<suffix>` that matches only below an absolute prefix. All forms canonicalize deterministically ([FW-FID4](#fw-fid4)) and stay fail-loud on non-representable resolution; no relative `..` traversal is introduced. |
 | <a id="fw-cap7"></a>**FW-CAP7** Metadata denial for the sensitive set | Where the backend can express it (Seatbelt denies `file-read-metadata` per path), subtracted sensitive paths are denied at the metadata layer too, so existence/size/mtime of credentials do not leak via `stat`. Where it cannot (Linux/Landlock), the residual is reported Partial — narrowing the §3 EACCES-not-ENOENT concession specifically for credentials. |
+| <a id="fw-cap8"></a>**FW-CAP8** Three-layer evaluation, deny-terminal | Path access resolves in a fixed order: (1) **hide** — unlisted paths are inaccessible (EACCES-shaped, not ENOENT; the report says so, [FW-CAP4](#fw-cap4)); (2) **allow** — grants punch holes, more specific wins within the layer; (3) **deny** — applied last and terminal. No allow at any layer, and no rule order, overrides a deny. The only removal of a deny is the typed credential exclude ([FW-CRED5](#fw-cred5)), which deletes the deny entry rather than overriding it. The structural form of [FW-BP4](#fw-bp4)/[FW-INV8](#fw-inv8). *(Added by FEP-3.)* |
+| <a id="fw-cap9"></a>**FW-CAP9** Verb grammar & create/write split | The fs grant vocabulary is a closed verb set — `read`/`readonly`, `readwrite`, `write`, `allow`, `readexec`, `exec`, `deny`. `write` grants read + modify-existing but **not create**; `allow`/`readwrite` additionally grant create. Enforced on both backends: Landlock drops the `Make*` rights, Seatbelt allows every `file-write-*` op except `file-write-create`. *(Added by FEP-3; the `write`/`writes-no-create` axis is the create/write split of [FW-CAP1](#fw-cap1).)* |
 
 ### 5.3 OS isolation / confiner (FW-ISO)
 
@@ -171,6 +174,7 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 | <a id="fw-iso6"></a>**FW-ISO6** Two postures | Support spawn-confined (launcher confines a child; preferred) and confine-self (process restricts itself; pledge-style). |
 | <a id="fw-iso7"></a>**FW-ISO7** Capability detection | Detect Landlock ABI / seccomp / Seatbelt availability at runtime and degrade with a report; never crash and never silently no-op. |
 | <a id="fw-iso8"></a>**FW-ISO8** Anti-shedding baseline | On Linux, set `NO_NEW_PRIVS` and a seccomp baseline that blocks confinement-shedding and privilege-escalation paths, while remaining permissive enough that normal toolchains run unmodified. |
+| <a id="fw-iso9"></a>**FW-ISO9** Exec as a verb | Execution is expressed as the `exec`/`readexec` verb rather than a separate posture; off by default (no verb grants execute ⇒ execute is ungoverned/transparent). Reframes [FW-ISO4](#fw-iso4); the internal exec posture is unchanged (verbs desugar onto it). No traversal token — a covering-directory grant applies. The exec grant confers execute only, not read, on both backends ([FW-XR6](#fw-xr6) parity). *(Added by FEP-3.)* |
 
 ### 5.4 Gateway / MCP (FW-GW)
 
@@ -229,6 +233,8 @@ The Blueprint is one typed model with multiple surfaces (§4); these requirement
 | <a id="fw-bp3"></a>**FW-BP3** Composition via `extends` | A Blueprint may extend one or more base Blueprints (presets/profiles). Resolution is deterministic and cycles are detected and errored. |
 | <a id="fw-bp4"></a>**FW-BP4** allow / deny / subtract vocabulary | First-class allow (reads/writes), deny/subtract (read+write), and write-subtract semantics over path patterns in the [FW-CAP6](#fw-cap6) grammar. At any layer and at equal precedence, deny/subtract wins over allow (safety bias); no allow at any layer shadows a deny at any layer — the only un-deny is the typed credential exclude ([FW-CRED5](#fw-cred5)). No general glob exists. |
 | <a id="fw-bp5"></a>**FW-BP5** Path sigils | Blueprint path patterns admit a closed set of authoring sigils, expanded at the CLI edge *before* compilation: `~` → `$HOME` and `$CWD` → the launch directory, so a grant can be written relative to the project it runs in. Fixed tokens only — never general `$VAR` interpolation, since the process environment is exactly what the launcher strips ([FW-CRED2](#fw-cred2)), and letting an arbitrary variable name a path would reopen that surface. An expanded sigil is an absolute path that canonicalizes like any grant ([FW-CAP6](#fw-cap6)/[FW-FID4](#fw-fid4)); an unresolvable sigil (e.g. no readable working directory) fails loud, never silently widening ([FW-INV6](#fw-inv6)). |
+| <a id="fw-bp6"></a>**FW-BP6** Flat verb rules | One string is one rule (`"<verb>:<path>"`), identical between the CLI flag (`--rule`), a `--set` fragment, and a file `rules` line — a third surface onto the one model ([FW-BP1](#fw-bp1)). Grants and denies are sets merged by union; the result is order-independent (profile stacking is commutative). Denies narrow from any layer; allows widen and are the only trusted layer (maps onto [FW-CAP2](#fw-cap2)). Verbs desugar into the fields above at the CLI edge, so every verb also has a nested `[fs]` equivalent. *(Added by FEP-3.)* |
+| <a id="fw-bp7"></a>**FW-BP7** Mode posture | `unveil` (empty universe) and `subtractive` (ambient minus catalog) are a last-set-wins posture aliasing `[fs] read-mode` ([FW-BP2](#fw-bp2)), not a union rule; setting both in one layer is a loud error, but across layers they compose by ordinary last-wins. The credential floor applies in both modes. *(Added by FEP-3.)* |
 
 ### 5.9 Credential catalog & launcher (FW-CRED)
 
@@ -284,6 +290,8 @@ These hold for every session under every backend, and are the properties the tes
 <a id="fw-inv9"></a>**FW-INV9 — No-oracle for credentials.** Denied credential paths and stripped credential env vars are indistinguishable, to the confined agent, from genuinely absent resources — no error text, code, or timing reveals existence.
 
 <a id="fw-inv10"></a>**FW-INV10 — Discovery is non-authoritative.** A discovered candidate has no effect until accepted into an enforced Blueprint. Observation never itself widens a live enforced session, except within a pre-declared auto-widen zone.
+
+<a id="fw-inv11"></a>**FW-INV11 — Structural floor.** Because the credential catalog compiles into the deny layer and deny is terminal ([FW-CAP8](#fw-cap8)), no allow, no rule order, no profile, and no discovery path can produce access to a floored location; the sole removal is the typed exclude ([FW-CRED5](#fw-cred5)). The structural form of [FW-INV8](#fw-inv8) (added by FEP-3).
 
 (The env-shading honesty guarantee — that the report discloses launcher-contingency — is carried by [FW-CRED8](#fw-cred8) rather than a standalone invariant, and is a specialization of [FW-INV5](#fw-inv5) report-soundness.)
 
@@ -379,6 +387,14 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-055"></a>**FW-E2E-055: Path sigils scope a grant ([FW-BP5](#fw-bp5)).** A blueprint grants `$CWD/**` and is run from a project directory. Pass: a file under the launch directory is readable while a sibling outside it is denied by the real kernel; `~` still expands to `$HOME`; a non-sigil path is untouched; and `$CWD` resolving to `$HOME` or `/` warns (a broad-grant nudge) rather than silently widening. Fail: a path outside `$CWD` is granted, or a sigil expands wrong.
 
+<a id="fw-e2e-056"></a>**FW-E2E-056: Create/write split ([FW-CAP9](#fw-cap9)).** The `write` verb compiles to every `file-write-*` op except `file-write-create`; under real Seatbelt a paired allow/deny probe shows an existing file modifiable but a new file/dir uncreatable. Pass: modify allowed, create (file and dir) denied. Fail: create succeeds, or modify is denied.
+
+<a id="fw-e2e-057"></a>**FW-E2E-057: Mode posture ([FW-BP7](#fw-bp7)).** `mode` compiles identically to the equivalent `[fs] read-mode` for both values, and a child's `mode` overrides a base's `read-mode` across `extends` while both-in-one-layer errors loud. Pass: byte-identical compile; last-wins across layers; same-layer conflict rejected. Fail: divergence, or a same-layer conflict silently picked.
+
+<a id="fw-e2e-058"></a>**FW-E2E-058: Rule order independence ([FW-BP6](#fw-bp6)/[FW-CAP8](#fw-cap8)).** The same verb rules in different orders compile to the same policy, and a deny beats an allow regardless of order. Pass: order-independent compile; deny terminal. Fail: order changes the policy, or an allow reopens a deny.
+
+<a id="fw-e2e-061"></a>**FW-E2E-061: Rule/table parity ([FW-BP1](#fw-bp1)).** Grants authored as flat verb rules and as the nested `[fs]` table compile byte-identically. Pass: byte-identical policy from both. Fail: divergence.
+
 ### 7.8 Credential catalog & launcher
 
 <a id="fw-e2e-045"></a>**FW-E2E-045: Path credential denied and itemized.** Under the default catalog, `~/.aws/credentials` is read. Pass: read denied (EACCES); operator channel names type `aws`; agent sees a bare EACCES with no annotation. Fail: read succeeds, or the agent-facing error names the type.
@@ -466,6 +482,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | net default-deny | Enforced | Enforced |
 | net host allowlist (direct) | Unenforceable direct (use gateway) | Partial (Seatbelt remote filters) |
 | net port allowlist (direct) | Enforced (ABI v4+) / else Reported | Enforced |
+| fs write vs create split ([FW-CAP9](#fw-cap9)) | Enforced (Landlock drops `Make*`) | Enforced (deny `file-write-create`) |
 | exec allowlist | Enforced (optional) | Enforced (optional) |
 | MCP tool/resource/prompt shading | Enforced (gateway) | Enforced (gateway) |
 | cross-domain UNIX socket block | Partial (recent, coarse) | Enforced (path-gated) |
@@ -495,6 +512,8 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-CAP5](#fw-cap5) Inspectable interpreter | [FW-E2E-026](#fw-e2e-026), 027 | 024 |
 | [FW-CAP6](#fw-cap6) Anchored & basename patterns | [FW-E2E-038](#fw-e2e-038) | [FW-FID4](#fw-fid4) |
 | [FW-CAP7](#fw-cap7) Metadata denial (sensitive set) | [FW-E2E-037](#fw-e2e-037) | INV5 |
+| [FW-CAP8](#fw-cap8) Three-layer evaluation, deny-terminal | [FW-E2E-058](#fw-e2e-058) | INV11, [FW-BP4](#fw-bp4) |
+| [FW-CAP9](#fw-cap9) Verb grammar & create/write split | [FW-E2E-056](#fw-e2e-056) | 061 |
 | [FW-ISO1](#fw-iso1) Read confinement | [FW-E2E-001](#fw-e2e-001) | 003, 004 |
 | [FW-ISO2](#fw-iso2) Write confinement | [FW-E2E-002](#fw-e2e-002) | 004 |
 | [FW-ISO3](#fw-iso3) Net default-deny | [FW-E2E-006](#fw-e2e-006) | 007, 008, INV3 |
@@ -503,6 +522,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-ISO6](#fw-iso6) Two postures | [FW-E2E-001](#fw-e2e-001) | — |
 | [FW-ISO7](#fw-iso7) Capability detection | [FW-E2E-025](#fw-e2e-025), 026 | INV6 |
 | [FW-ISO8](#fw-iso8) Anti-shedding baseline | [FW-ADV-001](#fw-adv-001) | 002, INV2 |
+| [FW-ISO9](#fw-iso9) Exec as a verb | [FW-E2E-056](#fw-e2e-056) | [FW-XR6](#fw-xr6) |
 | [FW-GW1](#fw-gw1) Transport-agnostic backends | [FW-E2E-010](#fw-e2e-010) | 019 |
 | [FW-GW2](#fw-gw2) Tool shading | [FW-E2E-013](#fw-e2e-013), 014 | ADV-004 |
 | [FW-GW3](#fw-gw3) Full-surface policy | [FW-E2E-015](#fw-e2e-015), 016, 017 | — |
@@ -530,6 +550,8 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-BP3](#fw-bp3) `extends` composition | [FW-E2E-044](#fw-e2e-044) | — |
 | [FW-BP4](#fw-bp4) allow/deny/subtract | [FW-E2E-042](#fw-e2e-042) | 045, 049 |
 | [FW-BP5](#fw-bp5) Path sigils | [FW-E2E-055](#fw-e2e-055) | — |
+| [FW-BP6](#fw-bp6) Flat verb rules | [FW-E2E-058](#fw-e2e-058), 061 | [FW-CAP9](#fw-cap9) |
+| [FW-BP7](#fw-bp7) Mode posture | [FW-E2E-057](#fw-e2e-057) | — |
 | [FW-CRED1](#fw-cred1) Typed catalog | [FW-E2E-045](#fw-e2e-045), 046 | 049 |
 | [FW-CRED2](#fw-cred2) Two kinds, two arms | [FW-E2E-045](#fw-e2e-045), 046 | 050 |
 | [FW-CRED3](#fw-cred3) Env-points-to-file | [FW-E2E-047](#fw-e2e-047) | — |
@@ -579,5 +601,7 @@ Kernel-mechanism-first, honesty-first, reuse-validated-early:
 8. **Capability-model hardening** (FEP-1): the env axis ([FW-ENV1](#fw-env1)/2), execution-vector write-subtract ([FW-TRA7](#fw-tra7)), sensitive-set metadata denial ([FW-CAP7](#fw-cap7)), any-depth patterns ([FW-CAP6](#fw-cap6)), extended sensitive set ([FW-TRA8](#fw-tra8)), and the anti-escalation guarantee ([FW-XR8](#fw-xr8)) — landed and compiled/enforced on both backends. The fs additions are real-Seatbelt verified ([FW-E2E-037](#fw-e2e-037)..039); the env axis (a CLI-shell spawn transform, not a kernel capability) by unit tests plus the FidelityReport. Host-scoped egress (FW-EGR) and the violation stream ([FW-FID5](fep-1.md#fw-fid5)) remain deferred in `fep-1.md`.
 
 9. **Blueprints, the credential catalog, and discovery** (FEP-2): the layered Blueprint model with `extends`, a CLI override surface, and path sigils ([FW-BP1](#fw-bp1)–5), the typed credential catalog enforced across the confiner and the launcher arm with per-type report labels and per-platform honesty ([FW-CRED1](#fw-cred1)–9), and observe-then-widen discovery bounded by the catalog floor ([FW-DISC1](#fw-disc1)–6; [FW-INV7](#fw-inv7)–10) — landed and folded into this document (§2, §4, §5.8–5.10, §6, §7.7–7.10), verified on real Seatbelt + the unified-log denial feed ([FW-E2E-041](#fw-e2e-041)..055, [FW-ADV-012](#fw-adv-012)..015). On Linux the catalog's path arm rides whatever carries fs enforcement, with any-depth floor rows reported Partial per [FW-CRED9](#fw-cred9). Credential brokering remains deferred (§11).
+
+10. **Filesystem capability rules** (FEP-3): a flat verb-rule grammar and a `mode` posture over the existing model ([FW-BP6](#fw-bp6)/[FW-BP7](#fw-bp7)), the three-layer deny-terminal evaluation named as a first-class property ([FW-CAP8](#fw-cap8), [FW-INV11](#fw-inv11)), the create/write split ([FW-CAP9](#fw-cap9)) and exec-as-a-verb with cross-backend parity ([FW-ISO9](#fw-iso9)/[FW-XR6](#fw-xr6)) — landed and folded into this document (§4, §5.2–5.3, §5.8, §6, §7.7, §9, §10), with a Seatbelt paired allow/deny probe for the split ([FW-E2E-056](#fw-e2e-056)..058, [FW-E2E-061](#fw-e2e-061)). Rule provenance + `formwork explain` ([FW-FID6](fep-3.md#fw-fid6)) and per-deny mechanism labels ([FW-FID7](fep-3.md#fw-fid7)) remain deferred in `fep-3.md`.
 
 If steps 1–4 pass, Formwork is a transparent, reusable filesystem confiner that behaves the same on both platforms and tells the truth about itself. If steps 5–7 pass, it is a complete agent sandbox: one privileged broker, everything else in a mould, egress forced through a policy gateway, and every claim backed by a mechanism or reported as a gap.
