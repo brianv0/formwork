@@ -45,9 +45,9 @@ def test_gateway_unknown_server_is_a_loud_config_error(cli):
 
 
 @pytest.mark.fw_e2e("FW-E2E-061")
-def test_rules_demo_verb_surface_compiles(cli):
-    """The verb-surface example (flat `rules` + `mode`, FEP-3) is a well-formed blueprint that
-    compiles like any other -- verbs are a surface onto the one model (FW-BP1)."""
+def test_rules_demo_compiles(cli):
+    """The verb-rule example (flat `rules` + `mode`, FEP-3) is a well-formed blueprint that compiles
+    like any other -- verbs desugar into the one model (FW-BP1)."""
     result = cli("compile", "--blueprint", BLUEPRINTS / "rules-demo.toml", "--target", "macos", "--report-only")
     assert result.code == 0, result.stderr
     caps = json.loads(result.stdout)["per-capability"]

@@ -115,7 +115,7 @@ The compiler is the single authority that maps this blueprint to concrete mechan
 
 The Blueprint is a typed, versioned schema with **multiple surfaces onto one model** ([FW-BP1](#fw-bp1)): the TOML file is one serialization; the CLI flags are another, applied as an override layer. It is deliberately a standard serialization, not a bespoke DSL — a Blueprint is data with no control flow, and a policy language would pay SELinux's legibility cost to describe a struct. If real logic is ever required, the answer is an existing configuration language, never a new one.
 
-A third authoring surface onto the same model — the flat **verb** grammar (`"<verb>:<path>"`, e.g. `deny:~/.ssh`) and the `mode` posture — is added by FEP-3 ([FW-BP6](fep-3.md#fw-bp6)/[FW-BP7](fep-3.md#fw-bp7)), together with the create/write split it makes expressible ([FW-CAP9](fep-3.md#fw-cap9)). Verbs desugar into the fields above at the CLI edge; the grammar and its adoption-time fold into this section live in `fep-3.md`.
+FEP-3 adds a third way to write the same grants: flat **verb** rules (`"<verb>:<path>"`, e.g. `deny:~/.ssh`) and a `mode` posture ([FW-BP6](fep-3.md#fw-bp6)/[FW-BP7](fep-3.md#fw-bp7)), plus the create/write split they make expressible ([FW-CAP9](fep-3.md#fw-cap9)). Verbs desugar into the fields above at the CLI edge; the grammar lives in `fep-3.md`.
 
 Two semantics choices, both settled earlier in design:
 

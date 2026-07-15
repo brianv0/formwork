@@ -41,7 +41,7 @@ enforce a capability, `formwork` reports the gap instead of pretending (it never
 examples/
   blueprints/agent-session.toml   # Axis A: confine an agent — scoped writes, secrets subtracted, HTTPS-only egress
   blueprints/mcp-gateway.toml      # Axis B: gateway policy — [mcp.files] shading + backend confinement
-  blueprints/rules-demo.toml       # the flat verb surface (rules/mode) — same model, terser authoring
+  blueprints/rules-demo.toml       # flat verb rules (rules/mode) — same model, terser to write
   gateway-demo.sh             # runnable Axis B demo against the built-in fixture (no external deps)
   claude-code/                # per-host: sandbox-agent.sh + the MCP-override config to stage
   codex/
@@ -105,7 +105,7 @@ formwork run --blueprint examples/blueprints/agent-session.toml \
 formwork run --blueprint examples/blueprints/agent-session.toml \
   --allow-cred aws --rule "readonly:$HOME/.aws/**" -- <agent>
 
-# Mix the flat rule surface with a `--set` TOML fragment — both parse as the same model (FW-BP1):
+# Mix verb rules with a `--set` TOML fragment — both parse as the same model (FW-BP1):
 formwork compile --blueprint examples/blueprints/rules-demo.toml \
   --set 'net = { ports = [443] }' --rule "deny:$HOME/.npmrc" --target linux-v6 --report-only
 

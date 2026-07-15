@@ -89,7 +89,7 @@ pub enum ReadMode {
     AmbientMinusSubtract,
 }
 
-/// The reads posture as spelled on the flat rule surface (FW-BP1): a friendlier alias of
+/// The reads posture, written in flat verb rules (FW-BP1): a friendlier alias of
 /// [`ReadMode`]. `unveil` starts from an empty universe (only grants readable);
 /// `subtractive` starts from ambient reads minus the catalog floor. A posture, not a rule -- the
 /// loader maps it onto `fs.read_mode` before merge, so it carries no independent semantics.

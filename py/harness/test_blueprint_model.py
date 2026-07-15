@@ -225,8 +225,8 @@ def test_rules_are_order_independent_and_deny_terminal(cli, tmp_path):
 
 
 @pytest.mark.fw_e2e("FW-E2E-061")
-def test_flat_rule_surface_equals_nested_fs(cli, tmp_path):
-    """FW-BP1: the flat rule surface and the nested [fs] table are one model (byte-identical)."""
+def test_flat_rules_equal_nested_fs(cli, tmp_path):
+    """FW-BP1: flat verb rules and the nested [fs] table are one model (byte-identical)."""
     flat = tmp_path / "flat.toml"
     flat.write_text(
         'net = "deny"\nmode = "unveil"\n'

@@ -134,8 +134,8 @@ fn resolve_layer(
     Ok(())
 }
 
-/// Desugar the flat rule surface (FW-BP1) into `fs`/`exec`, then empty `rules`/`mode` -- the same
-/// edge that resolves `extends`, so verbs never reach the pure merge or compiler. One `"<verb>:<path>"`
+/// Desugar flat verb rules (FW-BP1) into `fs`/`exec`, then empty `rules`/`mode` -- the same edge
+/// that resolves `extends`, so verbs never reach the pure merge or compiler. One `"<verb>:<path>"`
 /// string is one rule; the path takes the same sigils as any grant (FW-BP5). Deny still beats allow
 /// at match time (FW-BP4), so a verb only ever appends to a set; order does not matter.
 fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn flat_rules_equal_nested_fs_after_load() {
-        // FW-BP1: the flat rule surface and the nested `[fs]` table are one model.
+        // FW-BP1: flat verb rules and the nested `[fs]` table are one model.
         let flat = "net = \"deny\"\nmode = \"unveil\"\n\
                     rules = [\"readonly:/usr/**\", \"readwrite:/work/p/**\", \"deny:/work/p/secret\"]\n";
         let nested = "net = \"deny\"\n[fs]\nread-mode = \"closed\"\n\

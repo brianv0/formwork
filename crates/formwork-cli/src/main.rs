@@ -187,7 +187,7 @@ impl BlueprintArgs {
             // Sigils expand in `extends` too, matching a file's `extends` (FW-BP1/FW-BP5 parity).
             extends: self.extends.iter().map(|e| sigils.expand(e)).collect(),
             // Verbs and `mode` are desugared into `fs`/`exec` by the loader (blueprint_load), the
-            // same edge that resolves a file's `rules`/`mode`, so the two surfaces stay one model.
+            // same edge that resolves a file's `rules`/`mode`, so `--rule` and a file agree.
             rules: self.rule.clone(),
             mode: self.mode.as_deref().map(parse_mode).transpose()?,
             fs: formwork_blueprint::FsLayer {
