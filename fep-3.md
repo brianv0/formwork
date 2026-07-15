@@ -1,19 +1,16 @@
-# FEP-3 (draft, landing): the verb-based evaluation model
+# FEP-3 (draft, landing): filesystem capability rules
 
-**Formwork Enhancement Proposal 3 — in progress on branch
-`claude/codebase-research-docs-2s4fhv`.** Companion to `formwork.md` (design + end-to-end spec)
-and `constitution.md` (doctrine). The design rationale and the two-proposal comparison live in
-`research/eval-model-proposals.md`; the chosen implementation plan (Proposal A) is
-`research/proposal-a-implementation-plan.md`.
+**Formwork Enhancement Proposal 3.** Companion to `formwork.md` (design + end-to-end spec) and
+`constitution.md` (doctrine).
 
-This FEP adds a **verb-based authoring surface** for filesystem capabilities — a flat
-`"<verb>:<path>"` rule vocabulary and a `mode` posture, both desugared into the existing
-`Blueprint` model (verbs are a surface, not a second model, [FW-BP1](formwork.md#fw-bp1)) — plus the
-**create/write split** it makes expressible, per-rule **provenance** with `formwork explain`, and
-per-deny **mechanism labels** in the FidelityReport. The three-layer evaluation model
-(hide → allow → deny-terminal) is Formwork's existing compile semantics
-([FW-BP4](formwork.md#fw-bp4), [FW-INV8](formwork.md#fw-inv8)); this FEP names it as a first-class
-property and extends the vocabulary around it.
+This FEP adds a flat **rule grammar** for filesystem capabilities — one `"<verb>:<path>"` string per
+rule and a `mode` posture — desugared into the existing `Blueprint` model at the CLI edge (verbs are
+a surface, not a second model, [FW-BP1](formwork.md#fw-bp1)), plus the **create/write split** it
+makes expressible, per-rule **provenance** with `formwork explain`, and per-deny **mechanism labels**
+in the FidelityReport. Access is evaluated **hide → allow → deny-terminal** — deny wins, no allow
+reopens it — which is Formwork's existing compile semantics ([FW-BP4](formwork.md#fw-bp4),
+[FW-INV8](formwork.md#fw-inv8)); this FEP names that model as a first-class property and extends the
+vocabulary around it.
 
 New identifiers continue the `formwork.md` sequences and are minted here (this is their defining
 document until the FEP lands and folds into `formwork.md`, mirroring `fep-1.md` for FW-EGR/FW-FID5).
