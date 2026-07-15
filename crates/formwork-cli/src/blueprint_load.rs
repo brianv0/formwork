@@ -129,7 +129,64 @@ fn resolve_layer(
         resolve_file(&base_path, sigils, visiting, out)
             .with_context(|| format!("resolving extends {base:?}"))?;
     }
+    desugar_rules(&mut layer, sigils)?;
     out.push(layer);
+    Ok(())
+}
+
+/// Desugar the flat rule surface (FW-BP1) into `fs`/`exec`, then empty `rules`/`mode` -- the same
+/// edge that resolves `extends`, so verbs never reach the pure merge or compiler. One `"<verb>:<path>"`
+/// string is one rule; the path takes the same sigils as any grant (FW-BP5). Deny still beats allow
+/// at match time (FW-BP4), so a verb only ever appends to a set; order does not matter.
+fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
+    if let Some(mode) = layer.mode.take() {
+        if layer.fs.read_mode.is_some() {
+            bail!("set either `mode` or `[fs] read-mode` in a layer, not both");
+        }
+        layer.fs.read_mode = Some(mode.read_mode());
+    }
+    if layer.rules.is_empty() {
+        return Ok(());
+    }
+    // Exec verbs fold into one allow-list for this layer (last-set-wins across layers, FW-ISO4);
+    // an allow-list already present on the layer is extended, never dropped.
+    let mut exec_paths: Vec<PathPattern> = match layer.exec.take() {
+        Some(ExecPosture::Allowlist(p)) => p,
+        Some(ExecPosture::Unrestricted) => {
+            bail!("exec verbs (`exec`/`readexec`/`allow`) conflict with an explicit `exec = unrestricted` in the same layer");
+        }
+        None => Vec::new(),
+    };
+    for raw in std::mem::take(&mut layer.rules) {
+        let (verb, path) = raw
+            .split_once(':')
+            .ok_or_else(|| anyhow!("rule {raw:?} is not \"<verb>:<path>\""))?;
+        let pat = PathPattern::parse(&sigils.expand(path.trim()))
+            .with_context(|| format!("rule {raw:?}"))?;
+        match verb.trim() {
+            "read" | "readonly" => layer.fs.reads.push(pat),
+            "readwrite" => layer.fs.writes.push(pat),
+            "allow" => {
+                layer.fs.writes.push(pat.clone());
+                exec_paths.push(pat);
+            }
+            "readexec" => {
+                layer.fs.reads.push(pat.clone());
+                exec_paths.push(pat);
+            }
+            "exec" => exec_paths.push(pat),
+            "deny" => layer.fs.subtract.push(pat),
+            // The create/write split (a distinct write-without-create grant) is not wired yet;
+            // fail loud rather than silently granting create.
+            "write" => bail!("rule verb `write` (create/write split) is not available yet; use `readwrite`"),
+            other => bail!(
+                "unknown rule verb {other:?} in {raw:?} (known: read, readonly, readwrite, allow, readexec, exec, deny)"
+            ),
+        }
+    }
+    if !exec_paths.is_empty() {
+        layer.exec = Some(ExecPosture::Allowlist(exec_paths));
+    }
     Ok(())
 }
 
@@ -401,7 +458,85 @@ fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use formwork_blueprint::PathPattern;
+    use formwork_blueprint::{ExecPosture, Mode, PathPattern, ReadMode};
+
+    fn pp(s: &str) -> PathPattern {
+        PathPattern::parse(s).unwrap()
+    }
+
+    #[test]
+    fn desugar_maps_verbs_and_mode_to_fields() {
+        let sigils = Sigils::new("/home/x", "/work");
+        let mut layer = BlueprintLayer {
+            mode: Some(Mode::StrictUnveil),
+            rules: vec![
+                "readonly:/usr/**".into(),
+                "readwrite:~/project/**".into(),
+                "readexec:/bin/ls".into(),
+                "exec:/bin/cat".into(),
+                "deny:~/.ssh".into(),
+            ],
+            ..Default::default()
+        };
+        desugar_rules(&mut layer, &sigils).unwrap();
+        // Emptied like `extends`, so merge never sees verbs.
+        assert!(layer.rules.is_empty() && layer.mode.is_none());
+        assert_eq!(layer.fs.read_mode, Some(ReadMode::Closed));
+        assert_eq!(layer.fs.reads, vec![pp("/usr/**"), pp("/bin/ls")]);
+        assert_eq!(layer.fs.writes, vec![pp("/home/x/project/**")]);
+        assert_eq!(layer.fs.subtract, vec![pp("/home/x/.ssh")]);
+        assert_eq!(
+            layer.exec,
+            Some(ExecPosture::Allowlist(vec![pp("/bin/ls"), pp("/bin/cat")]))
+        );
+    }
+
+    #[test]
+    fn flat_rules_equal_nested_fs_after_load() {
+        // FW-BP1: the flat rule surface and the nested `[fs]` table are one model.
+        let flat = "net = \"deny\"\nmode = \"strict-unveil\"\n\
+                    rules = [\"readonly:/usr/**\", \"readwrite:/work/p/**\", \"deny:/work/p/secret\"]\n";
+        let nested = "net = \"deny\"\n[fs]\nread-mode = \"closed\"\n\
+                      reads = [\"/usr/**\"]\nwrites = [\"/work/p/**\"]\nsubtract = [\"/work/p/secret\"]\n";
+        let sigils = Sigils::new("/home/x", "/work");
+        let load = |src: &str| {
+            let layer: BlueprintLayer = toml::from_str(src).unwrap();
+            let mut out = Vec::new();
+            resolve_layer(
+                layer,
+                Path::new("/work"),
+                &sigils,
+                &mut Vec::new(),
+                &mut out,
+            )
+            .unwrap();
+            formwork_blueprint::merge(&out)
+        };
+        assert_eq!(load(flat), load(nested));
+    }
+
+    #[test]
+    fn desugar_rejects_bad_input() {
+        let sigils = Sigils::new("/home/x", "/work");
+        let layer = |rules: &[&str], mode, read_mode| BlueprintLayer {
+            rules: rules.iter().map(|s| s.to_string()).collect(),
+            mode,
+            fs: formwork_blueprint::FsLayer {
+                read_mode,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(desugar_rules(&mut layer(&["bogus:/x"], None, None), &sigils).is_err());
+        assert!(desugar_rules(&mut layer(&["write:/x"], None, None), &sigils).is_err());
+        assert!(desugar_rules(&mut layer(&["deny"], None, None), &sigils).is_err());
+        // `mode` and `[fs] read-mode` in one layer is a loud conflict.
+        assert!(desugar_rules(
+            &mut layer(&[], Some(Mode::Subtractive), Some(ReadMode::Closed)),
+            &sigils
+        )
+        .is_err());
+    }
 
     #[test]
     fn expands_leading_tilde_in_paths() {

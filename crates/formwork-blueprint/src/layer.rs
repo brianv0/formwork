@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Blueprint, EnvPosture, ExecPosture, McpPolicy, NetPosture, PathPattern, ReadMode};
+use crate::{
+    Blueprint, EnvPosture, ExecPosture, McpPolicy, Mode, NetPosture, PathPattern, ReadMode,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -20,6 +22,16 @@ pub struct BlueprintLayer {
     /// layer, FW-DISC6): TOML has no `None`, and empty sections are noise in a reviewed artifact.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extends: Vec<String>,
+    /// The flat rule surface (FW-BP1): one `"<verb>:<path>"` string per rule, the same vocabulary
+    /// on a `--rule` flag and a file line. Like `extends`, this is meaningful only in an authored
+    /// layer and is desugared into `fs`/`exec` (and emptied) by the CLI loader before merge, so the
+    /// pure merge and compiler never see verbs -- verbs are a surface, not a second model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<String>,
+    /// The reads posture as a friendlier alias of `fs.read-mode` (FW-BP1). Loader-mapped onto
+    /// `fs.read_mode` and emptied before merge; setting both in one layer is a loud error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
     #[serde(default, skip_serializing_if = "FsLayer::is_empty")]
     pub fs: FsLayer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +147,8 @@ impl BlueprintLayer {
     pub fn from_blueprint(bp: &Blueprint) -> BlueprintLayer {
         BlueprintLayer {
             extends: Vec::new(),
+            rules: Vec::new(),
+            mode: None,
             fs: FsLayer {
                 read_mode: Some(bp.fs.read_mode),
                 reads: bp.fs.reads.clone(),

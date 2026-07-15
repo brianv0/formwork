@@ -83,6 +83,26 @@ pub enum ReadMode {
     AmbientMinusSubtract,
 }
 
+/// The reads posture as spelled on the flat rule surface (FW-BP1): a friendlier alias of
+/// [`ReadMode`]. `strict-unveil` starts from an empty universe (only grants readable);
+/// `subtractive` starts from ambient reads minus the catalog floor. A posture, not a rule -- the
+/// loader maps it onto `fs.read_mode` before merge, so it carries no independent semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    StrictUnveil,
+    Subtractive,
+}
+
+impl Mode {
+    pub fn read_mode(self) -> ReadMode {
+        match self {
+            Mode::StrictUnveil => ReadMode::Closed,
+            Mode::Subtractive => ReadMode::AmbientMinusSubtract,
+        }
+    }
+}
+
 /// `Deny` is the fail-closed default (FW-XR3); `Ports` allows direct TCP connect to a port set
 /// only where the platform can enforce it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]

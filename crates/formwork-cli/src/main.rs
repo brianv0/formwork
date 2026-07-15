@@ -149,6 +149,15 @@ struct BlueprintArgs {
     /// Net posture: "deny" or "ports:443,8080".
     #[arg(long)]
     net: Option<String>,
+    /// Append a flat capability rule "<verb>:<path>" (repeatable), e.g. --rule "deny:~/.ssh". The
+    /// same vocabulary as a file `rules` line (FW-BP1). Verbs: read/readonly, readwrite, allow,
+    /// readexec, exec, deny.
+    #[arg(long)]
+    rule: Vec<String>,
+    /// Reads posture: "strict-unveil" (empty universe) or "subtractive" (ambient minus catalog);
+    /// a friendlier alias of `[fs] read-mode`.
+    #[arg(long)]
+    mode: Option<String>,
     /// Extra base blueprints layered under the CLI overrides (repeatable, resolved against cwd).
     #[arg(long)]
     extends: Vec<String>,
@@ -177,6 +186,10 @@ impl BlueprintArgs {
         Ok(BlueprintLayer {
             // Sigils expand in `extends` too, matching a file's `extends` (FW-BP1/FW-BP5 parity).
             extends: self.extends.iter().map(|e| sigils.expand(e)).collect(),
+            // Verbs and `mode` are desugared into `fs`/`exec` by the loader (blueprint_load), the
+            // same edge that resolves a file's `rules`/`mode`, so the two surfaces stay one model.
+            rules: self.rule.clone(),
+            mode: self.mode.as_deref().map(parse_mode).transpose()?,
             fs: formwork_blueprint::FsLayer {
                 read_mode: None,
                 reads: patterns("read", &self.read)?,
@@ -213,6 +226,14 @@ fn parse_net(s: &str) -> Result<NetPosture> {
         return Ok(NetPosture::Ports(ports));
     }
     bail!("--net accepts \"deny\" or \"ports:<p1,p2,…>\", got {s:?}")
+}
+
+fn parse_mode(s: &str) -> Result<formwork_blueprint::Mode> {
+    match s {
+        "strict-unveil" => Ok(formwork_blueprint::Mode::StrictUnveil),
+        "subtractive" => Ok(formwork_blueprint::Mode::Subtractive),
+        other => bail!("--mode accepts \"strict-unveil\" or \"subtractive\", got {other:?}"),
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
