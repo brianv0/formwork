@@ -78,6 +78,48 @@ formwork run --blueprint examples/blueprints/agent-session.toml \
   --rule "deny:$CWD/secrets" -- <agent> <flags>
 ```
 
+### CLI recipes
+
+`--rule` and `--mode` are the highest override layer — they apply on top of the file (and any
+`extends` chain), so you shape a shipped blueprint per-run without editing it. `--blueprint` names
+the base; everything else refines it.
+
+```sh
+# Add extra denies for one run — safe from any layer, since deny is terminal (FW-CAP8):
+formwork run --blueprint examples/blueprints/agent-session.toml \
+  --rule "deny:$CWD/secrets" --rule "deny:$CWD/.env.production" -- claude --dangerously-skip-permissions
+
+# Let the agent EDIT an existing dir but not CREATE new files under it (create/write split, FW-CAP9):
+formwork run --blueprint examples/blueprints/agent-session.toml \
+  --rule "write:$CWD/var/log" -- <agent>
+
+# Flip a blueprint to strict-unveil (empty universe) and hand-pick what's readable/runnable:
+formwork run --blueprint examples/blueprints/agent-session.toml --mode strict-unveil \
+  --rule "readonly:/usr/**" --rule "readexec:/bin/**" --rule "readwrite:$CWD/**" -- <agent>
+
+# Tighten an otherwise-unrestricted agent's exec down to an allowlist (last-wins over `exec = "unrestricted"`):
+formwork run --blueprint examples/blueprints/agent-session.toml \
+  --rule "exec:/usr/bin/git" --rule "exec:/usr/bin/python3" -- <agent>
+
+# Let one credential type through the floor AND grant its directory, in one invocation (FW-CRED5):
+formwork run --blueprint examples/blueprints/agent-session.toml \
+  --allow-cred aws --rule "readonly:$HOME/.aws/**" -- <agent>
+
+# Mix the flat rule surface with a `--set` TOML fragment — both parse as the same model (FW-BP1):
+formwork compile --blueprint examples/blueprints/rules-demo.toml \
+  --set 'net = { ports = [443] }' --rule "deny:$HOME/.npmrc" --target linux-v6 --report-only
+
+# Inspect the merged, canonical policy the confiner will enforce (not just the report):
+formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos | jq '.confiner'
+
+# Compile a Linux policy on a Mac (or vice-versa) to review it before enforcing — pure, no kernel:
+formwork compile --blueprint examples/blueprints/rules-demo.toml --target linux-v6 --report-only
+```
+
+Every `--rule` value is the exact string a file `rules = [...]` line would hold, so a recipe you
+like copies straight into a blueprint. A bad verb, an unknown `--mode`, or a malformed rule is a
+loud error, never a silent no-op.
+
 ## Install `formwork`
 
 The examples call `formwork` on your PATH. Build and install it from the repo root:
