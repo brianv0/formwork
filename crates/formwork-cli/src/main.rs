@@ -154,7 +154,7 @@ struct BlueprintArgs {
     /// readexec, exec, deny.
     #[arg(long)]
     rule: Vec<String>,
-    /// Reads posture: "strict-unveil" (empty universe) or "subtractive" (ambient minus catalog);
+    /// Reads posture: "unveil" (empty universe) or "subtractive" (ambient minus catalog);
     /// a friendlier alias of `[fs] read-mode`.
     #[arg(long)]
     mode: Option<String>,
@@ -233,9 +233,9 @@ fn parse_net(s: &str) -> Result<NetPosture> {
 
 fn parse_mode(s: &str) -> Result<formwork_blueprint::Mode> {
     match s {
-        "strict-unveil" => Ok(formwork_blueprint::Mode::StrictUnveil),
+        "unveil" => Ok(formwork_blueprint::Mode::Unveil),
         "subtractive" => Ok(formwork_blueprint::Mode::Subtractive),
-        other => bail!("--mode accepts \"strict-unveil\" or \"subtractive\", got {other:?}"),
+        other => bail!("--mode accepts \"unveil\" or \"subtractive\", got {other:?}"),
     }
 }
 

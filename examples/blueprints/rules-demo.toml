@@ -11,9 +11,9 @@
 
 net = "deny"
 
-# `mode` is a friendlier spelling of `[fs] read-mode`: `strict-unveil` starts from an empty universe
+# `mode` is a friendlier spelling of `[fs] read-mode`: `unveil` starts from an empty universe
 # (only grants are readable); `subtractive` starts from ambient reads minus the credential floor.
-mode = "strict-unveil"
+mode = "unveil"
 
 rules = [
     # Read-only ambient toolchain (interpreters, system libs).

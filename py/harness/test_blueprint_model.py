@@ -186,7 +186,7 @@ def test_cwd_sigil_scopes_a_grant_to_the_launch_directory(cli, tmp_path):
 def test_write_verb_splits_create_from_modify(cli, tmp_path):
     """FW-CAP9: the `write` verb grants modify/unlink/chmod on a path but never create."""
     bp = tmp_path / "s.toml"
-    bp.write_text('net = "deny"\nmode = "strict-unveil"\nrules = ["readonly:/usr/**", "write:/data/logs"]\n')
+    bp.write_text('net = "deny"\nmode = "unveil"\nrules = ["readonly:/usr/**", "write:/data/logs"]\n')
     r = cli("compile", "--blueprint", bp, "--target", "macos")
     assert r.code == 0, r.stderr
     sbpl = json.loads(r.stdout)["confiner"]["sbpl"]
@@ -200,7 +200,7 @@ def test_write_verb_splits_create_from_modify(cli, tmp_path):
 @pytest.mark.fw_e2e("FW-E2E-057")
 def test_mode_posture_aliases_read_mode(cli, tmp_path):
     """FW-BP7: `mode` is a friendlier spelling of `[fs] read-mode`; both values compile identically."""
-    for mode, read_mode in (("strict-unveil", "closed"), ("subtractive", "ambient-minus-subtract")):
+    for mode, read_mode in (("unveil", "closed"), ("subtractive", "ambient-minus-subtract")):
         flat = tmp_path / f"flat-{mode}.toml"
         flat.write_text(f'net = "deny"\nmode = "{mode}"\nrules = ["readonly:/usr/**"]\n')
         nested = tmp_path / f"nested-{mode}.toml"
@@ -229,7 +229,7 @@ def test_flat_rule_surface_equals_nested_fs(cli, tmp_path):
     """FW-BP1: the flat rule surface and the nested [fs] table are one model (byte-identical)."""
     flat = tmp_path / "flat.toml"
     flat.write_text(
-        'net = "deny"\nmode = "strict-unveil"\n'
+        'net = "deny"\nmode = "unveil"\n'
         'rules = ["readonly:/usr/**", "readwrite:/work/p/**", "deny:/work/p/secret"]\n'
     )
     nested = tmp_path / "nested.toml"
@@ -251,15 +251,15 @@ def test_mode_and_read_mode_compose_across_extends(cli, tmp_path):
     `extends`."""
     (tmp_path / "base.toml").write_text('net = "deny"\n[fs]\nread-mode = "ambient-minus-subtract"\nreads = ["/usr/**"]\n')
     child = tmp_path / "child.toml"
-    child.write_text('extends = ["base.toml"]\nmode = "strict-unveil"\nrules = ["readonly:/work/**"]\n')
+    child.write_text('extends = ["base.toml"]\nmode = "unveil"\nrules = ["readonly:/work/**"]\n')
     r = cli("compile", "--blueprint", child, "--target", "linux-v6")
     assert r.code == 0, r.stderr
     policy = json.loads(r.stdout)["confiner"]
-    # The child's mode (strict-unveil -> closed) wins over the base's ambient read-mode.
+    # The child's mode (unveil -> closed) wins over the base's ambient read-mode.
     assert policy["read-mode"] == "closed", "child `mode` must override base `read-mode` via last-wins"
 
     # But both in the SAME layer is a loud conflict, not a silent pick.
     same = tmp_path / "same.toml"
-    same.write_text('net = "deny"\nmode = "strict-unveil"\n[fs]\nread-mode = "closed"\n')
+    same.write_text('net = "deny"\nmode = "unveil"\n[fs]\nread-mode = "closed"\n')
     bad = cli("compile", "--blueprint", same, "--target", "linux-v6")
     assert bad.code != 0 and "not both" in bad.stderr

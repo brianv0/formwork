@@ -65,7 +65,7 @@ on a `--rule` flag and a file line, so a policy reads the same however you autho
 | `exec` | execute only | `exec` allow-list |
 | `deny` | nothing (terminal) | `subtract` |
 
-`--mode strict-unveil` (empty universe) or `--mode subtractive` (ambient minus the credential floor)
+`--mode unveil` (empty universe) or `--mode subtractive` (ambient minus the credential floor)
 is a friendlier spelling of `[fs] read-mode`. `deny` is terminal — no allow overrides it — and the
 credential floor compiles into that same deny layer, so it can never be punched through. Example:
 
@@ -93,8 +93,8 @@ formwork run --blueprint examples/blueprints/agent-session.toml \
 formwork run --blueprint examples/blueprints/agent-session.toml \
   --rule "write:$CWD/var/log" -- <agent>
 
-# Flip a blueprint to strict-unveil (empty universe) and hand-pick what's readable/runnable:
-formwork run --blueprint examples/blueprints/agent-session.toml --mode strict-unveil \
+# Flip a blueprint to unveil (empty universe) and hand-pick what's readable/runnable:
+formwork run --blueprint examples/blueprints/agent-session.toml --mode unveil \
   --rule "readonly:/usr/**" --rule "readexec:/bin/**" --rule "readwrite:$CWD/**" -- <agent>
 
 # Tighten an otherwise-unrestricted agent's exec down to an allowlist (last-wins over `exec = "unrestricted"`):

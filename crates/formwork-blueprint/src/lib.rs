@@ -90,20 +90,20 @@ pub enum ReadMode {
 }
 
 /// The reads posture as spelled on the flat rule surface (FW-BP1): a friendlier alias of
-/// [`ReadMode`]. `strict-unveil` starts from an empty universe (only grants readable);
+/// [`ReadMode`]. `unveil` starts from an empty universe (only grants readable);
 /// `subtractive` starts from ambient reads minus the catalog floor. A posture, not a rule -- the
 /// loader maps it onto `fs.read_mode` before merge, so it carries no independent semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
-    StrictUnveil,
+    Unveil,
     Subtractive,
 }
 
 impl Mode {
     pub fn read_mode(self) -> ReadMode {
         match self {
-            Mode::StrictUnveil => ReadMode::Closed,
+            Mode::Unveil => ReadMode::Closed,
             Mode::Subtractive => ReadMode::AmbientMinusSubtract,
         }
     }

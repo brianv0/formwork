@@ -467,7 +467,7 @@ mod tests {
     fn desugar_maps_verbs_and_mode_to_fields() {
         let sigils = Sigils::new("/home/x", "/work");
         let mut layer = BlueprintLayer {
-            mode: Some(Mode::StrictUnveil),
+            mode: Some(Mode::Unveil),
             rules: vec![
                 "readonly:/usr/**".into(),
                 "readwrite:~/project/**".into(),
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn flat_rules_equal_nested_fs_after_load() {
         // FW-BP1: the flat rule surface and the nested `[fs]` table are one model.
-        let flat = "net = \"deny\"\nmode = \"strict-unveil\"\n\
+        let flat = "net = \"deny\"\nmode = \"unveil\"\n\
                     rules = [\"readonly:/usr/**\", \"readwrite:/work/p/**\", \"deny:/work/p/secret\"]\n";
         let nested = "net = \"deny\"\n[fs]\nread-mode = \"closed\"\n\
                       reads = [\"/usr/**\"]\nwrites = [\"/work/p/**\"]\nsubtract = [\"/work/p/secret\"]\n";
