@@ -219,6 +219,27 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
 
     created = add_path_rules(created, &read_paths, read_access)?;
     created = add_path_rules(created, &write_paths, write_access)?;
+    // The create/write split (FW-CAP9): grant the write bits MINUS the `Make*` (create) rights, so
+    // an existing file can be modified but nothing new is created under the grant. `Make*` stays in
+    // `handled_fs`, so governed-but-ungranted == denied. Uses the same holes as `writes`.
+    if !policy.writes_no_create.is_empty() {
+        let make_bits = AccessFs::MakeReg
+            | AccessFs::MakeDir
+            | AccessFs::MakeSym
+            | AccessFs::MakeSock
+            | AccessFs::MakeFifo
+            | AccessFs::MakeBlock
+            | AccessFs::MakeChar;
+        let write_nc_paths = expand_all(
+            &policy
+                .writes_no_create
+                .iter()
+                .map(root_of)
+                .collect::<Vec<_>>(),
+            &write_holes,
+        );
+        created = add_path_rules(created, &write_nc_paths, write_access & !make_bits)?;
+    }
     // The safe device nodes are writable regardless of mode (e.g. `cmd > /dev/null`).
     let dev_paths: Vec<PathBuf> = RW_DEVICES.iter().map(PathBuf::from).collect();
     created = add_path_rules(

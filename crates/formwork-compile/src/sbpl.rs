@@ -30,6 +30,7 @@ pub fn render(input: &CompileInput) -> String {
     render_writes(
         &mut b,
         &input.writes,
+        &input.writes_no_create,
         &input.subtract,
         &input.write_subtract,
         &input.floor,
@@ -99,6 +100,19 @@ const MACOS_WRITE_DEVICES: &[&str] = &[
     "/dev/stdout",
     "/dev/stderr",
     "/dev/fd",
+];
+
+/// Every `file-write-*` operation except `file-write-create`: the create/write split (FW-CAP9). A
+/// `write` grant may modify data, chmod, chown, set flags/times, and unlink existing entries, but
+/// not create new ones -- the root `(deny file-write* ...)` keeps creation denied.
+const MACOS_WRITE_NO_CREATE_OPS: &[&str] = &[
+    "file-write-data",
+    "file-write-flags",
+    "file-write-mode",
+    "file-write-owner",
+    "file-write-setugid",
+    "file-write-times",
+    "file-write-unlink",
 ];
 
 fn render_reads(
@@ -174,6 +188,7 @@ fn render_reads(
 fn render_writes(
     b: &mut String,
     writes: &[PathPattern],
+    writes_no_create: &[PathPattern],
     subtract: &[PathPattern],
     write_subtract: &[PathPattern],
     floor: &[PathPattern],
@@ -187,6 +202,18 @@ fn render_writes(
     }
     for p in writes {
         b.push_str(&format!("(allow file-write* {})\n", filter(p)));
+    }
+    // The create/write split (FW-CAP9): allow every file-write op EXCEPT create, so an existing
+    // file can be modified/chmod'd/unlinked but nothing new is created (the root deny above keeps
+    // create denied). Placed before the floor/subtract denies so those still win (last-match).
+    if !writes_no_create.is_empty() {
+        b.push_str(";; write, no create (FW-CAP9): modify existing, never create\n");
+        for p in writes_no_create {
+            let f = filter(p);
+            for op in MACOS_WRITE_NO_CREATE_OPS {
+                b.push_str(&format!("(allow {op} {f})\n"));
+            }
+        }
     }
     for p in floor {
         b.push_str(&format!("(deny file-write* {})\n", filter(p)));
@@ -317,11 +344,28 @@ mod tests {
             read_mode: ReadMode::Closed,
             effective_reads: vec![pp("/work/project/**")],
             writes: vec![pp("/work/project/**")],
+            writes_no_create: vec![],
             subtract: vec![pp("/work/project/.git/**")],
             write_subtract: vec![],
             net: NetPosture::Deny,
             exec: ExecPosture::Unrestricted,
         }
+    }
+
+    #[test]
+    fn writes_no_create_allows_modify_but_not_create() {
+        // FW-CAP9 create/write split: a `write` grant renders every file-write op except create.
+        let mut i = input();
+        i.writes = vec![];
+        i.writes_no_create = vec![pp("/data/**")];
+        let s = render(&i);
+        assert!(s.contains("(allow file-write-data (subpath \"/data\"))"));
+        assert!(s.contains("(allow file-write-unlink (subpath \"/data\"))"));
+        assert!(s.contains("(allow file-write-mode (subpath \"/data\"))"));
+        // Create is never granted; the root `(deny file-write* ...)` keeps it denied.
+        assert!(!s.contains("file-write-create (subpath \"/data\")"));
+        // And no blanket file-write* allow that would re-admit create.
+        assert!(!s.contains("(allow file-write* (subpath \"/data\"))"));
     }
 
     #[test]

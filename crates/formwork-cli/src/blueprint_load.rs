@@ -166,6 +166,8 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
         match verb.trim() {
             "read" | "readonly" => layer.fs.reads.push(pat),
             "readwrite" => layer.fs.writes.push(pat),
+            // The create/write split (FW-CAP9): modify existing, no create.
+            "write" => layer.fs.writes_no_create.push(pat),
             "allow" => {
                 layer.fs.writes.push(pat.clone());
                 exec_paths.push(pat);
@@ -176,11 +178,8 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
             }
             "exec" => exec_paths.push(pat),
             "deny" => layer.fs.subtract.push(pat),
-            // The create/write split (a distinct write-without-create grant) is not wired yet;
-            // fail loud rather than silently granting create.
-            "write" => bail!("rule verb `write` (create/write split) is not available yet; use `readwrite`"),
             other => bail!(
-                "unknown rule verb {other:?} in {raw:?} (known: read, readonly, readwrite, allow, readexec, exec, deny)"
+                "unknown rule verb {other:?} in {raw:?} (known: read, readonly, write, readwrite, allow, readexec, exec, deny)"
             ),
         }
     }
@@ -472,6 +471,7 @@ mod tests {
             rules: vec![
                 "readonly:/usr/**".into(),
                 "readwrite:~/project/**".into(),
+                "write:~/project/build".into(),
                 "readexec:/bin/ls".into(),
                 "exec:/bin/cat".into(),
                 "deny:~/.ssh".into(),
@@ -484,6 +484,7 @@ mod tests {
         assert_eq!(layer.fs.read_mode, Some(ReadMode::Closed));
         assert_eq!(layer.fs.reads, vec![pp("/usr/**"), pp("/bin/ls")]);
         assert_eq!(layer.fs.writes, vec![pp("/home/x/project/**")]);
+        assert_eq!(layer.fs.writes_no_create, vec![pp("/home/x/project/build")]);
         assert_eq!(layer.fs.subtract, vec![pp("/home/x/.ssh")]);
         assert_eq!(
             layer.exec,
@@ -528,7 +529,6 @@ mod tests {
             ..Default::default()
         };
         assert!(desugar_rules(&mut layer(&["bogus:/x"], None, None), &sigils).is_err());
-        assert!(desugar_rules(&mut layer(&["write:/x"], None, None), &sigils).is_err());
         assert!(desugar_rules(&mut layer(&["deny"], None, None), &sigils).is_err());
         // `mode` and `[fs] read-mode` in one layer is a loud conflict.
         assert!(desugar_rules(

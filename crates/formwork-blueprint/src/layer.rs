@@ -60,6 +60,9 @@ pub struct FsLayer {
     pub reads: Vec<PathPattern>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub writes: Vec<PathPattern>,
+    /// Read + modify-existing, no create (FW-CAP9); the `write` verb.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes_no_create: Vec<PathPattern>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtract: Vec<PathPattern>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -71,6 +74,7 @@ impl FsLayer {
         self.read_mode.is_none()
             && self.reads.is_empty()
             && self.writes.is_empty()
+            && self.writes_no_create.is_empty()
             && self.subtract.is_empty()
             && self.write_subtract.is_empty()
     }
@@ -114,6 +118,9 @@ pub fn merge(layers: &[BlueprintLayer]) -> Blueprint {
         }
         out.fs.reads.extend(layer.fs.reads.iter().cloned());
         out.fs.writes.extend(layer.fs.writes.iter().cloned());
+        out.fs
+            .writes_no_create
+            .extend(layer.fs.writes_no_create.iter().cloned());
         out.fs.subtract.extend(layer.fs.subtract.iter().cloned());
         out.fs
             .write_subtract
@@ -153,6 +160,7 @@ impl BlueprintLayer {
                 read_mode: Some(bp.fs.read_mode),
                 reads: bp.fs.reads.clone(),
                 writes: bp.fs.writes.clone(),
+                writes_no_create: bp.fs.writes_no_create.clone(),
                 subtract: bp.fs.subtract.clone(),
                 write_subtract: bp.fs.write_subtract.clone(),
             },
@@ -359,6 +367,7 @@ mod tests {
                 read_mode: ReadMode::AmbientMinusSubtract,
                 reads: vec![pp("/**")],
                 writes: vec![pp("/tmp/**")],
+                writes_no_create: vec![],
                 subtract: vec![pp("**/.env")],
                 write_subtract: vec![pp("**/.git/config")],
             },

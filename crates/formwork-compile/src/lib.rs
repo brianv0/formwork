@@ -35,6 +35,9 @@ pub struct CompileInput {
     pub read_mode: ReadMode,
     pub effective_reads: Vec<PathPattern>,
     pub writes: Vec<PathPattern>,
+    /// Read + modify-existing, no create (FW-CAP9). Read access is folded into `effective_reads`;
+    /// the write-without-create grant is carried separately for the backends to render.
+    pub writes_no_create: Vec<PathPattern>,
     pub subtract: Vec<PathPattern>,
     pub write_subtract: Vec<PathPattern>,
     /// The credential floor (FW-CRED2 path arm, FW-CRED4): every non-excluded catalog type's paths
@@ -52,6 +55,8 @@ impl CompileInput {
     fn from_blueprint(blueprint: &Blueprint, catalog: &ResolvedCatalog) -> Self {
         let mut reads = blueprint.fs.reads.clone();
         reads.extend(blueprint.fs.writes.iter().cloned());
+        // Write grants imply read; the no-create grant is a write grant too.
+        reads.extend(blueprint.fs.writes_no_create.iter().cloned());
         let floor_exempt: Vec<PathPattern> = catalog
             .types
             .iter()
@@ -67,6 +72,7 @@ impl CompileInput {
             read_mode: blueprint.fs.read_mode,
             effective_reads: canonicalize_set(&reads),
             writes: canonicalize_set(&blueprint.fs.writes),
+            writes_no_create: canonicalize_set(&blueprint.fs.writes_no_create),
             subtract: canonicalize_set(&blueprint.fs.subtract),
             write_subtract: canonicalize_set(&blueprint.fs.write_subtract),
             floor: canonicalize_set(&catalog.denied_paths(&blueprint.allow_credentials)),
@@ -428,6 +434,7 @@ fn compile_linux(
         read_mode: input.read_mode,
         reads: input.effective_reads.clone(),
         writes: input.writes.clone(),
+        writes_no_create: input.writes_no_create.clone(),
         subtract: canonicalize_set(&subtract),
         write_subtract: input.write_subtract.clone(),
         exec: exec_plan,
@@ -435,7 +442,7 @@ fn compile_linux(
         seccomp,
         no_new_privs: true,
     };
-    (ConfinerPolicy::Linux(policy), direct_ports)
+    (ConfinerPolicy::Linux(Box::new(policy)), direct_ports)
 }
 
 /// Serialize a compiled policy to canonical, compact JSON. Byte-identical for equal inputs
@@ -467,6 +474,7 @@ mod tests {
                 read_mode: ReadMode::Closed,
                 reads: vec![pp("/work/**")],
                 writes: vec![pp("/work/project/**")],
+                writes_no_create: vec![],
                 subtract: vec![pp("/work/.ssh/**")],
                 write_subtract: vec![pp("**/.git/hooks/**")],
             },

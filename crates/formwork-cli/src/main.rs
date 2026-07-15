@@ -194,6 +194,9 @@ impl BlueprintArgs {
                 read_mode: None,
                 reads: patterns("read", &self.read)?,
                 writes: patterns("write", &self.write)?,
+                // The write-without-create grant (FW-CAP9) is authored via the `write:` verb
+                // (`--rule`) or the nested `[fs] writes-no-create` key, not a dedicated sugar flag.
+                writes_no_create: Vec::new(),
                 subtract: patterns("subtract", &self.subtract)?,
                 write_subtract: patterns("write-subtract", &self.write_subtract)?,
             },

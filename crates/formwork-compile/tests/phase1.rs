@@ -27,6 +27,7 @@ fn rich_blueprint() -> Blueprint {
             read_mode: ReadMode::Closed,
             reads: vec![pp("/work/**")],
             writes: vec![pp("/work/project/**")],
+            writes_no_create: vec![],
             subtract: vec![pp("/work/project/.git/**"), pp("/work/.ssh/**")],
             write_subtract: vec![pp("**/.mcp.json")],
         },

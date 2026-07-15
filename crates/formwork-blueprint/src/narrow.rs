@@ -66,6 +66,8 @@ fn narrow_fs(parent: &FsBlueprint, req: &FsBlueprint) -> FsBlueprint {
     // Write-deny holes, like read+write holes, only ever grow under narrowing.
     let write_subtract = union_grants(&parent.write_subtract, &req.write_subtract);
     let writes = intersect_grants(&parent.writes, &req.writes);
+    // A weaker write grant narrows like any grant: a child keeps only what both allow.
+    let writes_no_create = intersect_grants(&parent.writes_no_create, &req.writes_no_create);
 
     // The narrower read mode wins (Closed < AmbientMinusSubtract).
     let (read_mode, reads) = match (parent.read_mode, req.read_mode) {
@@ -89,6 +91,7 @@ fn narrow_fs(parent: &FsBlueprint, req: &FsBlueprint) -> FsBlueprint {
         read_mode,
         reads: canonicalize_set(&reads),
         writes,
+        writes_no_create,
         subtract,
         write_subtract,
     }
@@ -349,6 +352,7 @@ mod tests {
             fs: FsBlueprint {
                 reads: vec![pp("/work/**")],
                 writes: vec![pp("/work/project/**")],
+                writes_no_create: vec![],
                 subtract: vec![pp("/work/.ssh/**")],
                 ..Default::default()
             },
