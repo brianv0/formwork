@@ -248,6 +248,48 @@ fn fw_e2e_039_write_subtract_reads_but_denies_writes() {
     );
 }
 
+/// FW-E2E-056: the `write` verb (create/write split, FW-CAP9) grants modify-existing but not
+/// create. Paired allow/deny against the real Seatbelt kernel -- report soundness is a probe, not
+/// the policy agreeing with itself (constitution: Testing).
+#[test]
+fn fw_e2e_056_write_no_create_modifies_but_cannot_create() {
+    let fx = Fixture::new("e2e056");
+    let dir = fx.root.join("logs");
+    fs::create_dir_all(&dir).unwrap();
+    let existing = dir.join("app.log");
+    fs::write(&existing, b"start\n").unwrap();
+
+    let blueprint = Blueprint {
+        fs: FsBlueprint {
+            read_mode: ReadMode::Closed,
+            reads: vec![pp(&fx.root)],
+            writes: Vec::new(),
+            writes_no_create: vec![pp(&dir)],
+            subtract: Vec::new(),
+            write_subtract: Vec::new(),
+        },
+        ..Blueprint::empty()
+    };
+    let policy = compile(&blueprint, &detect());
+
+    // Allow: appending to an existing file is a data write, not a create.
+    assert!(
+        sh_succeeds(&policy, &format!("echo more >> '{}'", existing.display())),
+        "write (no-create) must allow MODIFYING an existing file"
+    );
+    // Deny: creating a brand-new entry under the same grant is refused.
+    let newfile = dir.join("new.log");
+    assert!(
+        !sh_succeeds(&policy, &format!("echo hi > '{}'", newfile.display())),
+        "write (no-create) must DENY creating a new file (FW-CAP9)"
+    );
+    // A directory create is a create too.
+    assert!(
+        !sh_succeeds(&policy, &format!("mkdir '{}/sub'", dir.display())),
+        "write (no-create) must DENY creating a new directory (FW-CAP9)"
+    );
+}
+
 /// FW-E2E-005: a shell child, and its child, stay confined.
 #[test]
 fn fw_e2e_005_descendant_inheritance() {

@@ -241,3 +241,25 @@ def test_flat_rule_surface_equals_nested_fs(cli, tmp_path):
     b = cli("compile", "--blueprint", nested, "--target", "linux-v6")
     assert a.code == 0 and b.code == 0, (a.stderr, b.stderr)
     assert a.stdout == b.stdout, "flat rules must compile identically to the nested [fs] form"
+
+
+@pytest.mark.fw_e2e("FW-E2E-057")
+def test_mode_and_read_mode_compose_across_extends(cli, tmp_path):
+    """FW-BP7 + FW-BP2: `mode` and `[fs] read-mode` are two spellings of one posture. Across
+    layers they compose by last-wins (a child's `mode` overrides a base's `read-mode`, no error);
+    only both-in-ONE-layer is the loud conflict. Guards that the conflict check does not break
+    `extends`."""
+    (tmp_path / "base.toml").write_text('net = "deny"\n[fs]\nread-mode = "ambient-minus-subtract"\nreads = ["/usr/**"]\n')
+    child = tmp_path / "child.toml"
+    child.write_text('extends = ["base.toml"]\nmode = "strict-unveil"\nrules = ["readonly:/work/**"]\n')
+    r = cli("compile", "--blueprint", child, "--target", "linux-v6")
+    assert r.code == 0, r.stderr
+    policy = json.loads(r.stdout)["confiner"]
+    # The child's mode (strict-unveil -> closed) wins over the base's ambient read-mode.
+    assert policy["read-mode"] == "closed", "child `mode` must override base `read-mode` via last-wins"
+
+    # But both in the SAME layer is a loud conflict, not a silent pick.
+    same = tmp_path / "same.toml"
+    same.write_text('net = "deny"\nmode = "strict-unveil"\n[fs]\nread-mode = "closed"\n')
+    bad = cli("compile", "--blueprint", same, "--target", "linux-v6")
+    assert bad.code != 0 and "not both" in bad.stderr

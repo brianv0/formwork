@@ -249,8 +249,13 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     )?;
 
     if let ExecPlan::Allowlist { paths } = &policy.exec {
+        // Grant *only* Execute, not ReadFile: macOS `process-exec*` confers no read, so bundling
+        // ReadFile here would make the same `exec:` grant readable on Linux and not on macOS
+        // (FW-XR6 parity). A binary or script the loader must re-open to run then needs its content
+        // covered by a read grant -- the identical constraint on both backends. `readexec`/`allow`
+        // carry their own read grant, so they are unaffected.
         let exec_paths = expand_all(&paths.iter().map(root_of).collect::<Vec<_>>(), &[]);
-        created = add_path_rules(created, &exec_paths, AccessFs::Execute | AccessFs::ReadFile)?;
+        created = add_path_rules(created, &exec_paths, AccessFs::Execute.into())?;
     }
 
     // --- net grants ---

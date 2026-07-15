@@ -18,6 +18,28 @@ property and extends the vocabulary around it.
 New identifiers continue the `formwork.md` sequences and are minted here (this is their defining
 document until the FEP lands and folds into `formwork.md`, mirroring `fep-1.md` for FW-EGR/FW-FID5).
 
+## Grammar (the verb surface)
+
+One rule is one `"<verb>:<path>"` string, the same on a `--rule` flag, a `--set` fragment, and a
+file `rules = [...]` line. The path takes the same sigils as any grant (`~`, `$CWD`;
+[FW-BP5](formwork.md#fw-bp5)). Each verb desugars, at the CLI load edge, into the existing
+`Blueprint` fields — verbs are a surface onto the one model ([FW-BP1](formwork.md#fw-bp1)), never a
+second model — and the desugared form is what the pure merge and compiler see:
+
+| Verb | Grants (r=read w=modify c=create x=exec) | Desugars to |
+|---|---|---|
+| `read` / `readonly` | r | `fs.reads` |
+| `write` | r w | `fs.writes-no-create` ([FW-CAP9](#fw-cap9)) |
+| `readwrite` | r w c | `fs.writes` |
+| `allow` | r w c x | `fs.writes` + exec allow-list |
+| `readexec` | r x | `fs.reads` + exec allow-list |
+| `exec` | x | exec allow-list only |
+| `deny` | — (tombstone) | `fs.subtract` |
+
+`mode` is a friendlier alias of `[fs] read-mode`: `strict-unveil` → `closed`, `subtractive` →
+`ambient-minus-subtract` ([FW-BP7](#fw-bp7)). Every verb is also expressible in the nested `[fs]`
+table (e.g. `write` ↔ `writes-no-create`), so the two surfaces stay one model.
+
 ## Requirements
 
 | Req | Requirement |
@@ -37,7 +59,7 @@ Landed (black-box `formwork` CLI, compile-level so they run on any host):
 
 | Test | Scenario |
 |---|---|
-| <a id="fw-e2e-056"></a>**FW-E2E-056** create/write split | The `write` verb renders every `file-write-*` op except `file-write-create` on its path ([FW-CAP9](#fw-cap9)). |
+| <a id="fw-e2e-056"></a>**FW-E2E-056** create/write split | Compile-level: the `write` verb renders every `file-write-*` op except `file-write-create`. Enforcement (Seatbelt, paired allow/deny): under a `write` grant an existing file is modifiable but a new file/dir cannot be created ([FW-CAP9](#fw-cap9)). |
 | <a id="fw-e2e-057"></a>**FW-E2E-057** mode posture | `mode` compiles identically to the equivalent `[fs] read-mode`, for both values ([FW-BP7](#fw-bp7)). |
 | <a id="fw-e2e-058"></a>**FW-E2E-058** order independence | Rule order does not change the compiled policy; deny beats allow regardless ([FW-BP6](#fw-bp6)/[FW-CAP8](#fw-cap8)). |
 | <a id="fw-e2e-061"></a>**FW-E2E-061** surface parity | The flat rule surface and the nested `[fs]` table compile byte-identically ([FW-BP1](formwork.md#fw-bp1)). |
@@ -46,12 +68,49 @@ Reserved (minted with the tests as they land): `FW-E2E-059` explain provenance �
 any-depth rule platform-conditional · `FW-ADV-016` allow-cannot-override-deny · `FW-ADV-017`
 post-spawn create under a split dir denied.
 
+## Traceability (req → primary test)
+
+[FW-CAP8](#fw-cap8) → [FW-E2E-058](#fw-e2e-058) · [FW-CAP9](#fw-cap9) → [FW-E2E-056](#fw-e2e-056) ·
+[FW-BP6](#fw-bp6) → [FW-E2E-058](#fw-e2e-058), [FW-E2E-061](#fw-e2e-061) ·
+[FW-BP7](#fw-bp7) → [FW-E2E-057](#fw-e2e-057) · [FW-ISO9](#fw-iso9) → covered by the compiler exec
+tests + FW-XR6 parity below. [FW-FID6](#fw-fid6)/[FW-FID7](#fw-fid7) land with their tests.
+
+## Decisions (recorded per constitution Precedence & Conflicts)
+
+- **`deny` is a verb, not the rejected `subtract` synonym.** FEP-2 declined a free-floating `deny`
+  alias for `subtract` (`docs/fep2-plan.md` §8). In the verb model `deny` is a *first-class verb*
+  with a distinct meaning inherited from the unveil lineage: an additive override to **zero
+  permissions** — a tombstone — evaluated in the terminal deny layer ([FW-CAP8](#fw-cap8)). It
+  desugars to `subtract` because that is the mechanism, exactly as `readwrite` desugars to `writes`;
+  the surface verb is not a second name for the internal field. This visibly amends FEP-2's ruling
+  for the verb surface only; `subtract` remains the field/vocabulary word.
+- **`writes-no-create` is a new capability axis → a Concepts/Data-model decision at adoption.** The
+  create/write split ([FW-CAP9](#fw-cap9)) adds a `Blueprint` field and a serialized `LinuxPolicy`
+  field, which the constitution treats as Concepts (`FW-CAP1` closed vocabulary) and Data-model
+  surfaces. The change is additive/expand-only (every pre-FEP-3 blueprint compiles unchanged) and
+  pre-release (canary consumers), so no version bump — but folding into `formwork.md` §4 must add it
+  to the grammar and the Concepts list, not just cite an ID. (If the axis is judged not worth its
+  surface, it is one revert; the rest of the verb surface desugars onto existing fields with no
+  amendment.)
+- **Exec parity reached ([FW-XR6](formwork.md#fw-xr6)).** The Linux exec allow-list now grants
+  `Execute` only, not `Execute | ReadFile`, matching Seatbelt's read-free `process-exec*`. The same
+  `exec:` grant now behaves identically on both backends; a binary or script the loader must re-open
+  to run needs a separate read grant on either platform (documented, not a divergence).
+- **`mode` + `[fs] read-mode` in one layer is a loud conflict, by design.** They are two spellings
+  of one posture; picking a winner between spellings in a single layer would be arbitrary, so it
+  fails loud. Across layers (`extends`, CLI overrides) they compose by ordinary last-wins
+  ([FW-BP2](formwork.md#fw-bp2)) — the conflict is same-layer only, so it does not break `extends`
+  ([FW-E2E-057](#fw-e2e-057)).
+- **`Mode` is a distinct type from `ReadMode`.** It is the typed authoring surface for the `mode`
+  key (parse-don't-validate at the serde edge), one meaning per name; it maps to `ReadMode` and
+  carries no independent semantics. Kept as a two-line enum rather than an untyped string.
+
 ## Status
 
-Landing incrementally on the branch. Implemented so far: the flat verb-rule surface + `mode`
-posture ([FW-BP6](#fw-bp6)/[FW-BP7](#fw-bp7), verbs desugared onto the existing model), and the
-create/write split ([FW-CAP9](#fw-cap9)) across the pure types, the compiler, and both backends.
-Remaining: provenance + `explain` ([FW-FID6](#fw-fid6)), per-deny mechanism labels
-([FW-FID7](#fw-fid7)), and the black-box E2E tests. On adoption this folds into `formwork.md`
-(§4, §5, §10) and the numbering is re-confirmed against any other in-flight FEP
-(renumbering precedent: `docs/fep2-plan.md` §0).
+Landing incrementally on the branch. Implemented: the flat verb-rule surface + `mode` posture
+([FW-BP6](#fw-bp6)/[FW-BP7](#fw-bp7)), the create/write split ([FW-CAP9](#fw-cap9)) across the pure
+types, the compiler, and both backends with a Seatbelt paired allow/deny test, and exec parity
+([FW-XR6](formwork.md#fw-xr6)). Remaining: provenance + `explain` ([FW-FID6](#fw-fid6)) and per-deny
+mechanism labels ([FW-FID7](#fw-fid7)). On adoption this folds into `formwork.md` (§2, §4, §5, §10)
+with the Concepts/Data-model decision above, and the numbering is re-confirmed against any other
+in-flight FEP (renumbering precedent: `docs/fep2-plan.md` §0).
