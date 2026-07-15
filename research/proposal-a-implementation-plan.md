@@ -49,24 +49,54 @@
 - **`mode` maps to `read_mode`** (`strict-unveil`→`closed`, `subtractive`→`ambient-minus-subtract`);
   the nested `[fs]` surface stays valid (both coexist, unioned).
 - **The create/write split needs a new domain field**, `FsBlueprint.writes_no_create` (plus a matching
-  `LinuxPolicy`/`MacosPolicy` field) — so Proposal A touches the pure domain type *minimally*; it is not
-  purely a CLI change. Enforcement: Landlock drops `Make*` bits from the write mask for those paths
-  (split `write_access` at `crates/formwork-confine/src/linux/landlock.rs:178`); SBPL emits
-  `file-write-data`/`file-write-mode` but not `file-write-create` (`crates/formwork-compile/src/sbpl.rs:174-209`).
+  `LinuxPolicy`/`MacosPolicy` field, and a nested-`[fs]` key `writes-no-create` — see the FW-BP1 parity
+  note below) — so Proposal A touches the pure domain type *minimally*; it is not purely a CLI change.
+  Enforcement must be specified as a **full op/bit set**, not a two-op sketch (a `write` grant that can
+  only write data + chmod would be unable to delete, rename, or set times — a transparency break, `FW-TRA2`):
+  - **Landlock:** for `writes_no_create` paths, take today's `write_access` (`from_all(abi)` minus
+    `Execute`/`IoctlDev`, `crates/formwork-confine/src/linux/landlock.rs:165,178`) and drop **only** the
+    creation bits `MakeReg|MakeDir|MakeSym|MakeSock|MakeFifo|MakeBlock|MakeChar`; keep
+    `WriteFile|Truncate|ReadFile|ReadDir` (writes imply reads).
+  - **Seatbelt:** allow **all `file-write-*` operations except `file-write-create`** for those paths in
+    `render_writes` (`crates/formwork-compile/src/sbpl.rs:174-209`) — i.e. spell out the umbrella
+    (`file-write-data`,`-mode`,`-owner`,`-flags`,`-times`,`-unlink`,`-setugid`) minus `file-write-create`,
+    rather than the `(allow file-write* …)` wildcard.
+  - **Open semantic decision to settle in the FEP:** whether `write` includes **remove/rename**
+    (`RemoveFile`/`RemoveDir` on Landlock, `file-write-unlink` on Seatbelt). Default proposed: **include
+    them** (modify-existing spans delete/rename); `allow`/`readwrite` additionally grant create. Document
+    the choice; a create/write split test (Testing) must assert it on both backends.
 - **Exec verb semantics (corrected).** Pure `exec` (execute-without-read) **is** expressible on both
   backends — Seatbelt `render_exec` grants only `process-exec*` (`crates/formwork-compile/src/sbpl.rs:214-221`)
   and Landlock `AccessFs::Execute` is a distinct right. Today's Landlock allowlist ORs in `ReadFile`
   (`crates/formwork-confine/src/linux/landlock.rs:232`); a pure `exec` verb drops that `| ReadFile`,
   while `readexec` keeps a read grant. Caveat to document, not enforce: a dynamically-linked binary still
   needs read of itself + its libraries to actually launch (dyld/`ld.so`; `docs/spikes.md:40-50`).
-- **Provenance via a side-table, `Blueprint` unchanged.** Extend `merge` to also return per-resulting-pattern
-  source (`built-in`/`profile`/`file`/`cli`/`discovered`), reusing `ProvenanceEntry`
-  (`crates/formwork-blueprint/src/layer.rs:71-92`). Keeping `Blueprint` itself unchanged preserves `FW-FID4`.
+- **Provenance via a side-table, without breaking `merge`.** Do **not** change the signature of
+  `pub fn merge(layers: &[BlueprintLayer]) -> Blueprint` (`crates/formwork-blueprint/src/layer.rs:97`):
+  it has ~15 test callers plus the `from_blueprint` / `FW-E2E-041` refactor guard
+  (`crates/formwork-blueprint/src/layer.rs:133,355`) and the one production caller
+  (`crates/formwork-cli/src/blueprint_load.rs:64`). Add a **parallel** `merge_with_provenance(layers)
+  -> (Blueprint, ProvenanceMap)` (or thread an out-param) that returns per-resulting-pattern source
+  (`built-in`/`profile`/`file`/`cli`/`discovered`), reusing `ProvenanceEntry`
+  (`crates/formwork-blueprint/src/layer.rs:71-92`). `explain` calls the new function; the compile path
+  keeps calling plain `merge`, so `Blueprint`, `FW-FID4` determinism, and every existing test are untouched.
+- **Provenance must survive canonicalization.** `canonicalize_set` sorts, dedupes, and **drops any
+  pattern covered by another** (`crates/formwork-blueprint/src/path.rs:317-333`), so a dropped rule's
+  source is lost unless folded onto the surviving (covering) pattern. Define the fold: when pattern X is
+  dropped because Y covers it, attach X's provenance to Y (a pattern may then carry multiple sources).
 - **`formwork explain <path>`** is a new inspection subcommand (sibling to `compile --report-only`),
-  justified under `FW-CAP5`; it enforces nothing.
+  justified under `FW-CAP5`; it enforces nothing. It must **evaluate** the path against the merged model —
+  the winning rule is found via `covers`/`matches_path` with deny-terminal precedence
+  (`crates/formwork-blueprint/src/path.rs:163-234`), not a raw provenance-table lookup — then report that
+  rule's verb and folded provenance.
 - **Any-depth `**/`** stays (a)+(c): rule-level any-depth is a build error on Linux
   (`crates/formwork-confine/src/linux/landlock.rs:73-90`, `FW-INV6`), macOS-only as regex; `.env`-shaped
   shapes handled centrally via the catalog/backstop (`FW-CRED6`).
+- **FW-BP1 parity (both surfaces equivalent).** Every verb must be expressible in *both* the flat
+  `rules`/`--rule` surface and the nested `[fs]` table, or `FW-BP1` breaks. The only verb without a
+  pre-existing nested field is `write`, so the new `FsBlueprint.writes_no_create` field is exposed as the
+  nested key `writes-no-create` (serde kebab-case, `deny_unknown_fields`), not reachable only via the
+  `write:` verb. A parity test (Testing) asserts the two surfaces compile byte-identically.
 - **No constitution amendment** — new surface under `FW-BP1`; schema growth is additive/expand-only;
   new vocabulary (`verb`, `strict-unveil`) lives in the FEP/README, not `constitution.md`.
 - Proposed IDs above must be re-confirmed against any in-flight FEP at adoption (renumbering precedent:
@@ -89,21 +119,28 @@ Ordered so each step lands compiling, clippy-clean, and green before the next; e
    field (`crates/formwork-compile/src/policy.rs:34-101`) and compile mapping; split the Landlock write mask
    (`crates/formwork-confine/src/linux/landlock.rs:178`) and SBPL write rules
    (`crates/formwork-compile/src/sbpl.rs:174-209`).
-4. **Provenance + `explain`** — extend `merge` to emit a provenance side-table
-   (`crates/formwork-blueprint/src/layer.rs:97-128`); add the `explain` subcommand + handler
-   (`crates/formwork-cli/src/main.rs:50-119`).
+4. **Provenance + `explain`** — add a parallel `merge_with_provenance` alongside the unchanged `merge`
+   (`crates/formwork-blueprint/src/layer.rs:97-128`), folding a dropped pattern's source onto its covering
+   pattern through `canonicalize_set` (`crates/formwork-blueprint/src/path.rs:317-333`); add the `explain`
+   subcommand + handler that evaluates the path (`covers`/`matches_path`, deny-terminal) and reports the
+   winning verb + provenance (`crates/formwork-cli/src/main.rs:50-119`).
 5. **Report labels** — add `FW-FID7` per-deny mechanism labels and the snapshot-asymmetry / over-breadth
    note to `FidelityReport` (`crates/formwork-compile/src/report.rs:12-43`) and the compile path.
 6. **Docs + traceability** — FEP-3 draft minting the IDs, README/`formwork.md` surface notes, traceability rows.
 
 ## Testing
 
-- New (proposed): `FW-E2E-056` verb round-trip + create/write split (paired allow/deny probes on both
-  backends: create denied under `write`, allowed under `readwrite`); `FW-E2E-057` mode switch byte-deterministic;
-  `FW-E2E-058` order-independent profile stacking; `FW-E2E-059` `explain` provenance; `FW-E2E-060` any-depth
-  rule rejected on Linux / accepted on macOS; `FW-ADV-016` allow-cannot-override-deny; `FW-ADV-017` post-spawn
-  create under a split dir denied (Linux).
-- Regression: `FW-E2E-041` back-compat and `FW-E2E-027`/`FW-FID4` determinism must stay green after every step.
+- New (proposed): `FW-E2E-056` verb round-trip + create/write split — paired allow/deny probes on **both**
+  backends covering the full op set, not just create: under `write`, **create denied** but **modify /
+  truncate / chmod allowed** and the settled remove/rename decision asserted; under `readwrite`, create
+  allowed; `FW-E2E-057` mode switch byte-deterministic; `FW-E2E-058` order-independent profile stacking;
+  `FW-E2E-059` `explain` reports the winning verb + folded provenance for a path a covering rule swallowed;
+  `FW-E2E-060` any-depth rule rejected on Linux / accepted on macOS; `FW-E2E-061` **flat-vs-nested surface
+  parity** — the same grants authored as `rules`/`--rule` and as an `[fs]` table (incl. `writes-no-create`)
+  compile byte-identically (`FW-BP1`, analogous to `FW-E2E-043`); `FW-ADV-016` allow-cannot-override-deny;
+  `FW-ADV-017` post-spawn create under a split dir denied (Linux).
+- Regression: `FW-E2E-041` back-compat, `FW-E2E-043` CLI/file parity, and `FW-E2E-027`/`FW-FID4`
+  determinism must stay green after every step.
 - Harness: black-box `formwork` CLI via `py/` with FW-ID markers; kernel probes paired allow/deny (no mocks),
   per `constitution.md` Testing.
 
