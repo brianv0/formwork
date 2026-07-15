@@ -63,10 +63,8 @@ pub struct FsBlueprint {
     pub reads: Vec<PathPattern>,
     #[serde(default)]
     pub writes: Vec<PathPattern>,
-    /// Read + modify-existing, but NOT create (the create/write split, FW-CAP9): the `write` verb.
-    /// A weaker write grant than `writes` -- the agent may change files already present but cannot
-    /// create new entries under the grant. Enforced on both backends (Landlock drops the `Make*`
-    /// bits; Seatbelt allows every `file-write-*` op except `file-write-create`).
+    /// Read + modify-existing, but not create (the create/write split, FW-CAP9): the `write` verb.
+    /// A weaker `writes` -- change files that exist, plant no new ones.
     #[serde(default)]
     pub writes_no_create: Vec<PathPattern>,
     /// Sensitive paths denied even under a broad grant (read *and* write).

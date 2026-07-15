@@ -388,9 +388,8 @@ mod tests {
 
     #[test]
     fn narrowing_across_write_grades_is_conservative() {
-        // Cross-field: a full-write parent and a no-create child do not merge grades. Per-field
-        // intersection under-approximates (drops both) rather than over-approximate -- the sound,
-        // fail-closed direction the narrowing algebra is documented to take (never over-grants).
+        // Grades don't merge across fields: per-field intersection drops both rather than widen the
+        // no-create child into a full grant -- fail-closed, the direction narrowing must take.
         let full_parent = Blueprint {
             fs: FsBlueprint {
                 writes: vec![pp("/work/**")],

@@ -35,8 +35,7 @@ pub struct CompileInput {
     pub read_mode: ReadMode,
     pub effective_reads: Vec<PathPattern>,
     pub writes: Vec<PathPattern>,
-    /// Read + modify-existing, no create (FW-CAP9). Read access is folded into `effective_reads`;
-    /// the write-without-create grant is carried separately for the backends to render.
+    /// Read + modify-existing, no create (FW-CAP9); read access folds into `effective_reads`.
     pub writes_no_create: Vec<PathPattern>,
     pub subtract: Vec<PathPattern>,
     pub write_subtract: Vec<PathPattern>,

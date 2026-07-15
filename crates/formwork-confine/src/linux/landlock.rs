@@ -219,9 +219,8 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
 
     created = add_path_rules(created, &read_paths, read_access)?;
     created = add_path_rules(created, &write_paths, write_access)?;
-    // The create/write split (FW-CAP9): grant the write bits MINUS the `Make*` (create) rights, so
-    // an existing file can be modified but nothing new is created under the grant. `Make*` stays in
-    // `handled_fs`, so governed-but-ungranted == denied. Uses the same holes as `writes`.
+    // The create/write split (FW-CAP9): the write bits minus `Make*`. `Make*` stays in `handled_fs`,
+    // so governed-but-ungranted == denied. Same holes as `writes`.
     if !policy.writes_no_create.is_empty() {
         let make_bits = AccessFs::MakeReg
             | AccessFs::MakeDir
@@ -249,11 +248,9 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     )?;
 
     if let ExecPlan::Allowlist { paths } = &policy.exec {
-        // Grant *only* Execute, not ReadFile: macOS `process-exec*` confers no read, so bundling
-        // ReadFile here would make the same `exec:` grant readable on Linux and not on macOS
-        // (FW-XR6 parity). A binary or script the loader must re-open to run then needs its content
-        // covered by a read grant -- the identical constraint on both backends. `readexec`/`allow`
-        // carry their own read grant, so they are unaffected.
+        // Execute only, not ReadFile: macOS `process-exec*` confers no read, so bundling it would
+        // make the same `exec:` grant readable on Linux but not macOS (FW-XR6). `readexec`/`allow`
+        // carry their own read grant; a binary the loader must re-open needs read on either backend.
         let exec_paths = expand_all(&paths.iter().map(root_of).collect::<Vec<_>>(), &[]);
         created = add_path_rules(created, &exec_paths, AccessFs::Execute.into())?;
     }

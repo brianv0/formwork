@@ -102,9 +102,8 @@ const MACOS_WRITE_DEVICES: &[&str] = &[
     "/dev/fd",
 ];
 
-/// Every `file-write-*` operation except `file-write-create`: the create/write split (FW-CAP9). A
-/// `write` grant may modify data, chmod, chown, set flags/times, and unlink existing entries, but
-/// not create new ones -- the root `(deny file-write* ...)` keeps creation denied.
+/// The `file-write-*` ops a `write` grant allows: everything except `file-write-create` (FW-CAP9).
+/// Create stays denied by the root `(deny file-write* ...)`, which nothing here re-allows.
 const MACOS_WRITE_NO_CREATE_OPS: &[&str] = &[
     "file-write-data",
     "file-write-flags",
@@ -203,9 +202,7 @@ fn render_writes(
     for p in writes {
         b.push_str(&format!("(allow file-write* {})\n", filter(p)));
     }
-    // The create/write split (FW-CAP9): allow every file-write op EXCEPT create, so an existing
-    // file can be modified/chmod'd/unlinked but nothing new is created (the root deny above keeps
-    // create denied). Placed before the floor/subtract denies so those still win (last-match).
+    // Before the floor/subtract denies, so those still win by last-match (FW-CAP9).
     if !writes_no_create.is_empty() {
         b.push_str(";; write, no create (FW-CAP9): modify existing, never create\n");
         for p in writes_no_create {

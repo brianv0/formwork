@@ -179,7 +179,7 @@ def test_cwd_sigil_scopes_a_grant_to_the_launch_directory(cli, tmp_path):
     assert "$CWD resolves to" in from_root.stderr
 
 
-# --- FEP-3: the verb-based evaluation model (compile-level; enforcement is macOS/Landlock-gated) ---
+# --- FEP-3: filesystem capability rules (compile-level; enforcement is macOS/Landlock-gated) ---
 
 
 @pytest.mark.fw_e2e("FW-E2E-056")

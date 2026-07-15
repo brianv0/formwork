@@ -41,8 +41,7 @@ pub struct LinuxPolicy {
     /// Write grants already folded in.
     pub reads: Vec<PathPattern>,
     pub writes: Vec<PathPattern>,
-    /// Read + modify-existing, no create (FW-CAP9): the confiner grants these paths the write bits
-    /// minus `Make*`, so the agent can change existing files but not create new ones.
+    /// Read + modify-existing, no create (FW-CAP9): the write bits minus create, rendered per backend.
     pub writes_no_create: Vec<PathPattern>,
     pub subtract: Vec<PathPattern>,
     /// Write-denied but readable tamper vectors (FW-TRA7).
