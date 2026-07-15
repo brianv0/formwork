@@ -44,6 +44,18 @@ def test_gateway_unknown_server_is_a_loud_config_error(cli):
     assert "bogus" in result.stderr and "files" in result.stderr
 
 
+@pytest.mark.fw_e2e("FW-E2E-061")
+def test_rules_demo_compiles(cli):
+    """The verb-rule example (flat `rules` + `mode`, FEP-3) is a well-formed blueprint that compiles
+    like any other -- verbs desugar into the one model (FW-BP1)."""
+    result = cli("compile", "--blueprint", BLUEPRINTS / "rules-demo.toml", "--target", "macos", "--report-only")
+    assert result.code == 0, result.stderr
+    caps = json.loads(result.stdout)["per-capability"]
+    assert caps["fs-read"]["status"] == "enforced"
+    assert caps["exec"]["status"] == "enforced"  # readexec:/bin/** governs exec
+    assert caps["net-default-deny"]["status"] == "enforced"
+
+
 @pytest.mark.macos
 @pytest.mark.fw_e2e("FW-E2E-024")
 def test_agent_session_net_port_tier_enforced_on_macos(cli):

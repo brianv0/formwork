@@ -66,6 +66,8 @@ fn narrow_fs(parent: &FsBlueprint, req: &FsBlueprint) -> FsBlueprint {
     // Write-deny holes, like read+write holes, only ever grow under narrowing.
     let write_subtract = union_grants(&parent.write_subtract, &req.write_subtract);
     let writes = intersect_grants(&parent.writes, &req.writes);
+    // A weaker write grant narrows like any grant: a child keeps only what both allow.
+    let writes_no_create = intersect_grants(&parent.writes_no_create, &req.writes_no_create);
 
     // The narrower read mode wins (Closed < AmbientMinusSubtract).
     let (read_mode, reads) = match (parent.read_mode, req.read_mode) {
@@ -89,6 +91,7 @@ fn narrow_fs(parent: &FsBlueprint, req: &FsBlueprint) -> FsBlueprint {
         read_mode,
         reads: canonicalize_set(&reads),
         writes,
+        writes_no_create,
         subtract,
         write_subtract,
     }
@@ -349,6 +352,7 @@ mod tests {
             fs: FsBlueprint {
                 reads: vec![pp("/work/**")],
                 writes: vec![pp("/work/project/**")],
+                writes_no_create: vec![],
                 subtract: vec![pp("/work/.ssh/**")],
                 ..Default::default()
             },
@@ -356,5 +360,52 @@ mod tests {
             ..Blueprint::empty()
         };
         assert_eq!(s.narrow(&s), s.canonicalize());
+    }
+
+    #[test]
+    fn writes_no_create_intersects_like_a_grant() {
+        // A weaker write grant (FW-CAP9) narrows per-field like any other grant (FW-CAP2).
+        let parent = Blueprint {
+            fs: FsBlueprint {
+                writes_no_create: vec![pp("/work/**")],
+                ..Default::default()
+            },
+            ..Blueprint::empty()
+        };
+        let req = Blueprint {
+            fs: FsBlueprint {
+                writes_no_create: vec![pp("/work/logs/**"), pp("/etc/**")],
+                ..Default::default()
+            },
+            ..Blueprint::empty()
+        };
+        // /work/logs survives (covered by parent /work); /etc is dropped.
+        assert_eq!(
+            parent.narrow(&req).fs.writes_no_create,
+            vec![pp("/work/logs/**")]
+        );
+    }
+
+    #[test]
+    fn narrowing_across_write_grades_is_conservative() {
+        // Grades don't merge across fields: per-field intersection drops both rather than widen the
+        // no-create child into a full grant -- fail-closed, the direction narrowing must take.
+        let full_parent = Blueprint {
+            fs: FsBlueprint {
+                writes: vec![pp("/work/**")],
+                ..Default::default()
+            },
+            ..Blueprint::empty()
+        };
+        let no_create_child = Blueprint {
+            fs: FsBlueprint {
+                writes_no_create: vec![pp("/work/build")],
+                ..Default::default()
+            },
+            ..Blueprint::empty()
+        };
+        let n = full_parent.narrow(&no_create_child);
+        assert!(n.fs.writes.is_empty());
+        assert!(n.fs.writes_no_create.is_empty());
     }
 }

@@ -49,6 +49,7 @@ fn net_deny_policy(read_dirs: &[&Path]) -> CompiledPolicy {
             read_mode: ReadMode::Closed,
             reads,
             writes: vec![],
+            writes_no_create: vec![],
             subtract: vec![],
             write_subtract: vec![],
         },

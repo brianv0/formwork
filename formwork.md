@@ -115,6 +115,8 @@ The compiler is the single authority that maps this blueprint to concrete mechan
 
 The Blueprint is a typed, versioned schema with **multiple surfaces onto one model** ([FW-BP1](#fw-bp1)): the TOML file is one serialization; the CLI flags are another, applied as an override layer. It is deliberately a standard serialization, not a bespoke DSL — a Blueprint is data with no control flow, and a policy language would pay SELinux's legibility cost to describe a struct. If real logic is ever required, the answer is an existing configuration language, never a new one.
 
+FEP-3 adds a third way to write the same grants: flat **verb** rules (`"<verb>:<path>"`, e.g. `deny:~/.ssh`) and a `mode` posture ([FW-BP6](fep-3.md#fw-bp6)/[FW-BP7](fep-3.md#fw-bp7)), plus the create/write split they make expressible ([FW-CAP9](fep-3.md#fw-cap9)). Verbs desugar into the fields above at the CLI edge; the grammar lives in `fep-3.md`.
+
 Two semantics choices, both settled earlier in design:
 
 - **EACCES denial is acceptable; invisibility is preferred only where free.** Filesystem denials surface as the platform's natural errno (EACCES on Landlock, EPERM/EACCES on Seatbelt). Formwork does not build a mount-namespace or FUSE layer to fake ENOENT. The one place invisibility *is* cheap and *is* required is MCP tool/resource/prompt shading at the gateway, where an ungranted item is simply absent from the listing. For the sensitive *subset*, metadata is also denied where a backend supports it (Seatbelt `file-read-metadata`), so a credential's existence, size, and mtime do not leak through `stat` ([FW-CAP7](#fw-cap7)); where a backend cannot (Landlock), that residual is reported Partial rather than left as a blanket concession.

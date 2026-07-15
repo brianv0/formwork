@@ -316,6 +316,7 @@ async fn fw_e2e_019_backend_confinement_recursion() {
             read_mode: ReadMode::Closed,
             reads: vec![repo_glob],
             writes: vec![],
+            writes_no_create: vec![],
             subtract: vec![],
             write_subtract: vec![],
         },

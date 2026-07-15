@@ -46,6 +46,7 @@ fn closed_policy(
             read_mode: ReadMode::Closed,
             reads,
             writes,
+            writes_no_create: Vec::new(),
             subtract,
             write_subtract: Vec::new(),
         },

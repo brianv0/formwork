@@ -1,0 +1,20 @@
+# Filesystem grants as flat verb rules (FEP-3): one "<verb>:<path>" string per rule, the same on a
+# `--rule` flag or a file line. Verbs desugar into the Blueprint at the CLI edge, so this compiles
+# like the nested `[fs]` form. Full grammar: fep-3.md.
+#
+#   formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos --report-only
+
+net = "deny"
+
+# `mode` aliases `[fs] read-mode`: `unveil` = empty universe (only grants readable);
+# `subtractive` = ambient reads minus the credential floor.
+mode = "unveil"
+
+rules = [
+    "readonly:/usr/**",     # ambient toolchain, read-only
+    "readexec:/bin/**",     # system tools: read + execute
+    "readwrite:$CWD/**",    # the project: read + write + create
+    "write:$CWD/var/log",   # modify existing files, but not create new ones (FW-CAP9)
+    "deny:$CWD/.env",       # deny is terminal -- wins inside the readwrite grant above (FW-CAP8)
+    "deny:~/.ssh",
+]

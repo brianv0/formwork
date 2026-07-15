@@ -219,6 +219,26 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
 
     created = add_path_rules(created, &read_paths, read_access)?;
     created = add_path_rules(created, &write_paths, write_access)?;
+    // The create/write split (FW-CAP9): the write bits minus `Make*`. `Make*` stays in `handled_fs`,
+    // so governed-but-ungranted == denied. Same holes as `writes`.
+    if !policy.writes_no_create.is_empty() {
+        let make_bits = AccessFs::MakeReg
+            | AccessFs::MakeDir
+            | AccessFs::MakeSym
+            | AccessFs::MakeSock
+            | AccessFs::MakeFifo
+            | AccessFs::MakeBlock
+            | AccessFs::MakeChar;
+        let write_nc_paths = expand_all(
+            &policy
+                .writes_no_create
+                .iter()
+                .map(root_of)
+                .collect::<Vec<_>>(),
+            &write_holes,
+        );
+        created = add_path_rules(created, &write_nc_paths, write_access & !make_bits)?;
+    }
     // The safe device nodes are writable regardless of mode (e.g. `cmd > /dev/null`).
     let dev_paths: Vec<PathBuf> = RW_DEVICES.iter().map(PathBuf::from).collect();
     created = add_path_rules(
@@ -228,8 +248,11 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     )?;
 
     if let ExecPlan::Allowlist { paths } = &policy.exec {
+        // Execute only, not ReadFile: macOS `process-exec*` confers no read, so bundling it would
+        // make the same `exec:` grant readable on Linux but not macOS (FW-XR6). `readexec`/`allow`
+        // carry their own read grant; a binary the loader must re-open needs read on either backend.
         let exec_paths = expand_all(&paths.iter().map(root_of).collect::<Vec<_>>(), &[]);
-        created = add_path_rules(created, &exec_paths, AccessFs::Execute | AccessFs::ReadFile)?;
+        created = add_path_rules(created, &exec_paths, AccessFs::Execute.into())?;
     }
 
     // --- net grants ---

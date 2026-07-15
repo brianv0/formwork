@@ -63,6 +63,10 @@ pub struct FsBlueprint {
     pub reads: Vec<PathPattern>,
     #[serde(default)]
     pub writes: Vec<PathPattern>,
+    /// Read + modify-existing, but not create (the create/write split, FW-CAP9): the `write` verb.
+    /// A weaker `writes` -- change files that exist, plant no new ones.
+    #[serde(default)]
+    pub writes_no_create: Vec<PathPattern>,
     /// Sensitive paths denied even under a broad grant (read *and* write).
     #[serde(default)]
     pub subtract: Vec<PathPattern>,
@@ -81,6 +85,26 @@ pub enum ReadMode {
     #[default]
     Closed,
     AmbientMinusSubtract,
+}
+
+/// The reads posture, written in flat verb rules (FW-BP1): a friendlier alias of
+/// [`ReadMode`]. `unveil` starts from an empty universe (only grants readable);
+/// `subtractive` starts from ambient reads minus the catalog floor. A posture, not a rule -- the
+/// loader maps it onto `fs.read_mode` before merge, so it carries no independent semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    Unveil,
+    Subtractive,
+}
+
+impl Mode {
+    pub fn read_mode(self) -> ReadMode {
+        match self {
+            Mode::Unveil => ReadMode::Closed,
+            Mode::Subtractive => ReadMode::AmbientMinusSubtract,
+        }
+    }
 }
 
 /// `Deny` is the fail-closed default (FW-XR3); `Ports` allows direct TCP connect to a port set
@@ -328,6 +352,7 @@ impl Blueprint {
                 read_mode: self.fs.read_mode,
                 reads: canonicalize_set(&self.fs.reads),
                 writes: canonicalize_set(&self.fs.writes),
+                writes_no_create: canonicalize_set(&self.fs.writes_no_create),
                 subtract: canonicalize_set(&self.fs.subtract),
                 write_subtract: canonicalize_set(&self.fs.write_subtract),
             },

@@ -149,6 +149,15 @@ struct BlueprintArgs {
     /// Net posture: "deny" or "ports:443,8080".
     #[arg(long)]
     net: Option<String>,
+    /// Append a flat capability rule "<verb>:<path>" (repeatable), e.g. --rule "deny:~/.ssh". The
+    /// same vocabulary as a file `rules` line (FW-BP1). Verbs: read/readonly, readwrite, allow,
+    /// readexec, exec, deny.
+    #[arg(long)]
+    rule: Vec<String>,
+    /// Reads posture: "unveil" (empty universe) or "subtractive" (ambient minus catalog);
+    /// a friendlier alias of `[fs] read-mode`.
+    #[arg(long)]
+    mode: Option<String>,
     /// Extra base blueprints layered under the CLI overrides (repeatable, resolved against cwd).
     #[arg(long)]
     extends: Vec<String>,
@@ -177,10 +186,17 @@ impl BlueprintArgs {
         Ok(BlueprintLayer {
             // Sigils expand in `extends` too, matching a file's `extends` (FW-BP1/FW-BP5 parity).
             extends: self.extends.iter().map(|e| sigils.expand(e)).collect(),
+            // Verbs and `mode` are desugared into `fs`/`exec` by the loader (blueprint_load), the
+            // same edge that resolves a file's `rules`/`mode`, so `--rule` and a file agree.
+            rules: self.rule.clone(),
+            mode: self.mode.as_deref().map(parse_mode).transpose()?,
             fs: formwork_blueprint::FsLayer {
                 read_mode: None,
                 reads: patterns("read", &self.read)?,
                 writes: patterns("write", &self.write)?,
+                // The write-without-create grant (FW-CAP9) is authored via the `write:` verb
+                // (`--rule`) or the nested `[fs] writes-no-create` key, not a dedicated sugar flag.
+                writes_no_create: Vec::new(),
                 subtract: patterns("subtract", &self.subtract)?,
                 write_subtract: patterns("write-subtract", &self.write_subtract)?,
             },
@@ -213,6 +229,14 @@ fn parse_net(s: &str) -> Result<NetPosture> {
         return Ok(NetPosture::Ports(ports));
     }
     bail!("--net accepts \"deny\" or \"ports:<p1,p2,…>\", got {s:?}")
+}
+
+fn parse_mode(s: &str) -> Result<formwork_blueprint::Mode> {
+    match s {
+        "unveil" => Ok(formwork_blueprint::Mode::Unveil),
+        "subtractive" => Ok(formwork_blueprint::Mode::Subtractive),
+        other => bail!("--mode accepts \"unveil\" or \"subtractive\", got {other:?}"),
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]

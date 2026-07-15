@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Blueprint, EnvPosture, ExecPosture, McpPolicy, NetPosture, PathPattern, ReadMode};
+use crate::{
+    Blueprint, EnvPosture, ExecPosture, McpPolicy, Mode, NetPosture, PathPattern, ReadMode,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -20,6 +22,16 @@ pub struct BlueprintLayer {
     /// layer, FW-DISC6): TOML has no `None`, and empty sections are noise in a reviewed artifact.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extends: Vec<String>,
+    /// Flat verb rules (FW-BP1): one `"<verb>:<path>"` string per rule, the same on a `--rule` flag
+    /// and a file line. Like `extends`, this is meaningful only in an authored layer; the CLI loader
+    /// desugars it into `fs`/`exec` (and empties it) before merge, so the pure merge and compiler
+    /// never see verbs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<String>,
+    /// A friendlier alias of `fs.read-mode` (FW-BP1). Loader-mapped onto `fs.read_mode` and emptied
+    /// before merge; setting both in one layer is a loud error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
     #[serde(default, skip_serializing_if = "FsLayer::is_empty")]
     pub fs: FsLayer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +60,9 @@ pub struct FsLayer {
     pub reads: Vec<PathPattern>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub writes: Vec<PathPattern>,
+    /// Read + modify-existing, no create (FW-CAP9); the `write` verb.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes_no_create: Vec<PathPattern>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtract: Vec<PathPattern>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -59,6 +74,7 @@ impl FsLayer {
         self.read_mode.is_none()
             && self.reads.is_empty()
             && self.writes.is_empty()
+            && self.writes_no_create.is_empty()
             && self.subtract.is_empty()
             && self.write_subtract.is_empty()
     }
@@ -102,6 +118,9 @@ pub fn merge(layers: &[BlueprintLayer]) -> Blueprint {
         }
         out.fs.reads.extend(layer.fs.reads.iter().cloned());
         out.fs.writes.extend(layer.fs.writes.iter().cloned());
+        out.fs
+            .writes_no_create
+            .extend(layer.fs.writes_no_create.iter().cloned());
         out.fs.subtract.extend(layer.fs.subtract.iter().cloned());
         out.fs
             .write_subtract
@@ -135,10 +154,13 @@ impl BlueprintLayer {
     pub fn from_blueprint(bp: &Blueprint) -> BlueprintLayer {
         BlueprintLayer {
             extends: Vec::new(),
+            rules: Vec::new(),
+            mode: None,
             fs: FsLayer {
                 read_mode: Some(bp.fs.read_mode),
                 reads: bp.fs.reads.clone(),
                 writes: bp.fs.writes.clone(),
+                writes_no_create: bp.fs.writes_no_create.clone(),
                 subtract: bp.fs.subtract.clone(),
                 write_subtract: bp.fs.write_subtract.clone(),
             },
@@ -345,6 +367,7 @@ mod tests {
                 read_mode: ReadMode::AmbientMinusSubtract,
                 reads: vec![pp("/**")],
                 writes: vec![pp("/tmp/**")],
+                writes_no_create: vec![],
                 subtract: vec![pp("**/.env")],
                 write_subtract: vec![pp("**/.git/config")],
             },
