@@ -18,9 +18,11 @@ doctrine that requires judgment.
 ## Concepts   [closed list; amendments by proposal only]
 This system has exactly these concepts, each with one name and one Rust type:
 - **Blueprint** (`formwork_blueprint::Blueprint`) — the capability grant: a finite enumeration
-  of fs read/write/subtract, net posture, exec posture, environment posture, per-server MCP
-  visibility, credential exclusions (`allow-credentials`, [FW-CRED5](formwork.md#fw-cred5)), and the discovery
-  auto-widen zone ([FW-DISC4](formwork.md#fw-disc4)). No mechanism turns natural language into a grant ([FW-CAP1](formwork.md#fw-cap1)).
+  of fs read / write / write-without-create / subtract, net posture, exec posture, environment
+  posture, per-server MCP visibility, credential exclusions (`allow-credentials`, [FW-CRED5](formwork.md#fw-cred5)),
+  and the discovery auto-widen zone ([FW-DISC4](formwork.md#fw-disc4)). The fs write axis has two grades — full
+  write (create included) and write-without-create ([FW-CAP9](formwork.md#fw-cap9), added by FEP-3). No
+  mechanism turns natural language into a grant ([FW-CAP1](formwork.md#fw-cap1)).
   Assembled by a deterministic layer merge — baseline → `extends` chain → file → CLI
   overrides ([FW-BP2](formwork.md#fw-bp2), added by FEP-2); path sets merge additively and deny beats allow.
   (Environment posture — [FW-ENV1](formwork.md#fw-env1)/2, added by FEP-1 — is applied at spawn by the Launcher;
@@ -98,6 +100,10 @@ compatibility discipline concentrate here.
   "permissions". **sigil** = a path-pattern authoring token expanded at the CLI
   edge before compilation (`~`→`$HOME`, `$CWD`→launch dir, [FW-BP5](formwork.md#fw-bp5)), never general
   environment interpolation.
+- The fs write axis has two grades, each with one name: **write** = full write, create
+  included (field `writes`, flag `--write`, verb `readwrite`) · **modify** = write existing
+  files but not create ([FW-CAP9](formwork.md#fw-cap9); field `writes-no-create`, verb `modify`). Never spell the
+  weaker grade as a bare `write` — everything named "write" grants create.
 - **floor** = the catalog-derived deny/strip set under every Blueprint ([FW-CRED4](formwork.md#fw-cred4)) · **strip**
   = the Launcher removing an env var pre-spawn (absent, not empty — [FW-INV7](formwork.md#fw-inv7)/9) · **exclude** =
   the typed `allow-credentials` lift, the only un-deny ([FW-CRED5](formwork.md#fw-cred5)) · **learn** = an enforced

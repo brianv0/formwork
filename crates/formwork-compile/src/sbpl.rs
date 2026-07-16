@@ -102,7 +102,7 @@ const MACOS_WRITE_DEVICES: &[&str] = &[
     "/dev/fd",
 ];
 
-/// The `file-write-*` ops a `write` grant allows: everything except `file-write-create` (FW-CAP9).
+/// The `file-write-*` ops a `modify` grant allows: everything except `file-write-create` (FW-CAP9).
 /// Create stays denied by the root `(deny file-write* ...)`, which nothing here re-allows.
 const MACOS_WRITE_NO_CREATE_OPS: &[&str] = &[
     "file-write-data",
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn writes_no_create_allows_modify_but_not_create() {
-        // FW-CAP9 create/write split: a `write` grant renders every file-write op except create.
+        // FW-CAP9 create/write split: a `modify` grant renders every file-write op except create.
         let mut i = input();
         i.writes = vec![];
         i.writes_no_create = vec![pp("/data/**")];

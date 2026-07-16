@@ -248,7 +248,7 @@ fn fw_e2e_039_write_subtract_reads_but_denies_writes() {
     );
 }
 
-/// FW-E2E-056: the `write` verb (create/write split, FW-CAP9) grants modify-existing but not
+/// FW-E2E-056: the `modify` verb (create/write split, FW-CAP9) grants modify-existing but not
 /// create. Paired allow/deny against the real Seatbelt kernel -- report soundness is a probe, not
 /// the policy agreeing with itself (constitution: Testing).
 #[test]

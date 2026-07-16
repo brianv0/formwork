@@ -53,13 +53,13 @@ examples/
 The blueprints above use the nested `[fs]` table. The same filesystem grants can be written as a
 flat list of **verb rules** — one `"<verb>:<path>"` string per rule — which is the *same vocabulary*
 on a `--rule` flag and a file line, so a policy reads the same however you author it (`FW-BP1`). See
-`blueprints/rules-demo.toml` and [`fep-3.md`](../fep-3.md) for the full grammar.
+`blueprints/rules-demo.toml` and `formwork.md` (§4, §5) for the full grammar.
 
 | Verb | Grants | Nested-`[fs]` equivalent |
 |---|---|---|
 | `read` / `readonly` | read | `reads` |
-| `write` | read + modify, **no create** | `writes-no-create` |
 | `readwrite` | read + write + create | `writes` |
+| `modify` | read + modify, **no create** | `writes-no-create` |
 | `allow` | read + write + create + exec | `writes` + `exec` allow-list |
 | `readexec` | read + execute | `reads` + `exec` allow-list |
 | `exec` | execute only | `exec` allow-list |
@@ -89,9 +89,9 @@ the base; everything else refines it.
 formwork run --blueprint examples/blueprints/agent-session.toml \
   --rule "deny:$CWD/secrets" --rule "deny:$CWD/.env.production" -- claude --dangerously-skip-permissions
 
-# Let the agent EDIT an existing dir but not CREATE new files under it (create/write split, FW-CAP9):
+# Let the agent EDIT existing files but not CREATE new ones (create/write split, FW-CAP9):
 formwork run --blueprint examples/blueprints/agent-session.toml \
-  --rule "write:$CWD/var/log" -- <agent>
+  --rule "modify:$CWD/var/log/app.log" -- <agent>
 
 # Flip a blueprint to unveil (empty universe) and hand-pick what's readable/runnable:
 formwork run --blueprint examples/blueprints/agent-session.toml --mode unveil \
@@ -114,6 +114,12 @@ formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos 
 
 # Compile a Linux policy on a Mac (or vice-versa) to review it before enforcing — pure, no kernel:
 formwork compile --blueprint examples/blueprints/rules-demo.toml --target linux-v6 --report-only
+
+# Ask why one path is granted or denied — the deciding rule and the layer it came from (FW-FID6):
+formwork explain --blueprint examples/blueprints/rules-demo.toml '$CWD/.env'
+# Overrides apply here too, so you can check a deny before running under it (deny is terminal, FW-CAP8):
+formwork explain --blueprint examples/blueprints/agent-session.toml \
+  --rule "deny:$CWD/secrets/**" "$CWD/secrets/key"
 ```
 
 Every `--rule` value is the exact string a file `rules = [...]` line would hold, so a recipe you

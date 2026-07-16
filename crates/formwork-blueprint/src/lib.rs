@@ -7,6 +7,7 @@ mod launcher;
 mod layer;
 mod narrow;
 mod path;
+mod provenance;
 
 pub use catalog::{Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP};
 pub use discovery::{
@@ -17,6 +18,7 @@ pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
 pub use narrow::intersect_grants;
 pub use path::{canonicalize_set, PathError, PathPattern};
+pub use provenance::{merge_with_provenance, Explanation, Provenance, RuleSource, Verdict};
 
 use std::collections::BTreeMap;
 
@@ -63,7 +65,7 @@ pub struct FsBlueprint {
     pub reads: Vec<PathPattern>,
     #[serde(default)]
     pub writes: Vec<PathPattern>,
-    /// Read + modify-existing, but not create (the create/write split, FW-CAP9): the `write` verb.
+    /// Read + modify-existing, but not create (the create/write split, FW-CAP9): the `modify` verb.
     /// A weaker `writes` -- change files that exist, plant no new ones.
     #[serde(default)]
     pub writes_no_create: Vec<PathPattern>,

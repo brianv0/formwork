@@ -183,10 +183,10 @@ def test_cwd_sigil_scopes_a_grant_to_the_launch_directory(cli, tmp_path):
 
 
 @pytest.mark.fw_e2e("FW-E2E-056")
-def test_write_verb_splits_create_from_modify(cli, tmp_path):
-    """FW-CAP9: the `write` verb grants modify/unlink/chmod on a path but never create."""
+def test_modify_verb_splits_create_from_modify(cli, tmp_path):
+    """FW-CAP9: the `modify` verb grants modify/unlink/chmod on a path but never create."""
     bp = tmp_path / "s.toml"
-    bp.write_text('net = "deny"\nmode = "unveil"\nrules = ["readonly:/usr/**", "write:/data/logs"]\n')
+    bp.write_text('net = "deny"\nmode = "unveil"\nrules = ["readonly:/usr/**", "modify:/data/logs"]\n')
     r = cli("compile", "--blueprint", bp, "--target", "macos")
     assert r.code == 0, r.stderr
     sbpl = json.loads(r.stdout)["confiner"]["sbpl"]
@@ -263,3 +263,46 @@ def test_mode_and_read_mode_compose_across_extends(cli, tmp_path):
     same.write_text('net = "deny"\nmode = "unveil"\n[fs]\nread-mode = "closed"\n')
     bad = cli("compile", "--blueprint", same, "--target", "linux-v6")
     assert bad.code != 0 and "not both" in bad.stderr
+
+
+@pytest.mark.fw_e2e("FW-E2E-059")
+def test_explain_names_winning_rule_and_provenance(cli, tmp_path):
+    """FW-FID6: `explain <path>` reports the read/write verdict, the rule that decides each under
+    the deny-terminal model (FW-CAP8), and the layer that rule came from -- without enforcing."""
+    bp = tmp_path / "s.toml"
+    bp.write_text(
+        'net = "deny"\nmode = "unveil"\n'
+        'rules = ["readwrite:/work/**", "modify:/var/log/app.log"]\n'
+    )
+
+    # A granted path names the file rule and its origin.
+    granted = json.loads(cli("explain", "--blueprint", bp, "/work/src/main.rs").stdout)
+    assert granted["read"]["decision"] == "granted"
+    assert granted["read"]["rule"] == "/work/**"
+    assert granted["read"]["source"] == {"origin": "file", "name": str(bp)}
+
+    # A `--rule` deny is terminal (deny beats the file's readwrite) and is attributed to the CLI.
+    denied = json.loads(
+        cli("explain", "--blueprint", bp, "/work/src/secret", "--rule", "deny:/work/src/secret").stdout
+    )
+    assert denied["read"]["decision"] == "denied"
+    assert denied["read"]["source"] == {"origin": "cli"}
+    assert denied["write"]["decision"] == "denied"
+
+    # The credential floor is a built-in, un-liftable deny (the backstop shape `**/credentials`).
+    floored = json.loads(cli("explain", "--blueprint", bp, "/work/vault/credentials").stdout)
+    assert floored["read"]["decision"] == "denied"
+    assert floored["read"]["source"] == {"origin": "built-in"}
+    assert "credential floor" in floored["read"]["rule"]
+
+    # An unlisted path under `unveil` (empty universe) is hidden, not ambient.
+    hidden = json.loads(cli("explain", "--blueprint", bp, "/etc/hosts").stdout)
+    assert hidden["read"]["decision"] == "hidden"
+
+    # Exec is a separate axis (FW-ISO9): an `exec:` grant shows execute even where read is closed.
+    execd = json.loads(
+        cli("explain", "--blueprint", bp, "/usr/bin/git", "--rule", "exec:/usr/bin/git").stdout
+    )
+    assert execd["exec"]["decision"] == "granted"
+    assert execd["exec"]["source"] == {"origin": "cli"}
+    assert execd["read"]["decision"] == "hidden", "exec confers execute only, not read"

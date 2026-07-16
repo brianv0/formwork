@@ -6,6 +6,7 @@
 //! formwork run     --blueprint s.toml -- cmd args…   # spawn-confined
 //! formwork enforce-self --blueprint s.toml -- cmd…   # confine-self, then exec
 //! formwork gateway --blueprint s.toml --server files -- cmd…  # MCP policy proxy over stdio
+//! formwork explain --blueprint s.toml <path>          # why a path is granted/denied (dry-run)
 //! ```
 //!
 //! The capability blueprint is passed with `--blueprint`; `--spec` is accepted as a back-compat
@@ -13,9 +14,9 @@
 //! `--set '<toml>'` fragments and the sugar flags (`--read/--write/--subtract/--write-subtract/`
 //! `--allow-cred/--net/--extends`) layer over the file, additively, deny-beats-allow.
 //!
-//! `detect`/`compile` don't enforce and run on any host (including compiling a Linux policy on a Mac);
-//! `run`/`enforce-self`/`gateway` need a real confiner and error honestly where the backend is
-//! unimplemented.
+//! `detect`/`compile`/`explain` don't enforce and run on any host (including compiling a Linux policy
+//! on a Mac); `run`/`enforce-self`/`gateway` need a real confiner and error honestly where the
+//! backend is unimplemented.
 
 mod blueprint_load;
 mod learn;
@@ -116,6 +117,17 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
+    /// Explain one path against the merged blueprint without enforcing (FW-FID6): print the read,
+    /// write, and exec verdict, the rule that decides each under the deny-terminal model (FW-CAP8),
+    /// and the layer that rule came from. Reflects the merged blueprint (file, `extends`, overrides,
+    /// credential floor) like `compile`, not the session-only denies `run` adds (the dynamic
+    /// env-file-ref deny FW-CRED3, and policy-input write-protection FW-XR8). Same override surface.
+    Explain {
+        #[command(flatten)]
+        blueprint: BlueprintArgs,
+        /// The path to explain (sigils `~`/`$CWD` expand as in a grant).
+        path: String,
+    },
 }
 
 /// One blueprint, two surfaces (FW-BP1): the file plus the CLI override layer. `--set` fragments
@@ -150,8 +162,8 @@ struct BlueprintArgs {
     #[arg(long)]
     net: Option<String>,
     /// Append a flat capability rule "<verb>:<path>" (repeatable), e.g. --rule "deny:~/.ssh". The
-    /// same vocabulary as a file `rules` line (FW-BP1). Verbs: read/readonly, readwrite, allow,
-    /// readexec, exec, deny.
+    /// same vocabulary as a file `rules` line (FW-BP1). Verbs: read/readonly, readwrite, modify
+    /// (write without create), allow, readexec, exec, deny.
     #[arg(long)]
     rule: Vec<String>,
     /// Reads posture: "unveil" (empty universe) or "subtractive" (ambient minus catalog);
@@ -174,6 +186,17 @@ impl BlueprintArgs {
         blueprint_load::load_stack(&self.blueprint, &self.set, sugar, &sigils)
     }
 
+    /// As [`Self::load`], but also returns the per-layer provenance for `explain` (FW-FID6).
+    fn load_with_provenance(
+        &self,
+        home: &str,
+    ) -> Result<(Blueprint, formwork_blueprint::Provenance)> {
+        let cwd = cwd()?;
+        let sigils = blueprint_load::Sigils::new(home, &cwd);
+        let sugar = self.sugar_layer(&sigils)?;
+        blueprint_load::load_stack_with_provenance(&self.blueprint, &self.set, sugar, &sigils)
+    }
+
     fn sugar_layer(&self, sigils: &blueprint_load::Sigils) -> Result<BlueprintLayer> {
         let patterns = |flag: &str, values: &[String]| -> Result<Vec<PathPattern>> {
             values
@@ -194,7 +217,7 @@ impl BlueprintArgs {
                 read_mode: None,
                 reads: patterns("read", &self.read)?,
                 writes: patterns("write", &self.write)?,
-                // The write-without-create grant (FW-CAP9) is authored via the `write:` verb
+                // The write-without-create grant (FW-CAP9) is authored via the `modify:` verb
                 // (`--rule`) or the nested `[fs] writes-no-create` key, not a dedicated sugar flag.
                 writes_no_create: Vec::new(),
                 subtract: patterns("subtract", &self.subtract)?,
@@ -316,6 +339,7 @@ fn main() -> Result<()> {
         Cmd::Learn { .. } => "learn",
         Cmd::Accept { .. } => "accept",
         Cmd::Gateway { .. } => "gateway",
+        Cmd::Explain { .. } => "explain",
     };
     // One correlation id per invocation, propagated to every layer's events via the current span.
     let _root = tracing::info_span!("formwork", run_id = std::process::id(), cmd).entered();
@@ -354,7 +378,28 @@ fn main() -> Result<()> {
             server,
             argv,
         } => gateway(blueprint, server, argv)?,
+        Cmd::Explain { blueprint, path } => explain(blueprint, path)?,
     }
+    Ok(())
+}
+
+/// Explain one path against the merged blueprint (FW-FID6), no enforcement. Evaluates the
+/// deny-terminal model (FW-CAP8) against the authored -- not enforcement-canonicalized -- grants,
+/// so the rule it names is the one the operator wrote. The credential floor is a built-in,
+/// un-liftable deny, resolved here the way `compile --report-only` resolves it. Scope matches
+/// `compile`: the session-only denies `prepare_session` adds (FW-CRED3 env-file refs, FW-XR8
+/// policy-input write-protection) are not applied -- explain reflects the blueprint, not a run.
+fn explain(args: BlueprintArgs, path: String) -> Result<()> {
+    let home = home();
+    let (blueprint, provenance) = args.load_with_provenance(&home)?;
+    let cwd = cwd()?;
+    let target = PathPattern::parse(&blueprint_load::Sigils::new(&home, &cwd).expand(&path))
+        .with_context(|| format!("explaining {path:?}"))?;
+    let catalog =
+        ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
+    let floor = catalog.floor_type_of(&blueprint.allow_credentials, &target);
+    let explanation = provenance.explain(&blueprint, target.base(), floor);
+    println!("{}", serde_json::to_string_pretty(&explanation)?);
     Ok(())
 }
 
