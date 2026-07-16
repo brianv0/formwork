@@ -114,6 +114,12 @@ formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos 
 
 # Compile a Linux policy on a Mac (or vice-versa) to review it before enforcing — pure, no kernel:
 formwork compile --blueprint examples/blueprints/rules-demo.toml --target linux-v6 --report-only
+
+# Ask why one path is granted or denied — the deciding rule and the layer it came from (FW-FID6):
+formwork explain --blueprint examples/blueprints/rules-demo.toml '$CWD/.env'
+# Overrides apply here too, so you can check a deny before running under it (deny is terminal, FW-CAP8):
+formwork explain --blueprint examples/blueprints/agent-session.toml \
+  --rule "deny:$CWD/secrets/**" "$CWD/secrets/key"
 ```
 
 Every `--rule` value is the exact string a file `rules = [...]` line would hold, so a recipe you

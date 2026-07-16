@@ -212,6 +212,7 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 | <a id="fw-fid2"></a>**FW-FID2** Dry-run / audit | Produce the compiled policy and report without enforcing (CI on non-capable boxes; cross-platform policy development). |
 | <a id="fw-fid3"></a>**FW-FID3** Runtime observability | Emit a structured record of grants and denials at runtime, suitable for a host's journal when embedded, or standalone logging otherwise. |
 | <a id="fw-fid4"></a>**FW-FID4** Deterministic compile | The same blueprint compiles to a byte-identical policy and report. |
+| <a id="fw-fid6"></a>**FW-FID6** Rule provenance & explain | Each effective fs rule carries the layer it came from — `built-in \| profile \| file \| cli \| discovered`. `formwork explain <path>` reports the read and write verdict for a path, the rule that decides each under the deny-terminal model ([FW-CAP8](#fw-cap8)), and that rule's provenance, without enforcing. The provenance is a side table beside the merged Blueprint, so the compiler and its determinism ([FW-FID4](#fw-fid4)) are untouched. Extends [FW-CAP5](#fw-cap5) inspectability; the layer tag reuses the discovery provenance idea ([FW-DISC6](#fw-disc6)). *(Added by FEP-3.)* |
 
 ### 5.7 Environment (FW-ENV)
 
@@ -395,6 +396,8 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-061"></a>**FW-E2E-061: Rule/table parity ([FW-BP1](#fw-bp1)).** Grants authored as flat verb rules and as the nested `[fs]` table compile byte-identically. Pass: byte-identical policy from both. Fail: divergence.
 
+<a id="fw-e2e-059"></a>**FW-E2E-059: Explain names the winning rule and provenance ([FW-FID6](#fw-fid6)).** `explain <path>` over a layered blueprint reports, per path, the read/write verdict, the deciding rule, and its origin: a granted path names the file rule; a `--rule` deny is terminal and attributed to `cli`; a credential-floor path is denied as `built-in`; an unlisted path under `unveil` is hidden, not ambient. Pass: each verdict names the right rule and origin without enforcing. Fail: a wrong rule/origin, or a deny that does not win.
+
 ### 7.8 Credential catalog & launcher
 
 <a id="fw-e2e-045"></a>**FW-E2E-045: Path credential denied and itemized.** Under the default catalog, `~/.aws/credentials` is read. Pass: read denied (EACCES); operator channel names type `aws`; agent sees a bare EACCES with no annotation. Fail: read succeeds, or the agent-facing error names the type.
@@ -543,6 +546,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-FID2](#fw-fid2) Dry-run / audit | [FW-E2E-026](#fw-e2e-026) | 027 |
 | [FW-FID3](#fw-fid3) Runtime observability | [FW-E2E-024](#fw-e2e-024) | — |
 | [FW-FID4](#fw-fid4) Deterministic compile | [FW-E2E-027](#fw-e2e-027) | 026 |
+| [FW-FID6](#fw-fid6) Rule provenance & explain | [FW-E2E-059](#fw-e2e-059) | [FW-CAP5](#fw-cap5), [FW-CAP8](#fw-cap8) |
 | [FW-ENV1](#fw-env1) Environment axis | [FW-E2E-036](#fw-e2e-036) | [FW-FID1](#fw-fid1) |
 | [FW-ENV2](#fw-env2) Default secret-shaped scrub | [FW-E2E-036](#fw-e2e-036) | [FW-TRA2](#fw-tra2) |
 | [FW-BP1](#fw-bp1) One model, many surfaces | [FW-E2E-043](#fw-e2e-043) | 042 |
@@ -602,6 +606,6 @@ Kernel-mechanism-first, honesty-first, reuse-validated-early:
 
 9. **Blueprints, the credential catalog, and discovery** (FEP-2): the layered Blueprint model with `extends`, a CLI override surface, and path sigils ([FW-BP1](#fw-bp1)–5), the typed credential catalog enforced across the confiner and the launcher arm with per-type report labels and per-platform honesty ([FW-CRED1](#fw-cred1)–9), and observe-then-widen discovery bounded by the catalog floor ([FW-DISC1](#fw-disc1)–6; [FW-INV7](#fw-inv7)–10) — landed and folded into this document (§2, §4, §5.8–5.10, §6, §7.7–7.10), verified on real Seatbelt + the unified-log denial feed ([FW-E2E-041](#fw-e2e-041)..055, [FW-ADV-012](#fw-adv-012)..015). On Linux the catalog's path arm rides whatever carries fs enforcement, with any-depth floor rows reported Partial per [FW-CRED9](#fw-cred9). Credential brokering remains deferred (§11).
 
-10. **Filesystem capability rules** (FEP-3): a flat verb-rule grammar and a `mode` posture over the existing model ([FW-BP6](#fw-bp6)/[FW-BP7](#fw-bp7)), the three-layer deny-terminal evaluation named as a first-class property ([FW-CAP8](#fw-cap8), [FW-INV11](#fw-inv11)), the create/write split ([FW-CAP9](#fw-cap9)) and exec-as-a-verb with cross-backend parity ([FW-ISO9](#fw-iso9)/[FW-XR6](#fw-xr6)) — landed and folded into this document (§4, §5.2–5.3, §5.8, §6, §7.7, §9, §10), with a Seatbelt paired allow/deny probe for the split ([FW-E2E-056](#fw-e2e-056)..058, [FW-E2E-061](#fw-e2e-061)). Rule provenance + `formwork explain` ([FW-FID6](fep-3.md#fw-fid6)) and per-deny mechanism labels ([FW-FID7](fep-3.md#fw-fid7)) remain deferred in `fep-3.md`.
+10. **Filesystem capability rules** (FEP-3): a flat verb-rule grammar and a `mode` posture over the existing model ([FW-BP6](#fw-bp6)/[FW-BP7](#fw-bp7)), the three-layer deny-terminal evaluation named as a first-class property ([FW-CAP8](#fw-cap8), [FW-INV11](#fw-inv11)), the create/write split ([FW-CAP9](#fw-cap9)), exec-as-a-verb with cross-backend parity ([FW-ISO9](#fw-iso9)/[FW-XR6](#fw-xr6)), and rule provenance + `formwork explain` ([FW-FID6](#fw-fid6)) — landed and folded into this document (§4, §5.2–5.3, §5.6, §5.8, §6, §7.7, §9, §10), with a Seatbelt paired allow/deny probe for the split ([FW-E2E-056](#fw-e2e-056)..058, [FW-E2E-061](#fw-e2e-061)) and a dry-run explain probe ([FW-E2E-059](#fw-e2e-059)). One proposed item, per-deny mechanism labels, is parked: on macOS every deny is uniformly LSM-enforced (the label carries no information), and its Linux-only disclosures reference machinery not yet built — revisit if a Landlock test kernel lands.
 
 If steps 1–4 pass, Formwork is a transparent, reusable filesystem confiner that behaves the same on both platforms and tells the truth about itself. If steps 5–7 pass, it is a complete agent sandbox: one privileged broker, everything else in a mould, egress forced through a policy gateway, and every claim backed by a mechanism or reported as a gap.

@@ -7,6 +7,7 @@ mod launcher;
 mod layer;
 mod narrow;
 mod path;
+mod provenance;
 
 pub use catalog::{Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP};
 pub use discovery::{
@@ -17,6 +18,7 @@ pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
 pub use narrow::intersect_grants;
 pub use path::{canonicalize_set, PathError, PathPattern};
+pub use provenance::{merge_with_provenance, Explanation, Provenance, RuleSource, Verdict};
 
 use std::collections::BTreeMap;
 

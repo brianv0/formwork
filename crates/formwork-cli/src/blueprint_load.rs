@@ -8,7 +8,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use formwork_blueprint::{Blueprint, BlueprintLayer, ExecPosture, PathPattern};
+use formwork_blueprint::{
+    merge_with_provenance, Blueprint, BlueprintLayer, ExecPosture, PathPattern, Provenance,
+    RuleSource,
+};
 
 /// Load the file's layer stack (extends chain flattened, bases first) and merge, with no CLI
 /// overrides. The single-file case degenerates to exactly the pre-layering behavior (FW-E2E-041).
@@ -31,40 +34,28 @@ pub fn load_stack(
     sugar: BlueprintLayer,
     sigils: &Sigils,
 ) -> Result<Blueprint> {
-    let mut layers = Vec::new();
-    let mut visiting = Vec::new();
-    resolve_file(path, sigils, &mut visiting, &mut layers)?;
-    // Relative `extends` in a CLI override (no file to sit beside) resolve against the launch
-    // directory -- the same path `$CWD` expands to.
-    let cwd = Path::new(sigils.cwd);
-    for fragment in sets {
-        let mut value: toml::Value = toml::from_str(fragment)
-            .with_context(|| format!("parsing --set fragment {fragment:?}"))?;
-        sigils.expand_value(&mut value);
-        let layer: BlueprintLayer = value
-            .try_into()
-            .with_context(|| format!("interpreting --set fragment {fragment:?}"))?;
-        resolve_layer(layer, cwd, sigils, &mut visiting, &mut layers)?;
-    }
-    // A discovered layer sits beside its blueprint and applies from the next run on
-    // (FW-DISC4/6). It loads above the file (learned refinements) and below CLI overrides, and
-    // only with valid provenance -- a grant nobody can attribute is refused loud.
-    let discovered = crate::learn::discovered_path(path);
-    if discovered.exists() {
-        let layer = parse_discovered_layer(&discovered, sigils)?;
-        tracing::info!(
-            file = %discovered.display(),
-            reads = layer.fs.reads.len(),
-            writes = layer.fs.writes.len(),
-            "discovered layer loaded (grants carry discovery provenance)"
-        );
-        layers.push(layer);
-    }
-    resolve_layer(sugar, cwd, sigils, &mut visiting, &mut layers)?;
-    let blueprint = formwork_blueprint::merge(&layers);
+    let layers = load_layers(path, sets, sugar, sigils)?;
+    let plain: Vec<BlueprintLayer> = layers.into_iter().map(|(_, l)| l).collect();
+    validate(formwork_blueprint::merge(&plain))
+}
 
-    // A typo'd credential type would silently stay blocked -- fail-closed but intent-hiding, the
-    // same trap as a typo'd gateway server name. Validate at the edge (parse, don't validate).
+/// Same stack as [`load_stack`], but each layer keeps the [`RuleSource`] it came from so `explain`
+/// (FW-FID6) can name which layer decides a path. The merged Blueprint is identical to
+/// `load_stack`'s (FW-FID4); the [`Provenance`] is a side table.
+pub fn load_stack_with_provenance(
+    path: &Path,
+    sets: &[String],
+    sugar: BlueprintLayer,
+    sigils: &Sigils,
+) -> Result<(Blueprint, Provenance)> {
+    let layers = load_layers(path, sets, sugar, sigils)?;
+    let (blueprint, provenance) = merge_with_provenance(&layers);
+    Ok((validate(blueprint)?, provenance))
+}
+
+/// A typo'd credential type would silently stay blocked -- fail-closed but intent-hiding, the same
+/// trap as a typo'd gateway server name. Validate at the edge (parse, don't validate).
+fn validate(blueprint: Blueprint) -> Result<Blueprint> {
     let catalog = formwork_blueprint::Catalog::builtin();
     for t in &blueprint.allow_credentials {
         if !catalog.is_known_type(t) {
@@ -78,13 +69,78 @@ pub fn load_stack(
     Ok(blueprint)
 }
 
+/// Resolve the whole layer stack, each tagged with its origin (FW-FID6): the named file, its
+/// `extends` bases (profiles), the discovered layer, and every `--set`/sugar CLI override.
+fn load_layers(
+    path: &Path,
+    sets: &[String],
+    sugar: BlueprintLayer,
+    sigils: &Sigils,
+) -> Result<Vec<(RuleSource, BlueprintLayer)>> {
+    let mut layers = Vec::new();
+    let mut visiting = Vec::new();
+    resolve_file(
+        path,
+        RuleSource::File(path.display().to_string()),
+        sigils,
+        &mut visiting,
+        &mut layers,
+    )?;
+    // Relative `extends` in a CLI override (no file to sit beside) resolve against the launch
+    // directory -- the same path `$CWD` expands to.
+    let cwd = Path::new(sigils.cwd);
+    for fragment in sets {
+        let mut value: toml::Value = toml::from_str(fragment)
+            .with_context(|| format!("parsing --set fragment {fragment:?}"))?;
+        sigils.expand_value(&mut value);
+        let layer: BlueprintLayer = value
+            .try_into()
+            .with_context(|| format!("interpreting --set fragment {fragment:?}"))?;
+        resolve_layer(
+            layer,
+            RuleSource::Cli,
+            cwd,
+            sigils,
+            &mut visiting,
+            &mut layers,
+        )?;
+    }
+    // A discovered layer sits beside its blueprint and applies from the next run on
+    // (FW-DISC4/6). It loads above the file (learned refinements) and below CLI overrides, and
+    // only with valid provenance -- a grant nobody can attribute is refused loud.
+    let discovered = crate::learn::discovered_path(path);
+    if discovered.exists() {
+        let layer = parse_discovered_layer(&discovered, sigils)?;
+        tracing::info!(
+            file = %discovered.display(),
+            reads = layer.fs.reads.len(),
+            writes = layer.fs.writes.len(),
+            "discovered layer loaded (grants carry discovery provenance)"
+        );
+        layers.push((
+            RuleSource::Discovered(discovered.display().to_string()),
+            layer,
+        ));
+    }
+    resolve_layer(
+        sugar,
+        RuleSource::Cli,
+        cwd,
+        sigils,
+        &mut visiting,
+        &mut layers,
+    )?;
+    Ok(layers)
+}
+
 /// Depth-first post-order: every base lands before the layer that extends it, so the extending
 /// layer's contributions sit higher in the stack (FW-BP2 as amended).
 fn resolve_file(
     path: &Path,
+    source: RuleSource,
     sigils: &Sigils,
     visiting: &mut Vec<PathBuf>,
-    out: &mut Vec<BlueprintLayer>,
+    out: &mut Vec<(RuleSource, BlueprintLayer)>,
 ) -> Result<()> {
     let canon = std::fs::canonicalize(path)
         .with_context(|| format!("resolving blueprint {}", path.display()))?;
@@ -107,18 +163,20 @@ fn resolve_file(
     let base_dir = canon.parent().map(Path::to_path_buf).unwrap_or_default();
 
     visiting.push(canon);
-    resolve_layer(layer, &base_dir, sigils, visiting, out)?;
+    resolve_layer(layer, source, &base_dir, sigils, visiting, out)?;
     visiting.pop();
     Ok(())
 }
 
 /// Resolve one layer's `extends` (relative to `base_dir`), pushing bases then the layer itself.
+/// The layer carries `source`; its `extends` bases are profiles named by their path.
 fn resolve_layer(
     mut layer: BlueprintLayer,
+    source: RuleSource,
     base_dir: &Path,
     sigils: &Sigils,
     visiting: &mut Vec<PathBuf>,
-    out: &mut Vec<BlueprintLayer>,
+    out: &mut Vec<(RuleSource, BlueprintLayer)>,
 ) -> Result<()> {
     for base in std::mem::take(&mut layer.extends) {
         let base_path = if Path::new(&base).is_absolute() {
@@ -126,11 +184,17 @@ fn resolve_layer(
         } else {
             base_dir.join(&base)
         };
-        resolve_file(&base_path, sigils, visiting, out)
-            .with_context(|| format!("resolving extends {base:?}"))?;
+        resolve_file(
+            &base_path,
+            RuleSource::Profile(base.clone()),
+            sigils,
+            visiting,
+            out,
+        )
+        .with_context(|| format!("resolving extends {base:?}"))?;
     }
     desugar_rules(&mut layer, sigils)?;
-    out.push(layer);
+    out.push((source, layer));
     Ok(())
 }
 
@@ -505,13 +569,15 @@ mod tests {
             let mut out = Vec::new();
             resolve_layer(
                 layer,
+                RuleSource::Cli,
                 Path::new("/work"),
                 &sigils,
                 &mut Vec::new(),
                 &mut out,
             )
             .unwrap();
-            formwork_blueprint::merge(&out)
+            let plain: Vec<BlueprintLayer> = out.into_iter().map(|(_, l)| l).collect();
+            formwork_blueprint::merge(&plain)
         };
         assert_eq!(load(flat), load(nested));
     }

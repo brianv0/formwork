@@ -1,36 +1,30 @@
-# FEP-3 (partially landed): filesystem capability rules
+# FEP-3 (landed): filesystem capability rules
 
-**Formwork Enhancement Proposal 3.** Companion to `formwork.md` (design + end-to-end spec) and
-`constitution.md` (doctrine).
+**Formwork Enhancement Proposal 3 — landed in full.** Companion to `formwork.md`
+(design + end-to-end spec) and `constitution.md` (doctrine).
 
-The filesystem **rule grammar** has landed and been folded into `formwork.md`: a flat
-`"<verb>:<path>"` vocabulary and a `mode` posture, desugared into the existing `Blueprint` model at
-the CLI edge, with access evaluated **hide → allow → deny-terminal**. What folded where:
+Everything this FEP proposed has been implemented and **folded into `formwork.md`**:
 
-- flat verb rules + the `mode` posture — `formwork.md` §4, §5.8
-  ([FW-BP6](formwork.md#fw-bp6)/[FW-BP7](formwork.md#fw-bp7)).
-- three-layer deny-terminal evaluation and the **create/write split** (the `write` verb /
-  `writes-no-create` field) — §4, §5.2
-  ([FW-CAP8](formwork.md#fw-cap8)/[FW-CAP9](formwork.md#fw-cap9)), with the structural-floor
-  invariant [FW-INV11](formwork.md#fw-inv11) (§6).
-- **exec as a verb**, execute-without-read on both backends ([FW-XR6](formwork.md#fw-xr6) parity) —
-  §5.3 ([FW-ISO9](formwork.md#fw-iso9)).
-- tests [FW-E2E-056](formwork.md#fw-e2e-056)..058 and [FW-E2E-061](formwork.md#fw-e2e-061) — §7.7,
-  with traceability in §10.
+- **flat verb rules + the `mode` posture** — a `"<verb>:<path>"` vocabulary and an
+  `unveil`/`subtractive` posture, desugared into the existing `Blueprint` model at the
+  CLI edge: §4, §5.8 ([FW-BP6](formwork.md#fw-bp6)/[FW-BP7](formwork.md#fw-bp7)).
+- **three-layer deny-terminal evaluation and the create/write split** (the `write` verb /
+  `writes-no-create` field): §4, §5.2 ([FW-CAP8](formwork.md#fw-cap8)/[FW-CAP9](formwork.md#fw-cap9)),
+  with the structural-floor invariant [FW-INV11](formwork.md#fw-inv11) (§6).
+- **exec as a verb**, execute-without-read on both backends ([FW-XR6](formwork.md#fw-xr6)
+  parity): §5.3 ([FW-ISO9](formwork.md#fw-iso9)).
+- **rule provenance + `formwork explain`** — each effective rule carries its layer
+  (`built-in | profile | file | cli | discovered`) and a dry-run `explain <path>` names the
+  deciding rule and its origin: §5.6 ([FW-FID6](formwork.md#fw-fid6)).
+- tests [FW-E2E-056](formwork.md#fw-e2e-056)..058, [FW-E2E-059](formwork.md#fw-e2e-059),
+  and [FW-E2E-061](formwork.md#fw-e2e-061) — §7.7, with traceability in §10.
 
-What remains here are the **two deferred subsystems** — they need new *runtime* machinery
-(a provenance path and a report-labelling pass), so they are genuinely follow-up.
-
-## Deferred requirements
-
-| Req | Requirement |
-|---|---|
-| <a id="fw-fid6"></a>**FW-FID6** Rule provenance & explain | Every effective rule carries provenance — `built-in \| profile \| file \| cli \| discovered`. `formwork explain <path>` reports the winning rule (evaluated via the deny-terminal model, [FW-CAP8](formwork.md#fw-cap8)), its verb, and its provenance, without enforcing. Extends [FW-CAP5](formwork.md#fw-cap5) inspectability; reuses the discovery provenance machinery ([FW-DISC6](formwork.md#fw-disc6)). |
-| <a id="fw-fid7"></a>**FW-FID7** Per-deny mechanism labels | The FidelityReport labels each deny by mechanism (`enforced-via-LSM` / `enforced-via-enumeration` / `enforced-via-overmount` / `partial`) and discloses the Linux snapshot asymmetry (allows may go stale post-spawn; denies cannot) and hole-ancestor over-breadth. Extends [FW-XR1](formwork.md#fw-xr1)/[FW-XR6](formwork.md#fw-xr6). |
-
-Reserved test IDs (minted with the work): `FW-E2E-059` explain provenance · `FW-E2E-060` any-depth
-rule platform-conditional · `FW-ADV-016` allow-cannot-override-deny · `FW-ADV-017` post-spawn create
-under a split dir denied.
+One proposed item is **parked**, not landed: a per-deny mechanism-label pass on the
+FidelityReport (`FW-FID7`, with reserved tests `FW-E2E-060` / `FW-ADV-016` / `FW-ADV-017`).
+It is lopsided across backends — on macOS every deny is uniformly LSM-enforced so the label
+carries no information, and its Linux-only disclosures (snapshot asymmetry, hole-ancestor
+over-breadth, overmount references) depend on machinery not yet built. Revisit if a Landlock
+test kernel lands; the numbers are held for it.
 
 ## Decisions (recorded per constitution Precedence & Conflicts)
 
@@ -58,7 +52,7 @@ under a split dir denied.
 
 - **Constitution Concepts / Data-model.** The create/write split ([FW-CAP9](formwork.md#fw-cap9))
   added a `Blueprint` field (`writes-no-create`) and a serialized `LinuxPolicy` field. Folding into
-  `formwork.md` (§4 grammar, §5.2, Concepts-grade content) is done here; the matching
-  `constitution.md` Concepts-list amendment — the closed capability vocabulary now admits the write
-  grade — remains an open, human-reviewed decision. The change is additive/expand-only (every
-  pre-FEP-3 blueprint compiles unchanged) and pre-release (canary consumers), so no version bump.
+  `formwork.md` (§4 grammar, §5.2, Concepts-grade content) is done; the matching `constitution.md`
+  Concepts-list amendment — the closed capability vocabulary now admits the write grade — remains an
+  open, human-reviewed decision. The change is additive/expand-only (every pre-FEP-3 blueprint
+  compiles unchanged) and pre-release (canary consumers), so no version bump.
