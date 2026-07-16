@@ -522,7 +522,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-ISO6](#fw-iso6) Two postures | [FW-E2E-001](#fw-e2e-001) | — |
 | [FW-ISO7](#fw-iso7) Capability detection | [FW-E2E-025](#fw-e2e-025), 026 | INV6 |
 | [FW-ISO8](#fw-iso8) Anti-shedding baseline | [FW-ADV-001](#fw-adv-001) | 002, INV2 |
-| [FW-ISO9](#fw-iso9) Exec as a verb | [FW-E2E-056](#fw-e2e-056) | [FW-XR6](#fw-xr6) |
+| [FW-ISO9](#fw-iso9) Exec as a verb | [FW-E2E-061](#fw-e2e-061) | [FW-XR6](#fw-xr6) |
 | [FW-GW1](#fw-gw1) Transport-agnostic backends | [FW-E2E-010](#fw-e2e-010) | 019 |
 | [FW-GW2](#fw-gw2) Tool shading | [FW-E2E-013](#fw-e2e-013), 014 | ADV-004 |
 | [FW-GW3](#fw-gw3) Full-surface policy | [FW-E2E-015](#fw-e2e-015), 016, 017 | — |
