@@ -183,10 +183,10 @@ def test_cwd_sigil_scopes_a_grant_to_the_launch_directory(cli, tmp_path):
 
 
 @pytest.mark.fw_e2e("FW-E2E-056")
-def test_write_verb_splits_create_from_modify(cli, tmp_path):
-    """FW-CAP9: the `write` verb grants modify/unlink/chmod on a path but never create."""
+def test_modify_verb_splits_create_from_modify(cli, tmp_path):
+    """FW-CAP9: the `modify` verb grants modify/unlink/chmod on a path but never create."""
     bp = tmp_path / "s.toml"
-    bp.write_text('net = "deny"\nmode = "unveil"\nrules = ["readonly:/usr/**", "write:/data/logs"]\n')
+    bp.write_text('net = "deny"\nmode = "unveil"\nrules = ["readonly:/usr/**", "modify:/data/logs"]\n')
     r = cli("compile", "--blueprint", bp, "--target", "macos")
     assert r.code == 0, r.stderr
     sbpl = json.loads(r.stdout)["confiner"]["sbpl"]
@@ -272,7 +272,7 @@ def test_explain_names_winning_rule_and_provenance(cli, tmp_path):
     bp = tmp_path / "s.toml"
     bp.write_text(
         'net = "deny"\nmode = "unveil"\n'
-        'rules = ["readwrite:/work/**", "write:/work/logs/app.log"]\n'
+        'rules = ["readwrite:/work/**", "modify:/var/log/app.log"]\n'
     )
 
     # A granted path names the file rule and its origin.

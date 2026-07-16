@@ -60,7 +60,7 @@ pub struct FsLayer {
     pub reads: Vec<PathPattern>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub writes: Vec<PathPattern>,
-    /// Read + modify-existing, no create (FW-CAP9); the `write` verb.
+    /// Read + modify-existing, no create (FW-CAP9); the `modify` verb.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub writes_no_create: Vec<PathPattern>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

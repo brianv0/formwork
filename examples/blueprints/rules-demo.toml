@@ -14,7 +14,7 @@ rules = [
     "readonly:/usr/**",         # ambient toolchain, read-only
     "readexec:/bin/**",         # system tools: read + execute
     "readwrite:$CWD/**",        # the project: read + write + create
-    "write:/var/log/app.log",   # append to an existing shared log, but never create new files (FW-CAP9)
+    "modify:/var/log/app.log",  # append to an existing shared log, but never create new files (FW-CAP9)
     "deny:$CWD/.env",           # deny is terminal -- wins inside the readwrite grant above (FW-CAP8)
     "deny:~/.ssh",
 ]

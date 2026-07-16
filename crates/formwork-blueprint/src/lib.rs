@@ -65,7 +65,7 @@ pub struct FsBlueprint {
     pub reads: Vec<PathPattern>,
     #[serde(default)]
     pub writes: Vec<PathPattern>,
-    /// Read + modify-existing, but not create (the create/write split, FW-CAP9): the `write` verb.
+    /// Read + modify-existing, but not create (the create/write split, FW-CAP9): the `modify` verb.
     /// A weaker `writes` -- change files that exist, plant no new ones.
     #[serde(default)]
     pub writes_no_create: Vec<PathPattern>,

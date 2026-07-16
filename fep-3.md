@@ -8,7 +8,7 @@ Everything this FEP proposed has been implemented and **folded into `formwork.md
 - **flat verb rules + the `mode` posture** — a `"<verb>:<path>"` vocabulary and an
   `unveil`/`subtractive` posture, desugared into the existing `Blueprint` model at the
   CLI edge: §4, §5.8 ([FW-BP6](formwork.md#fw-bp6)/[FW-BP7](formwork.md#fw-bp7)).
-- **three-layer deny-terminal evaluation and the create/write split** (the `write` verb /
+- **three-layer deny-terminal evaluation and the create/write split** (the `modify` verb /
   `writes-no-create` field): §4, §5.2 ([FW-CAP8](formwork.md#fw-cap8)/[FW-CAP9](formwork.md#fw-cap9)),
   with the structural-floor invariant [FW-INV11](formwork.md#fw-inv11) (§6).
 - **exec as a verb**, execute-without-read on both backends ([FW-XR6](formwork.md#fw-xr6)
@@ -40,17 +40,23 @@ Everything this FEP proposed has been implemented and **folded into `formwork.md
 - **`Mode` is a distinct type from `ReadMode`.** It is the typed form of the `mode` key
   (parse-don't-validate at the serde edge), one meaning per name; it maps to `ReadMode` and carries
   no independent semantics. Kept as a two-line enum rather than an untyped string.
+- **The weaker write grade is spelled `modify`, not a bare `write`.** The verb was `write`, which
+  collided both ways: against the full-write `writes` field and the `--write` flag (create
+  included), and against readers' expectation that a bare `write` is the general write. Renamed to
+  `modify` so every "write"-named surface (`writes`, `--write`, `readwrite`) grants create and the
+  no-create grade has its own word (constitution Vocabulary, one word per concept). Pre-release, so a
+  direct rename, no alias: an old `write:` rule now fails loud with the known-verb list.
 - **Per-deny mechanism labels dropped.** A proposed FidelityReport pass would have labelled each
   deny by mechanism (LSM / enumeration / overmount / partial) and disclosed the Linux snapshot
   asymmetry and hole-ancestor over-breadth. Dropped, not deferred: on macOS every deny is uniformly
   LSM-enforced so the label carries no information, and the Linux-only disclosures reference
   machinery not built. If the need returns it is a fresh proposal, not a reserved slot here.
 
-## Open at adoption
+## Adopted
 
-- **Constitution Concepts / Data-model.** The create/write split ([FW-CAP9](formwork.md#fw-cap9))
-  added a `Blueprint` field (`writes-no-create`) and a serialized `LinuxPolicy` field. Folding into
-  `formwork.md` (§4 grammar, §5.2, Concepts-grade content) is done; the matching `constitution.md`
-  Concepts-list amendment — the closed capability vocabulary now admits the write grade — remains an
-  open, human-reviewed decision. The change is additive/expand-only (every pre-FEP-3 blueprint
-  compiles unchanged) and pre-release (canary consumers), so no version bump.
+- **Constitution Concepts / Vocabulary.** The create/write split ([FW-CAP9](formwork.md#fw-cap9))
+  added a `Blueprint` field (`writes-no-create`) and a serialized `LinuxPolicy` field. The matching
+  `constitution.md` amendment landed with this work: the Concepts enumeration now admits the
+  write-without-create grade, and the Vocabulary pins one word per grade (**write** = full,
+  **modify** = no-create). The change is additive/expand-only (every pre-FEP-3 blueprint compiles
+  unchanged) and pre-release (canary consumers), so no version bump.

@@ -58,8 +58,8 @@ on a `--rule` flag and a file line, so a policy reads the same however you autho
 | Verb | Grants | Nested-`[fs]` equivalent |
 |---|---|---|
 | `read` / `readonly` | read | `reads` |
-| `write` | read + modify, **no create** | `writes-no-create` |
 | `readwrite` | read + write + create | `writes` |
+| `modify` | read + modify, **no create** | `writes-no-create` |
 | `allow` | read + write + create + exec | `writes` + `exec` allow-list |
 | `readexec` | read + execute | `reads` + `exec` allow-list |
 | `exec` | execute only | `exec` allow-list |
@@ -89,9 +89,9 @@ the base; everything else refines it.
 formwork run --blueprint examples/blueprints/agent-session.toml \
   --rule "deny:$CWD/secrets" --rule "deny:$CWD/.env.production" -- claude --dangerously-skip-permissions
 
-# Let the agent EDIT an existing dir but not CREATE new files under it (create/write split, FW-CAP9):
+# Let the agent EDIT existing files but not CREATE new ones (create/write split, FW-CAP9):
 formwork run --blueprint examples/blueprints/agent-session.toml \
-  --rule "write:$CWD/var/log" -- <agent>
+  --rule "modify:$CWD/var/log/app.log" -- <agent>
 
 # Flip a blueprint to unveil (empty universe) and hand-pick what's readable/runnable:
 formwork run --blueprint examples/blueprints/agent-session.toml --mode unveil \

@@ -230,8 +230,9 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
         match verb.trim() {
             "read" | "readonly" => layer.fs.reads.push(pat),
             "readwrite" => layer.fs.writes.push(pat),
-            // The create/write split (FW-CAP9): modify existing, no create.
-            "write" => layer.fs.writes_no_create.push(pat),
+            // The create/write split (FW-CAP9): `modify` grants write minus create, a distinct
+            // word from full `readwrite`/`writes` so the weaker grade never reads as full write.
+            "modify" => layer.fs.writes_no_create.push(pat),
             "allow" => {
                 layer.fs.writes.push(pat.clone());
                 exec_paths.push(pat);
@@ -243,7 +244,7 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
             "exec" => exec_paths.push(pat),
             "deny" => layer.fs.subtract.push(pat),
             other => bail!(
-                "unknown rule verb {other:?} in {raw:?} (known: read, readonly, write, readwrite, allow, readexec, exec, deny)"
+                "unknown rule verb {other:?} in {raw:?} (known: read, readonly, readwrite, modify, allow, readexec, exec, deny)"
             ),
         }
     }
@@ -535,7 +536,7 @@ mod tests {
             rules: vec![
                 "readonly:/usr/**".into(),
                 "readwrite:~/project/**".into(),
-                "write:~/project/build".into(),
+                "modify:~/project/build".into(),
                 "readexec:/bin/ls".into(),
                 "exec:/bin/cat".into(),
                 "deny:~/.ssh".into(),

@@ -162,8 +162,8 @@ struct BlueprintArgs {
     #[arg(long)]
     net: Option<String>,
     /// Append a flat capability rule "<verb>:<path>" (repeatable), e.g. --rule "deny:~/.ssh". The
-    /// same vocabulary as a file `rules` line (FW-BP1). Verbs: read/readonly, readwrite, allow,
-    /// readexec, exec, deny.
+    /// same vocabulary as a file `rules` line (FW-BP1). Verbs: read/readonly, readwrite, modify
+    /// (write without create), allow, readexec, exec, deny.
     #[arg(long)]
     rule: Vec<String>,
     /// Reads posture: "unveil" (empty universe) or "subtractive" (ambient minus catalog);
@@ -217,7 +217,7 @@ impl BlueprintArgs {
                 read_mode: None,
                 reads: patterns("read", &self.read)?,
                 writes: patterns("write", &self.write)?,
-                // The write-without-create grant (FW-CAP9) is authored via the `write:` verb
+                // The write-without-create grant (FW-CAP9) is authored via the `modify:` verb
                 // (`--rule`) or the nested `[fs] writes-no-create` key, not a dedicated sugar flag.
                 writes_no_create: Vec::new(),
                 subtract: patterns("subtract", &self.subtract)?,
