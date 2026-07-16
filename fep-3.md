@@ -19,13 +19,6 @@ Everything this FEP proposed has been implemented and **folded into `formwork.md
 - tests [FW-E2E-056](formwork.md#fw-e2e-056)..058, [FW-E2E-059](formwork.md#fw-e2e-059),
   and [FW-E2E-061](formwork.md#fw-e2e-061) — §7.7, with traceability in §10.
 
-One proposed item is **parked**, not landed: a per-deny mechanism-label pass on the
-FidelityReport (`FW-FID7`, with reserved tests `FW-E2E-060` / `FW-ADV-016` / `FW-ADV-017`).
-It is lopsided across backends — on macOS every deny is uniformly LSM-enforced so the label
-carries no information, and its Linux-only disclosures (snapshot asymmetry, hole-ancestor
-over-breadth, overmount references) depend on machinery not yet built. Revisit if a Landlock
-test kernel lands; the numbers are held for it.
-
 ## Decisions (recorded per constitution Precedence & Conflicts)
 
 - **`deny` is a verb, not the rejected `subtract` synonym.** FEP-2 declined a free-floating `deny`
@@ -47,6 +40,11 @@ test kernel lands; the numbers are held for it.
 - **`Mode` is a distinct type from `ReadMode`.** It is the typed form of the `mode` key
   (parse-don't-validate at the serde edge), one meaning per name; it maps to `ReadMode` and carries
   no independent semantics. Kept as a two-line enum rather than an untyped string.
+- **Per-deny mechanism labels dropped.** A proposed FidelityReport pass would have labelled each
+  deny by mechanism (LSM / enumeration / overmount / partial) and disclosed the Linux snapshot
+  asymmetry and hole-ancestor over-breadth. Dropped, not deferred: on macOS every deny is uniformly
+  LSM-enforced so the label carries no information, and the Linux-only disclosures reference
+  machinery not built. If the need returns it is a fresh proposal, not a reserved slot here.
 
 ## Open at adoption
 
