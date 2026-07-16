@@ -117,9 +117,11 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
-    /// Explain one path against the merged blueprint without enforcing (FW-FID6): print the read and
-    /// write verdict, the rule that decides each under the deny-terminal model (FW-CAP8), and the
-    /// layer that rule came from. Same override surface as `compile`.
+    /// Explain one path against the merged blueprint without enforcing (FW-FID6): print the read,
+    /// write, and exec verdict, the rule that decides each under the deny-terminal model (FW-CAP8),
+    /// and the layer that rule came from. Reflects the merged blueprint (file, `extends`, overrides,
+    /// credential floor) like `compile`, not the session-only denies `run` adds (the dynamic
+    /// env-file-ref deny FW-CRED3, and policy-input write-protection FW-XR8). Same override surface.
     Explain {
         #[command(flatten)]
         blueprint: BlueprintArgs,
@@ -384,7 +386,9 @@ fn main() -> Result<()> {
 /// Explain one path against the merged blueprint (FW-FID6), no enforcement. Evaluates the
 /// deny-terminal model (FW-CAP8) against the authored -- not enforcement-canonicalized -- grants,
 /// so the rule it names is the one the operator wrote. The credential floor is a built-in,
-/// un-liftable deny, resolved here the way `compile --report-only` resolves it.
+/// un-liftable deny, resolved here the way `compile --report-only` resolves it. Scope matches
+/// `compile`: the session-only denies `prepare_session` adds (FW-CRED3 env-file refs, FW-XR8
+/// policy-input write-protection) are not applied -- explain reflects the blueprint, not a run.
 fn explain(args: BlueprintArgs, path: String) -> Result<()> {
     let home = home();
     let (blueprint, provenance) = args.load_with_provenance(&home)?;

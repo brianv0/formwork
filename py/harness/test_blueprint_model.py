@@ -298,3 +298,11 @@ def test_explain_names_winning_rule_and_provenance(cli, tmp_path):
     # An unlisted path under `unveil` (empty universe) is hidden, not ambient.
     hidden = json.loads(cli("explain", "--blueprint", bp, "/etc/hosts").stdout)
     assert hidden["read"]["decision"] == "hidden"
+
+    # Exec is a separate axis (FW-ISO9): an `exec:` grant shows execute even where read is closed.
+    execd = json.loads(
+        cli("explain", "--blueprint", bp, "/usr/bin/git", "--rule", "exec:/usr/bin/git").stdout
+    )
+    assert execd["exec"]["decision"] == "granted"
+    assert execd["exec"]["source"] == {"origin": "cli"}
+    assert execd["read"]["decision"] == "hidden", "exec confers execute only, not read"

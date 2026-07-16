@@ -1,13 +1,14 @@
-//! Per-rule provenance and `explain` (FW-FID6): for a path, which rule decides read/write access
-//! under the deny-terminal model (FW-CAP8), and which layer that rule came from. The provenance is
-//! a side table alongside the merged Blueprint, so the compiler and its determinism are untouched.
+//! Per-rule provenance and `explain` (FW-FID6): for a path, which rule decides read/write/exec
+//! access under the deny-terminal model (FW-CAP8), and which layer that rule came from. The
+//! provenance is a side table alongside the merged Blueprint, so the compiler and its determinism
+//! are untouched.
 
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::layer::{merge, BlueprintLayer};
-use crate::{Blueprint, PathPattern, ReadMode};
+use crate::{Blueprint, ExecPosture, PathPattern, ReadMode};
 
 /// Where an effective rule came from (FW-FID6).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -25,7 +26,7 @@ pub enum RuleSource {
     Discovered(String),
 }
 
-/// Effective fs patterns tagged with the layer they came from. Kept raw (not canonicalized) so
+/// Effective fs/exec patterns tagged with the layer they came from. Kept raw (not canonicalized) so
 /// `explain` can name the exact rule and origin that decides a path.
 #[derive(Clone, Debug, Default)]
 pub struct Provenance {
@@ -34,10 +35,13 @@ pub struct Provenance {
     writes_no_create: Vec<(PathPattern, RuleSource)>,
     subtract: Vec<(PathPattern, RuleSource)>,
     write_subtract: Vec<(PathPattern, RuleSource)>,
+    /// The winning exec allow-list (empty when exec is unrestricted). Exec is a last-set-wins
+    /// posture, not a union of path sets, so a later layer's allow-list replaces an earlier one.
+    exec: Vec<(PathPattern, RuleSource)>,
 }
 
-/// Like [`merge`], but also records, per fs pattern, the layer it came from. The returned Blueprint
-/// is identical to `merge(...)` (FW-FID4); provenance is a side table for `explain` only.
+/// Like [`merge`], but also records, per fs/exec pattern, the layer it came from. The returned
+/// Blueprint is identical to `merge(...)` (FW-FID4); provenance is a side table for `explain` only.
 pub fn merge_with_provenance(layers: &[(RuleSource, BlueprintLayer)]) -> (Blueprint, Provenance) {
     let plain: Vec<BlueprintLayer> = layers.iter().map(|(_, l)| l.clone()).collect();
     let blueprint = merge(&plain);
@@ -51,11 +55,18 @@ pub fn merge_with_provenance(layers: &[(RuleSource, BlueprintLayer)]) -> (Bluepr
         p.writes_no_create.extend(tag(&layer.fs.writes_no_create));
         p.subtract.extend(tag(&layer.fs.subtract));
         p.write_subtract.extend(tag(&layer.fs.write_subtract));
+        // Exec is last-set-wins (mirrors `merge`): a layer's allow-list replaces the running one;
+        // an explicit `unrestricted` clears it, matching the merged posture the Blueprint carries.
+        match &layer.exec {
+            Some(ExecPosture::Allowlist(paths)) => p.exec = tag(paths),
+            Some(ExecPosture::Unrestricted) => p.exec.clear(),
+            None => {}
+        }
     }
     (blueprint, p)
 }
 
-/// A read or write verdict for a path (FW-FID6), naming the winning rule and its origin.
+/// A read, write, or exec verdict for a path (FW-FID6), naming the winning rule and its origin.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(tag = "decision", rename_all = "kebab-case")]
 pub enum Verdict {
@@ -63,24 +74,29 @@ pub enum Verdict {
     Granted { rule: String, source: RuleSource },
     /// A deny applies -- deny is terminal (FW-CAP8), so it wins over any grant.
     Denied { rule: String, source: RuleSource },
-    /// Subtractive mode's default-allow read: no rule names it, but ambient reads are on.
+    /// Default-allow with no rule naming it: subtractive-mode reads, or unrestricted exec
+    /// (ungoverned/transparent, FW-ISO9). Access is on, but no grant is responsible.
     Ambient,
-    /// Unlisted under an empty universe (`unveil` / closed): not accessible.
+    /// No grant reaches this in a closed universe -- unlisted under `unveil` reads, an unlisted
+    /// write (writes have no ambient), or a path outside an exec allow-list. Not accessible.
     Hidden,
 }
 
-/// The read + write verdicts for a path.
+/// The read, write, and exec verdicts for a path.
 #[derive(Debug, Serialize)]
 pub struct Explanation {
     pub path: String,
     pub read: Verdict,
     pub write: Verdict,
+    pub exec: Verdict,
 }
 
 impl Provenance {
     /// Evaluate `path` under the deny-terminal model (FW-CAP8): a matching deny wins; otherwise a
     /// matching grant; otherwise the mode's default. `floor_type` is the credential-floor match the
-    /// caller computes from the catalog -- a built-in, un-liftable deny of both read and write.
+    /// caller computes from the catalog -- a built-in, un-liftable deny of both read and write. Exec
+    /// is a separate axis (FW-ISO9): the read/write floor never governs it, matching enforcement
+    /// where an exec grant confers execute only ([FW-XR6](#fw-xr6) parity).
     pub fn explain(
         &self,
         blueprint: &Blueprint,
@@ -137,10 +153,21 @@ impl Provenance {
             Verdict::Hidden
         };
 
+        // Exec is governed only by the exec posture (FW-ISO9). Unrestricted means execute is
+        // ungoverned (ambient); an allow-list grants only listed paths, everything else is closed.
+        let exec = match blueprint.exec {
+            ExecPosture::Unrestricted => Verdict::Ambient,
+            ExecPosture::Allowlist(_) => match first(&self.exec) {
+                Some((rule, source)) => Verdict::Granted { rule, source },
+                None => Verdict::Hidden,
+            },
+        };
+
         Explanation {
             path: path.display().to_string(),
             read,
             write,
+            exec,
         }
     }
 }
@@ -252,5 +279,49 @@ mod tests {
         let t = prov.explain(&bp, Path::new("/data/.git/config"), None);
         assert!(matches!(t.read, Verdict::Granted { .. }));
         assert!(matches!(t.write, Verdict::Denied { .. }));
+    }
+
+    #[test]
+    fn explain_reports_exec_as_a_separate_axis() {
+        // An exec allow-list from the `exec`/`readexec` verbs (last-set-wins across layers).
+        let with_allowlist = BlueprintLayer {
+            exec: Some(ExecPosture::Allowlist(vec![pp("/usr/bin/git")])),
+            fs: FsLayer {
+                read_mode: Some(ReadMode::Closed),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (bp, prov) =
+            merge_with_provenance(&[(RuleSource::File("s.toml".into()), with_allowlist)]);
+        // A listed binary: exec granted and attributed, even though read is closed (FW-XR6 parity).
+        let git = prov.explain(&bp, Path::new("/usr/bin/git"), None);
+        assert_eq!(
+            git.exec,
+            Verdict::Granted {
+                rule: "/usr/bin/git".into(),
+                source: RuleSource::File("s.toml".into())
+            }
+        );
+        assert_eq!(
+            git.read,
+            Verdict::Hidden,
+            "exec confers execute only, not read"
+        );
+        // An unlisted binary under an allow-list: exec closed.
+        assert_eq!(
+            prov.explain(&bp, Path::new("/bin/sh"), None).exec,
+            Verdict::Hidden
+        );
+
+        // Default (no exec verb) leaves exec unrestricted -- ungoverned/transparent (FW-ISO9).
+        let (bp2, prov2) = merge_with_provenance(&[(
+            RuleSource::File("s.toml".into()),
+            layer(FsLayer::default()),
+        )]);
+        assert_eq!(
+            prov2.explain(&bp2, Path::new("/usr/bin/git"), None).exec,
+            Verdict::Ambient
+        );
     }
 }
