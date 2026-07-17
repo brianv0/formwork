@@ -8,6 +8,8 @@ mod policy;
 mod report;
 mod sbpl;
 
+pub use sbpl::MACOS_RESOLVER_SOCKET;
+
 pub use policy::{
     CompiledPolicy, ConfinerPolicy, ExecPlan, GatewayPolicy, LinuxNetPlan, LinuxPolicy,
     MacosPolicy, SeccompPlan, SocketFamily,

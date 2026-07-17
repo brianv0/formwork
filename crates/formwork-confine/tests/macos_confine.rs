@@ -9,7 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use formwork_blueprint::{Blueprint, FsBlueprint, PathPattern, ReadMode, ResolvedCatalog};
+use formwork_blueprint::{
+    Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
+};
 use formwork_detect::detect;
 
 /// Integration tests enforce what the product enforces: the builtin catalog resolved for the
@@ -93,15 +95,28 @@ enum ConnectProbe {
     OtherFailure(i32), // reached connect() but failed otherwise, or the probe could not run
 }
 
-/// Runs the self-contained `fw-connect-probe` binary *inside* the sandbox and reads its exit code.
-/// It is staged into `cwd` -- which the policy grants read -- because the build-output path is
-/// outside the read scope; being std-only it links just libSystem and so starts under the read-only
-/// policy wherever `/bin/cat` does. (An earlier version shelled out to `/usr/bin/python3`, but that
-/// CLT stub cannot load its interpreter when `xcode-select` points into `/Applications/Xcode.app`,
-/// as on GitHub's macOS runners -- it dies before reaching `connect()`.)
 fn tcp_connect_probe(policy: &formwork_compile::CompiledPolicy, cwd: &Path) -> ConnectProbe {
-    let staged = cwd.join("fw-connect-probe");
-    fs::copy(env!("CARGO_BIN_EXE_fw-connect-probe"), &staged).expect("stage probe binary");
+    staged_probe(env!("CARGO_BIN_EXE_fw-connect-probe"), policy, cwd)
+}
+
+/// Reachability of the system resolver socket, which `getaddrinfo` must connect to (FW-ISO5 DNS).
+fn resolver_socket_probe(policy: &formwork_compile::CompiledPolicy, cwd: &Path) -> ConnectProbe {
+    staged_probe(env!("CARGO_BIN_EXE_fw-resolve-probe"), policy, cwd)
+}
+
+/// Runs a self-contained probe binary *inside* the sandbox and reads its exit code. It is staged
+/// into `cwd` -- which the policy grants read -- because the build-output path is outside the read
+/// scope; being std-only it links just libSystem and so starts under the read-only policy wherever
+/// `/bin/cat` does. (An earlier version shelled out to `/usr/bin/python3`, but that CLT stub cannot
+/// load its interpreter when `xcode-select` points into `/Applications/Xcode.app`, as on GitHub's
+/// macOS runners -- it dies before reaching `connect()`.)
+fn staged_probe(
+    probe_bin: &str,
+    policy: &formwork_compile::CompiledPolicy,
+    cwd: &Path,
+) -> ConnectProbe {
+    let staged = cwd.join(Path::new(probe_bin).file_name().expect("probe file name"));
+    fs::copy(probe_bin, &staged).expect("stage probe binary");
     let mut cmd = Command::new(&staged);
     cmd.current_dir(cwd);
     cmd.stdout(std::process::Stdio::null())
@@ -472,5 +487,37 @@ fn fw_e2e_006_direct_egress_denied() {
         tcp_connect_probe(&policy, &fx.granted()),
         ConnectProbe::DeniedAtConnect,
         "direct network egress must be denied at connect() under net=deny"
+    );
+}
+
+/// FW-ISO5 (DNS): a granted port tier can resolve names, and net=deny still cannot. Seatbelt counts
+/// an AF_UNIX connect as `network-outbound`, so the FW-ISO3 deny blanket also severs `getaddrinfo`
+/// unless the port tier re-allows the resolver socket -- which stranded the port tier at literal IPs
+/// (an agent granted :443 could not reach its model API). Paired against the real kernel: the deny
+/// half proves the re-allow is scoped to the tier and does not leak a hole into net=deny.
+#[test]
+fn fw_iso5_port_tier_reaches_resolver_and_deny_does_not() {
+    let fx = Fixture::new("iso5dns");
+    // The socket's absence must not masquerade as a denial, so establish it unconfined.
+    assert!(
+        Path::new(formwork_compile::MACOS_RESOLVER_SOCKET).exists(),
+        "no resolver socket on this host: the probe cannot tell allow from deny"
+    );
+
+    let mut with_ports = Blueprint::empty();
+    with_ports.fs.read_mode = ReadMode::Closed;
+    with_ports.fs.reads = vec![pp(&fx.granted())];
+    with_ports.net = NetPosture::Ports(vec![443]);
+    let with_ports = compile(&with_ports, &detect());
+
+    assert_eq!(
+        resolver_socket_probe(&with_ports, &fx.granted()),
+        ConnectProbe::Connected,
+        "a granted port tier must reach the resolver, or it resolves nothing and reaches only IPs"
+    );
+    assert_eq!(
+        resolver_socket_probe(&confined_read_only(&fx.granted()), &fx.granted()),
+        ConnectProbe::DeniedAtConnect,
+        "under net=deny the resolver must stay unreachable: no port tier, no names to look up"
     );
 }
