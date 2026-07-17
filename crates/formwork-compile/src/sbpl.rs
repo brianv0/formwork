@@ -41,6 +41,12 @@ pub fn render(input: &CompileInput) -> String {
     b
 }
 
+/// Seatbelt classifies an AF_UNIX connect as `network-outbound`, so FW-ISO3's `(deny network*)`
+/// also blocks `getaddrinfo` -- an FW-ISO5 port tier would reach literal IPs only. A literal, not
+/// `(remote unix-socket)`: a blanket unix grant would also open the Docker socket and ssh-agent.
+/// Public so the confiner's resolver probe asserts against the very literal the rule grants.
+pub const MACOS_RESOLVER_SOCKET: &str = "/private/var/run/mDNSResponder";
+
 fn render_net(b: &mut String, net: &NetPosture) {
     b.push_str("\n;; net: fail-closed egress (FW-ISO3)\n");
     b.push_str("(deny network*)\n");
@@ -52,6 +58,11 @@ fn render_net(b: &mut String, net: &NetPosture) {
                     "(allow network-outbound (remote tcp \"*:{p}\"))\n"
                 ));
             }
+            // Port tier only: under FW-ISO3 deny a reachable resolver would leak looked-up names.
+            b.push_str(";; DNS: the resolver socket the port tier is useless without\n");
+            b.push_str(&format!(
+                "(allow network-outbound (literal \"{MACOS_RESOLVER_SOCKET}\"))\n"
+            ));
         }
     }
 }
@@ -453,6 +464,27 @@ mod tests {
         i.net = NetPosture::Ports(vec![8080]);
         let s = render(&i);
         assert!(s.contains("(allow network-outbound (remote tcp \"*:8080\"))"));
+    }
+
+    /// The resolver rule rides with the port tier and only with it -- `net_denied_by_default` above
+    /// pins the deny half by asserting no `network-outbound` line at all.
+    #[test]
+    fn port_tier_reallows_resolver_socket() {
+        let mut i = input();
+        i.net = NetPosture::Ports(vec![443]);
+        let s = render(&i);
+        assert!(s.contains(&format!(
+            "(allow network-outbound (literal \"{MACOS_RESOLVER_SOCKET}\"))"
+        )));
+    }
+
+    /// An empty port list is a tier that grants nothing, so it must not smuggle the resolver through.
+    #[test]
+    fn empty_port_tier_grants_no_resolver() {
+        let mut i = input();
+        i.net = NetPosture::Ports(vec![]);
+        let s = render(&i);
+        assert!(!s.contains("network-outbound"));
     }
 
     #[test]

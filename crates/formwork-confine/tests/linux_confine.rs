@@ -10,7 +10,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use formwork_blueprint::{Blueprint, FsBlueprint, PathPattern, ReadMode, ResolvedCatalog};
+use formwork_blueprint::{
+    Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
+};
 use formwork_compile::{CompiledPolicy, ConfinerPolicy};
 use formwork_detect::detect;
 
@@ -275,6 +277,48 @@ fn net_default_deny_blocks_udp() {
         code, 7,
         "UDP egress must be denied with EPERM (exit 7); got {code}"
     );
+}
+
+/// FW-ISO5 (DNS, Linux): the mirror of the macOS resolver test -- the two kernels sever DNS at
+/// different layers, so the shared claim (a granted port tier can resolve a name) needs a
+/// per-backend probe. Which half runs depends on the kernel, so the report drives the assertion
+/// rather than a second copy of the ABI rule (FW-E2E-024, report soundness):
+///
+///   * tier Enforced (Landlock net, ABI 4+): net-deny's seccomp inet filter is not installed and
+///     Landlock net governs TCP only, so nothing blocks the resolver's UDP:53 -- DNS works with no
+///     macOS-style re-allow. Asserts not-EPERM, not success: a sandboxed runner may have no route.
+///   * tier Unenforceable (below ABI 4, e.g. CI's 5.15): the tier falls back to a full seccomp inet
+///     deny, so DNS is deliberately dead. That is FW-INV6 honesty, not the macOS bug -- formwork
+///     reports the gap instead of silently opening egress, and the fix must not weaken it.
+#[test]
+fn port_tier_resolver_matches_reported_fidelity() {
+    use formwork_compile::{Capability, Fidelity};
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-udp-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    let mut blueprint = Blueprint::empty();
+    blueprint.fs.read_mode = ReadMode::Closed;
+    blueprint.fs.reads = vec![pp(probe_dir)];
+    blueprint.net = NetPosture::Ports(vec![443]);
+    let policy = compile(&blueprint, &detect());
+    let tier = policy
+        .report
+        .per_capability
+        .get(&Capability::NetPortTier)
+        .expect("a requested port tier is always reported");
+    let enforced = matches!(tier, Fidelity::Enforced { .. });
+
+    let code = run(&policy, Command::new(&probe));
+    if enforced {
+        assert_ne!(
+            code, 7,
+            "an enforced port tier must leave the resolver reachable, else it reaches only IPs"
+        );
+    } else {
+        assert_eq!(
+            code, 7,
+            "an unenforceable port tier must fail closed to the inet deny, not open egress; got {code}"
+        );
+    }
 }
 
 /// FW-TRA2 (Linux): the sandbox is transparent -- a shell that forks and execs a child runs clean
