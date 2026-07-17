@@ -398,6 +398,8 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-059"></a>**FW-E2E-059: Explain names the winning rule and provenance ([FW-FID6](#fw-fid6)).** `explain <path>` over a layered blueprint reports, per path, the read/write/exec verdict, the deciding rule, and its origin: a granted path names the file rule; a `--rule` deny is terminal and attributed to `cli`; a credential-floor path is denied as `built-in`; an unlisted path under `unveil` is hidden, not ambient; an `exec:` grant shows execute even where read is closed (FW-ISO9/FW-XR6). Pass: each verdict names the right rule and origin without enforcing. Fail: a wrong rule/origin, or a deny that does not win.
 
+<a id="fw-e2e-060"></a>**FW-E2E-060: CLI overrides compose with an `unveil` blueprint ([FW-BP1](#fw-bp1)/[FW-BP2](#fw-bp2)/[FW-BP7](#fw-bp7)).** Over an empty-universe (`unveil`) file, the CLI override surface behaves as an operator expects: a `--read`/`--write` sugar grant fills the closed universe (write implies read); `--rule exec:` closes exec to an allow-list on a separate axis (the listed binary runs but is unreadable, an unlisted one does not run); the `--mode unveil` flag flips a subtractive file to closed by last-wins (ambient-only path hidden, explicit grant kept); and the credential floor stays un-liftable under a broad `--read`. Pass: each verdict matches, dry-run on any host. Fail: a CLI grant that does not populate the universe, an exec allow-list that leaks, a mode flag that does not override, or a floor a `--read` lifts.
+
 ### 7.8 Credential catalog & launcher
 
 <a id="fw-e2e-045"></a>**FW-E2E-045: Path credential denied and itemized.** Under the default catalog, `~/.aws/credentials` is read. Pass: read denied (EACCES); operator channel names type `aws`; agent sees a bare EACCES with no annotation. Fail: read succeeds, or the agent-facing error names the type.
@@ -549,13 +551,13 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-FID6](#fw-fid6) Rule provenance & explain | [FW-E2E-059](#fw-e2e-059) | [FW-CAP5](#fw-cap5), [FW-CAP8](#fw-cap8) |
 | [FW-ENV1](#fw-env1) Environment axis | [FW-E2E-036](#fw-e2e-036) | [FW-FID1](#fw-fid1) |
 | [FW-ENV2](#fw-env2) Default secret-shaped scrub | [FW-E2E-036](#fw-e2e-036) | [FW-TRA2](#fw-tra2) |
-| [FW-BP1](#fw-bp1) One model, many surfaces | [FW-E2E-043](#fw-e2e-043) | 042 |
-| [FW-BP2](#fw-bp2) Override precedence | [FW-E2E-042](#fw-e2e-042) | 043 |
+| [FW-BP1](#fw-bp1) One model, many surfaces | [FW-E2E-043](#fw-e2e-043), 060 | 042 |
+| [FW-BP2](#fw-bp2) Override precedence | [FW-E2E-042](#fw-e2e-042), 060 | 043 |
 | [FW-BP3](#fw-bp3) `extends` composition | [FW-E2E-044](#fw-e2e-044) | — |
 | [FW-BP4](#fw-bp4) allow/deny/subtract | [FW-E2E-042](#fw-e2e-042) | 045, 049 |
 | [FW-BP5](#fw-bp5) Path sigils | [FW-E2E-055](#fw-e2e-055) | — |
 | [FW-BP6](#fw-bp6) Flat verb rules | [FW-E2E-058](#fw-e2e-058), 061 | [FW-CAP9](#fw-cap9) |
-| [FW-BP7](#fw-bp7) Mode posture | [FW-E2E-057](#fw-e2e-057) | — |
+| [FW-BP7](#fw-bp7) Mode posture | [FW-E2E-057](#fw-e2e-057), 060 | — |
 | [FW-CRED1](#fw-cred1) Typed catalog | [FW-E2E-045](#fw-e2e-045), 046 | 049 |
 | [FW-CRED2](#fw-cred2) Two kinds, two arms | [FW-E2E-045](#fw-e2e-045), 046 | 050 |
 | [FW-CRED3](#fw-cred3) Env-points-to-file | [FW-E2E-047](#fw-e2e-047) | — |
