@@ -265,6 +265,58 @@ def test_mode_and_read_mode_compose_across_extends(cli, tmp_path):
     assert bad.code != 0 and "not both" in bad.stderr
 
 
+@pytest.mark.fw_e2e("FW-E2E-060")
+def test_cli_flags_compose_with_an_unveil_blueprint(cli, tmp_path):
+    """FW-BP1/FW-BP2 + FW-BP7 + FW-ISO9: the CLI override surface composes with an `unveil`
+    (empty-universe) blueprint the way an operator expects. Sugar flags populate the closed
+    universe; `--rule exec:` closes exec to an allow-list on a separate axis; the `--mode unveil`
+    flag flips a subtractive file to closed by last-wins; and the credential floor stays
+    un-liftable underneath all of it. All dry-run via `explain`, so it runs on any host."""
+    env = {"HOME": str(tmp_path)}
+
+    def explain(bp, path, *flags):
+        r = cli("explain", "--blueprint", bp, path, *flags, env=env)
+        assert r.code == 0, r.stderr
+        return json.loads(r.stdout)
+
+    unveil = tmp_path / "unveil.toml"
+    unveil.write_text('net = "deny"\nmode = "unveil"\n')
+
+    # 1. Empty universe: an unlisted path is hidden; a CLI `--read` grant fills it in (origin cli).
+    assert explain(unveil, "/opt/data/x")["read"]["decision"] == "hidden"
+    granted = explain(unveil, "/opt/data/x", "--read", "/opt/data/**")
+    assert granted["read"]["decision"] == "granted"
+    assert granted["read"]["source"] == {"origin": "cli"}
+
+    # 2. A CLI `--write` grant implies read under unveil (FW-TRA3: write implies read).
+    w = explain(unveil, "/work/f", "--write", "/work/**")
+    assert w["write"]["decision"] == "granted"
+    assert w["read"]["decision"] == "granted"
+
+    # 3. `--rule exec:` closes exec to an allow-list over unveil (FW-ISO9). Exec is a separate axis:
+    #    the listed binary runs (origin cli) but stays unreadable; an unlisted one does not run.
+    listed = explain(unveil, "/bin/ls", "--rule", "exec:/bin/ls")
+    assert listed["exec"]["decision"] == "granted"
+    assert listed["exec"]["source"] == {"origin": "cli"}
+    assert listed["read"]["decision"] == "hidden", "exec confers execute only, not read"
+    assert explain(unveil, "/bin/bash", "--rule", "exec:/bin/ls")["exec"]["decision"] != "granted"
+
+    # 4. The `--mode unveil` FLAG flips a subtractive file to a closed universe by last-wins
+    #    (FW-BP2/FW-BP7): an ambient-only path goes hidden, an explicitly-granted one stays granted.
+    sub = tmp_path / "sub.toml"
+    sub.write_text('net = "deny"\n[fs]\nread-mode = "ambient-minus-subtract"\nreads = ["/usr/**"]\n')
+    assert explain(sub, "/etc/hosts")["read"]["decision"] == "ambient"
+    assert explain(sub, "/etc/hosts", "--mode", "unveil")["read"]["decision"] == "hidden"
+    assert explain(sub, "/usr/lib/x", "--mode", "unveil")["read"]["decision"] == "granted"
+
+    # 5. The credential floor is un-liftable (FW-INV8): a broad CLI `--read ~/**` cannot expose
+    #    ~/.ssh (origin built-in), while a non-sensitive sibling under the same grant is readable.
+    floored = explain(unveil, "~/.ssh/id_rsa", "--read", "~/**")
+    assert floored["read"]["decision"] == "denied"
+    assert floored["read"]["source"] == {"origin": "built-in"}
+    assert explain(unveil, "~/notes.txt", "--read", "~/**")["read"]["decision"] == "granted"
+
+
 @pytest.mark.fw_e2e("FW-E2E-059")
 def test_explain_names_winning_rule_and_provenance(cli, tmp_path):
     """FW-FID6: `explain <path>` reports the read/write verdict, the rule that decides each under
