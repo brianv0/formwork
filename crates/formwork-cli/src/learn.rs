@@ -44,12 +44,27 @@ pub struct ProposalEntry {
     pub run_id: String,
 }
 
+/// Both discovery artifacts derive from the CANONICAL blueprint path, computed here and nowhere
+/// else. `accept` reaches the blueprint through the proposal's recorded (canonical) string while
+/// the loader reaches it through the CLI-given path -- a symlinked or relative blueprint would
+/// otherwise make the two derive different files, and an accepted grant would land in a
+/// discovered layer no run ever loads (silent no-op, the FW-INV6 shape).
+fn canonical_blueprint(blueprint: &Path) -> PathBuf {
+    std::fs::canonicalize(blueprint).unwrap_or_else(|_| blueprint.to_path_buf())
+}
+
 pub fn proposal_path(blueprint: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.proposal.toml", blueprint.display()))
+    PathBuf::from(format!(
+        "{}.proposal.toml",
+        canonical_blueprint(blueprint).display()
+    ))
 }
 
 pub fn discovered_path(blueprint: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.discovered.toml", blueprint.display()))
+    PathBuf::from(format!(
+        "{}.discovered.toml",
+        canonical_blueprint(blueprint).display()
+    ))
 }
 
 /// One unified-log Sandbox record: `Sandbox: cat(29810) deny(1) file-read-data /private/tmp/x`.
@@ -81,13 +96,17 @@ fn parse_sandbox_denial(event_message: &str) -> Option<DenialRecord> {
 
 /// Unified-log records persist lazily: under low logging pressure a short-lived process's buffered
 /// denials can take well over the old fixed 4-second slack to reach the store `log show` reads --
-/// and a workload that dies on its first denied read (the canonical discovery case) is exactly the
-/// short-lived shape that loses its records to that latency. So collection polls to quiescence:
-/// re-read the whole run window until two consecutive reads agree, bounded by a cap. Over-capture
-/// is safe by design (candidates are inert until accepted, credentials floored regardless), so the
-/// slack and cap can be generous.
+/// and a workload that dies on its first denied read in a millisecond (the canonical discovery
+/// case) is exactly the shape that loses its records to that latency. So collection polls to
+/// quiescence with a floor: re-read the whole run window until two consecutive reads agree, but
+/// never conclude before MIN_SETTLE of observation -- two equal reads two seconds apart prove the
+/// store was briefly quiet, not that a millisecond workload's buffered records ever flushed
+/// (an empty read repeated is the trap: it looks quiescent precisely when nothing has landed
+/// yet). Bounded by a cap. Over-capture is safe by design (candidates are inert until accepted,
+/// credentials floored regardless), so the slack, floor, and cap can all be generous.
 const PERSISTENCE_SLACK_SECS: u64 = 2;
 const QUIESCENCE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+const QUIESCENCE_MIN_SETTLE: std::time::Duration = std::time::Duration::from_secs(6);
 const QUIESCENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Collect the run window's denials, polling until the log store stops yielding new records.
@@ -97,17 +116,19 @@ fn collect_denials_quiescent(run_started: std::time::Instant) -> Result<Vec<Deni
     collect_until_quiescent(
         || collect_denials(run_started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS),
         QUIESCENCE_POLL,
+        QUIESCENCE_MIN_SETTLE,
         QUIESCENCE_CAP,
     )
 }
 
 /// The quiescence control flow, separated from the impure `log show` collector so the
-/// stabilization property (FW-E2E-064's mechanism) is testable as a pure function of a chosen
-/// record sequence -- the same substitution the constitution allows for the compiler's
+/// stabilization-with-floor property (FW-E2E-064's mechanism) is testable as a pure function of a
+/// chosen record sequence -- the same substitution the constitution allows for the compiler's
 /// HostProfile; the feed itself is exercised by the macOS E2E tests, never mocked there.
 fn collect_until_quiescent(
     mut collect: impl FnMut() -> Result<Vec<DenialRecord>>,
     poll: std::time::Duration,
+    min_settle: std::time::Duration,
     cap: std::time::Duration,
 ) -> Result<Vec<DenialRecord>> {
     let polling_started = std::time::Instant::now();
@@ -116,13 +137,13 @@ fn collect_until_quiescent(
         if polling_started.elapsed() >= cap {
             tracing::warn!(
                 cap_secs = cap.as_secs(),
-                "denial collection hit its quiescence cap; late-flushing records may be missing (re-run `formwork learn` to catch them)"
+                "denial collection hit its quiescence cap (late-flushing records may be missing -- re-run `formwork learn` -- or unrelated sandboxed processes kept the feed busy; over-capture is safe either way)"
             );
             return Ok(last);
         }
         std::thread::sleep(poll);
         let next = collect()?;
-        if next == last {
+        if next == last && polling_started.elapsed() >= min_settle {
             return Ok(next);
         }
         last = next;
@@ -522,11 +543,60 @@ mod tests {
                 Ok(batch)
             },
             std::time::Duration::from_millis(1),
+            std::time::Duration::ZERO,
             std::time::Duration::from_secs(30),
         )
         .unwrap();
         assert_eq!(result, sequence[2]);
         assert_eq!(calls, 3, "polling stops at the first repeated read");
+    }
+
+    /// The millisecond-workload trap (FW-E2E-064): before anything has flushed, the store reads
+    /// empty and "stable" -- the floor forbids trusting that until real settle time has passed.
+    #[test]
+    fn quiescence_does_not_trust_empty_reads_before_the_floor() {
+        let floor = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = collect_until_quiescent(
+            || Ok(Vec::new()),
+            std::time::Duration::from_millis(25),
+            floor,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(result.is_empty());
+        assert!(
+            started.elapsed() >= floor,
+            "an all-empty feed concluded after {:?}, before the {floor:?} floor",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn quiescence_floor_catches_a_record_that_flushes_after_empty_reads() {
+        let flushed_at = std::time::Duration::from_millis(150);
+        let record = DenialRecord {
+            path: "/late/flush".to_string(),
+            access: DenialAccess::Read,
+        };
+        let started = std::time::Instant::now();
+        let expected = record.clone();
+        let result = collect_until_quiescent(
+            move || {
+                // The store is empty until "persistence latency" elapses -- longer than several
+                // polls, shorter than the floor -- then the record appears.
+                if started.elapsed() < flushed_at {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![record.clone()])
+                }
+            },
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(400),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(result, vec![expected], "the late-flushing record must be captured");
     }
 
     #[test]
@@ -544,6 +614,7 @@ mod tests {
                     .collect())
             },
             std::time::Duration::from_millis(1),
+            std::time::Duration::ZERO,
             std::time::Duration::from_millis(20),
         )
         .unwrap();
@@ -558,6 +629,7 @@ mod tests {
         let result = collect_until_quiescent(
             || bail!("log show failed"),
             std::time::Duration::from_millis(1),
+            std::time::Duration::ZERO,
             std::time::Duration::from_millis(10),
         );
         assert!(result.is_err());

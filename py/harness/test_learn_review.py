@@ -114,6 +114,38 @@ def test_accepted_grants_load_into_the_next_run(review, cli, tmp_path):
     assert verdict["source"]["origin"] == "discovered"
 
 
+@pytest.mark.fw_e2e("FW-E2E-063")
+def test_accept_through_a_symlinked_blueprint_reaches_the_next_run(tmp_path, cli):
+    """Both discovery artifacts derive from the CANONICAL blueprint path: accept reaches the
+    blueprint through the proposal's recorded string, the loader through the CLI-given path.
+    With a symlinked blueprint those used to diverge -- the accepted grant landed in a discovered
+    layer no run ever loaded (a silent no-op of the whole review loop)."""
+    policies = tmp_path / "policies"
+    policies.mkdir()
+    target = policies / "real.toml"
+    target.write_text(BLUEPRINT)
+    link = tmp_path / "bp.toml"
+    link.symlink_to(target)
+    env = {"HOME": str(tmp_path)}
+
+    # The proposal sits beside the canonical blueprint, as a learning run would have written it.
+    canonical = target.resolve()
+    proposal = canonical.parent / (canonical.name + ".proposal.toml")
+    proposal.write_text(PROPOSAL.format(blueprint=canonical))
+
+    accepted = cli("learn", "--blueprint", link, "--accept", "1", cwd=tmp_path, env=env)
+    assert accepted.code == 0, accepted.stderr
+
+    explained = cli(
+        "explain", "--blueprint", link, "--json", "/opt/toolchain/lib.py",
+        cwd=tmp_path, env=env,
+    )
+    assert explained.code == 0, explained.stderr
+    verdict = json.loads(explained.stdout)["explanations"][0]["read"]
+    assert verdict["decision"] == "granted", explained.stdout
+    assert verdict["source"]["origin"] == "discovered", explained.stdout
+
+
 @pytest.mark.fw_e2e("FW-E2E-062")
 @pytest.mark.skipif(sys.platform == "darwin", reason="macOS has a wired denial feed")
 def test_learn_without_a_denial_feed_fails_before_the_workload(review, tmp_path):

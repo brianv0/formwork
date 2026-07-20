@@ -213,6 +213,50 @@ fn learn_rejects_mixing_review_flags_with_a_command() {
     assert!(out.stderr.contains("not both"), "{}", out.stderr);
 }
 
+/// FW-E2E-064 at the cargo-test boundary, so the stock macOS CI job (`cargo test --workspace`)
+/// verifies learn is useful for the canonical discovery shape: a workload that dies on its first
+/// denial in about a millisecond, while the unified log persists the record only seconds later.
+/// Runs against the real Seatbelt kernel and the real `log show` feed -- if a runner cannot
+/// carry either, this fails loudly rather than letting CI imply learn works there.
+#[cfg(target_os = "macos")]
+#[test]
+fn learn_captures_a_millisecond_workloads_denial() {
+    let dir = Scratch::new("learn-ms");
+    // Kernel-resolved root (macOS /var -> /private/var), so the blueprint grant and the
+    // proposal's kernel-reported paths line up.
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let ok = root.join("ok.txt");
+    std::fs::write(&ok, "ok\n").unwrap();
+    let denied = root.join("denied.txt");
+    std::fs::write(&denied, "nope\n").unwrap();
+    std::fs::write(
+        root.join("bp.toml"),
+        format!(
+            "net = \"deny\"\n[fs]\nread-mode = \"closed\"\nreads = [\"{}\"]\n",
+            ok.display()
+        ),
+    )
+    .unwrap();
+
+    let out = formwork(
+        &root,
+        &root,
+        &["learn", "--blueprint", "bp.toml", "--", "/bin/cat", denied.to_str().unwrap()],
+    );
+    assert_ne!(out.code, 0, "cat of the denied file failing IS the scenario: {}", out.stderr);
+
+    let proposal = root.join("bp.toml.proposal.toml");
+    assert!(proposal.exists(), "no proposal written:\n{}", out.stderr);
+    let text = std::fs::read_to_string(&proposal).unwrap();
+    assert!(
+        text.contains(denied.to_str().unwrap()),
+        "millisecond denial lost to feed-persistence latency:\n{text}\n{}",
+        out.stderr
+    );
+    // The proposal pointer is a stdout result (survives quiet telemetry), not a log line.
+    assert!(out.stdout.contains("proposal:"), "{}", out.stdout);
+}
+
 /// FW-E2E-062 / FW-INV5 at the CLI edge: on a host with no denial feed, `learn` refuses BEFORE
 /// the workload runs instead of running it and admitting afterwards that nothing could be
 /// observed.
