@@ -7,7 +7,7 @@ the same role `IMPLEMENTATION_PLAN.md` plays for `formwork.md`. Requirement IDs 
 > **Historical record.** FEP-2 landed in full and its requirements were reintegrated into
 > `formwork.md` (§2, §4, §5.8–5.10, §6, §7.7–7.10); `fep2.md` is now a short landed-and-folded
 > pointer. Section references to `fep2.md` below resolve against the proposal as adopted —
-> `git log -- fep2.md`, prior to the reintegration commit.
+> `git log --follow -- docs/fep2.md`, prior to the reintegration commit.
 
 ## 0. Conflicts found during planning, and their resolutions
 
@@ -17,7 +17,7 @@ Precedence & Conflicts — not by silently deviating.
 
 **C1 — Test-ID collisions.** `fep2.md` §9 assumed the base sequence ended at [FW-E2E-028](../formwork.md#fw-e2e-028) /
 [FW-ADV-006](../formwork.md#fw-adv-006). In fact FEP-1 landed [FW-E2E-036](../formwork.md#fw-e2e-036)..039 into `formwork.md`, and `fep-1.md` reserves
-[FW-E2E-029](../fep-1.md#fw-e2e-029)..032 + 040 and [FW-ADV-007](../fep-1.md#fw-adv-007)..009 + 011 for the deferred egress/violation-stream work.
+[FW-E2E-029](fep-1.md#fw-e2e-029)..032 + 040 and [FW-ADV-007](fep-1.md#fw-adv-007)..009 + 011 for the deferred egress/violation-stream work.
 FEP-2's tests are renumbered to the next free contiguous blocks:
 
 | fep2.md draft | final ID | scenario |
@@ -40,7 +40,7 @@ FEP-2's tests are renumbered to the next free contiguous blocks:
 | `FW-ADV-008` | **FW-ADV-013** | discovery confused-deputy |
 | `FW-ADV-009` | **FW-ADV-014** | launcher-bypass honesty |
 
-`FW-ADV-010` stays unassigned (a gap `fep-1.md` left); [FW-ADV-011](../fep-1.md#fw-adv-011) stays reserved for FEP-1
+`FW-ADV-010` stays unassigned (a gap `fep-1.md` left); [FW-ADV-011](fep-1.md#fw-adv-011) stays reserved for FEP-1
 Part A. One name per idea (constitution Vocabulary) is why this is fixed now, before any
 marker exists.
 

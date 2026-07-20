@@ -130,7 +130,7 @@ test — carries a stable unique identifier: `FW-<FAMILY><n>` for requirements
 EGR — a new family is a Concepts-grade amendment), `FW-INV<n>` for invariants,
 `FW-E2E-<nnn>` / `FW-ADV-<nnn>` for tests. The rules:
 - **Minted once, in the defining document.** `formwork.md` once landed; an
-  FEP's remainder document until then (`fep-1.md` holds FW-EGR1–6 and FW-FID5
+  FEP's remainder document until then (`docs/fep-1.md` holds FW-EGR1–6 and FW-FID5
   today). Exactly one definition per ID, and each definition site carries an
   HTML anchor named for the lowercase ID (`<a id="fw-cap2">`).
 - **Never renumbered, never reused.** Sequences are monotonic and shared

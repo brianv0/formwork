@@ -111,7 +111,7 @@ converged on the same architecture: the kernel denies all egress; a host-side
 proxy (outside the sandbox) enforces a domain allowlist, reached via unix
 socket/loopback. Formwork offers only `NetPosture::Ports`
 (`crates/formwork-blueprint/src/lib.rs:52-60`) — ":443 to anywhere" — and the
-gateway is an MCP stdio shader, not an egress filter ([FW-GW7](formwork.md#fw-gw7) deferred to Phase 7,
+gateway is an MCP stdio shader, not an egress filter ([FW-GW7](../formwork.md#fw-gw7) deferred to Phase 7,
 `IMPLEMENTATION_PLAN.md:158-162`; `reqwest` not in the lockfile). Since the whole
 industry's credential story is "reads open, egress gated," and *our* story is
 "reads closed," adding domain egress would make us strictly stronger than everyone.
@@ -189,7 +189,7 @@ nothing to build that UX on.
 
 ## Recommended changes, priced by their CVEs
 
-1. **Build the egress proxy (accelerate [FW-GW7](formwork.md#fw-gw7))** with the published failure modes
+1. **Build the egress proxy (accelerate [FW-GW7](../formwork.md#fw-gw7))** with the published failure modes
    as the test plan:
    - empty-allowlist must mean deny (CVE-2025-66479);
    - hostname validation must reject null bytes / percent-encoding / CRLF / IPv6
