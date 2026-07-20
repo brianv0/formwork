@@ -148,7 +148,8 @@ EGR — a new family is a Concepts-grade amendment), `FW-INV<n>` for invariants,
   currency, and it is what Comments means by the durable "why". (Rustdoc
   hyperlinking was evaluated and declined: most citations live in non-doc
   comments rustdoc never renders, and rustdoc cannot express repo-relative
-  links. The convention is stated once, here and in the README — never as
+  links. The convention is stated once, here and in `docs/STATUS.md` (the
+  README is user-facing and carries no requirement IDs) — never as
   per-file boilerplate.)
 - **Drift fails CI.** The harness canary (`py/harness/test_requirements.py`)
   fails when a cited ID has no definition, a definition lacks its anchor or is
