@@ -74,7 +74,10 @@ The durable, human-reviewed surfaces of this project are:
   ([FW-CAP3](formwork.md#fw-cap3), realized by the catalog + backstop);
 - the **discovery artifacts** — the proposal (`*.proposal.toml`) and the provenance-carrying
   discovered layer (`*.discovered.toml`, [FW-DISC6](formwork.md#fw-disc6)) — machine-written, human-accepted;
-- the **`formwork` CLI surface** — its subcommands and their JSON output.
+- the **`formwork` CLI surface** — its subcommands and their output: stable
+  JSON on the machine doors (`compile`, `detect`, `explain --json`), prose on
+  the human doors (`explain`, `learn` listings). Only the JSON shapes are
+  contract; prose may be reworded without a version event.
 
 These are designed before the code that uses them and evolve only through
 human-reviewed change. Changes to a published surface follow
@@ -216,8 +219,12 @@ Libraries only *emit*; the subscriber is installed exactly once, at the CLI
 entrypoint — no library crate installs a subscriber or configures logging.
 Runtime grants and denials are emitted as structured records ([FW-FID3](formwork.md#fw-fid3)), and the
 FidelityReport is the compile-time telemetry. No print debugging in committed
-code — the only `println!` is the CLI writing its own JSON result to stdout,
-which is product output, not logging.
+code — the only `println!` is the CLI writing its own result to stdout: the
+stable JSON of the machine doors (`compile`, `detect`, `--json`) and the
+human-readable result of the human doors (`explain`'s prose, `learn`'s
+candidate listing — [FW-E2E-063](formwork.md#fw-e2e-063)). Both are product output, not logging; a
+result that only reached stderr would vanish under quiet telemetry, which is
+its own fail-silent.
 Rationale: "fails loudly" needs somewhere to fail to, and a silently
 downgraded confinement is as suspect as a crash; telemetry emitted at
 the boundaries is what makes both audible.

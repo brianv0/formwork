@@ -177,6 +177,8 @@ fn hidden_detect_still_prints_the_host_profile() {
     assert!(matches!(profile["os"].as_str(), Some("macos" | "linux")));
 }
 
+/// The listing half of FW-E2E-063 at the Rust boundary; the full review loop (accept by number /
+/// pattern / all, floor refusal) is discharged by the py harness, the outermost boundary.
 #[test]
 fn learn_review_lists_candidates_on_stdout() {
     let dir = Scratch::new("learn-list");
@@ -211,8 +213,9 @@ fn learn_rejects_mixing_review_flags_with_a_command() {
     assert!(out.stderr.contains("not both"), "{}", out.stderr);
 }
 
-/// FW-INV5 at the CLI edge: on a host with no denial feed, `learn` refuses BEFORE the workload
-/// runs instead of running it and admitting afterwards that nothing could be observed.
+/// FW-E2E-062 / FW-INV5 at the CLI edge: on a host with no denial feed, `learn` refuses BEFORE
+/// the workload runs instead of running it and admitting afterwards that nothing could be
+/// observed.
 #[cfg(target_os = "linux")]
 #[test]
 fn learn_fails_fast_without_a_denial_feed() {

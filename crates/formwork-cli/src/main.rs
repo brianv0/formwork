@@ -168,6 +168,9 @@ enum Cmd {
     /// capabilities plus the merged blueprint's fidelity summary (host-only when no blueprint is
     /// found). Reflects the merged blueprint like `compile`, not the session-only denies `run`
     /// adds (FW-CRED3 env-file refs, FW-XR8 policy-input write-protection). Same override surface.
+    /// Default output became human-readable in the usability rework, with `--json` carrying the
+    /// machine shape -- a pre-release surface change, no version bump (canary consumers only; the
+    /// FW-CRED8 Backend-rename precedent).
     Explain {
         #[command(flatten)]
         blueprint: BlueprintArgs,

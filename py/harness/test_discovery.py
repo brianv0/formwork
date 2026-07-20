@@ -1,6 +1,7 @@
 """Discovery E2E (FEP-2 §9.3) + the confused-deputy adversarial case (FW-ADV-013), against the
 real Seatbelt kernel and the real unified-log denial feed -- macOS only, like the confiner suite.
-One learning fixture drives FW-E2E-051..053; 054 and ADV-013 make their own runs.
+(The dry-run review loop, FW-E2E-062/063, is cross-platform and lives in test_learn_review.py.)
+One learning fixture drives FW-E2E-051..053; 054, 064 and ADV-013 make their own runs.
 
 The FEP's FW-E2E-051 sketch names a pytest run against a real repo; the harness has no reuse
 workload fixtures yet (FW-E2E-020..023 are unimplemented), so the same property is exercised
@@ -143,6 +144,32 @@ def test_discovery_is_non_authoritative_within_a_run(tmp_path, cli):
               env={"HOME": str(home)}, timeout=120)
     assert "FIRST_SUCCEEDED" not in res.stdout
     assert "SECOND_SUCCEEDED" not in res.stdout, "observation must not widen the live session"
+
+
+@pytest.mark.fw_e2e("FW-E2E-064")
+def test_short_lived_workload_denials_are_captured(tmp_path, cli):
+    """The canonical discovery shape: the workload dies on its FIRST denial, in well under a
+    second, and the unified log's persistence latency outlives it. Collection is anchored to the
+    run start and polled to quiescence, so the denial must still land in the proposal."""
+    home = tmp_path / "home"
+    home.mkdir()
+    ok = tmp_path / "ok.txt"
+    ok.write_text("ok\n")
+    denied = tmp_path / "denied.txt"
+    denied.write_text("nope\n")
+    bp = tmp_path / "bp.toml"
+    bp.write_text(f'net = "deny"\n[fs]\nread-mode = "closed"\nreads = ["{ok}"]\n')
+    res = cli("learn", "--blueprint", bp, "--", "/bin/cat", denied,
+              env={"HOME": str(home)}, timeout=120)
+    assert res.code != 0, "the workload failing on the denial IS the scenario"
+    proposal = tmp_path / "bp.toml.proposal.toml"
+    assert proposal.exists(), res.stderr
+    text = proposal.read_text()
+    assert str(denied.resolve()) in text, (
+        f"short-lived denial lost to feed-persistence latency:\n{text}\n{res.stderr}"
+    )
+    # The proposal pointer is a stdout result (survives quiet telemetry), not a log line.
+    assert "proposal:" in res.stdout, res.stdout
 
 
 @pytest.mark.fw_adv("FW-ADV-013")

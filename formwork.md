@@ -424,6 +424,12 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-054"></a>**FW-E2E-054: Discovery non-authoritative.** A denial observed in learning mode, outside any auto-widen zone. Pass: the live enforced session is not widened; the operation still fails in that run. Fail: observation silently widened the session.
 
+<a id="fw-e2e-062"></a>**FW-E2E-062: Learning without a denial feed fails fast ([FW-INV5](#fw-inv5)/[FW-INV6](#fw-inv6)).** `formwork learn -- cmd` on a host with no wired denial feed. Pass: the invocation errors *before* the workload spawns, naming the missing feed and the alternatives (`run` + hand-authored grants, `--observe-anyway`); no proposal file appears; with `--observe-anyway` the run is enforced, the absence of observation is reported loudly, and still no proposal is written. Fail: the workload runs and the missing feed is only announced afterwards, or an empty proposal pretends observation happened.
+
+<a id="fw-e2e-063"></a>**FW-E2E-063: Review loop closes over the proposal ([FW-DISC5](#fw-disc5)/[FW-DISC6](#fw-disc6)).** From a proposal holding needs-review candidates, driven entirely through the CLI: listing prints the candidates numbered on stdout (the result stream, present under quiet telemetry); accepting by 1-based number and by exact pattern moves exactly the selected entries into the discovered layer with discovery provenance and rewrites the proposal without them; `--accept-all` consumes the remainder; a credential-floor-matching entry is refused at accept regardless of what the proposal claims ([FW-INV8](#fw-inv8)). Dry-run on any host — the proposal file is input, no kernel needed. Pass: each behavior as stated. Fail: a listing lost to the telemetry channel, an unselected entry consumed, provenance missing, or a floored entry accepted.
+
+<a id="fw-e2e-064"></a>**FW-E2E-064: Short-lived workload denials are captured ([FW-DISC1](#fw-disc1)/[FW-DISC2](#fw-disc2)).** A learning run whose workload dies on its first denial (`cat` of an ungranted file — exiting in well under a second, the canonical discovery shape). Pass: the denied path still appears in the proposal, despite denial-feed persistence latency exceeding the workload's lifetime (collection is anchored to the run start and polled to quiescence). Fail: an empty proposal because collection read a window the feed had not yet flushed.
+
 ### 7.10 Adversarial
 
 <a id="fw-adv-001"></a>**FW-ADV-001: Sandbox shedding.** The confined process attempts, in sequence: `execve` of a setuid binary, `prctl` to clear `NO_NEW_PRIVS`, and re-exec to try to drop the seccomp filter. Pass: all fail; confinement persists across every attempt. Fail: any attempt restores access or relaxes the filter.
@@ -567,12 +573,12 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-CRED7](#fw-cred7) Channel split | [FW-E2E-045](#fw-e2e-045), 046 | ADV-012, INV9 |
 | [FW-CRED8](#fw-cred8) Report mechanism | [FW-E2E-050](#fw-e2e-050) | ADV-014 |
 | [FW-CRED9](#fw-cred9) Floor enforceability | [FW-E2E-050](#fw-e2e-050) | INV5; Linux kernel enforcement deferred |
-| [FW-DISC1](#fw-disc1) Learning mode | [FW-E2E-051](#fw-e2e-051) | 054 |
-| [FW-DISC2](#fw-disc2) Reverse compile | [FW-E2E-051](#fw-e2e-051) | 052, 053 |
+| [FW-DISC1](#fw-disc1) Learning mode | [FW-E2E-051](#fw-e2e-051) | 054, 062, 064 |
+| [FW-DISC2](#fw-disc2) Reverse compile | [FW-E2E-051](#fw-e2e-051) | 052, 053, 064 |
 | [FW-DISC3](#fw-disc3) Catalog floor | [FW-ADV-013](#fw-adv-013), 015 | 051, INV8 |
 | [FW-DISC4](#fw-disc4) Auto-widen zone | [FW-E2E-052](#fw-e2e-052) | 054 |
-| [FW-DISC5](#fw-disc5) Review diff | [FW-E2E-051](#fw-e2e-051) | 053 |
-| [FW-DISC6](#fw-disc6) Provenance | [FW-E2E-053](#fw-e2e-053) | — |
+| [FW-DISC5](#fw-disc5) Review diff | [FW-E2E-051](#fw-e2e-051), 063 | 053 |
+| [FW-DISC6](#fw-disc6) Provenance | [FW-E2E-053](#fw-e2e-053) | 063 |
 | Launcher arm (§2) | [FW-E2E-046](#fw-e2e-046), 050 | 047, INV7, ADV-014 |
 
 ## 11. Open questions

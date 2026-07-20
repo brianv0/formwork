@@ -94,18 +94,34 @@ const QUIESCENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 /// Anchored to the run's start (the window is recomputed as elapsed-since-start each poll), never
 /// to collection time -- a `--last N` fixed at collection would drift off the run it brackets.
 fn collect_denials_quiescent(run_started: std::time::Instant) -> Result<Vec<DenialRecord>> {
+    collect_until_quiescent(
+        || collect_denials(run_started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS),
+        QUIESCENCE_POLL,
+        QUIESCENCE_CAP,
+    )
+}
+
+/// The quiescence control flow, separated from the impure `log show` collector so the
+/// stabilization property (FW-E2E-064's mechanism) is testable as a pure function of a chosen
+/// record sequence -- the same substitution the constitution allows for the compiler's
+/// HostProfile; the feed itself is exercised by the macOS E2E tests, never mocked there.
+fn collect_until_quiescent(
+    mut collect: impl FnMut() -> Result<Vec<DenialRecord>>,
+    poll: std::time::Duration,
+    cap: std::time::Duration,
+) -> Result<Vec<DenialRecord>> {
     let polling_started = std::time::Instant::now();
-    let mut last = collect_denials(run_started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS)?;
+    let mut last = collect()?;
     loop {
-        if polling_started.elapsed() >= QUIESCENCE_CAP {
+        if polling_started.elapsed() >= cap {
             tracing::warn!(
-                cap_secs = QUIESCENCE_CAP.as_secs(),
+                cap_secs = cap.as_secs(),
                 "denial collection hit its quiescence cap; late-flushing records may be missing (re-run `formwork learn` to catch them)"
             );
             return Ok(last);
         }
-        std::thread::sleep(QUIESCENCE_POLL);
-        let next = collect_denials(run_started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS)?;
+        std::thread::sleep(poll);
+        let next = collect()?;
         if next == last {
             return Ok(next);
         }
@@ -482,6 +498,69 @@ mod tests {
         );
         assert_eq!(by_path["/var/cache/x"], "learn-2");
         assert_eq!(merged.len(), 3);
+    }
+
+    /// The stabilization property behind FW-E2E-064: a feed that is still flushing (each read
+    /// yields more than the last) keeps being re-read; the first repeated read is the answer.
+    #[test]
+    fn quiescence_returns_the_first_repeated_read() {
+        let read = |path: &str| DenialRecord {
+            path: path.to_string(),
+            access: DenialAccess::Read,
+        };
+        let sequence = [
+            vec![read("/a")],
+            vec![read("/a"), read("/b")], // a late-flushing record arrived between polls
+            vec![read("/a"), read("/b")], // ...and now the store is quiet
+            vec![read("/a"), read("/b"), read("/never-reached")],
+        ];
+        let mut calls = 0;
+        let result = collect_until_quiescent(
+            || {
+                let batch = sequence[calls].clone();
+                calls += 1;
+                Ok(batch)
+            },
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(result, sequence[2]);
+        assert_eq!(calls, 3, "polling stops at the first repeated read");
+    }
+
+    #[test]
+    fn quiescence_cap_bounds_a_feed_that_never_settles() {
+        let mut calls: usize = 0;
+        let result = collect_until_quiescent(
+            || {
+                calls += 1;
+                // Every read yields something new, so only the cap can end the loop.
+                Ok((0..calls)
+                    .map(|i| DenialRecord {
+                        path: format!("/flush/{i}"),
+                        access: DenialAccess::Write,
+                    })
+                    .collect())
+            },
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+        // Bounded, and what WAS collected is returned rather than discarded (over-capture is
+        // safe; under-capture just means another learning run).
+        assert_eq!(result.len(), calls);
+        assert!(calls >= 2, "the cap must not fire before a re-read happened");
+    }
+
+    #[test]
+    fn quiescence_propagates_collector_errors() {
+        let result = collect_until_quiescent(
+            || bail!("log show failed"),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(10),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
