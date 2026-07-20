@@ -79,6 +79,40 @@ fn parse_sandbox_denial(event_message: &str) -> Option<DenialRecord> {
     })
 }
 
+/// Unified-log records persist lazily: under low logging pressure a short-lived process's buffered
+/// denials can take well over the old fixed 4-second slack to reach the store `log show` reads --
+/// and a workload that dies on its first denied read (the canonical discovery case) is exactly the
+/// short-lived shape that loses its records to that latency. So collection polls to quiescence:
+/// re-read the whole run window until two consecutive reads agree, bounded by a cap. Over-capture
+/// is safe by design (candidates are inert until accepted, credentials floored regardless), so the
+/// slack and cap can be generous.
+const PERSISTENCE_SLACK_SECS: u64 = 2;
+const QUIESCENCE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+const QUIESCENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Collect the run window's denials, polling until the log store stops yielding new records.
+/// Anchored to the run's start (the window is recomputed as elapsed-since-start each poll), never
+/// to collection time -- a `--last N` fixed at collection would drift off the run it brackets.
+fn collect_denials_quiescent(run_started: std::time::Instant) -> Result<Vec<DenialRecord>> {
+    let polling_started = std::time::Instant::now();
+    let mut last = collect_denials(run_started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS)?;
+    loop {
+        if polling_started.elapsed() >= QUIESCENCE_CAP {
+            tracing::warn!(
+                cap_secs = QUIESCENCE_CAP.as_secs(),
+                "denial collection hit its quiescence cap; late-flushing records may be missing (re-run `formwork learn` to catch them)"
+            );
+            return Ok(last);
+        }
+        std::thread::sleep(QUIESCENCE_POLL);
+        let next = collect_denials(run_started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS)?;
+        if next == last {
+            return Ok(next);
+        }
+        last = next;
+    }
+}
+
 /// Post-hoc collection over the run window (plus slack for log-persistence latency).
 fn collect_denials(window_secs: u64) -> Result<Vec<DenialRecord>> {
     let output = Command::new("/usr/bin/log")
@@ -122,10 +156,10 @@ pub fn conclude_learning_run(
     blueprint_path: &Path,
     catalog: &ResolvedCatalog,
     run_id: &str,
-    window_secs: u64,
+    run_started: std::time::Instant,
     workload_status: &std::process::ExitStatus,
 ) -> Result<()> {
-    let records = collect_denials(window_secs)?;
+    let records = collect_denials_quiescent(run_started)?;
     let outcome = reverse_compile(
         &records,
         catalog,
@@ -197,23 +231,30 @@ pub fn conclude_learning_run(
         candidates,
     };
     let body = format!(
-        "# formwork learn proposal -- review with `formwork accept --proposal {p}` (no selection\n\
-         # lists entries by number), then accept per entry (--entry <N> or --entry <pattern>).\n\
+        "# formwork learn proposal -- list with `formwork learn --list`, then accept per entry\n\
+         # (`formwork learn --accept <N>` or `--accept <pattern>`, repeatable; `--accept-all`).\n\
          # Paths are kernel-resolved (macOS: /tmp appears as /private/tmp). Nothing here has any\n\
          # effect until accepted (FW-INV10).\n{body}",
-        p = path.display(),
         body = toml::to_string_pretty(&proposal).context("serializing proposal")?
     );
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    let needs_review = proposal
+        .candidates
+        .iter()
+        .filter(|c| c.candidate.tag == CandidateTag::NeedsReview)
+        .count();
+    // The proposal pointer is the run's RESULT, so it goes to stdout; telemetry stays on stderr.
+    println!(
+        "proposal: {} ({} candidates, {} needs review) -- review with `formwork learn --list`",
+        path.display(),
+        proposal.candidates.len(),
+        needs_review
+    );
     tracing::info!(
         workload_exit = workload_status.code().unwrap_or(-1),
         proposal = %path.display(),
         candidates = proposal.candidates.len(),
-        needs_review = proposal
-            .candidates
-            .iter()
-            .filter(|c| c.candidate.tag == CandidateTag::NeedsReview)
-            .count(),
+        needs_review,
         withheld = outcome.withheld.len(),
         "learning run complete (proposal written regardless of workload exit)"
     );
@@ -283,35 +324,52 @@ fn merge_into_discovered(
     Ok(accepted.len())
 }
 
-/// `formwork accept`: per-entry, human-in-the-loop acceptance (FW-DISC5). With no selection it
+/// `formwork learn --list`/`--accept` (and the hidden `accept` alias): per-entry,
+/// human-in-the-loop acceptance (FW-DISC5). With no selection it
 /// lists the candidates by number instead of erroring, so the review loop is self-describing.
 /// A selection names an entry by its 1-based number or by its exact pattern. The credential
 /// floor is re-checked here with NO exclusions -- even a forged proposal cannot move a catalog
 /// location into the discovered layer through this door (FW-INV8).
 pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -> Result<()> {
-    let text = std::fs::read_to_string(proposal_file)
-        .with_context(|| format!("reading proposal {}", proposal_file.display()))?;
+    let text = match std::fs::read_to_string(proposal_file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+            "no proposal at {} -- run `formwork learn -- <cmd> …` first to observe one",
+            proposal_file.display()
+        ),
+        Err(e) => {
+            return Err(e).context(format!("reading proposal {}", proposal_file.display()))
+        }
+    };
     let proposal: ProposalFile = toml::from_str(&text)
         .with_context(|| format!("parsing proposal {}", proposal_file.display()))?;
 
+    // The listing IS this invocation's result, so it goes to stdout -- under RUST_LOG=warn a
+    // stderr listing would silently vanish, hiding the one thing the user asked for.
     if !all && entries.is_empty() {
         if proposal.candidates.is_empty() {
-            tracing::info!("proposal has no candidates; nothing to review");
+            println!("proposal has no candidates; nothing to review");
             return Ok(());
         }
         for (index, entry) in proposal.candidates.iter().enumerate() {
-            tracing::info!(
-                entry = index + 1,
-                pattern = %entry.candidate.pattern.canonical(),
-                access = ?entry.candidate.access,
-                tag = ?entry.candidate.tag,
-                observed_by = %entry.run_id,
-                "candidate"
+            let access = match entry.candidate.access {
+                DenialAccess::Read => "read",
+                DenialAccess::Write => "write",
+            };
+            let tag = match entry.candidate.tag {
+                CandidateTag::NeedsReview => "needs-review",
+                CandidateTag::AutoAccepted => "auto-accepted",
+            };
+            println!(
+                "{:>3}. {} ({access}, {tag}, observed by {})",
+                index + 1,
+                entry.candidate.pattern.canonical(),
+                entry.run_id
             );
         }
-        tracing::info!(
-            "select with --entry <number|pattern> (repeatable) or --all; auto-accepted entries \
-             are already in the discovered layer and are listed for audit only"
+        println!(
+            "select with `formwork learn --accept <number|pattern>` (repeatable) or --accept-all; \
+             auto-accepted entries are already in the discovered layer and are listed for audit only"
         );
         return Ok(());
     }
@@ -377,10 +435,10 @@ pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -
     std::fs::write(proposal_file, body)
         .with_context(|| format!("rewriting {}", proposal_file.display()))?;
 
-    tracing::info!(
-        accepted = count,
-        into = %discovered.display(),
-        "accepted discovered grants; they apply from the next run"
+    println!(
+        "accepted {count} grant{} into {}; they apply from the next run",
+        if count == 1 { "" } else { "s" },
+        discovered.display()
     );
     Ok(())
 }

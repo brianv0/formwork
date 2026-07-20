@@ -11,7 +11,7 @@ from pathlib import Path
 from helpers import REPO_ROOT
 
 # The defining documents, in precedence order: an ID must be defined in exactly one.
-DEFINING = ("formwork.md", "fep-1.md")
+DEFINING = ("formwork.md", "docs/fep-1.md")
 
 ID_RE = re.compile(
     r"FW-(?:E2E|ADV)-\d{3}"

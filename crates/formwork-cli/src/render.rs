@@ -1,0 +1,159 @@
+//! Human renderings of the observability surfaces: the host summary (the `--help` epilogue and
+//! `explain`'s first line), per-path verdicts, and the fidelity-report summary. `compile` and
+//! `explain --json` stay the machine door with stable JSON; everything here is prose for a person
+//! at a terminal, so wording favors "what can I do about it" over field names.
+
+use formwork_blueprint::{Explanation, RuleSource, Verdict};
+use formwork_compile::{Backend, Fidelity, FidelityReport};
+use formwork_detect::{HostProfile, Os};
+
+/// One line answering "will this machine enforce, and can `learn` observe?".
+pub fn host_summary(profile: &HostProfile) -> String {
+    match profile.os {
+        Os::MacOs => format!(
+            "macOS ({}) -- Seatbelt: kernel enforcement ready; `learn` denial feed: unified log",
+            profile.os_version
+        ),
+        Os::Linux => match profile.landlock_abi {
+            Some(abi) => format!(
+                "Linux {} -- Landlock ABI v{abi} + seccomp: kernel enforcement ready; no denial \
+                 feed (`formwork learn` unavailable)",
+                profile.os_version
+            ),
+            None => format!(
+                "Linux {} -- no Landlock (kernel 5.13+ needed){}: fs enforcement unavailable; \
+                 compile/dry-run still work",
+                profile.os_version,
+                if profile.seccomp { ", seccomp only" } else { ", no seccomp" }
+            ),
+        },
+    }
+}
+
+fn source(s: &RuleSource) -> String {
+    match s {
+        RuleSource::BuiltIn => "built-in".to_string(),
+        RuleSource::Profile(name) => format!("profile {name}"),
+        RuleSource::File(name) => format!("blueprint {name}"),
+        RuleSource::Cli => "cli override".to_string(),
+        RuleSource::Discovered(name) => format!("discovered layer {name}"),
+    }
+}
+
+fn verdict(v: &Verdict) -> String {
+    match v {
+        Verdict::Granted { rule, source: s } => format!("granted by {rule} ({})", source(s)),
+        Verdict::Denied { rule, source: s } => format!("denied by {rule} ({})", source(s)),
+        Verdict::Ambient => "allowed by default (no rule names it)".to_string(),
+        Verdict::Hidden => "not granted (nothing reaches it in this policy)".to_string(),
+    }
+}
+
+/// One path's three verdicts, indented under the path.
+pub fn explanation(e: &Explanation) -> String {
+    format!(
+        "{}\n  read:  {}\n  write: {}\n  exec:  {}\n",
+        e.path,
+        verdict(&e.read),
+        verdict(&e.write),
+        verdict(&e.exec)
+    )
+}
+
+fn backend(b: Backend) -> &'static str {
+    match b {
+        Backend::Landlock => "landlock",
+        Backend::Seccomp => "seccomp",
+        Backend::Seatbelt => "seatbelt",
+        Backend::Gateway => "gateway",
+        Backend::Launcher => "launcher",
+        Backend::None => "none",
+    }
+}
+
+fn fidelity(f: &Fidelity) -> String {
+    match f {
+        Fidelity::Enforced { backend: b } => format!("enforced ({})", backend(*b)),
+        Fidelity::Partial { backend: b, reason } => {
+            format!("partial ({}) -- {reason}", backend(*b))
+        }
+        Fidelity::Unenforceable { reason } => format!("unavailable -- {reason}"),
+    }
+}
+
+/// The fidelity report as prose: per-capability honesty plus the credential floor's shape. The
+/// full itemization stays in `compile --report-only`; this is the at-a-glance form.
+pub fn report_summary(report: &FidelityReport) -> String {
+    let mut out = String::from("capabilities:\n");
+    let width = report
+        .per_capability
+        .keys()
+        .map(|c| c.as_key().len())
+        .max()
+        .unwrap_or(0);
+    for (capability, f) in &report.per_capability {
+        out.push_str(&format!(
+            "  {:width$}  {}\n",
+            capability.as_key(),
+            fidelity(f),
+            width = width
+        ));
+    }
+    let creds = &report.credentials;
+    let path_types = creds.per_type.values().filter(|f| f.path.is_some()).count();
+    let env_types = creds.per_type.values().filter(|f| f.env.is_some()).count();
+    out.push_str(&format!(
+        "credential floor: catalog v{} -- {path_types} path type{} denied, {env_types} env \
+         type{} stripped; allowed through: {}\n",
+        creds.catalog_version,
+        if path_types == 1 { "" } else { "s" },
+        if env_types == 1 { "" } else { "s" },
+        if creds.allowed.is_empty() {
+            "(none)".to_string()
+        } else {
+            creds.allowed.join(", ")
+        }
+    ));
+    out.push_str(&format!("note: {}\n", creds.launcher_contingency));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_summary_states_enforcement_and_learn_availability() {
+        let mac = host_summary(&HostProfile::synthetic_macos());
+        assert!(mac.contains("Seatbelt") && mac.contains("unified log"), "{mac}");
+
+        let linux_v6 = host_summary(&HostProfile::synthetic_linux(Some(6)));
+        assert!(
+            linux_v6.contains("Landlock ABI v6") && linux_v6.contains("`formwork learn` unavailable"),
+            "{linux_v6}"
+        );
+
+        let degraded = host_summary(&HostProfile::synthetic_linux(None));
+        assert!(
+            degraded.contains("no Landlock") && degraded.contains("compile/dry-run still work"),
+            "{degraded}"
+        );
+    }
+
+    #[test]
+    fn verdicts_name_rule_and_origin() {
+        let e = Explanation {
+            path: "/work/secret".to_string(),
+            read: Verdict::Denied {
+                rule: "/work/secret".to_string(),
+                source: RuleSource::Cli,
+            },
+            write: Verdict::Hidden,
+            exec: Verdict::Ambient,
+        };
+        let text = explanation(&e);
+        assert!(text.contains("read:  denied by /work/secret (cli override)"), "{text}");
+        assert!(text.contains("write: not granted"), "{text}");
+        assert!(text.contains("exec:  allowed by default"), "{text}");
+    }
+}

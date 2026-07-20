@@ -13,6 +13,90 @@ use formwork_blueprint::{
     RuleSource,
 };
 
+/// The blueprint file every subcommand looks for when `--blueprint` is not given.
+pub const DEFAULT_BLUEPRINT_NAME: &str = "FORMWORK.toml";
+
+/// Profiles compiled into the binary, addressable as `extends = ["builtin:<name>"]` -- so a
+/// blueprint can layer on the shipped default without a repo checkout (the release-binary user
+/// has no `profiles/` directory to point at).
+const BUILTIN_PROFILES: &[(&str, &str)] = &[(
+    "default",
+    include_str!("../../../profiles/default.toml"),
+)];
+
+/// How the blueprint path was chosen. Auto-discovery must never be silent (a policy the user
+/// never named still governs the session), so the source travels with the path into logs and
+/// `compile`/`explain` output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlueprintSource {
+    Flag,
+    Discovered,
+}
+
+impl BlueprintSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlueprintSource::Flag => "flag",
+            BlueprintSource::Discovered => "auto-discovered",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedBlueprint {
+    pub path: PathBuf,
+    pub source: BlueprintSource,
+}
+
+/// Resolve which blueprint file governs this invocation: the explicit flag always wins; otherwise
+/// a `FORMWORK.toml` discovered from the launch directory upward. `Ok(None)` means neither -- the
+/// caller decides whether that is an error (enforcing commands) or a degraded mode (`explain`
+/// with no blueprint still summarizes the host).
+pub fn resolve_blueprint(
+    flag: Option<&Path>,
+    cwd: &Path,
+    home: &str,
+) -> Option<ResolvedBlueprint> {
+    if let Some(path) = flag {
+        tracing::info!(blueprint = %path.display(), source = "flag", "blueprint resolved");
+        return Some(ResolvedBlueprint {
+            path: path.to_path_buf(),
+            source: BlueprintSource::Flag,
+        });
+    }
+    let found = find_default_blueprint(cwd, home)?;
+    tracing::info!(
+        blueprint = %found.display(),
+        source = "auto-discovered",
+        "blueprint resolved (no --blueprint given; found {DEFAULT_BLUEPRINT_NAME})"
+    );
+    Some(ResolvedBlueprint {
+        path: found,
+        source: BlueprintSource::Discovered,
+    })
+}
+
+/// Walk from `cwd` upward looking for a `FORMWORK.toml`, stopping at `$HOME` (inclusive) so a
+/// project never silently inherits a file from above the user's own tree, and never consulting
+/// the filesystem root for a nested cwd (a root-owned policy file governing every launch would
+/// be a surprise, not a convenience).
+pub fn find_default_blueprint(cwd: &Path, home: &str) -> Option<PathBuf> {
+    let home = Path::new(home);
+    for dir in cwd.ancestors() {
+        if dir.parent().is_none() && cwd.parent().is_some() {
+            break;
+        }
+        let candidate = dir.join(DEFAULT_BLUEPRINT_NAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir == home {
+            break;
+        }
+    }
+    None
+}
+
 /// Load the file's layer stack (extends chain flattened, bases first) and merge, with no CLI
 /// overrides. The single-file case degenerates to exactly the pre-layering behavior (FW-E2E-041).
 /// Production callers always pass overrides, so this exists for the tests only.
@@ -179,6 +263,32 @@ fn resolve_layer(
     out: &mut Vec<(RuleSource, BlueprintLayer)>,
 ) -> Result<()> {
     for base in std::mem::take(&mut layer.extends) {
+        // `builtin:<name>` resolves against the compiled-in profiles, not the filesystem, so a
+        // release binary can extend the shipped default with no repo checkout present.
+        if let Some(name) = base.strip_prefix("builtin:") {
+            let Some((_, text)) = BUILTIN_PROFILES.iter().find(|(n, _)| *n == name) else {
+                let known: Vec<String> = BUILTIN_PROFILES
+                    .iter()
+                    .map(|(n, _)| format!("builtin:{n}"))
+                    .collect();
+                bail!("unknown builtin profile {base:?} (known: {known:?})");
+            };
+            let mut value: toml::Value = toml::from_str(text)
+                .with_context(|| format!("parsing builtin profile {base:?}"))?;
+            sigils.expand_value(&mut value);
+            let builtin: BlueprintLayer = value
+                .try_into()
+                .with_context(|| format!("interpreting builtin profile {base:?}"))?;
+            resolve_layer(
+                builtin,
+                RuleSource::Profile(base.clone()),
+                base_dir,
+                sigils,
+                visiting,
+                out,
+            )?;
+            continue;
+        }
         let base_path = if Path::new(&base).is_absolute() {
             PathBuf::from(&base)
         } else {
@@ -809,5 +919,86 @@ mod tests {
         };
         let out = canonicalize_for_enforcement(&blueprint).unwrap();
         assert_eq!(out.fs.subtract, blueprint.fs.subtract);
+    }
+
+    #[test]
+    fn builtin_default_profile_resolves_without_a_checkout() {
+        let dir = Scratch::new("builtin");
+        std::fs::write(
+            dir.path().join("bp.toml"),
+            "extends = [\"builtin:default\"]\nrules = [\"readwrite:/work/proj/**\"]\n",
+        )
+        .unwrap();
+        let bp = load(&dir.path().join("bp.toml"), "/home/x").unwrap();
+        // The embedded default's posture and tamper-vector holes come through...
+        assert_eq!(bp.net, formwork_blueprint::NetPosture::Deny);
+        assert_eq!(
+            bp.fs.read_mode,
+            formwork_blueprint::ReadMode::AmbientMinusSubtract
+        );
+        assert!(bp
+            .fs
+            .write_subtract
+            .contains(&PathPattern::parse("**/.git/hooks/**").unwrap()));
+        // ...and the extending file's grant layers on top.
+        assert!(bp
+            .fs
+            .writes
+            .contains(&PathPattern::parse("/work/proj/**").unwrap()));
+    }
+
+    #[test]
+    fn unknown_builtin_profile_fails_loud_naming_the_known_set() {
+        let dir = Scratch::new("builtin-bad");
+        std::fs::write(
+            dir.path().join("bp.toml"),
+            "extends = [\"builtin:bogus\"]\n",
+        )
+        .unwrap();
+        let err = load(&dir.path().join("bp.toml"), "/home/x").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("builtin:bogus") && msg.contains("builtin:default"), "{msg}");
+    }
+
+    #[test]
+    fn default_blueprint_discovery_walks_up_and_stops_at_home() {
+        let dir = Scratch::new("discover");
+        let home = dir.path().join("home");
+        let project = home.join("work").join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let home_str = home.to_str().unwrap();
+
+        // Nothing anywhere: no discovery.
+        assert_eq!(find_default_blueprint(&project, home_str), None);
+
+        // A file in a parent (still under $HOME) is found from a nested cwd.
+        std::fs::write(home.join("work").join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
+        assert_eq!(
+            find_default_blueprint(&project, home_str),
+            Some(home.join("work").join(DEFAULT_BLUEPRINT_NAME))
+        );
+
+        // The cwd's own file wins over a parent's.
+        std::fs::write(project.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
+        assert_eq!(
+            find_default_blueprint(&project, home_str),
+            Some(project.join(DEFAULT_BLUEPRINT_NAME))
+        );
+
+        // The walk never escapes above $HOME: a file beside (not under) home is not picked up
+        // from a cwd inside home.
+        std::fs::write(dir.path().join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
+        std::fs::remove_file(project.join(DEFAULT_BLUEPRINT_NAME)).unwrap();
+        std::fs::remove_file(home.join("work").join(DEFAULT_BLUEPRINT_NAME)).unwrap();
+        assert_eq!(find_default_blueprint(&project, home_str), None);
+
+        // A cwd outside $HOME still walks its own ancestors (a project need not live under
+        // home), just never as far as the filesystem root.
+        let outside = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert_eq!(
+            find_default_blueprint(&outside, home_str),
+            Some(dir.path().join(DEFAULT_BLUEPRINT_NAME))
+        );
     }
 }

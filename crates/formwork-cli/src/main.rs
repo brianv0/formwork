@@ -1,58 +1,79 @@
 //! `formwork` -- the CLI and v1 embedding surface.
 //!
 //! ```text
-//! formwork detect
-//! formwork compile --blueprint s.toml [--host h.json | --target linux-v6|macos] [--report-only]
-//! formwork run     --blueprint s.toml -- cmd args…   # spawn-confined
-//! formwork enforce-self --blueprint s.toml -- cmd…   # confine-self, then exec
-//! formwork gateway --blueprint s.toml --server files -- cmd…  # MCP policy proxy over stdio
-//! formwork explain --blueprint s.toml <path>          # why a path is granted/denied (dry-run)
+//! formwork run     [--blueprint s.toml] -- cmd args…  # spawn-confined (--confine-self to exec in place)
+//! formwork learn   [--blueprint s.toml] -- cmd args…  # enforced run + denial observation
+//! formwork learn   --list | --accept <n|pattern> | --accept-all   # review the proposal
+//! formwork explain [--blueprint s.toml] [path…]       # human observability: host, policy, verdicts
+//! formwork compile [--blueprint s.toml] [--host h.json | --target linux-v6|macos] [--report-only]
+//! formwork gateway [--blueprint s.toml] --server files -- cmd…  # MCP policy proxy over stdio
 //! ```
 //!
-//! The capability blueprint is passed with `--blueprint`; `--spec` is accepted as a back-compat
-//! alias. Every blueprint-taking subcommand accepts the same override surface (FW-BP1/BP2):
-//! `--set '<toml>'` fragments and the sugar flags (`--read/--write/--subtract/--write-subtract/`
-//! `--allow-cred/--net/--extends`) layer over the file, additively, deny-beats-allow.
+//! The blueprint is `--blueprint` (alias `--spec`), or a `FORMWORK.toml` discovered from the
+//! launch directory upward -- always announced, never silent. Every blueprint-taking subcommand
+//! accepts the same override surface (FW-BP1/BP2): `--set '<toml>'` fragments and the sugar flags
+//! (`--read/--write/--subtract/--write-subtract/--allow-cred/--net/--extends`) layer over the
+//! file, additively, deny-beats-allow.
 //!
-//! `detect`/`compile`/`explain` don't enforce and run on any host (including compiling a Linux policy
-//! on a Mac); `run`/`enforce-self`/`gateway` need a real confiner and error honestly where the
-//! backend is unimplemented.
+//! `compile`/`explain` (and the hidden `detect`) don't enforce and run on any host (including
+//! compiling a Linux policy on a Mac); `run`/`gateway` need a real confiner and error honestly
+//! where the backend is unimplemented. `detect` and `enforce-self`/`accept` remain as hidden
+//! plumbing / back-compat aliases of `explain`'s host summary, `run --confine-self`, and
+//! `learn --accept`.
 
 mod blueprint_load;
 mod learn;
+mod render;
 
 use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
+use blueprint_load::ResolvedBlueprint;
 use formwork_blueprint::{
     Blueprint, BlueprintLayer, McpPolicy, NetPosture, PathPattern, ResolvedCatalog,
 };
 use formwork_compile::compile;
 use formwork_detect::{detect, HostProfile};
 
+const AFTER_HELP: &str = "With no --blueprint, every subcommand looks for a FORMWORK.toml in the \
+current directory and its parents (up to $HOME) and says so when it uses one.\n\nPath patterns \
+(in blueprint files and flags) accept two sigils, expanded before compilation: ~ for $HOME and \
+$CWD for the launch directory -- so `--read '$CWD/**'` scopes a grant to the project you run \
+from.\n\nTelemetry goes to stderr (stdout stays a clean result stream). RUST_LOG=warn quiets it; \
+RUST_LOG=debug itemizes the credential floor per type.";
+
 #[derive(Parser)]
-#[command(
-    name = "formwork",
-    version,
-    about = "OS-level sandbox for agent sessions",
-    after_help = "Path patterns (in blueprint files and flags) accept two sigils, expanded before \
-compilation: ~ for $HOME and $CWD for the launch directory -- so `--read '$CWD/**'` scopes a grant \
-to the project you run from.\n\nTelemetry goes to stderr (stdout stays a clean result stream). \
-RUST_LOG=warn quiets it; RUST_LOG=debug itemizes the credential floor per type."
-)]
+#[command(name = "formwork", version, about = "OS-level sandbox for agent sessions")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
 }
 
+/// Parse argv with a computed help epilogue: probing the host is two cheap syscalls, and "will
+/// this machine enforce?" is the first question a new user brings to `--help`.
+fn parse_cli() -> Cli {
+    let epilogue = format!(
+        "{AFTER_HELP}\n\nThis host: {}",
+        render::host_summary(&detect())
+    );
+    let matches = Cli::command().after_help(epilogue).get_matches();
+    match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
-    /// Probe this host's enforcement capabilities and print a HostProfile as JSON.
+    /// Probe this host's enforcement capabilities and print a HostProfile as JSON. Hidden
+    /// plumbing: scripts gate on it and `detect > host.json` feeds `compile --host`; humans get
+    /// the same answer from `formwork explain` (or the `--help` epilogue).
+    #[command(hide = true)]
     Detect,
-    /// Compile a blueprint into a policy + fidelity report without enforcing (dry-run).
+    /// Compile a blueprint into a policy + fidelity report without enforcing (dry-run, JSON).
     Compile {
         #[command(flatten)]
         blueprint: BlueprintArgs,
@@ -70,10 +91,15 @@ enum Cmd {
     Run {
         #[command(flatten)]
         blueprint: BlueprintArgs,
+        /// Confine THIS process, then exec the command in place (the confine-self posture:
+        /// PID-preserving, no launcher left in the tree). Default is the safer spawn posture.
+        #[arg(long)]
+        confine_self: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
-    /// Confine the current process, then exec the given command (confine-self posture).
+    /// Hidden back-compat alias of `run --confine-self`.
+    #[command(hide = true)]
     EnforceSelf {
         #[command(flatten)]
         blueprint: BlueprintArgs,
@@ -84,16 +110,35 @@ enum Cmd {
     /// denials the kernel logged during the window, and reverse-compile them into a reviewable
     /// proposal. Observation never widens the live session (FW-INV10). Exits with the WORKLOAD's
     /// status -- a first learning run usually fails on the very denials it is there to observe;
-    /// the proposal is written regardless.
+    /// the proposal is written regardless. Review the proposal with --list / --accept /
+    /// --accept-all (no command after --).
     Learn {
         #[command(flatten)]
         blueprint: BlueprintArgs,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        /// List the proposal's candidates by number (review mode; no command after --).
+        #[arg(long)]
+        list: bool,
+        /// Accept one needs-review candidate by its 1-based number or exact pattern (repeatable;
+        /// review mode). Credential-floor matches are refused regardless of what the proposal
+        /// claims (FW-INV8).
+        #[arg(long)]
+        accept: Vec<String>,
+        /// Accept every needs-review candidate (review mode).
+        #[arg(long)]
+        accept_all: bool,
+        /// Review a proposal file that is not beside its blueprint (default:
+        /// <blueprint>.proposal.toml).
+        #[arg(long)]
+        proposal: Option<PathBuf>,
+        /// On a host with no denial feed (currently: everything but macOS), run enforced anyway.
+        /// No proposal will be written -- observation is impossible, not just skipped.
+        #[arg(long)]
+        observe_anyway: bool,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
-    /// Accept needs-review entries from a `formwork learn` proposal into the discovered layer,
-    /// per entry (FW-DISC5). Credential-floor matches are refused here regardless of what the
-    /// proposal claims (FW-INV8).
+    /// Hidden back-compat alias of `formwork learn --list` / `--accept`.
+    #[command(hide = true)]
     Accept {
         #[arg(long)]
         proposal: PathBuf,
@@ -117,16 +162,20 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
-    /// Explain one path against the merged blueprint without enforcing (FW-FID6): print the read,
-    /// write, and exec verdict, the rule that decides each under the deny-terminal model (FW-CAP8),
-    /// and the layer that rule came from. Reflects the merged blueprint (file, `extends`, overrides,
-    /// credential floor) like `compile`, not the session-only denies `run` adds (the dynamic
-    /// env-file-ref deny FW-CRED3, and policy-input write-protection FW-XR8). Same override surface.
+    /// Explain the session without enforcing (FW-FID6), human-readably. With paths: each path's
+    /// read, write, and exec verdict, the rule that decides it under the deny-terminal model
+    /// (FW-CAP8), and the layer that rule came from. With no path: this host's enforcement
+    /// capabilities plus the merged blueprint's fidelity summary (host-only when no blueprint is
+    /// found). Reflects the merged blueprint like `compile`, not the session-only denies `run`
+    /// adds (FW-CRED3 env-file refs, FW-XR8 policy-input write-protection). Same override surface.
     Explain {
         #[command(flatten)]
         blueprint: BlueprintArgs,
-        /// The path to explain (sigils `~`/`$CWD` expand as in a grant).
-        path: String,
+        /// Machine-readable JSON instead of the human rendering.
+        #[arg(long)]
+        json: bool,
+        /// Paths to explain (sigils `~`/`$CWD` expand as in a grant).
+        paths: Vec<String>,
     },
 }
 
@@ -135,8 +184,10 @@ enum Cmd {
 /// sugar flags desugar into one final layer (postures here beat `--set`, both beat the file).
 #[derive(clap::Args)]
 struct BlueprintArgs {
+    /// The blueprint file. Omitted: a FORMWORK.toml discovered from the launch directory upward
+    /// (announced, never silent).
     #[arg(long, visible_alias = "spec")]
-    blueprint: PathBuf,
+    blueprint: Option<PathBuf>,
     /// Override layer as a TOML fragment in blueprint syntax (repeatable, applied in order),
     /// e.g. --set 'net = "deny"' or --set '[fs]
     /// subtract = ["~/other/**"]'.
@@ -176,25 +227,67 @@ struct BlueprintArgs {
 }
 
 impl BlueprintArgs {
+    /// Which blueprint file governs this invocation, or a teaching error when none is named and
+    /// none is discoverable. The resolved source travels into logs and `compile`/`explain` output
+    /// so auto-discovery is never silent.
+    fn resolve(&self) -> Result<ResolvedBlueprint> {
+        self.try_resolve()?.ok_or_else(|| {
+            anyhow!(
+                "no blueprint: pass --blueprint <file>, or create a {name} in this directory (or \
+                 a parent, up to $HOME). A minimal {name}:\n\n    \
+                 extends = [\"builtin:default\"]\n    \
+                 rules = [\"readwrite:$CWD/**\"]\n",
+                name = blueprint_load::DEFAULT_BLUEPRINT_NAME
+            )
+        })
+    }
+
+    /// As [`Self::resolve`], but `Ok(None)` when nothing is named or discoverable -- for the one
+    /// caller (`explain` with no path) that degrades to a host-only summary instead of erroring.
+    fn try_resolve(&self) -> Result<Option<ResolvedBlueprint>> {
+        let cwd = cwd()?;
+        Ok(blueprint_load::resolve_blueprint(
+            self.blueprint.as_deref(),
+            std::path::Path::new(&cwd),
+            &home(),
+        ))
+    }
+
+    /// Whether any override flag was given -- overrides without a base blueprint are an error,
+    /// not a silent no-op (the user expressed intent that would otherwise be dropped).
+    fn has_overrides(&self) -> bool {
+        !(self.set.is_empty()
+            && self.read.is_empty()
+            && self.write.is_empty()
+            && self.subtract.is_empty()
+            && self.write_subtract.is_empty()
+            && self.allow_cred.is_empty()
+            && self.rule.is_empty()
+            && self.extends.is_empty())
+            || self.net.is_some()
+            || self.mode.is_some()
+    }
+
     /// Resolve the full layer stack and merge (FW-BP2). Path sigils (`~`, `$CWD`) in flag values
     /// expand against the same `$HOME`/launch directory as file contents, via one shared
     /// [`blueprint_load::Sigils`], so the two surfaces stay one model.
-    fn load(&self, home: &str) -> Result<Blueprint> {
+    fn load(&self, path: &std::path::Path, home: &str) -> Result<Blueprint> {
         let cwd = cwd()?;
         let sigils = blueprint_load::Sigils::new(home, &cwd);
         let sugar = self.sugar_layer(&sigils)?;
-        blueprint_load::load_stack(&self.blueprint, &self.set, sugar, &sigils)
+        blueprint_load::load_stack(path, &self.set, sugar, &sigils)
     }
 
     /// As [`Self::load`], but also returns the per-layer provenance for `explain` (FW-FID6).
     fn load_with_provenance(
         &self,
+        path: &std::path::Path,
         home: &str,
     ) -> Result<(Blueprint, formwork_blueprint::Provenance)> {
         let cwd = cwd()?;
         let sigils = blueprint_load::Sigils::new(home, &cwd);
         let sugar = self.sugar_layer(&sigils)?;
-        blueprint_load::load_stack_with_provenance(&self.blueprint, &self.set, sugar, &sigils)
+        blueprint_load::load_stack_with_provenance(path, &self.set, sugar, &sigils)
     }
 
     fn sugar_layer(&self, sigils: &blueprint_load::Sigils) -> Result<BlueprintLayer> {
@@ -330,7 +423,7 @@ fn init_telemetry() {
 
 fn main() -> Result<()> {
     init_telemetry();
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let cmd = match &cli.command {
         Cmd::Detect => "detect",
         Cmd::Compile { .. } => "compile",
@@ -354,20 +447,64 @@ fn main() -> Result<()> {
             target,
             report_only,
         } => {
-            let blueprint = blueprint.load(&home())?;
+            let resolved = blueprint.resolve()?;
+            let blueprint = blueprint.load(&resolved.path, &home())?;
             let host = resolve_host(&host, &target)?;
             let catalog = ResolvedCatalog::builtin_for_home(&home())
                 .context("resolving credential catalog")?;
             let policy = compile(&blueprint, &host, &catalog);
-            if report_only {
-                println!("{}", serde_json::to_string_pretty(&policy.report)?);
+            let mut value = if report_only {
+                serde_json::to_value(&policy.report)?
             } else {
-                println!("{}", serde_json::to_string_pretty(&policy)?);
+                serde_json::to_value(&policy)?
+            };
+            attach_blueprint_info(&mut value, &resolved);
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        Cmd::Run {
+            blueprint,
+            confine_self,
+            argv,
+        } => {
+            let posture = if confine_self {
+                Posture::Self_
+            } else {
+                Posture::Spawn
+            };
+            run(blueprint, argv, posture)?
+        }
+        Cmd::EnforceSelf { blueprint, argv } => run(blueprint, argv, Posture::Self_)?,
+        Cmd::Learn {
+            blueprint,
+            list,
+            accept,
+            accept_all,
+            proposal,
+            observe_anyway,
+            argv,
+        } => {
+            let review = list || !accept.is_empty() || accept_all;
+            if review && !argv.is_empty() {
+                bail!(
+                    "give either a command to observe (after --) or review flags \
+                     (--list/--accept/--accept-all), not both"
+                );
+            }
+            if review {
+                let proposal = match proposal {
+                    Some(p) => p,
+                    None => learn::proposal_path(&blueprint.resolve()?.path),
+                };
+                learn::accept(&proposal, &accept, accept_all, &home())?;
+            } else if argv.is_empty() {
+                bail!(
+                    "nothing to do: give a command to observe (`formwork learn -- cmd …`) or \
+                     review the proposal (--list, --accept <n|pattern>, --accept-all)"
+                );
+            } else {
+                learn_run(blueprint, argv, observe_anyway)?;
             }
         }
-        Cmd::Run { blueprint, argv } => run(blueprint, argv, Posture::Spawn)?,
-        Cmd::EnforceSelf { blueprint, argv } => run(blueprint, argv, Posture::Self_)?,
-        Cmd::Learn { blueprint, argv } => learn_run(blueprint, argv)?,
         Cmd::Accept {
             proposal,
             entry,
@@ -378,28 +515,115 @@ fn main() -> Result<()> {
             server,
             argv,
         } => gateway(blueprint, server, argv)?,
-        Cmd::Explain { blueprint, path } => explain(blueprint, path)?,
+        Cmd::Explain {
+            blueprint,
+            json,
+            paths,
+        } => explain(blueprint, paths, json)?,
     }
     Ok(())
 }
 
-/// Explain one path against the merged blueprint (FW-FID6), no enforcement. Evaluates the
+/// Stamp which blueprint the output reflects, and how it was chosen, into a `compile`/`explain`
+/// JSON result -- the dry-run must always say what it dry-ran, or auto-discovery turns opaque.
+fn attach_blueprint_info(value: &mut serde_json::Value, resolved: &ResolvedBlueprint) {
+    if let serde_json::Value::Object(map) = value {
+        map.insert(
+            "blueprint".to_string(),
+            serde_json::json!({
+                "path": resolved.path.display().to_string(),
+                "source": resolved.source.as_str(),
+            }),
+        );
+    }
+}
+
+/// Explain paths against the merged blueprint (FW-FID6), no enforcement. Evaluates the
 /// deny-terminal model (FW-CAP8) against the authored -- not enforcement-canonicalized -- grants,
 /// so the rule it names is the one the operator wrote. The credential floor is a built-in,
 /// un-liftable deny, resolved here the way `compile --report-only` resolves it. Scope matches
 /// `compile`: the session-only denies `prepare_session` adds (FW-CRED3 env-file refs, FW-XR8
 /// policy-input write-protection) are not applied -- explain reflects the blueprint, not a run.
-fn explain(args: BlueprintArgs, path: String) -> Result<()> {
+/// With no path, summarizes the session instead: host capabilities plus the merged blueprint's
+/// fidelity report (host-only when no blueprint exists) -- the human door `detect`'s JSON never was.
+fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
+    if paths.is_empty() {
+        return explain_summary(&args, json);
+    }
     let home = home();
-    let (blueprint, provenance) = args.load_with_provenance(&home)?;
+    let resolved = args.resolve()?;
+    let (blueprint, provenance) = args.load_with_provenance(&resolved.path, &home)?;
     let cwd = cwd()?;
-    let target = PathPattern::parse(&blueprint_load::Sigils::new(&home, &cwd).expand(&path))
-        .with_context(|| format!("explaining {path:?}"))?;
+    let sigils = blueprint_load::Sigils::new(&home, &cwd);
     let catalog =
         ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
-    let floor = catalog.floor_type_of(&blueprint.allow_credentials, &target);
-    let explanation = provenance.explain(&blueprint, target.base(), floor);
-    println!("{}", serde_json::to_string_pretty(&explanation)?);
+    let mut explanations = Vec::new();
+    for path in &paths {
+        let target = PathPattern::parse(&sigils.expand(path))
+            .with_context(|| format!("explaining {path:?}"))?;
+        let floor = catalog.floor_type_of(&blueprint.allow_credentials, &target);
+        explanations.push(provenance.explain(&blueprint, target.base(), floor));
+    }
+    if json {
+        let mut value = serde_json::json!({ "explanations": explanations });
+        attach_blueprint_info(&mut value, &resolved);
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!(
+            "blueprint: {} ({})",
+            resolved.path.display(),
+            resolved.source.as_str()
+        );
+        for explanation in &explanations {
+            print!("{}", render::explanation(explanation));
+        }
+    }
+    Ok(())
+}
+
+/// The no-path `explain`: what this session would be, before running anything. With a blueprint
+/// (named or discovered): host + the merged policy's fidelity summary. Without one: the host
+/// summary alone -- unless override flags were given, which need a base and error like any other
+/// blueprint-taking use.
+fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
+    let host = detect();
+    let resolved = match args.try_resolve()? {
+        Some(resolved) => resolved,
+        None if !args.has_overrides() && args.blueprint.is_none() => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "host": host }))?
+                );
+            } else {
+                println!("host: {}", render::host_summary(&host));
+                println!(
+                    "\nno blueprint found (no --blueprint, no {} here or in a parent); showing \
+                     host capabilities only",
+                    blueprint_load::DEFAULT_BLUEPRINT_NAME
+                );
+            }
+            return Ok(());
+        }
+        None => return Err(args.resolve().unwrap_err()),
+    };
+    let blueprint = args.load(&resolved.path, &home())?;
+    let catalog =
+        ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
+    let policy = compile(&blueprint, &host, &catalog);
+    if json {
+        let mut value = serde_json::json!({ "host": host, "report": policy.report });
+        attach_blueprint_info(&mut value, &resolved);
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!(
+            "blueprint: {} ({})",
+            resolved.path.display(),
+            resolved.source.as_str()
+        );
+        println!("host: {}", render::host_summary(&host));
+        print!("{}", render::report_summary(&policy.report));
+    }
     Ok(())
 }
 
@@ -426,10 +650,14 @@ struct Session {
     blueprint: Blueprint,
     catalog: ResolvedCatalog,
     policy: formwork_compile::CompiledPolicy,
+    /// The resolved blueprint file this session was built from (flag or discovered FORMWORK.toml);
+    /// `learn` derives the proposal/discovered-layer paths from it.
+    blueprint_path: PathBuf,
 }
 
 fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
-    let mut blueprint = args.load(&home())?;
+    let resolved = args.resolve()?;
+    let mut blueprint = args.load(&resolved.path, &home())?;
     let catalog =
         ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
     // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
@@ -443,8 +671,9 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
         )?);
     // The policy inputs are write-denied inside the session: a confined agent must not be able
     // to edit the blueprint, forge the discovered layer, or doctor the proposal that shapes its
-    // own NEXT run (FW-XR8 / FW-INV8).
-    blueprint_load::protect_policy_inputs(&mut blueprint, &args.blueprint)?;
+    // own NEXT run (FW-XR8 / FW-INV8). Keys off the RESOLVED path, so a discovered FORMWORK.toml
+    // is protected exactly like an explicit one.
+    blueprint_load::protect_policy_inputs(&mut blueprint, &resolved.path)?;
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
     // faithfully rendered (FW-INV6). The catalog's paths get the same treatment -- a floor hole
@@ -460,6 +689,7 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
         blueprint,
         catalog,
         policy,
+        blueprint_path: resolved.path,
     })
 }
 
@@ -498,10 +728,22 @@ fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<
 
 /// `formwork learn`: an enforced run bracketed by observation (FW-DISC1). Visibly distinct from
 /// a plain run, changes nothing about the live policy, and concludes by writing the proposal /
-/// self-accepting in-zone candidates for the NEXT run.
-fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>) -> Result<()> {
-    let session = prepare_session(&blueprint)?;
+/// self-accepting in-zone candidates for the NEXT run. On a host with no denial feed this fails
+/// BEFORE the workload runs (FW-INV5): running an entire session and only then announcing that
+/// observation was impossible would waste the run while looking like it worked.
+fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) -> Result<()> {
     let host = detect();
+    let has_denial_feed = matches!(host.os, formwork_detect::Os::MacOs);
+    if !has_denial_feed && !observe_anyway {
+        bail!(
+            "`formwork learn` needs a kernel denial feed, and this host has none (the macOS \
+             unified-log tap is the only wired source; Landlock audit needs kernel 6.15+ and is \
+             not wired yet). The policy itself is enforceable: use `formwork run` and author \
+             grants by hand, or pass --observe-anyway to run enforced without observation (no \
+             proposal will be written)."
+        );
+    }
+    let session = prepare_session(&blueprint)?;
     tracing::info!(
         "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
     );
@@ -514,24 +756,21 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>) -> Result<()> {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    let (program, args) = argv.split_first().expect("argv is required");
+    let (program, args) = argv.split_first().expect("argv is non-empty");
     let status = spawn_confined_child(&session, program, args)?;
 
-    if matches!(host.os, formwork_detect::Os::MacOs) {
-        // Slack covers unified-log persistence latency; over-capture within the window is safe
-        // (floored or review-gated), under-capture just means another learning run.
-        let window_secs = started.elapsed().as_secs() + 4;
+    if has_denial_feed {
         learn::conclude_learning_run(
             &session.blueprint,
-            &blueprint.blueprint,
+            &session.blueprint_path,
             &session.catalog,
             &run_id,
-            window_secs,
+            started,
             &status,
         )?;
     } else {
         tracing::warn!(
-            "learning ran enforced, but this host has no denial feed (the macOS unified-log tap is the only wired source; Landlock audit needs kernel 6.15+ and is unwired) -- no proposal was written (FW-INV5: reported, not pretended)"
+            "--observe-anyway: ran enforced, but this host has no denial feed -- no proposal was written (FW-INV5: reported, not pretended)"
         );
     }
     std::process::exit(status.code().unwrap_or(1));
