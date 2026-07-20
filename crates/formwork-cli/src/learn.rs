@@ -374,9 +374,7 @@ pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -
             "no proposal at {} -- run `formwork learn -- <cmd> …` first to observe one",
             proposal_file.display()
         ),
-        Err(e) => {
-            return Err(e).context(format!("reading proposal {}", proposal_file.display()))
-        }
+        Err(e) => return Err(e).context(format!("reading proposal {}", proposal_file.display())),
     };
     let proposal: ProposalFile = toml::from_str(&text)
         .with_context(|| format!("parsing proposal {}", proposal_file.display()))?;
@@ -596,7 +594,11 @@ mod tests {
             std::time::Duration::from_secs(5),
         )
         .unwrap();
-        assert_eq!(result, vec![expected], "the late-flushing record must be captured");
+        assert_eq!(
+            result,
+            vec![expected],
+            "the late-flushing record must be captured"
+        );
     }
 
     #[test]
@@ -621,7 +623,10 @@ mod tests {
         // Bounded, and what WAS collected is returned rather than discarded (over-capture is
         // safe; under-capture just means another learning run).
         assert_eq!(result.len(), calls);
-        assert!(calls >= 2, "the cap must not fire before a re-read happened");
+        assert!(
+            calls >= 2,
+            "the cap must not fire before a re-read happened"
+        );
     }
 
     #[test]

@@ -14,19 +14,23 @@ pub fn host_summary(profile: &HostProfile) -> String {
             "macOS ({}) -- Seatbelt: kernel enforcement ready; `learn` denial feed: unified log",
             profile.os_version
         ),
-        Os::Linux => match profile.landlock_abi {
-            Some(abi) => format!(
+        Os::Linux => {
+            match profile.landlock_abi {
+                Some(abi) => format!(
                 "Linux {} -- Landlock ABI v{abi} + seccomp: kernel enforcement ready; no denial \
                  feed (`formwork learn` unavailable)",
                 profile.os_version
             ),
-            None => format!(
+                None => {
+                    format!(
                 "Linux {} -- no Landlock (kernel 5.13+ needed){}: fs enforcement unavailable; \
                  compile/dry-run still work",
                 profile.os_version,
                 if profile.seccomp { ", seccomp only" } else { ", no seccomp" }
-            ),
-        },
+            )
+                }
+            }
+        }
     }
 }
 
@@ -125,11 +129,15 @@ mod tests {
     #[test]
     fn host_summary_states_enforcement_and_learn_availability() {
         let mac = host_summary(&HostProfile::synthetic_macos());
-        assert!(mac.contains("Seatbelt") && mac.contains("unified log"), "{mac}");
+        assert!(
+            mac.contains("Seatbelt") && mac.contains("unified log"),
+            "{mac}"
+        );
 
         let linux_v6 = host_summary(&HostProfile::synthetic_linux(Some(6)));
         assert!(
-            linux_v6.contains("Landlock ABI v6") && linux_v6.contains("`formwork learn` unavailable"),
+            linux_v6.contains("Landlock ABI v6")
+                && linux_v6.contains("`formwork learn` unavailable"),
             "{linux_v6}"
         );
 
@@ -152,7 +160,10 @@ mod tests {
             exec: Verdict::Ambient,
         };
         let text = explanation(&e);
-        assert!(text.contains("read:  denied by /work/secret (cli override)"), "{text}");
+        assert!(
+            text.contains("read:  denied by /work/secret (cli override)"),
+            "{text}"
+        );
         assert!(text.contains("write: not granted"), "{text}");
         assert!(text.contains("exec:  allowed by default"), "{text}");
     }

@@ -45,7 +45,8 @@ fn formwork(cwd: &Path, home: &Path, args: &[&str]) -> Output {
     }
 }
 
-const MINIMAL_BLUEPRINT: &str = "net = \"deny\"\n[fs]\nread-mode = \"closed\"\nreads = [\"/opt/data/**\"]\n";
+const MINIMAL_BLUEPRINT: &str =
+    "net = \"deny\"\n[fs]\nread-mode = \"closed\"\nreads = [\"/opt/data/**\"]\n";
 
 #[test]
 fn help_epilogue_reports_this_host() {
@@ -91,7 +92,14 @@ fn formwork_toml_is_discovered_and_stamped_into_compile_output() {
     let explicit = formwork(
         dir.path(),
         dir.path(),
-        &["compile", "--blueprint", "FORMWORK.toml", "--target", "linux-v6", "--report-only"],
+        &[
+            "compile",
+            "--blueprint",
+            "FORMWORK.toml",
+            "--target",
+            "linux-v6",
+            "--report-only",
+        ],
     );
     let report: serde_json::Value = serde_json::from_str(&explicit.stdout).unwrap();
     assert_eq!(report["blueprint"]["source"], "flag");
@@ -118,7 +126,14 @@ fn explain_json_wraps_explanations_and_names_the_blueprint() {
     let out = formwork(
         dir.path(),
         dir.path(),
-        &["explain", "--blueprint", "bp.toml", "--json", "/opt/data/x", "/etc/hosts"],
+        &[
+            "explain",
+            "--blueprint",
+            "bp.toml",
+            "--json",
+            "/opt/data/x",
+            "/etc/hosts",
+        ],
     );
     assert_eq!(out.code, 0, "{}", out.stderr);
     let value: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
@@ -139,8 +154,16 @@ fn explain_human_names_rule_and_origin() {
         &["explain", "--blueprint", "bp.toml", "/opt/data/x"],
     );
     assert_eq!(out.code, 0, "{}", out.stderr);
-    assert!(out.stdout.contains("blueprint: bp.toml (flag)"), "{}", out.stdout);
-    assert!(out.stdout.contains("granted by /opt/data/**"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("blueprint: bp.toml (flag)"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("granted by /opt/data/**"),
+        "{}",
+        out.stdout
+    );
 }
 
 #[test]
@@ -161,7 +184,11 @@ fn explain_without_any_blueprint_degrades_to_host_only() {
     let out = formwork(dir.path(), dir.path(), &["explain"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert!(out.stdout.contains("host: "), "{}", out.stdout);
-    assert!(out.stdout.contains("host capabilities only"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("host capabilities only"),
+        "{}",
+        out.stdout
+    );
 
     let json = formwork(dir.path(), dir.path(), &["explain", "--json"]);
     let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
@@ -196,7 +223,11 @@ fn learn_review_lists_candidates_on_stdout() {
     );
     assert_eq!(out.code, 0, "{}", out.stderr);
     // The listing is the RESULT: stdout, present even though nothing raised it to warn level.
-    assert!(out.stdout.contains("1. /opt/toolchain/**"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("1. /opt/toolchain/**"),
+        "{}",
+        out.stdout
+    );
     assert!(out.stdout.contains("needs-review"), "{}", out.stdout);
 }
 
@@ -207,7 +238,14 @@ fn learn_rejects_mixing_review_flags_with_a_command() {
     let out = formwork(
         dir.path(),
         dir.path(),
-        &["learn", "--blueprint", "bp.toml", "--list", "--", "/bin/true"],
+        &[
+            "learn",
+            "--blueprint",
+            "bp.toml",
+            "--list",
+            "--",
+            "/bin/true",
+        ],
     );
     assert_ne!(out.code, 0);
     assert!(out.stderr.contains("not both"), "{}", out.stderr);
@@ -241,9 +279,20 @@ fn learn_captures_a_millisecond_workloads_denial() {
     let out = formwork(
         &root,
         &root,
-        &["learn", "--blueprint", "bp.toml", "--", "/bin/cat", denied.to_str().unwrap()],
+        &[
+            "learn",
+            "--blueprint",
+            "bp.toml",
+            "--",
+            "/bin/cat",
+            denied.to_str().unwrap(),
+        ],
     );
-    assert_ne!(out.code, 0, "cat of the denied file failing IS the scenario: {}", out.stderr);
+    assert_ne!(
+        out.code, 0,
+        "cat of the denied file failing IS the scenario: {}",
+        out.stderr
+    );
 
     let proposal = root.join("bp.toml.proposal.toml");
     assert!(proposal.exists(), "no proposal written:\n{}", out.stderr);

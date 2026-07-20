@@ -19,10 +19,8 @@ pub const DEFAULT_BLUEPRINT_NAME: &str = "FORMWORK.toml";
 /// Profiles compiled into the binary, addressable as `extends = ["builtin:<name>"]` -- so a
 /// blueprint can layer on the shipped default without a repo checkout (the release-binary user
 /// has no `profiles/` directory to point at).
-const BUILTIN_PROFILES: &[(&str, &str)] = &[(
-    "default",
-    include_str!("../../../profiles/default.toml"),
-)];
+const BUILTIN_PROFILES: &[(&str, &str)] =
+    &[("default", include_str!("../../../profiles/default.toml"))];
 
 /// How the blueprint path was chosen. Auto-discovery must never be silent (a policy the user
 /// never named still governs the session), so the source travels with the path into logs and
@@ -52,11 +50,7 @@ pub struct ResolvedBlueprint {
 /// a `FORMWORK.toml` discovered from the launch directory upward. `Ok(None)` means neither -- the
 /// caller decides whether that is an error (enforcing commands) or a degraded mode (`explain`
 /// with no blueprint still summarizes the host).
-pub fn resolve_blueprint(
-    flag: Option<&Path>,
-    cwd: &Path,
-    home: &str,
-) -> Option<ResolvedBlueprint> {
+pub fn resolve_blueprint(flag: Option<&Path>, cwd: &Path, home: &str) -> Option<ResolvedBlueprint> {
     if let Some(path) = flag {
         tracing::info!(blueprint = %path.display(), source = "flag", "blueprint resolved");
         return Some(ResolvedBlueprint {
@@ -957,7 +951,10 @@ mod tests {
         .unwrap();
         let err = load(&dir.path().join("bp.toml"), "/home/x").unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("builtin:bogus") && msg.contains("builtin:default"), "{msg}");
+        assert!(
+            msg.contains("builtin:bogus") && msg.contains("builtin:default"),
+            "{msg}"
+        );
     }
 
     #[test]

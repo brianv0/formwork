@@ -46,7 +46,11 @@ from.\n\nTelemetry goes to stderr (stdout stays a clean result stream). RUST_LOG
 RUST_LOG=debug itemizes the credential floor per type.";
 
 #[derive(Parser)]
-#[command(name = "formwork", version, about = "OS-level sandbox for agent sessions")]
+#[command(
+    name = "formwork",
+    version,
+    about = "OS-level sandbox for agent sessions"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
