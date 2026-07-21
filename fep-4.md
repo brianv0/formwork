@@ -249,15 +249,35 @@ explicitly narrower sibling of the main threat model, with its two structural mi
 
 ## 7. Open questions (a spike decides, before any mechanism code)
 
-- **macOS observation mechanism — spike A vs B.** (A) SBPL `(trace "file")` profile-generation mode
-  (a profile *generator* — the closest fit — but private/undocumented and version-drifting); (B)
-  allow-default with a `(with report)` modifier on file rules, reusing the existing unified-log tap
-  (`learn.rs`) to parse *allow* records the way it parses *deny* today (cheapest if the report
-  modifier logs reliably). Endpoint Security (`ES_EVENT_TYPE_NOTIFY_OPEN`) is the supported,
-  complete path but carries an Apple entitlement + root + code-signing cost that breaks the
-  curl-and-run distribution; it stays a reported `Unavailable`/future, not v1. The spike (recorded in
-  `docs/spikes.md`, the same way the denial-feed choice was made in `docs/fep2-plan.md` §4) picks A
-  or B before §2.2's report toggle is built.
+- **macOS observation feed — spike A vs B vs fs_usage.** The feed is separable from enforcement:
+  the floor-only Seatbelt policy (§2.2) enforces regardless, and the feed only *observes* on top, so
+  these compose with the floor rather than replace it. Candidates, on a completeness-vs-cost axis:
+  - **(A) SBPL `(trace "file")` profile-generation mode** — a profile *generator*, subtree-scoped for
+    free (Seatbelt inheritance, [FW-XR4](formwork.md#fw-xr4)), no root; but private/undocumented and
+    version-drifting.
+  - **(B) allow-default with a `(with report)` modifier on file rules** — reuses the existing
+    structured ndjson `log show` tap (`learn.rs`) to parse *allow* records the way it parses *deny*
+    today; subtree-scoped, no root, cheapest if the report modifier logs reliably (incl. on metadata
+    ops). Depends on that modifier firing.
+  - **fs_usage** — kdebug/ktrace-based, so it captures the **broadest** set: every fs syscall
+    including metadata ops (`stat`/`access`/`readlink`/`getattrlist`), which matters here because
+    formwork itself enforces metadata denial ([FW-CAP7](formwork.md#fw-cap7)) — a data-open-only trace
+    would synthesize a Blueprint too tight for the enforced run. Mechanism-independent (no reliance on
+    the undocumented SBPL facilities). **Costs:** needs `sudo` (Seatbelt needs none — a real footprint
+    escalation, though amortized: record once, enforce many times without root); filters by PID/comm,
+    not spawn-subtree, so it needs run-window attribution or system-wide over-capture (safe by the
+    existing floored/review-gated design); can silently drop events under load (fine — too-tight fails
+    safe, and `FW-DISC9` forbids claiming completeness); and is a fragile columnar text parse with
+    path-normalization to verify (vs (B)'s kernel-resolved ndjson). `FW-INV12` still holds: a
+    floor-denied credential open that fs_usage records as an *attempt* is withheld by the
+    reverse-compile floor ([FW-DISC3](formwork.md#fw-disc3)) regardless of source.
+
+  Endpoint Security (`ES_EVENT_TYPE_NOTIFY_OPEN`) is the supported, structured, complete path but
+  carries an Apple entitlement + root + code-signing cost that breaks curl-and-run distribution; it
+  stays a reported `Unavailable`/future, not v1. The spike (recorded in `docs/spikes.md`, the same way
+  the denial-feed choice was made in `docs/fep2-plan.md` §4) picks the feed before §2.2's mechanism is
+  built — fs_usage is the front-runner for completeness, (B) for cost/reuse; the decision is whether
+  metadata-op coverage is worth the root requirement.
 - **Flag spelling.** `--permissive` (conventional; AppArmor "complain" lineage) vs `--unconfined`
   (the more brazenly honest spelling this repo's fail-loud doctrine tends to favor). Pinned in the
   Vocabulary amendment (§5c) once chosen.
