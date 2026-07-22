@@ -11,8 +11,8 @@ mod provenance;
 
 pub use catalog::{Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP};
 pub use discovery::{
-    reverse_compile, Candidate, CandidateTag, DenialAccess, DenialRecord, ProposalOutcome,
-    WithheldEntry,
+    reverse_compile, synthesize_blueprint, AccessRecord, Candidate, CandidateTag, DenialAccess,
+    DenialRecord, ProposalOutcome, WithheldEntry,
 };
 pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
@@ -44,6 +44,24 @@ pub struct Blueprint {
     pub allow_credentials: Vec<String>,
     #[serde(default)]
     pub discovery: DiscoveryBlueprint,
+}
+
+impl Blueprint {
+    /// The policy enforced *during* a permissive recording: everything allowed, so the workload runs
+    /// observably unconfined, except the credential floor. The floor is terminal, so the open `/**`
+    /// write cannot reach a credential (FW-INV11) -- a recording can never touch one.
+    pub fn floor_only_permissive() -> Self {
+        Blueprint {
+            fs: FsBlueprint {
+                read_mode: ReadMode::AmbientMinusSubtract,
+                writes: vec![
+                    PathPattern::parse("/**").expect("/** is a constant, valid open-write pattern")
+                ],
+                ..FsBlueprint::default()
+            },
+            ..Blueprint::empty()
+        }
+    }
 }
 
 /// The merged discovery posture (FW-DISC4): the operator-drawn zone inside which a learning run
