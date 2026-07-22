@@ -104,12 +104,11 @@ Where each level runs (be honest about it):
   the pinned reference server and drives it through the production shading path (`Gateway::run`). It
   isolates the shading so it needs no host confiner.
 - **Binary-level `FW-E2E-066`** exists twice. `crates/formwork-cli/tests/gateway_cli.rs` drives the
-  real `formwork gateway` binary and **runs in GitHub CI** on macOS (Seatbelt) and on Linux when the
-  runner carries Landlock — it skips, never fails, where no confiner is available.
+  real `formwork gateway` binary and runs under `cargo test` on macOS (Seatbelt) and on Linux when
+  the runner carries Landlock — it skips, never fails, where no confiner is available.
   `test_examples_gateway.py::test_example_gateway_shades_by_pattern` covers the same through the
-  black-box CLI, but the Python harness is a **local / `just test-e2e` gate — it is not wired into
-  GitHub CI** (only `cargo test --workspace` is), so the Rust CLI test is the one that gives CI
-  coverage of the binary path.
+  black-box CLI. The Python harness now runs in GitHub CI (the `test` job runs `uv run pytest` on
+  both OSes after `cargo test`), so both realizations are exercised there.
 - The orthogonal backend-confinement arm ([`FW-GW5`](../formwork.md#fw-gw5)) stays covered by the
   host-gated [`FW-E2E-019`](../formwork.md#fw-e2e-019).
 

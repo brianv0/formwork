@@ -85,6 +85,17 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # The Python black-box harness drives the built `formwork` binary at the outermost real
+      # boundary; platform-inappropriate tests skip via markers (macOS Seatbelt vs Linux Landlock),
+      # so each OS runs exactly what it can enforce. `uv` comes via the runner's preinstalled `pipx`
+      # (not a third-party action), matching the Dockerfile's uv-managed harness.
+      - name: Install uv
+        run: pipx install uv
+
+      - name: Python E2E harness
+        working-directory: py
+        run: uv run pytest -q
+
   # Integration test of MCP pattern shading (FW-GW9/FW-E2E-068) against a real, published MCP
   # server. Kept a separate Linux job because it pulls a pinned npm package at test time (network),
   # which the hermetic unit/integration suite above deliberately does not. The runner ships node, so
