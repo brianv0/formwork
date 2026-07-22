@@ -259,25 +259,54 @@ explicitly narrower sibling of the main threat model, with its two structural mi
     structured ndjson `log show` tap (`learn.rs`) to parse *allow* records the way it parses *deny*
     today; subtree-scoped, no root, cheapest if the report modifier logs reliably (incl. on metadata
     ops). Depends on that modifier firing.
-  - **fs_usage** — kdebug/ktrace-based, so it captures the **broadest** set: every fs syscall
-    including metadata ops (`stat`/`access`/`readlink`/`getattrlist`), which matters here because
-    formwork itself enforces metadata denial ([FW-CAP7](formwork.md#fw-cap7)) — a data-open-only trace
-    would synthesize a Blueprint too tight for the enforced run. Mechanism-independent (no reliance on
-    the undocumented SBPL facilities). **Costs:** needs `sudo` (Seatbelt needs none — a real footprint
-    escalation, though amortized: record once, enforce many times without root); filters by PID/comm,
-    not spawn-subtree, so it needs run-window attribution or system-wide over-capture (safe by the
-    existing floored/review-gated design); can silently drop events under load (fine — too-tight fails
-    safe, and `FW-DISC9` forbids claiming completeness); and is a fragile columnar text parse with
-    path-normalization to verify (vs (B)'s kernel-resolved ndjson). `FW-INV12` still holds: a
-    floor-denied credential open that fs_usage records as an *attempt* is withheld by the
-    reverse-compile floor ([FW-DISC3](formwork.md#fw-disc3)) regardless of source.
+  - **fs_usage** (front-runner) — kdebug/ktrace-based, so it captures the **broadest** set: every fs
+    syscall including metadata ops (`stat`/`access`/`readlink`/`getattrlist`), which matters here
+    because formwork itself enforces metadata denial ([FW-CAP7](formwork.md#fw-cap7)) — a
+    data-open-only trace would synthesize a Blueprint too tight for the enforced run.
+    Mechanism-independent (no reliance on the undocumented SBPL facilities). The parse-fragility and
+    under-load event-loss knocks are **not** weighed against it: this is a bootstrap run made a
+    handful of times, and `FW-DISC9` already forbids claiming the trace is complete. The real cost is
+    `sudo` (Seatbelt needs none — a footprint escalation, though amortized: record once, enforce many
+    times without root) and **attribution** (§7.1). `FW-INV12` still holds: a floor-denied credential
+    open that fs_usage records as an *attempt* is withheld by the reverse-compile floor
+    ([FW-DISC3](formwork.md#fw-disc3)) regardless of source.
 
   Endpoint Security (`ES_EVENT_TYPE_NOTIFY_OPEN`) is the supported, structured, complete path but
   carries an Apple entitlement + root + code-signing cost that breaks curl-and-run distribution; it
   stays a reported `Unavailable`/future, not v1. The spike (recorded in `docs/spikes.md`, the same way
   the denial-feed choice was made in `docs/fep2-plan.md` §4) picks the feed before §2.2's mechanism is
-  built — fs_usage is the front-runner for completeness, (B) for cost/reuse; the decision is whether
-  metadata-op coverage is worth the root requirement.
+  built — fs_usage for completeness, (B) for cost/reuse; the decision is whether metadata-op coverage
+  is worth the root requirement.
+
+### 7.1 Attribution — the load-bearing part of a system-wide feed
+
+fs_usage (and any system-wide feed) captures everything, so recording is a **capture → resolve →
+filter** pipeline: capture system-wide, reconstruct the workload's process subtree, keep only its
+events. Two properties make this correct — and note that attribution matters *more* here than for
+denial-learn, because record's whole purpose is a **tight** Blueprint: over-capture that leaks
+unrelated processes' paths doesn't just add review noise, it loosens the allowlist against the tool's
+own goal, so the filter is load-bearing, not hygiene.
+
+1. **Build the subtree from captured lifecycle events, never a live `ps`.** A post-hoc process-table
+   query misses every child that already spawned and exited — for a build/test workload, exactly the
+   millisecond helpers (`cc1`, `ld`, `sh -c …`) you most want. That is the same short-lived-loss
+   failure class PR #18 fixed for denials; re-introducing it in attribution would silently drop the
+   fastest processes. So Phase 1 must capture process **fork/exec/exit with PPID** alongside the fs
+   events (fs_usage gives PID+comm per line but not reliable parent linkage), and Phase 2
+   reconstructs lineage from those captured events — which include the dead ones. PID reuse is
+   negligible over a few-second window.
+
+2. **Or sidestep lineage entirely with the audit session ID (ASID).** macOS `auditpipe(4)` can
+   preselect events by audit session — a kernel-maintained id inherited by the whole descendant tree
+   by construction. Since formwork is the launcher, it can start the workload in a fresh audit
+   session and attribute by ASID with zero lineage reconstruction and zero race. It needs root
+   (already paid) and the audit subsystem enabled, and OpenBSM is a rustier subsystem than fs_usage.
+
+The spike's real question is therefore **fs_usage + fork-event lineage vs ASID-preselected
+auditpipe**: the former is lighter and reuses a familiar tool; the latter is the "correct"
+race-free attribution at the cost of a heavier subsystem. Path resolution (fs_usage occasionally
+reports CWD-relative paths; the resolved absolute form is what `PathPattern` needs) is a Phase-3
+detail to confirm in the same spike, not a deciding factor.
 - **Flag spelling.** `--permissive` (conventional; AppArmor "complain" lineage) vs `--unconfined`
   (the more brazenly honest spelling this repo's fail-loud doctrine tends to favor). Pinned in the
   Vocabulary amendment (§5c) once chosen.
