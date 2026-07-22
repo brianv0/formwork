@@ -64,6 +64,26 @@ pub fn explanation(e: &Explanation) -> String {
     )
 }
 
+/// The remedy line under a credential-floor denial: the `allow-credentials` entry that lifts it.
+/// The floor is the one deny `explain` can never show a grant for (FW-CAP8), so naming the lever
+/// is the operator channel (FW-CRED7) the confined tool's bare EACCES lacks. The backstop also
+/// names its `shape`, since that is the surprise: it fires even inside a granted directory.
+pub fn floor_remedy(floor_type: &str, shape: Option<&str>) -> String {
+    if floor_type == "backstop" {
+        format!(
+            "  hint: credential backstop (shape {}) -- fires at any depth, even inside a granted \
+             directory. Lift with allow-credentials = [\"backstop\"] (coarse: un-denies every \
+             backstop shape everywhere; prefer narrowing a real type when one fits).\n",
+            shape.unwrap_or("**/<name>")
+        )
+    } else {
+        format!(
+            "  hint: credential floor (type {floor_type}) -- lift with \
+             allow-credentials = [\"{floor_type}\"].\n"
+        )
+    }
+}
+
 fn backend(b: Backend) -> &'static str {
     match b {
         Backend::Landlock => "landlock",
@@ -118,6 +138,14 @@ pub fn report_summary(report: &FidelityReport) -> String {
             creds.allowed.join(", ")
         }
     ));
+    // The backstop denies inside the operator's own granted set, so it earns its own line with the
+    // lift (FW-CRED6/CRED7); `None` means already lifted.
+    if creds.backstop.is_some() {
+        out.push_str(
+            "backstop: filename shapes (credentials, id_rsa, id_ed25519, .netrc, …) denied at any \
+             depth, even inside granted directories; lift with allow-credentials = [\"backstop\"]\n",
+        );
+    }
     out.push_str(&format!("note: {}\n", creds.launcher_contingency));
     out
 }
@@ -166,5 +194,18 @@ mod tests {
         );
         assert!(text.contains("write: not granted"), "{text}");
         assert!(text.contains("exec:  allowed by default"), "{text}");
+    }
+
+    #[test]
+    fn floor_remedy_names_the_shape_and_the_lift() {
+        // The backstop remedy names the surprising shape and the coarse lift...
+        let bs = floor_remedy("backstop", Some("**/credentials"));
+        assert!(bs.contains("**/credentials"), "{bs}");
+        assert!(bs.contains("allow-credentials = [\"backstop\"]"), "{bs}");
+        assert!(bs.contains("any depth"), "{bs}");
+        // ...a curated type names itself as the lift instead.
+        let ssh = floor_remedy("ssh", None);
+        assert!(ssh.contains("allow-credentials = [\"ssh\"]"), "{ssh}");
+        assert!(!ssh.contains("backstop"), "{ssh}");
     }
 }

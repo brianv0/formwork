@@ -175,7 +175,58 @@ fn explain_with_no_path_summarizes_host_and_fidelity() {
     assert!(out.stdout.contains("host: "), "{}", out.stdout);
     assert!(out.stdout.contains("capabilities:"), "{}", out.stdout);
     assert!(out.stdout.contains("credential floor:"), "{}", out.stdout);
+    // The active backstop earns its own line in the summary, with the lift (FW-CRED6/CRED7).
+    assert!(out.stdout.contains("backstop:"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("allow-credentials = [\"backstop\"]"),
+        "{}",
+        out.stdout
+    );
     assert!(out.stdout.contains("(auto-discovered)"), "{}", out.stdout);
+}
+
+/// A file named `credentials` in a granted working set is denied by the backstop (deny beats
+/// allow, FW-CAP8): `explain PATH` must name the exact shape and the lift, so the cause of the
+/// confined tool's bare EACCES (FW-CRED7) is one command away.
+#[test]
+fn explain_backstop_denial_names_shape_and_lift() {
+    let dir = Scratch::new("explain-backstop");
+    std::fs::write(
+        dir.path().join("bp.toml"),
+        "net = \"deny\"\n[fs]\nread-mode = \"closed\"\nreads = [\"/**\"]\nwrites = [\"/**\"]\n",
+    )
+    .unwrap();
+    let out = formwork(
+        dir.path(),
+        dir.path(),
+        &["explain", "--blueprint", "bp.toml", "/srv/app/credentials"],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        out.stdout.contains("denied by credential floor (backstop)"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("**/credentials"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("allow-credentials = [\"backstop\"]"),
+        "{}",
+        out.stdout
+    );
+
+    // The path a user actually types when diagnosing the failure is relative -- it must resolve
+    // against cwd, not error on "must be absolute".
+    let rel = formwork(
+        dir.path(),
+        dir.path(),
+        &["explain", "--blueprint", "bp.toml", "./credentials"],
+    );
+    assert_eq!(rel.code, 0, "{}", rel.stderr);
+    assert!(
+        rel.stdout.contains("denied by credential floor (backstop)"),
+        "{}",
+        rel.stdout
+    );
 }
 
 #[test]

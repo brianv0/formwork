@@ -181,7 +181,8 @@ enum Cmd {
         /// Machine-readable JSON instead of the human rendering.
         #[arg(long)]
         json: bool,
-        /// Paths to explain (sigils `~`/`$CWD` expand as in a grant).
+        /// Paths to explain. Sigils `~`/`$CWD` expand as in a grant; a bare relative path
+        /// resolves against the current directory, so `explain ./credentials` just works.
         paths: Vec<String>,
     },
 }
@@ -564,14 +565,39 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
     let sigils = blueprint_load::Sigils::new(&home, &cwd);
     let catalog =
         ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
-    let mut explanations = Vec::new();
+    // Shape rides beside the verdict, not into the JSON: only the human door prints the lift hint,
+    // the machine shape stays stable (FW-CRED7).
+    let mut rows = Vec::new();
     for path in &paths {
-        let target = PathPattern::parse(&sigils.expand(path))
-            .with_context(|| format!("explaining {path:?}"))?;
+        // A bare relative path resolves against cwd here: blueprint rules stay absolute/sigil to be
+        // location-independent, but `explain` is a live diagnostic, not a stored grant.
+        let expanded = sigils.expand(path);
+        let expanded = if expanded.starts_with('/') {
+            expanded
+        } else {
+            std::path::Path::new(&cwd)
+                .join(&expanded)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let target =
+            PathPattern::parse(&expanded).with_context(|| format!("explaining {path:?}"))?;
         let floor = catalog.floor_type_of(&blueprint.allow_credentials, &target);
-        explanations.push(provenance.explain(&blueprint, target.base(), floor));
+        let shape = floor
+            .as_deref()
+            .filter(|t| *t == formwork_blueprint::BACKSTOP)
+            .and_then(|_| {
+                catalog
+                    .backstop
+                    .iter()
+                    .find(|p| p.matches_path(target.base()))
+                    .map(|p| p.to_string())
+            });
+        let explanation = provenance.explain(&blueprint, target.base(), floor.clone());
+        rows.push((explanation, floor, shape));
     }
     if json {
+        let explanations: Vec<_> = rows.iter().map(|(e, _, _)| e).collect();
         let mut value = serde_json::json!({ "explanations": explanations });
         attach_blueprint_info(&mut value, &resolved);
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -581,8 +607,11 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
             resolved.path.display(),
             resolved.source.as_str()
         );
-        for explanation in &explanations {
+        for (explanation, floor, shape) in &rows {
             print!("{}", render::explanation(explanation));
+            if let Some(floor_type) = floor {
+                print!("{}", render::floor_remedy(floor_type, shape.as_deref()));
+            }
         }
     }
     Ok(())
@@ -691,7 +720,7 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
         .context("canonicalizing credential catalog paths")?;
     let host = detect();
     let policy = compile(&blueprint, &host, &catalog);
-    itemize_credential_floor(&policy.report);
+    itemize_credential_floor(&policy.report, &catalog);
     Ok(Session {
         blueprint,
         catalog,
@@ -786,9 +815,11 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
 /// The operator channel's compile-time itemization (FW-CRED7). The full roll-call is identical
 /// on every run, so the default (info) line is a summary whose only varying part -- the
 /// deliberate exclusions -- is spelled out; the per-type roll-call itemizes at debug
-/// (RUST_LOG=debug). The compile report stays the canonical itemized form. The confined agent
-/// never sees any of this -- its channel is the bare EACCES / the absent variable (FW-INV9).
-fn itemize_credential_floor(report: &formwork_compile::FidelityReport) {
+/// (RUST_LOG=debug). The active backstop gets its own info line, because it is the one floor row
+/// that denies inside the operator's own granted working set (FW-CRED6). The compile report stays
+/// the canonical itemized form. The confined agent never sees any of this -- its channel is the
+/// bare EACCES / the absent variable (FW-INV9).
+fn itemize_credential_floor(report: &formwork_compile::FidelityReport, catalog: &ResolvedCatalog) {
     let creds = &report.credentials;
     let path_types: Vec<&str> = creds
         .per_type
@@ -814,6 +845,17 @@ fn itemize_credential_floor(report: &formwork_compile::FidelityReport) {
         stripped_env_types = ?env_types,
         "credential catalog floor, itemized"
     );
+    // The backstop is the one floor row that denies inside the operator's OWN granted set, so its
+    // bare EACCES (FW-CRED7) has no visible cause -- name it at spawn (`None` means lifted).
+    if creds.backstop.is_some() {
+        tracing::info!(
+            "credential backstop active: filename shapes (credentials, id_rsa, .netrc, …) are \
+             denied at any depth, even inside granted directories, and a confined tool hitting one \
+             sees a bare EACCES -- run `formwork explain <path>` for the shape and the lift"
+        );
+        let shapes: Vec<String> = catalog.backstop.iter().map(|p| p.to_string()).collect();
+        tracing::debug!(backstop_shapes = ?shapes, "credential backstop shapes");
+    }
 }
 
 /// The launcher arm (FEP-2 §6): build the confined child's environment -- the credential-catalog
