@@ -47,7 +47,7 @@ pub struct Blueprint {
 }
 
 impl Blueprint {
-    /// The policy enforced *during* a permissive recording: everything allowed, so the workload runs
+    /// The floor-only Blueprint for a permissive recording: everything allowed, so the workload runs
     /// observably unconfined, except the credential floor. The floor is terminal, so the open `/**`
     /// write cannot reach a credential (FW-INV11) -- a recording can never touch one.
     pub fn floor_only_permissive() -> Self {

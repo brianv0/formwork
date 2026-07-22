@@ -109,7 +109,7 @@ fn fidelity(f: &Fidelity) -> String {
         Fidelity::Partial { backend: b, reason } => {
             format!("partial ({}) -- {reason}", backend(*b))
         }
-        Fidelity::Unenforceable { reason } => format!("unavailable -- {reason}"),
+        Fidelity::Unenforceable { reason } => format!("unenforceable -- {reason}"),
     }
 }
 

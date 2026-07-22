@@ -24,7 +24,10 @@ from this document.**
 - **Spike gates mechanism.** The feed choice (fs_usage vs SBPL report vs ASID auditpipe) is unproven
   and determines whether the compile/confine layers change at all (§5.3). No mechanism code before
   the spike resolves.
-- **Draft IDs sit above #18's reservations** (`FW-E2E-062..064` taken): tests start at `FW-E2E-065`.
+- **Draft test IDs sit above the highest landed number.** First drafted at `FW-E2E-065`..067 (above
+  #18's `FW-E2E-062..064`), but #19 landed the MCP-shading tests at `FW-E2E-065`..067 and gateway
+  tests through `FW-E2E-069`, so the unlanded draft is renumbered up to `FW-E2E-070`..072 (never the
+  landed spec; constitution Requirements & identifiers). See `fep-4.md` §4/§6.
 
 **Timeline** is expressed as ordering + the one blocking unknown, not dates: §5.1 (pure core) lands
 immediately and independently; the spike (§5.2) is the critical path; §5.3–5.5 follow the spike and
@@ -64,7 +67,7 @@ rebase on #18. No calendar commitment.
 - `FW-DISC10` Blueprint synthesis/freeze — accepted grants may freeze into a standalone Blueprint.
 - `FW-INV12` recording floor — no recording can observe, propose, or synthesize a credential
   location.
-- Tests `FW-E2E-065` (round-trip), `FW-E2E-066` (floor), `FW-E2E-067` (no-feed fail-loud).
+- Tests `FW-E2E-070` (round-trip), `FW-E2E-071` (floor), `FW-E2E-072` (no-feed fail-loud).
 
 ## 4. Design decisions (load-bearing; full rationale in `fep-4.md`)
 
@@ -124,7 +127,7 @@ rebase on #18. No calendar commitment.
 - `--out app.blueprint.toml` freeze (`FW-DISC10`) — or defer (open decision).
 
 ### 5.6 Tests — Python E2E + Rust
-- `FW-E2E-065` round-trip; `FW-E2E-066` floor; `FW-E2E-067` no-feed fail-loud (§6).
+- `FW-E2E-070` round-trip; `FW-E2E-071` floor; `FW-E2E-072` no-feed fail-loud (§6).
 
 ## 6. Testing
 
@@ -132,12 +135,12 @@ rebase on #18. No calendar commitment.
   (§5.1). The spike's attribution logic, if it has a pure core, is unit-tested on injected event
   sequences (the substitution `learn.rs` already uses for quiescence).
 - **Real-boundary (macOS, no mocking the kernel — constitution Testing):**
-  - `FW-E2E-065` — spawn a workload under the floor-only policy; observed opens synthesize a
+  - `FW-E2E-070` — spawn a workload under the floor-only policy; observed opens synthesize a
     Blueprint; **re-enforcing it runs the same workload clean, and a path it never touched is denied**
     (paired allow/deny, [FW-E2E-024](../formwork.md#fw-e2e-024) pattern).
-  - `FW-E2E-066` — a workload reading a credential during recording is denied at the kernel and the
+  - `FW-E2E-071` — a workload reading a credential during recording is denied at the kernel and the
     credential is absent from proposal and synthesized Blueprint.
-  - `FW-E2E-067` — on `trace-feed: none`, `learn --permissive` fails loud and writes nothing.
+  - `FW-E2E-072` — on `trace-feed: none`, `learn --permissive` fails loud and writes nothing.
 - Deterministic; over-capture handled by the floor/review, not by flaky windows.
 
 ## 7. Observability
