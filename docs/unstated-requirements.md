@@ -3,8 +3,17 @@
 Requirements this project has been operating under that are written nowhere — teased out of the
 usability review, its implementation, and the constitution pass. Each entry states the norm, the
 evidence it was already binding (something was judged right or wrong by it), where it lives now,
-and whether it deserves minting as a real `FW-*` requirement. Nothing here is minted yet: the
-family list and ID sequences are review-gated, so this document is the proposal stage.
+and whether it deserves minting as a real `FW-*` requirement.
+
+**Status: minted (human-approved).** The recommendations below were reviewed and applied: items 1,
+5, 6, and 11 are now [FW-XR9](../formwork.md#fw-xr9), [FW-FID7](../formwork.md#fw-fid7),
+[FW-BP8](../formwork.md#fw-bp8) (with [FW-E2E-070](../formwork.md#fw-e2e-070)), and
+[FW-DISC11](../formwork.md#fw-disc11); items 2, 3, 4, 7, and 9 landed as the marked constitution
+amendments (Errors doctrine, Requirements & identifiers, Testing, Growth, Precedence & Conflicts —
+with the deprecations register in [`STATUS.md`](STATUS.md)); item 8 was already doctrine. Items 10
+(CI-matrix rule — mint when release automation is next touched) and 12 (exit-code contract — mint
+when an embedder needs it) remain deliberately unminted, per their own entries. The per-item prose
+below is kept as the design record.
 
 ## 1. Surface parity: a subcommand that cannot deliver on a platform refuses before consuming work
 

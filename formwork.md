@@ -148,6 +148,7 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 | <a id="fw-xr6"></a>**FW-XR6** Behavioral parity | An identical blueprint yields equivalent observable behavior for the enforceable intersection across Linux and macOS. Platform divergence appears only in the FidelityReport, never as a silent behavior change. |
 | <a id="fw-xr7"></a>**FW-XR7** fd-injection transport | The agent reaches the gateway via an inherited fd. Formwork never depends on an in-sandbox `connect()` nor on the filesystem sandbox selectively *allowing* a socket path. |
 | <a id="fw-xr8"></a>**FW-XR8** No agent-influenced escalation | No mechanism lets a confined process — or its instruction stream — disable, weaken, retry-outside, or reconfigure its own confinement. The policy is compiled and installed *before* the process runs ([FW-CAP2](#fw-cap2): narrowing only; widening does not exist). Any escalation a host chooses to offer is an out-of-band action on an unconfined process, never a signal the confined process can emit. |
+| <a id="fw-xr9"></a>**FW-XR9** Surface fail-fast | A subcommand that cannot deliver its promise on the current host fails *before* consuming the user's work (their run, their time), naming the missing mechanism and the nearest alternative. The command-surface sibling of [FW-INV5](#fw-inv5)/[FW-INV6](#fw-inv6): enforcement honesty says a wall that isn't real is reported, this says a *feature* that isn't real here refuses up front — running an entire workload and only then announcing the point of the command was impossible is a silent overpromise even when every byte was logged. [FW-E2E-062](#fw-e2e-062) pins the `learn` instance; the rule governs every future observe/probe/stream surface. |
 
 ### 5.2 Capability model (FW-CAP)
 
@@ -216,6 +217,8 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 | <a id="fw-fid4"></a>**FW-FID4** Deterministic compile | The same blueprint compiles to a byte-identical policy and report. |
 | <a id="fw-fid6"></a>**FW-FID6** Rule provenance & explain | Each effective fs/exec rule carries the layer it came from — `built-in \| profile \| file \| cli \| discovered`. `formwork explain <path>` reports the read, write, and exec verdict for a path, the rule that decides each under the deny-terminal model ([FW-CAP8](#fw-cap8)), and that rule's provenance, without enforcing. Exec is a separate axis ([FW-ISO9](#fw-iso9)): the read/write credential floor never governs it, matching enforcement where an exec grant confers execute only ([FW-XR6](#fw-xr6)). It reflects the merged Blueprint (like `compile`), not the session-only denies `run` adds ([FW-CRED3](#fw-cred3), [FW-XR8](#fw-xr8)). The provenance is a side table beside the merged Blueprint, so the compiler and its determinism ([FW-FID4](#fw-fid4)) are untouched. Extends [FW-CAP5](#fw-cap5) inspectability; the layer tag reuses the discovery provenance idea ([FW-DISC6](#fw-disc6)). *(Added by FEP-3.)* |
 
+| <a id="fw-fid7"></a>**FW-FID7** Resolved-input disclosure | Every artifact a command emits names the inputs it was resolved from and how each was chosen — `flag \| auto-discovered \| builtin` — so anything auto-chosen is announced everywhere the choice has effect. Explaining *rules* ([FW-FID6](#fw-fid6)) is not enough when the *file the rules came from* was picked by a walk the user never saw: the `blueprint: {path, source}` stamp on `compile`/`explain` output and the resolution line on the operator channel are the first instance; any future auto-resolved input (a host profile, a feed choice) carries the same disclosure. |
+
 ### 5.7 Environment (FW-ENV)
 
 Applied by the launcher at spawn (§2) — not the confiner — and reported in the `FidelityReport` like any other capability.
@@ -238,6 +241,7 @@ The Blueprint is one typed model with multiple surfaces (§4); these requirement
 | <a id="fw-bp5"></a>**FW-BP5** Path sigils | Blueprint path patterns admit a closed set of authoring sigils, expanded at the CLI edge *before* compilation: `~` → `$HOME` and `$CWD` → the launch directory, so a grant can be written relative to the project it runs in. Fixed tokens only — never general `$VAR` interpolation, since the process environment is exactly what the launcher strips ([FW-CRED2](#fw-cred2)), and letting an arbitrary variable name a path would reopen that surface. An expanded sigil is an absolute path that canonicalizes like any grant ([FW-CAP6](#fw-cap6)/[FW-FID4](#fw-fid4)); an unresolvable sigil (e.g. no readable working directory) fails loud, never silently widening ([FW-INV6](#fw-inv6)). |
 | <a id="fw-bp6"></a>**FW-BP6** Flat verb rules | One string is one rule (`"<verb>:<path>"`), identical between the CLI flag (`--rule`), a `--set` fragment, and a file `rules` line — a third surface onto the one model ([FW-BP1](#fw-bp1)). Grants and denies are sets merged by union; the result is order-independent (profile stacking is commutative). Denies narrow from any layer; allows widen and are the only trusted layer (maps onto [FW-CAP2](#fw-cap2)). Verbs desugar into the fields above at the CLI edge, so every verb also has a nested `[fs]` equivalent. *(Added by FEP-3.)* |
 | <a id="fw-bp7"></a>**FW-BP7** Mode posture | `unveil` (empty universe) and `subtractive` (ambient minus catalog) are a last-set-wins posture aliasing `[fs] read-mode` ([FW-BP2](#fw-bp2)), not a union rule; setting both in one layer is a loud error, but across layers they compose by ordinary last-wins. The credential floor applies in both modes. *(Added by FEP-3.)* |
+| <a id="fw-bp8"></a>**FW-BP8** Discovery trust scope | Implicit blueprint resolution (the `FORMWORK.toml` walk) consults only paths the invoking user controls, and its scope is fixed and documented: launch directory upward, ending at the first ancestor the user does not own (before consulting it), at `$HOME` (compared symlink-resolved, so a symlinked home cannot extend the walk), and never at the filesystem root for a nested cwd. A candidate file the user does not own is refused loudly, fail-closed. A policy file planted in a world-writable or foreign-owned directory silently governing a session is a confused-deputy of the same family [FW-XR8](#fw-xr8) forbids in-session; `--blueprint` remains the explicit door for any file discovery will not trust. |
 
 ### 5.9 Credential catalog & launcher (FW-CRED)
 
@@ -267,6 +271,7 @@ Discovery observes what a confined workload actually tries to touch and turns de
 | <a id="fw-disc4"></a>**FW-DISC4** Auto-widen zone | An operator-authored scope in the Blueprint within which discovered grants may be auto-accepted (e.g. project dir, language caches). Outside the zone, review is required. Empty by default — nothing self-grants out of the box. |
 | <a id="fw-disc5"></a>**FW-DISC5** Review as itemized diff | Proposals surface on the operator channel as a diff showing what widens and what was withheld and why. Acceptance is per-entry. |
 | <a id="fw-disc6"></a>**FW-DISC6** Provenance | An accepted discovered grant is recorded with provenance (added-via-discovery, run id), so audit distinguishes authored from learned grants. |
+| <a id="fw-disc11"></a>**FW-DISC11** Loop drivability | The discovery loop — observe, list, accept, next run — is drivable end-to-end from the `learn` surface without the user naming its artifact files: `<blueprint>.proposal.toml` and `<blueprint>.discovered.toml` are implementation conventions that surface in *output* as provenance, never as required *input* knowledge. Derived-path flags (`--proposal`) are escape hatches, not the paved road, and a flag a mode would ignore is refused, never silently dropped ([FW-INV6](#fw-inv6) at the CLI surface). *(`FW-DISC7`–`FW-DISC10` are reserved by the in-flight FEP-4 draft and are not landed numbers.)* |
 
 "Formwork never runs a real workload in a grant-whatever-is-attempted mode" is not a separate requirement — it is the combined consequence of [FW-DISC1](#fw-disc1) and [FW-DISC4](#fw-disc4), stated as a guarantee in [FW-INV10](#fw-inv10). Sticky learning within a trust boundary is the recommended workflow: accumulate proposals across runs, auto-accept only inside the operator-drawn zone, review everything else — discovery does the tedious enumeration; the human keeps the perimeter.
 
@@ -412,6 +417,8 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-060"></a>**FW-E2E-060: CLI overrides compose with an `unveil` blueprint ([FW-BP1](#fw-bp1)/[FW-BP2](#fw-bp2)/[FW-BP7](#fw-bp7)).** Over an empty-universe (`unveil`) file, the CLI override surface behaves as an operator expects: a `--read`/`--write` sugar grant fills the closed universe (write implies read); `--rule exec:` closes exec to an allow-list on a separate axis (the listed binary runs but is unreadable, an unlisted one does not run); the `--mode unveil` flag flips a subtractive file to closed by last-wins (ambient-only path hidden, explicit grant kept); and the credential floor stays un-liftable under a broad `--read`. Pass: each verdict matches, dry-run on any host. Fail: a CLI grant that does not populate the universe, an exec allow-list that leaks, a mode flag that does not override, or a floor a `--read` lifts.
 
+<a id="fw-e2e-070"></a>**FW-E2E-070: Discovery walk stays inside the trust boundary ([FW-BP8](#fw-bp8)).** Dry-run on any host. A `FORMWORK.toml` planted (a) in an ancestor directory the invoking user does not own, (b) above a symlinked `$HOME` (the walk reaching territory a textual home comparison would miss), and (c) as a foreign-owned file inside the user's own directory. Pass: none of the planted files governs a session — (a) ends the walk unconsulted, (b) stops at the resolved home, (c) is refused with a warning and does not fall through to a farther match — while the user's own launch-directory file still resolves, and `--blueprint` still opens any file explicitly. Ownership is exercised with an injected predicate at the unit boundary (chown requires root; the same pure-substitution allowance as the compiler's HostProfile), the symlinked-home arm against the real filesystem. Fail: implicit policy from territory the user does not control.
+
 ### 7.8 Credential catalog & launcher
 
 <a id="fw-e2e-045"></a>**FW-E2E-045: Path credential denied and itemized.** Under the default catalog, `~/.aws/credentials` is read. Pass: read denied (EACCES); operator channel names type `aws`; agent sees a bare EACCES with no annotation. Fail: read succeeds, or the agent-facing error names the type.
@@ -441,6 +448,8 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 <a id="fw-e2e-063"></a>**FW-E2E-063: Review loop closes over the proposal ([FW-DISC5](#fw-disc5)/[FW-DISC6](#fw-disc6)).** From a proposal holding needs-review candidates, driven entirely through the CLI: listing prints the candidates numbered on stdout (the result stream, present under quiet telemetry); accepting by 1-based number and by exact pattern moves exactly the selected entries into the discovered layer with discovery provenance and rewrites the proposal without them; `--accept-all` consumes the remainder; a credential-floor-matching entry is refused at accept regardless of what the proposal claims ([FW-INV8](#fw-inv8)). Dry-run on any host — the proposal file is input, no kernel needed. Pass: each behavior as stated. Fail: a listing lost to the telemetry channel, an unselected entry consumed, provenance missing, or a floored entry accepted.
 
 <a id="fw-e2e-064"></a>**FW-E2E-064: Short-lived workload denials are captured ([FW-DISC1](#fw-disc1)/[FW-DISC2](#fw-disc2)).** A learning run whose workload dies on its first denial (`cat` of an ungranted file — exiting in well under a second, the canonical discovery shape). Pass: the denied path still appears in the proposal, despite denial-feed persistence latency exceeding the workload's lifetime (collection is anchored to the run start, held open for a minimum settle window — an empty read repeated is never trusted before it — and polled to quiescence under a cap). Fail: an empty proposal because collection read a window the feed had not yet flushed.
+
+<a id="fw-e2e-071"></a>**FW-E2E-071: Linux denial feed via ptrace ([FW-DISC1](#fw-disc1)/[FW-DISC2](#fw-disc2)/[FW-XR6](#fw-xr6)).** On a Landlock-capable Linux host with `strace` installed, `formwork learn -- cmd` runs the workload enforced under an **unconfined** `strace` ancestor tracing a `run --confine-self` shim: the tracer needs no policy hole (it sits outside the wall, is the tracee's ancestor — no Yama exception — and the confined tree cannot reach it, [FW-XR8](#fw-xr8)). Denied file syscalls (`EACCES`/`EPERM` on the open/exec/mutate families — never `stat`/`access` probes, which Landlock does not govern) become denial records: the millisecond-`cat` shape ([FW-E2E-064](#fw-e2e-064)'s property) lands in the proposal with no persistence-latency window at all (the trace is complete when the tracee exits), a credential hit is withheld by the floor ([FW-DISC3](#fw-disc3)) through this tap exactly as through the macOS one, and attribution is exact — only this run's process tree is in the trace. Without `strace` on PATH, or without Landlock, `learn` fails fast naming the gap ([FW-E2E-062](#fw-e2e-062)/[FW-XR9](#fw-xr9)). Pass: each behavior as stated. Fail: a denial the kernel produced is missing from the proposal, a credential is proposed, or the tracer required weakening the policy.
 
 ### 7.10 Adversarial
 
@@ -515,6 +524,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | credential floor: absolute rows | Enforced (Landlock deny) | Enforced (Seatbelt deny) |
 | credential floor: any-depth rows | Partial (withheld; Landlock cannot root `**/`) | Enforced (regex) |
 | credential env strip | Enforced (launcher-contingent) | Enforced (launcher-contingent) |
+| `learn` denial feed | Provided (ptrace tap via installed `strace`, [FW-E2E-071](#fw-e2e-071)) | Provided (unified log, post-hoc) |
 
 ## 10. Requirements ↔ tests traceability
 
@@ -525,9 +535,10 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-XR3](#fw-xr3) Fail-closed egress | [FW-E2E-006](#fw-e2e-006), 025 | 007, 008, ADV-003 |
 | [FW-XR4](#fw-xr4) Descendant inheritance | [FW-E2E-005](#fw-e2e-005) | ADV-001, 005, INV2 |
 | [FW-XR5](#fw-xr5) Single privileged broker | [FW-E2E-019](#fw-e2e-019) | 010, ADV-005 |
-| [FW-XR6](#fw-xr6) Behavioral parity | [FW-E2E-028](#fw-e2e-028) | 024 |
+| [FW-XR6](#fw-xr6) Behavioral parity | [FW-E2E-028](#fw-e2e-028) | 024, 071 |
 | [FW-XR7](#fw-xr7) fd-injection transport | [FW-E2E-010](#fw-e2e-010), 012 | 011, ADV-006 |
 | [FW-XR8](#fw-xr8) No agent-influenced escalation | [FW-ADV-001](#fw-adv-001) | [FW-E2E-005](#fw-e2e-005), INV1 |
+| [FW-XR9](#fw-xr9) Surface fail-fast | [FW-E2E-062](#fw-e2e-062) | INV5, INV6 |
 | [FW-CAP1](#fw-cap1) Enumerable vocabulary | [FW-E2E-013](#fw-e2e-013), 001 | — |
 | [FW-CAP2](#fw-cap2) Monotonic narrowing | [FW-E2E-005](#fw-e2e-005) | INV1 |
 | [FW-CAP3](#fw-cap3) Subtractive default profile | [FW-E2E-003](#fw-e2e-003), 020 | 021, 022 |
@@ -554,6 +565,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-GW6](#fw-gw6) fd minting | [FW-E2E-011](#fw-e2e-011) | 010 |
 | [FW-GW7](#fw-gw7) Least-privilege gateway | [FW-E2E-019](#fw-e2e-019) | ADV-003 |
 | [FW-GW8](#fw-gw8) Transparent passthrough | [FW-E2E-018](#fw-e2e-018) | 020, 021 |
+| [FW-GW9](#fw-gw9) Pattern-matched shading | [FW-E2E-065](#fw-e2e-065), 066, 067 | 068, 069, ADV-004 |
 | [FW-TRA1](#fw-tra1) Ambient reuse | [FW-E2E-020](#fw-e2e-020), 021 | 022 |
 | [FW-TRA2](#fw-tra2) Toolchains run clean | [FW-E2E-020](#fw-e2e-020), 021, 022 | 023 |
 | [FW-TRA3](#fw-tra3) Sensitive-set subtraction | [FW-E2E-003](#fw-e2e-003) | 004 |
@@ -567,6 +579,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-FID3](#fw-fid3) Runtime observability | [FW-E2E-024](#fw-e2e-024) | — |
 | [FW-FID4](#fw-fid4) Deterministic compile | [FW-E2E-027](#fw-e2e-027) | 026 |
 | [FW-FID6](#fw-fid6) Rule provenance & explain | [FW-E2E-059](#fw-e2e-059) | [FW-CAP5](#fw-cap5), [FW-CAP8](#fw-cap8) |
+| [FW-FID7](#fw-fid7) Resolved-input disclosure | [FW-E2E-069](#fw-e2e-069) | 059, 062 |
 | [FW-ENV1](#fw-env1) Environment axis | [FW-E2E-036](#fw-e2e-036) | [FW-FID1](#fw-fid1) |
 | [FW-ENV2](#fw-env2) Default secret-shaped scrub | [FW-E2E-036](#fw-e2e-036) | [FW-TRA2](#fw-tra2) |
 | [FW-BP1](#fw-bp1) One model, many surfaces | [FW-E2E-043](#fw-e2e-043), 060 | 042 |
@@ -576,6 +589,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-BP5](#fw-bp5) Path sigils | [FW-E2E-055](#fw-e2e-055) | — |
 | [FW-BP6](#fw-bp6) Flat verb rules | [FW-E2E-058](#fw-e2e-058), 061 | [FW-CAP9](#fw-cap9) |
 | [FW-BP7](#fw-bp7) Mode posture | [FW-E2E-057](#fw-e2e-057), 060 | — |
+| [FW-BP8](#fw-bp8) Discovery trust scope | [FW-E2E-070](#fw-e2e-070) | [FW-XR8](#fw-xr8) |
 | [FW-CRED1](#fw-cred1) Typed catalog | [FW-E2E-045](#fw-e2e-045), 046 | 049 |
 | [FW-CRED2](#fw-cred2) Two kinds, two arms | [FW-E2E-045](#fw-e2e-045), 046 | 050 |
 | [FW-CRED3](#fw-cred3) Env-points-to-file | [FW-E2E-047](#fw-e2e-047) | — |
@@ -585,12 +599,13 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-CRED7](#fw-cred7) Channel split | [FW-E2E-045](#fw-e2e-045), 046 | ADV-012, INV9 |
 | [FW-CRED8](#fw-cred8) Report mechanism | [FW-E2E-050](#fw-e2e-050) | ADV-014 |
 | [FW-CRED9](#fw-cred9) Floor enforceability | [FW-E2E-050](#fw-e2e-050) | INV5; Linux kernel enforcement deferred |
-| [FW-DISC1](#fw-disc1) Learning mode | [FW-E2E-051](#fw-e2e-051) | 054, 062, 064 |
-| [FW-DISC2](#fw-disc2) Reverse compile | [FW-E2E-051](#fw-e2e-051) | 052, 053, 064 |
+| [FW-DISC1](#fw-disc1) Learning mode | [FW-E2E-051](#fw-e2e-051) | 054, 062, 064, 071 |
+| [FW-DISC2](#fw-disc2) Reverse compile | [FW-E2E-051](#fw-e2e-051) | 052, 053, 064, 071 |
 | [FW-DISC3](#fw-disc3) Catalog floor | [FW-ADV-013](#fw-adv-013), 015 | 051, INV8 |
 | [FW-DISC4](#fw-disc4) Auto-widen zone | [FW-E2E-052](#fw-e2e-052) | 054 |
 | [FW-DISC5](#fw-disc5) Review diff | [FW-E2E-051](#fw-e2e-051), 063 | 053 |
 | [FW-DISC6](#fw-disc6) Provenance | [FW-E2E-053](#fw-e2e-053) | 063 |
+| [FW-DISC11](#fw-disc11) Loop drivability | [FW-E2E-063](#fw-e2e-063) | 062 |
 | Launcher arm (§2) | [FW-E2E-046](#fw-e2e-046), 050 | 047, INV7, ADV-014 |
 
 ## 11. Open questions
