@@ -95,13 +95,23 @@ including a name that itself contains slashes (a resource `uri`), which is treat
 | [`FW-E2E-066`](../formwork.md#fw-e2e-066) | gateway + fixture | deny terminal over allow — on list and on the overlapping call |
 | [`FW-E2E-067`](../formwork.md#fw-e2e-067) | gateway + fixture | deny stays oracle-free (deny-hidden ≡ nonexistent) |
 | [`FW-E2E-069`](../formwork.md#fw-e2e-069) | CLI compile (any host) | patterns round-trip into compiled policy, deterministically; bad pattern / empty table fail loud |
+| [`FW-E2E-066`](../formwork.md#fw-e2e-066) | **real `formwork gateway` binary** | CLI → compile → confine backend → shade: pattern policy holds end-to-end where a confiner exists |
 | [`FW-E2E-068`](../formwork.md#fw-e2e-068) | real server, Linux CI | shading against `@modelcontextprotocol/server-everything` driven through the gateway |
 
-`FW-E2E-068` runs in the `mcp-integration` CI job (and `just test-integration-mcp`): it fetches the
-pinned reference server and drives it through the production shading path. It isolates the shading so
-it needs no host confiner; the orthogonal backend-confinement arm
-([`FW-GW5`](../formwork.md#fw-gw5)) stays covered by the host-gated
-[`FW-E2E-019`](../formwork.md#fw-e2e-019).
+Where each level runs (be honest about it):
+
+- **`FW-E2E-068`** runs in the `mcp-integration` CI job (and `just test-integration-mcp`): it fetches
+  the pinned reference server and drives it through the production shading path (`Gateway::run`). It
+  isolates the shading so it needs no host confiner.
+- **Binary-level `FW-E2E-066`** exists twice. `crates/formwork-cli/tests/gateway_cli.rs` drives the
+  real `formwork gateway` binary and **runs in GitHub CI** on macOS (Seatbelt) and on Linux when the
+  runner carries Landlock — it skips, never fails, where no confiner is available.
+  `test_examples_gateway.py::test_example_gateway_shades_by_pattern` covers the same through the
+  black-box CLI, but the Python harness is a **local / `just test-e2e` gate — it is not wired into
+  GitHub CI** (only `cargo test --workspace` is), so the Rust CLI test is the one that gives CI
+  coverage of the binary path.
+- The orthogonal backend-confinement arm ([`FW-GW5`](../formwork.md#fw-gw5)) stays covered by the
+  host-gated [`FW-E2E-019`](../formwork.md#fw-e2e-019).
 
 ## Open questions
 
