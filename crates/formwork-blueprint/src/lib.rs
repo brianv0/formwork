@@ -317,12 +317,9 @@ pub struct Visibility {
 /// What the allow layer admits, before the terminal deny is applied.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 enum AllowScope {
-    /// Every name (the `"allow-all"` keyword, or a `deny`-only table).
     All,
-    /// No name (the `"deny"` keyword, or an empty allowlist) -- the fail-closed default.
     #[default]
     Nothing,
-    /// Exactly the names matched by these patterns.
     Only(Vec<Pattern>),
 }
 
@@ -405,7 +402,6 @@ impl Default for Visibility {
 }
 
 impl Visibility {
-    /// Allow every name on this axis (`"allow-all"`).
     pub fn all() -> Self {
         Visibility {
             allow: AllowScope::All,
@@ -413,8 +409,7 @@ impl Visibility {
         }
     }
 
-    /// Allow exactly these literal identifiers (no pattern parsing) -- the common programmatic case
-    /// and the shape every pre-pattern blueprint compiles to.
+    /// Literal identifiers only, no `/…/` parsing -- the shape every pre-pattern blueprint compiles to.
     pub fn allow_exact<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -440,7 +435,6 @@ impl Visibility {
         })
     }
 
-    /// Attach a parsed terminal deny list to an existing allow scope (builder for tests/callers).
     pub fn with_deny(mut self, deny: &[String]) -> Result<Self, VisibilityError> {
         self.deny = parse_patterns(deny)?;
         Ok(self)
@@ -479,9 +473,8 @@ enum VisibilityKeyword {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VisibilityTable {
-    // Absent `allow` means "all" (a deny-only carve-out); an explicit empty list means "none". A
-    // typo'd key is rejected (deny_unknown_fields), so a misspelling can never become a silent
-    // allow-all.
+    // `deny_unknown_fields` so a misspelled key errors rather than parsing as a deny-only
+    // (allow-all) table -- a typo must never silently widen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     allow: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -677,8 +670,6 @@ mod tests {
 
     #[test]
     fn regex_allow_matches_whole_name_only() {
-        // A `/re/` entry is anchored to the entire name: `/get_.*/` covers `get_issue` but not the
-        // substring hit `forget_me` -- allow patterns stay tight (FW-GW9).
         let v = tools_vis(r#"{ allow = ["/get_.*/"] }"#);
         assert!(v.permits("get_issue"));
         assert!(v.permits("get_"));
@@ -697,8 +688,6 @@ mod tests {
 
     #[test]
     fn deny_is_terminal_over_allow() {
-        // Deny wins even when allow (here allow-all) would admit the name -- the MCP-surface form of
-        // the deny-terminal fs model (FW-GW9/FW-CAP8).
         let v = tools_vis(r#"{ allow = ["/.*/"], deny = ["/delete_.*/", "http_fetch"] }"#);
         assert!(v.permits("read_file"));
         assert!(!v.permits("delete_repo"), "deny pattern beats allow-all");
@@ -707,7 +696,6 @@ mod tests {
 
     #[test]
     fn deny_only_table_means_all_except() {
-        // Omitting `allow` means "everything", so a deny-only table reads as all-except-deny.
         let v = tools_vis(r#"{ deny = ["/admin_.*/"] }"#);
         assert!(v.permits("echo"));
         assert!(!v.permits("admin_reset"));
@@ -737,7 +725,6 @@ mod tests {
 
     #[test]
     fn invalid_regex_fails_loud_at_parse() {
-        // An unbalanced group cannot compile; parsing must reject it, never fall back to deny-all.
         let err = toml::from_str::<Blueprint>("[mcp.s]\ntools = { allow = [\"/get_(/\"] }\n")
             .unwrap_err();
         assert!(err.to_string().contains("invalid MCP pattern"), "{err}");
@@ -755,8 +742,7 @@ mod tests {
 
     #[test]
     fn visibility_json_round_trips_through_serde() {
-        // The compiled policy embeds Visibility as JSON (compile --json); it must survive a round
-        // trip byte-for-byte after canonicalization (FW-FID4).
+        // The compiled policy embeds Visibility as JSON (compile --json), so it must round-trip.
         for fragment in [
             r#""allow-all""#,
             r#""deny""#,
@@ -775,7 +761,6 @@ mod tests {
     fn canonicalize_is_deterministic_for_patterns() {
         let a = tools_vis(r#"{ allow = ["/b.*/", "a", "a"], deny = ["z", "z"] }"#);
         let b = tools_vis(r#"{ allow = ["a", "/b.*/"], deny = ["z"] }"#);
-        // Wrap in a Blueprint so the whole-tree canonicalize runs, then compare byte output.
         let canon = |v: &Visibility| serde_json::to_string(&v.canonicalize()).unwrap();
         assert_eq!(canon(&a), canon(&b));
     }

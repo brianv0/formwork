@@ -339,7 +339,6 @@ async fn fw_e2e_066_deny_pattern_hides_from_list() {
 /// and the refusal is indistinguishable from a nonexistent tool -- deny does not become an oracle.
 #[tokio::test]
 async fn fw_e2e_067_deny_pattern_refuses_call_without_oracle() {
-    // Allow-all *except* delete_*; the tool exists on the backend but is denied by pattern.
     let mut agent = start(tools_policy(&["/.*/"], &["/delete_.*/"]));
 
     // delete_file exists on the backend; delete_missing does not -- but both match the deny pattern,
@@ -383,7 +382,6 @@ async fn fw_e2e_067_deny_pattern_refuses_call_without_oracle() {
         "deny must be indistinguishable from absence (no oracle)"
     );
 
-    // A tool the deny does not match still round-trips.
     agent
         .request(
             3,
@@ -401,7 +399,7 @@ async fn fw_e2e_067_deny_pattern_refuses_call_without_oracle() {
 /// call time (the overlap half of FW-E2E-066).
 #[tokio::test]
 async fn fw_e2e_066_deny_beats_overlapping_allow() {
-    // Allow every *_file tool, but deny delete_*: delete_file is in both, deny is terminal.
+    // delete_file matches both allow (/.*_file/) and deny (/delete_.*/); the deny must win.
     let mut agent = start(tools_policy(&["/.*_file/"], &["/delete_.*/"]));
 
     agent.request(1, "tools/list", json!({})).await;

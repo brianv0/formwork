@@ -30,8 +30,7 @@ fn reply(id: &Option<Value>, result: Value) {
 }
 
 fn main() {
-    // A spread of prefixes so pattern shading (FW-GW9) has something to partition: read_*/list_*
-    // (safe reads), write_*/delete_* (mutating), http_fetch (egress).
+    // A spread of prefixes so pattern shading (FW-GW9) has distinct families to allow/deny across.
     let mut tools: Vec<&str> = vec![
         "read_file",
         "list_dir",

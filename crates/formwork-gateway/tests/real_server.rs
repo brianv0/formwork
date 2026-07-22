@@ -94,7 +94,7 @@ async fn fw_e2e_068_regex_shading_against_real_server() {
         ..Default::default()
     };
 
-    // Spawn the real server as the backend. `npx -y` fetches the pinned package on first run.
+    // `npx -y` fetches the pinned package on first run rather than prompting.
     let child = Command::new("npx")
         .arg("-y")
         .arg(SERVER_SPEC)
@@ -112,7 +112,7 @@ async fn fw_e2e_068_regex_shading_against_real_server() {
     let backend_out = child.stdout.take().unwrap();
     let backend_in = child.stdin.take().unwrap();
 
-    // Wrap the backend in the production shading path.
+    // `Gateway::run` is the production shading path the `formwork gateway` CLI wraps.
     let (agent_side, gw_agent_read) = tokio::io::duplex(1 << 16);
     let (gw_agent_write, agent_read) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {
@@ -126,7 +126,6 @@ async fn fw_e2e_068_regex_shading_against_real_server() {
         reader: BufReader::new(agent_read).lines(),
     };
 
-    // MCP handshake, exactly as a host would.
     agent
         .request(
             1,
@@ -145,7 +144,6 @@ async fn fw_e2e_068_regex_shading_against_real_server() {
     );
     agent.notify("notifications/initialized", json!({})).await;
 
-    // 1) tools/list is shaded to exactly the allowed-minus-denied set.
     agent.request(2, "tools/list", json!({})).await;
     let listed = tool_names(&agent.recv_id(2).await);
     assert_eq!(
@@ -158,7 +156,6 @@ async fn fw_e2e_068_regex_shading_against_real_server() {
         "only allow-matched, non-denied real tools are visible"
     );
 
-    // 2) an allowed tool round-trips against the real backend.
     agent
         .request(
             3,
@@ -179,7 +176,8 @@ async fn fw_e2e_068_regex_shading_against_real_server() {
         "echo should reflect input: {text}"
     );
 
-    // 3) a real tool the allow does not cover is hidden and refused oracle-free.
+    // sampleLLM: no allow covers it. getResourceReference: allow `/get.*/` would cover it, but the
+    // deny removes it -- both must refuse, and refuse identically (oracle-free, deny-terminal).
     agent
         .request(
             4,
@@ -188,7 +186,6 @@ async fn fw_e2e_068_regex_shading_against_real_server() {
         )
         .await;
     let allow_miss = agent.recv_id(4).await;
-    // 4) a real tool the *deny* removes (even though allow `/get.*/` would cover it) is refused too.
     agent
         .request(
             5,
