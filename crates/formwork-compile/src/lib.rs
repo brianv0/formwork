@@ -466,7 +466,7 @@ mod tests {
         mcp.insert(
             "files".to_string(),
             formwork_blueprint::McpPolicy {
-                tools: Visibility::Allow(vec!["read_file".into()]),
+                tools: Visibility::allow_exact(["read_file"]),
                 ..Default::default()
             },
         );

@@ -130,6 +130,32 @@ Every `--rule` value is the exact string a file `rules = [...]` line would hold,
 like copies straight into a blueprint. A bad verb, an unknown `--mode`, or a malformed rule is a
 loud error, never a silent no-op.
 
+## Shading MCP tools with patterns (Axis B)
+
+Each `[mcp.<server>]` axis — `tools`, `resources`, `prompts` — takes an **allow** scope and a
+terminal **deny** list. Entries are exact identifiers or anchored regex written `/…/`, matched
+against the *whole* name (`FW-GW9`). A deny always wins over an allow, so you can open a family and
+carve the dangerous members back out:
+
+```toml
+[mcp.github]
+# read-only surface only; destructive tools denied even though they'd match a broad allow:
+tools = { allow = ["/^(get|list|search)_.*/"], deny = ["/^delete_.*/", "merge_pull_request"] }
+
+[mcp.everything]
+# expose everything EXCEPT model-sampling and env-printing tools (omit `allow` to mean "all"):
+tools = { deny = ["/^sample.*/", "printEnv"] }
+
+[mcp.files]
+resources = "allow-all"          # keywords still work: "allow-all" | "deny"
+prompts   = { allow = ["greeting"] }
+```
+
+Patterns are anchored to the entire identifier, so `/get_.*/` covers `get_issue` but not
+`forget_me`; use `.*` for prefixes. Because this is a userspace match in the privileged gateway (not
+a kernel path rule), a real regex is sound here where a general filesystem glob is not. A malformed
+`/…/`, an unknown table key, or an empty `{}` is a loud error, never a silent allow-all or deny-all.
+
 ## Install `formwork`
 
 The examples call `formwork` on your PATH. Build and install it from the repo root:

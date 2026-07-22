@@ -84,3 +84,35 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  # Integration test of MCP pattern shading (FW-GW9/FW-E2E-068) against a real, published MCP
+  # server. Kept a separate Linux job because it pulls a pinned npm package at test time (network),
+  # which the hermetic unit/integration suite above deliberately does not. The runner ships node, so
+  # no third-party action is added (constitution: minimal supply-chain surface for a sandbox tool).
+  mcp-integration:
+    name: mcp-integration (real server)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: mcp-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: mcp-${{ runner.os }}-cargo-
+
+      - name: Show node version (preinstalled on the runner)
+        run: node --version && npx --version
+
+      # `--ignored` runs exactly the network-dependent real-server test; it fetches the pinned
+      # @modelcontextprotocol/server-everything and drives it through the gateway with a regex policy.
+      - name: Regex shading against a real MCP server
+        run: cargo test -p formwork-gateway --test real_server --locked -- --ignored --nocapture

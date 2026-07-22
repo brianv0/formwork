@@ -286,9 +286,9 @@ mod tests {
         let merged = merge(&[a, b]);
         assert_eq!(
             merged.mcp["files"].tools,
-            Visibility::Allow(vec!["read_file".into()])
+            Visibility::allow_exact(["read_file"])
         );
-        assert_eq!(merged.mcp["web"].tools, Visibility::AllowAll);
+        assert_eq!(merged.mcp["web"].tools, Visibility::all());
     }
 
     #[test]

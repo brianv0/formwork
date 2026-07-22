@@ -9,6 +9,9 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+# Compiles the `/…/` allow/deny patterns the MCP gateway shades tool/resource/prompt names with
+# (FW-GW9). Linear-time matching, so a hostile pattern cannot wedge the gateway.
+regex = { workspace = true }
 # Parses only the embedded credential catalog (FW-CRED1) at first use; already in this binary's
 # trust base via formwork-cli, so it widens nothing (Growth).
 toml = { workspace = true }

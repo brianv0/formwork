@@ -81,7 +81,7 @@ fn names(list: &Value, field: &str, id_field: &str) -> Vec<String> {
 
 fn tools_only(allow: &[&str]) -> McpPolicy {
     McpPolicy {
-        tools: Visibility::Allow(allow.iter().map(|s| s.to_string()).collect()),
+        tools: Visibility::allow_exact(allow.iter().copied()),
         ..Default::default()
     }
 }
@@ -152,8 +152,8 @@ async fn fw_e2e_014_adv_004_ungranted_call_refused_no_oracle() {
 #[tokio::test]
 async fn fw_e2e_015_resource_and_prompt_shading() {
     let policy = McpPolicy {
-        resources: Visibility::Allow(vec!["file:///pub".into()]),
-        prompts: Visibility::Allow(vec!["greeting".into()]),
+        resources: Visibility::allow_exact(["file:///pub"]),
+        prompts: Visibility::allow_exact(["greeting"]),
         ..Default::default()
     };
     let mut agent = start(policy);
@@ -198,7 +198,7 @@ async fn fw_e2e_015_resource_and_prompt_shading() {
 #[tokio::test]
 async fn fw_e2e_015_resource_templates_shaded_by_uri_template() {
     let policy = McpPolicy {
-        resources: Visibility::Allow(vec!["file:///logs/{name}".into()]),
+        resources: Visibility::allow_exact(["file:///logs/{name}"]),
         ..Default::default()
     };
     let mut agent = start(policy);
@@ -286,6 +286,142 @@ async fn fw_e2e_017_sampling_allowed_passes_through() {
     assert_eq!(
         msg["method"], "sampling/createMessage",
         "allowed sampling reaches the agent"
+    );
+}
+
+/// A tools policy from parsed allow/deny pattern lists (exact names or `/re/`).
+fn tools_policy(allow: &[&str], deny: &[&str]) -> McpPolicy {
+    let to_vec = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    McpPolicy {
+        tools: Visibility::parse(&to_vec(allow), &to_vec(deny)).expect("valid patterns"),
+        ..Default::default()
+    }
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// FW-E2E-065 / FW-GW9: a `/re/` allow pattern shades `tools/list` to just the matching names --
+/// the rest are absent, same as an exact allowlist, but expressed by pattern.
+#[tokio::test]
+async fn fw_e2e_065_regex_allow_shades_list() {
+    let mut agent = start(tools_policy(&["/read_.*/", "/list_.*/"], &[]));
+    agent.request(1, "tools/list", json!({})).await;
+    let listed = sorted(names(&agent.recv().await, "tools", "name"));
+    assert_eq!(
+        listed,
+        vec!["list_dir".to_string(), "read_file".to_string()],
+        "only pattern-matched tools are visible; write_file/delete_file/http_fetch are absent"
+    );
+}
+
+/// FW-E2E-066 / FW-GW9 / FW-CAP8: deny is terminal. Under allow-all, a deny pattern removes matching
+/// tools from the listing entirely -- the shading is stateless, so list and call agree.
+#[tokio::test]
+async fn fw_e2e_066_deny_pattern_hides_from_list() {
+    let mut agent = start(tools_policy(&["/.*/"], &["/delete_.*/", "http_fetch"]));
+    agent.request(1, "tools/list", json!({})).await;
+    let listed = sorted(names(&agent.recv().await, "tools", "name"));
+    assert_eq!(
+        listed,
+        vec![
+            "list_dir".to_string(),
+            "read_file".to_string(),
+            "write_file".to_string()
+        ],
+        "deny patterns (delete_*) and the exact deny (http_fetch) are hidden despite allow-all"
+    );
+}
+
+/// FW-E2E-067 / FW-GW9 / FW-ADV-004: a tool the deny pattern removes is refused on a guessed call,
+/// and the refusal is indistinguishable from a nonexistent tool -- deny does not become an oracle.
+#[tokio::test]
+async fn fw_e2e_067_deny_pattern_refuses_call_without_oracle() {
+    // Allow-all *except* delete_*; the tool exists on the backend but is denied by pattern.
+    let mut agent = start(tools_policy(&["/.*/"], &["/delete_.*/"]));
+
+    // delete_file exists on the backend; delete_missing does not -- but both match the deny pattern,
+    // so both are refused *at the gateway* before reaching the backend, and must look identical.
+    agent
+        .request(
+            1,
+            "tools/call",
+            json!({"name": "delete_file", "arguments": {}}),
+        )
+        .await;
+    let denied_real = agent.recv().await;
+
+    agent
+        .request(
+            2,
+            "tools/call",
+            json!({"name": "delete_missing", "arguments": {}}),
+        )
+        .await;
+    let nonexistent = agent.recv().await;
+
+    assert!(
+        denied_real["error"].is_object(),
+        "a deny-matched call must error, not execute"
+    );
+    assert_eq!(
+        denied_real["error"]["code"], nonexistent["error"]["code"],
+        "deny-refusal and absence share an error code"
+    );
+    let strip = |v: &Value| {
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .replace("delete_file", "X")
+            .replace("delete_missing", "X")
+    };
+    assert_eq!(
+        strip(&denied_real),
+        strip(&nonexistent),
+        "deny must be indistinguishable from absence (no oracle)"
+    );
+
+    // A tool the deny does not match still round-trips.
+    agent
+        .request(
+            3,
+            "tools/call",
+            json!({"name": "read_file", "arguments": {}}),
+        )
+        .await;
+    assert_eq!(
+        agent.recv().await["result"]["content"][0]["text"],
+        "ok:read_file"
+    );
+}
+
+/// FW-E2E-066 / FW-GW9 / FW-CAP8: when allow and deny both match a name, deny wins -- proven at
+/// call time (the overlap half of FW-E2E-066).
+#[tokio::test]
+async fn fw_e2e_066_deny_beats_overlapping_allow() {
+    // Allow every *_file tool, but deny delete_*: delete_file is in both, deny is terminal.
+    let mut agent = start(tools_policy(&["/.*_file/"], &["/delete_.*/"]));
+
+    agent.request(1, "tools/list", json!({})).await;
+    let listed = sorted(names(&agent.recv().await, "tools", "name"));
+    assert_eq!(
+        listed,
+        vec!["read_file".to_string(), "write_file".to_string()],
+        "delete_file matches allow (*_file) but deny (delete_*) removes it"
+    );
+
+    agent
+        .request(
+            2,
+            "tools/call",
+            json!({"name": "delete_file", "arguments": {}}),
+        )
+        .await;
+    assert!(
+        agent.recv().await["error"].is_object(),
+        "deny beats the overlapping allow on the call too"
     );
 }
 

@@ -41,6 +41,12 @@ test-linux-full:
 test-e2e:
     cd py && uv run pytest -v
 
+# Integration test of MCP pattern shading (FW-GW9/FW-E2E-068) against a REAL published server
+# (@modelcontextprotocol/server-everything) driven through the gateway. Needs node + network; the
+# test skips itself if `npx` is absent. Mirrors the CI `mcp-integration` job.
+test-integration-mcp:
+    cargo test -p formwork-gateway --test real_server -- --ignored --nocapture
+
 # --- inspection -----------------------------------------------------------------------------
 
 detect:

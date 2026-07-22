@@ -30,7 +30,15 @@ fn reply(id: &Option<Value>, result: Value) {
 }
 
 fn main() {
-    let mut tools: Vec<&str> = vec!["read_file", "write_file", "http_fetch"];
+    // A spread of prefixes so pattern shading (FW-GW9) has something to partition: read_*/list_*
+    // (safe reads), write_*/delete_* (mutating), http_fetch (egress).
+    let mut tools: Vec<&str> = vec![
+        "read_file",
+        "list_dir",
+        "write_file",
+        "delete_file",
+        "http_fetch",
+    ];
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {

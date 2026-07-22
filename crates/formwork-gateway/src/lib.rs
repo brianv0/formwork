@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn filter_list_hides_ungranted_and_keeps_granted() {
         let policy = McpPolicy {
-            tools: formwork_blueprint::Visibility::Allow(vec!["keep".into()]),
+            tools: formwork_blueprint::Visibility::allow_exact(["keep"]),
             ..Default::default()
         };
         let resp = json!({
