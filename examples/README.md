@@ -25,8 +25,9 @@ Each host's `sandbox-agent.sh` shows the exact invocation.
 Formwork claims only what the current host can back. Check yours:
 
 ```sh
-formwork detect                                   # capabilities of this machine
-formwork compile --blueprint examples/blueprints/agent-session.toml --report-only   # per-capability fidelity
+formwork explain                                  # capabilities of this machine, human-readably
+formwork explain --blueprint examples/blueprints/agent-session.toml   # + this blueprint's per-capability fidelity
+formwork compile --blueprint examples/blueprints/agent-session.toml --report-only   # the same, as JSON for CI
 ```
 
 On macOS (Seatbelt) fs read/write, default-deny egress, and the direct-TCP port tier are all
@@ -82,7 +83,10 @@ formwork run --blueprint examples/blueprints/agent-session.toml \
 
 `--rule` and `--mode` are the highest override layer — they apply on top of the file (and any
 `extends` chain), so you shape a shipped blueprint per-run without editing it. `--blueprint` names
-the base; everything else refines it.
+the base; everything else refines it. (Omit `--blueprint` entirely and every subcommand looks for
+a `FORMWORK.toml` in the current directory and its parents — and announces which file it used, in
+its logs and in `compile`/`explain` output. A project's `FORMWORK.toml` can start from the
+compiled-in default with `extends = ["builtin:default"]`, no repo checkout needed.)
 
 ```sh
 # Add extra denies for one run — safe from any layer, since deny is terminal (FW-CAP8):

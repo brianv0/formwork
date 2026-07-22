@@ -56,9 +56,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Native OS backends differ (Seatbelt on macOS; Landlock/seccomp stub on Linux), so the
+        # Native OS backends differ (Seatbelt on macOS; Landlock/seccomp on Linux), so the
         # suite must run on both. Integration tests that need a real kernel mechanism are cfg-gated
-        # to their OS, so a stock runner exercises exactly what it can enforce.
+        # to their OS, so a stock runner exercises exactly what it can enforce. The macOS job also
+        # carries the learn-usefulness probe (FW-E2E-064: a millisecond workload's denial must
+        # survive unified-log persistence latency) against the real Seatbelt + `log show` feed.
         os: [ubuntu-22.04, macos-14]
     steps:
       - uses: actions/checkout@v4

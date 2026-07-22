@@ -1,64 +1,17 @@
 # Formwork
 
-An OS-level sandbox for agent sessions: it takes a capability blueprint and turns the four capabilities
-that touch the real operating system — read, write, exec, net — into boundaries the kernel actually
-enforces, on Linux and macOS, for an agent process and every child it spawns. Plus an MCP-aware
-gateway so every tool call and every byte of egress is forced through one auditable door.
+An OS-level sandbox for agent sessions: it takes a capability blueprint and turns the four
+capabilities that touch the real operating system — read, write, exec, net — into boundaries the
+kernel actually enforces, on Linux and macOS, for an agent process and every child it spawns. Plus
+an MCP-aware gateway so every tool call and every byte of egress is forced through one auditable
+door.
 
-See [`formwork.md`](formwork.md) for the design and end-to-end test spec, and
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for how it is being built. Identifiers like
-`FW-CAP2` — in code, docs, and test names — cite requirements defined in `formwork.md`
-(anchored, so `formwork.md#fw-cap2` jumps to the definition; see the constitution's
-*Requirements & identifiers*).
+Formwork targets **good isolation, not perfect isolation**: a hard wall against accidental,
+careless, and prompt-injected overreach and against untrusted code the agent runs — not against
+kernel exploitation. Every enforcement claim is backed by a real mechanism on the current host or
+reported as a gap; Formwork never silently claims containment it cannot deliver.
 
-Formwork targets **good isolation, not perfect isolation** (design §1, §3): a hard wall against
-accidental, careless, and prompt-injected overreach and against untrusted code the agent runs — not
-against kernel/LSM exploitation. Every enforcement claim is backed by a real mechanism on the
-current host or reported as a gap; Formwork never silently claims containment it cannot deliver.
-
-## Status
-
-Under construction, kernel-mechanism-first (plan §4).
-
-| Phase | What | State |
-|---|---|---|
-| 1 | Blueprint, pure compiler, fidelity report, dry-run | **done** — `FW-E2E-026/027` + narrowing/report tests green; `detect` + degraded-host honesty verified on real Linux (Docker) |
-| 3 | macOS confiner (Seatbelt) | **done** — real kernel enforcement; `FW-E2E-001..006, 024` green natively |
-| 5 | fd-injection transport (seam) | **done** — `FW-E2E-010/011/012` green; transport verified on macOS *and* Linux |
-| — | Python E2E harness | **done** — black-box CLI tests + generated traceability, `uv`-managed |
-| 6 | Gateway (MCP shading) | **done** — `FW-E2E-013..019` + `FW-ADV-004` green; backend confinement uses real Seatbelt |
-| 2 | Linux confiner (Landlock + seccomp) | designed ([`docs/linux-backend.md`](docs/linux-backend.md)); honest stub — needs a 5.13+ kernel to verify |
-
-65 Rust tests pass on macOS (`cargo test`), 8 Python E2E tests pass (`cd py && uv run pytest`),
-clippy is clean under `-D warnings`, and the whole workspace cross-compiles for Linux
-(`cargo check --target x86_64-unknown-linux-gnu`). On real Linux (Docker, kernel 5.10 — no Landlock)
-`formwork detect` and the degraded-host honesty path ([FW-E2E-025](formwork.md#fw-e2e-025)/026, [FW-INV6](formwork.md#fw-inv6)) are verified.
-
-## Workspace
-
-- `crates/formwork-blueprint` — capability blueprint: types, canonical form, narrowing algebra (FW-CAP*).
-- `crates/formwork-detect` — `HostProfile` detection (the only impure input to compilation).
-- `crates/formwork-compile` — the pure `blueprint → {confiner, gateway, FidelityReport}` compiler.
-- `crates/formwork-confine` — the confiners (Landlock+seccomp / Seatbelt), two postures.
-- `crates/formwork-seam` — the fd-injection transport: socketpair-at-spawn + `SCM_RIGHTS` minting.
-- `crates/formwork-gateway` — the MCP-aware policy proxy: shading, policing, transparent passthrough.
-- `crates/formwork-cli` — the `formwork` binary (v1 embedding surface).
-- `profiles/` — the subtractive default profile and sensitive set.
-- `py/` — the pytest end-to-end / adversarial harness and MCP/reuse fixtures (dev-only).
-
-## Try it
-
-```sh
-cargo build
-# What can this host enforce?
-cargo run -p formwork-cli -- detect
-# Compile a blueprint to a policy + honest fidelity report, without enforcing (works on any OS):
-cargo run -p formwork-cli -- compile --blueprint examples/e2e-001.toml --report-only
-# Cross-platform dry-run: compile a Linux policy while on a Mac (FW-E2E-026):
-cargo run -p formwork-cli -- compile --blueprint examples/e2e-001.toml --target linux-v6 --report-only
-```
-
-## Download
+## Install
 
 Prebuilt `formwork` binaries (macOS and Linux, arm64 and x86_64) are published on
 [GitHub Releases](https://github.com/brianv0/formwork/releases): every merge to `main` updates the
@@ -68,7 +21,7 @@ tags (`v*`) cut stable releases. Each asset ships with a `SHA256SUMS` file. For 
 ```sh
 curl -fsSLO https://github.com/brianv0/formwork/releases/download/canary/formwork-canary-aarch64-apple-darwin.tar.gz
 tar -xzf formwork-canary-aarch64-apple-darwin.tar.gz
-./formwork-canary-aarch64-apple-darwin/formwork detect
+./formwork-canary-aarch64-apple-darwin/formwork explain
 ```
 
 > **macOS Gatekeeper:** the binaries are not yet Developer-ID-signed or notarized. The terminal
@@ -80,13 +33,92 @@ tar -xzf formwork-canary-aarch64-apple-darwin.tar.gz
 > xattr -d com.apple.quarantine formwork-canary-*.tar.gz && tar -xzf formwork-canary-*.tar.gz
 > ```
 
-## Testing
+Or build from source: `cargo install --path crates/formwork-cli`.
 
-`just test` (or `cargo test --workspace`) runs the pure + native-OS-backend tests on any host.
-Linux enforcement is tested first-line in Docker (`just test-linux`) with Docker's own
-seccomp/AppArmor disabled so only Formwork's sandbox is under test, and gated on `formwork detect`
-so tests skip tiers the Docker VM kernel can't carry; `just test-linux-full` falls back to a Lima
-VM with a pinned 6.12+ kernel for the ABI-v6 tier. See plan §5.
+## Quickstart
+
+Drop a `FORMWORK.toml` in your project — every subcommand finds it automatically (current
+directory, then parents up to `$HOME`) and announces which file it used:
+
+```toml
+# FORMWORK.toml — extend the built-in default profile (broad reads, credentials and other
+# projects denied, secret-shaped env vars scrubbed), then open what this project needs:
+extends = ["builtin:default"]
+net = { ports = [443] }              # HTTPS egress only; omit for no network at all
+rules = ["readwrite:$CWD/**"]        # the project directory is the writable working set
+```
+
+```sh
+# Run your agent behind the kernel wall — its in-app permission prompts stop being load-bearing:
+formwork run -- claude --dangerously-skip-permissions
+
+# What does this host enforce, and what would this session's policy be?
+formwork explain
+
+# Why is a specific path granted or denied, and by which rule?
+formwork explain ~/.ssh/id_ed25519 '$CWD/src/main.rs'
+```
+
+The sandbox holds for the whole process tree — a `git` or `python` the agent spawns hits the same
+walls. Denials surface as ordinary `EACCES`/`EPERM`, credentials stay unreadable even under broad
+read grants, and a deny always beats an allow, from any layer.
+
+On macOS, `formwork learn` runs a workload enforced while recording what the kernel denied, then
+proposes grants for review — nothing is widened until you accept it:
+
+```sh
+formwork learn -- npm test        # enforced run; denials become a reviewable proposal
+formwork learn --list             # see the proposed grants, numbered
+formwork learn --accept 1         # accept by number or pattern; applies from the next run
+```
+
+See [`examples/`](examples/README.md) for complete blueprints, the rule vocabulary, CLI recipes,
+and wiring for Claude Code, codex, and opencode.
+
+## Platform support
+
+| Capability | macOS | Linux |
+|---|---|---|
+| Filesystem read/write walls (`run`, `gateway`) | ✅ Seatbelt | ✅ Landlock + seccomp (kernel 5.13+) |
+| Default-deny network, port tier | ✅ | ✅ (best on kernel 6.7+) |
+| Exec allow-lists | ✅ | ✅ |
+| MCP gateway shading | ✅ | ✅ |
+| `learn` (denial observation) | ✅ unified-log feed | ❌ fails fast with the reason — Landlock's audit feed (kernel 6.15+) is not wired yet |
+| `compile` / `explain` dry-run | ✅ any host | ✅ any host, cross-platform (compile a Linux policy on a Mac) |
+
+On a host that can't carry a capability (an older kernel, a missing mechanism), Formwork reports
+the gap in its fidelity report and refuses to pretend — it fails closed, never silently open.
+`formwork explain` (or the `--help` epilogue) tells you where the machine you're on stands.
+
+## Commands
+
+```text
+formwork run      [--blueprint …] -- <cmd> …   confine a command and every child it spawns
+formwork learn    [--blueprint …] -- <cmd> …   enforced run + denial observation → proposal
+formwork learn    --list | --accept <n|pat>    review / accept proposed grants
+formwork explain  [--blueprint …] [path …]     host capabilities, policy summary, per-path verdicts
+formwork compile  [--blueprint …] [--target …] compiled policy + fidelity report as JSON (for CI)
+formwork gateway  [--blueprint …] --server <name> -- <mcp server cmd>   MCP policy proxy
+```
+
+`explain` is the human door (prose; `--json` for machines), `compile` the machine door (stable
+JSON). Both state which blueprint file they resolved and how. Blueprints compose: a file, its
+`extends` chain (including the compiled-in `builtin:default`), a learned-grants layer, and CLI
+overrides (`--rule`, `--set`, sugar flags) merge into one model where deny always wins.
+
+## Development
+
+`just test` (or `cargo test --workspace`) runs the pure + native-OS-backend tests on any host;
+`cd py && uv run pytest` runs the black-box end-to-end harness. Linux enforcement is tested
+first-line in Docker (`just test-linux`) with Docker's own seccomp/AppArmor disabled so only
+Formwork's sandbox is under test; `just test-linux-full` falls back to a Lima VM with a pinned
+6.12+ kernel.
+
+- [`formwork.md`](formwork.md) — the design and end-to-end test spec (with the requirement
+  identifiers cited throughout code and tests).
+- [`docs/STATUS.md`](docs/STATUS.md) — implementation status by phase.
+- [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — how it is being built.
+- [`constitution.md`](constitution.md) — project doctrine, including the honesty rules.
 
 ## License
 

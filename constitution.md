@@ -74,7 +74,10 @@ The durable, human-reviewed surfaces of this project are:
   ([FW-CAP3](formwork.md#fw-cap3), realized by the catalog + backstop);
 - the **discovery artifacts** — the proposal (`*.proposal.toml`) and the provenance-carrying
   discovered layer (`*.discovered.toml`, [FW-DISC6](formwork.md#fw-disc6)) — machine-written, human-accepted;
-- the **`formwork` CLI surface** — its subcommands and their JSON output.
+- the **`formwork` CLI surface** — its subcommands and their output: stable
+  JSON on the machine doors (`compile`, `detect`, `explain --json`), prose on
+  the human doors (`explain`, `learn` listings). Only the JSON shapes are
+  contract; prose may be reworded without a version event.
 
 These are designed before the code that uses them and evolve only through
 human-reviewed change. Changes to a published surface follow
@@ -130,7 +133,7 @@ test — carries a stable unique identifier: `FW-<FAMILY><n>` for requirements
 EGR — a new family is a Concepts-grade amendment), `FW-INV<n>` for invariants,
 `FW-E2E-<nnn>` / `FW-ADV-<nnn>` for tests. The rules:
 - **Minted once, in the defining document.** `formwork.md` once landed; an
-  FEP's remainder document until then (`fep-1.md` holds FW-EGR1–6 and FW-FID5
+  FEP's remainder document until then (`docs/fep-1.md` holds FW-EGR1–6 and FW-FID5
   today). Exactly one definition per ID, and each definition site carries an
   HTML anchor named for the lowercase ID (`<a id="fw-cap2">`).
 - **Never renumbered, never reused.** Sequences are monotonic and shared
@@ -145,7 +148,8 @@ EGR — a new family is a Concepts-grade amendment), `FW-INV<n>` for invariants,
   currency, and it is what Comments means by the durable "why". (Rustdoc
   hyperlinking was evaluated and declined: most citations live in non-doc
   comments rustdoc never renders, and rustdoc cannot express repo-relative
-  links. The convention is stated once, here and in the README — never as
+  links. The convention is stated once, here and in `docs/STATUS.md` (the
+  README is user-facing and carries no requirement IDs) — never as
   per-file boilerplate.)
 - **Drift fails CI.** The harness canary (`py/harness/test_requirements.py`)
   fails when a cited ID has no definition, a definition lacks its anchor or is
@@ -216,8 +220,12 @@ Libraries only *emit*; the subscriber is installed exactly once, at the CLI
 entrypoint — no library crate installs a subscriber or configures logging.
 Runtime grants and denials are emitted as structured records ([FW-FID3](formwork.md#fw-fid3)), and the
 FidelityReport is the compile-time telemetry. No print debugging in committed
-code — the only `println!` is the CLI writing its own JSON result to stdout,
-which is product output, not logging.
+code — the only `println!` is the CLI writing its own result to stdout: the
+stable JSON of the machine doors (`compile`, `detect`, `--json`) and the
+human-readable result of the human doors (`explain`'s prose, `learn`'s
+candidate listing — [FW-E2E-063](formwork.md#fw-e2e-063)). Both are product output, not logging; a
+result that only reached stderr would vanish under quiet telemetry, which is
+its own fail-silent.
 Rationale: "fails loudly" needs somewhere to fail to, and a silently
 downgraded confinement is as suspect as a crash; telemetry emitted at
 the boundaries is what makes both audible.

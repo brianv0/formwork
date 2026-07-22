@@ -197,13 +197,19 @@ JSONL ([FW-FID3](formwork.md#fw-fid3)).
 ### 3.7 CLI surface (v1 embedding API)
 
 ```
-formwork detect                             # HostProfile as JSON
-formwork compile  --blueprint s.toml [--host h.json]   # policy + report, no enforcement
-formwork run      --blueprint s.toml -- cmd args…      # spawn-confined
-formwork enforce-self --blueprint s.toml               # confine-self, then exec $SHELL or --exec
-formwork gateway  --blueprint s.toml --servers m.toml  # run broker; used by `run` internally
-formwork probe    --report r.json                 # paired allow/deny probes (FW-E2E-024)
+formwork run      [--blueprint s.toml] -- cmd args…    # spawn-confined (--confine-self to exec in place)
+formwork learn    [--blueprint s.toml] -- cmd args…    # enforced run + denial observation → proposal
+formwork learn    --list | --accept <n|pattern>        # review / accept proposed grants
+formwork explain  [--blueprint s.toml] [path…]         # host + policy summary, per-path verdicts (--json)
+formwork compile  [--blueprint s.toml] [--host h.json] # policy + report as JSON, no enforcement
+formwork gateway  [--blueprint s.toml] --server name -- cmd…  # MCP policy proxy over stdio
 ```
+
+The blueprint is `--blueprint`, or a `FORMWORK.toml` discovered from the launch directory upward
+(announced, never silent; `extends = ["builtin:default"]` reaches the compiled-in default
+profile). `detect` (HostProfile as JSON), `enforce-self`, and `accept` remain as hidden
+plumbing / back-compat aliases of `explain`'s host summary, `run --confine-self`, and
+`learn --accept`.
 
 ## 4. Phases
 

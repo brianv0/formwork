@@ -9,6 +9,15 @@ import pytest
 
 from helpers import write_blueprint
 
+
+def compiled_policy(result):
+    """Parse a `formwork compile` result and drop the input-provenance envelope (`blueprint`),
+    which names the input file and so legitimately differs between two authoring surfaces of the
+    same policy. Everything else must still compare byte-for-byte (via ==)."""
+    body = json.loads(result.stdout)
+    body.pop("blueprint", None)
+    return body
+
 RICH_BLUEPRINT = """\
 net = { ports = [443] }
 exec = "unrestricted"
@@ -103,7 +112,8 @@ subtract = ["/work/.ssh/**"]
         "--set", '[fs]\nreads = ["/work/**"]\nwrites = ["/work/project/**"]\nsubtract = ["/work/.ssh/**"]',
     )
     assert from_set.code == 0, from_set.stderr
-    assert from_set.stdout == from_file.stdout, "--set surface diverged from the file surface"
+    assert compiled_policy(from_set) == compiled_policy(from_file), \
+        "--set surface diverged from the file surface"
 
     from_sugar = cli(
         "compile", "--blueprint", empty, "--target", "macos",
@@ -113,7 +123,8 @@ subtract = ["/work/.ssh/**"]
         "--subtract", "/work/.ssh/**",
     )
     assert from_sugar.code == 0, from_sugar.stderr
-    assert from_sugar.stdout == from_file.stdout, "sugar flags diverged from the file surface"
+    assert compiled_policy(from_sugar) == compiled_policy(from_file), \
+        "sugar flags diverged from the file surface"
 
 
 @pytest.mark.fw_e2e("FW-E2E-044")
@@ -208,7 +219,8 @@ def test_mode_posture_aliases_read_mode(cli, tmp_path):
         a = cli("compile", "--blueprint", flat, "--target", "linux-v6")
         b = cli("compile", "--blueprint", nested, "--target", "linux-v6")
         assert a.code == 0 and b.code == 0, (a.stderr, b.stderr)
-        assert a.stdout == b.stdout, f"mode {mode} must equal read-mode {read_mode}"
+        assert compiled_policy(a) == compiled_policy(b), \
+            f"mode {mode} must equal read-mode {read_mode}"
 
 
 @pytest.mark.fw_e2e("FW-E2E-058")
@@ -240,7 +252,8 @@ def test_flat_rules_equal_nested_fs(cli, tmp_path):
     a = cli("compile", "--blueprint", flat, "--target", "linux-v6")
     b = cli("compile", "--blueprint", nested, "--target", "linux-v6")
     assert a.code == 0 and b.code == 0, (a.stderr, b.stderr)
-    assert a.stdout == b.stdout, "flat rules must compile identically to the nested [fs] form"
+    assert compiled_policy(a) == compiled_policy(b), \
+        "flat rules must compile identically to the nested [fs] form"
 
 
 @pytest.mark.fw_e2e("FW-E2E-057")
@@ -275,9 +288,9 @@ def test_cli_flags_compose_with_an_unveil_blueprint(cli, tmp_path):
     env = {"HOME": str(tmp_path)}
 
     def explain(bp, path, *flags):
-        r = cli("explain", "--blueprint", bp, path, *flags, env=env)
+        r = cli("explain", "--blueprint", bp, "--json", path, *flags, env=env)
         assert r.code == 0, r.stderr
-        return json.loads(r.stdout)
+        return json.loads(r.stdout)["explanations"][0]
 
     unveil = tmp_path / "unveil.toml"
     unveil.write_text('net = "deny"\nmode = "unveil"\n')
@@ -327,34 +340,35 @@ def test_explain_names_winning_rule_and_provenance(cli, tmp_path):
         'rules = ["readwrite:/work/**", "modify:/var/log/app.log"]\n'
     )
 
+    def explain(path, *flags):
+        r = cli("explain", "--blueprint", bp, "--json", path, *flags)
+        assert r.code == 0, r.stderr
+        return json.loads(r.stdout)["explanations"][0]
+
     # A granted path names the file rule and its origin.
-    granted = json.loads(cli("explain", "--blueprint", bp, "/work/src/main.rs").stdout)
+    granted = explain("/work/src/main.rs")
     assert granted["read"]["decision"] == "granted"
     assert granted["read"]["rule"] == "/work/**"
     assert granted["read"]["source"] == {"origin": "file", "name": str(bp)}
 
     # A `--rule` deny is terminal (deny beats the file's readwrite) and is attributed to the CLI.
-    denied = json.loads(
-        cli("explain", "--blueprint", bp, "/work/src/secret", "--rule", "deny:/work/src/secret").stdout
-    )
+    denied = explain("/work/src/secret", "--rule", "deny:/work/src/secret")
     assert denied["read"]["decision"] == "denied"
     assert denied["read"]["source"] == {"origin": "cli"}
     assert denied["write"]["decision"] == "denied"
 
     # The credential floor is a built-in, un-liftable deny (the backstop shape `**/credentials`).
-    floored = json.loads(cli("explain", "--blueprint", bp, "/work/vault/credentials").stdout)
+    floored = explain("/work/vault/credentials")
     assert floored["read"]["decision"] == "denied"
     assert floored["read"]["source"] == {"origin": "built-in"}
     assert "credential floor" in floored["read"]["rule"]
 
     # An unlisted path under `unveil` (empty universe) is hidden, not ambient.
-    hidden = json.loads(cli("explain", "--blueprint", bp, "/etc/hosts").stdout)
+    hidden = explain("/etc/hosts")
     assert hidden["read"]["decision"] == "hidden"
 
     # Exec is a separate axis (FW-ISO9): an `exec:` grant shows execute even where read is closed.
-    execd = json.loads(
-        cli("explain", "--blueprint", bp, "/usr/bin/git", "--rule", "exec:/usr/bin/git").stdout
-    )
+    execd = explain("/usr/bin/git", "--rule", "exec:/usr/bin/git")
     assert execd["exec"]["decision"] == "granted"
     assert execd["exec"]["source"] == {"origin": "cli"}
     assert execd["read"]["decision"] == "hidden", "exec confers execute only, not read"

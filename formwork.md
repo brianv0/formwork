@@ -133,7 +133,7 @@ Five further points pin the vocabulary above down so it is unambiguous to the co
 
 ## 5. Requirements
 
-Every requirement, invariant, and end-to-end test in this document carries a stable identifier: `FW-<FAMILY><n>` for requirements (families: XR, CAP, ISO, GW, TRA, FID, ENV, BP, CRED, DISC — plus EGR, reserved in `fep-1.md`), `FW-INV<n>` for invariants (§6), and `FW-E2E-<nnn>` / `FW-ADV-<nnn>` for tests (§7). An ID is minted once, in the document that defines it, and is never renumbered or reused; enhancement proposals continue the sequences and reserve blocks at adoption. Each definition carries an HTML anchor named for the lowercase ID, so any document can cite a requirement as a link — `[FW-CAP2](formwork.md#fw-cap2)` — and code cites the bare, greppable ID. The full convention is doctrine (`constitution.md`, Requirements & identifiers) and CI-checked (`py/harness/test_requirements.py`).
+Every requirement, invariant, and end-to-end test in this document carries a stable identifier: `FW-<FAMILY><n>` for requirements (families: XR, CAP, ISO, GW, TRA, FID, ENV, BP, CRED, DISC — plus EGR, reserved in `docs/fep-1.md`), `FW-INV<n>` for invariants (§6), and `FW-E2E-<nnn>` / `FW-ADV-<nnn>` for tests (§7). An ID is minted once, in the document that defines it, and is never renumbered or reused; enhancement proposals continue the sequences and reserve blocks at adoption. Each definition carries an HTML anchor named for the lowercase ID, so any document can cite a requirement as a link — `[FW-CAP2](formwork.md#fw-cap2)` — and code cites the bare, greppable ID. The full convention is doctrine (`constitution.md`, Requirements & identifiers) and CI-checked (`py/harness/test_requirements.py`).
 
 ### 5.1 Cross-cutting requirements
 
@@ -424,6 +424,12 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-054"></a>**FW-E2E-054: Discovery non-authoritative.** A denial observed in learning mode, outside any auto-widen zone. Pass: the live enforced session is not widened; the operation still fails in that run. Fail: observation silently widened the session.
 
+<a id="fw-e2e-062"></a>**FW-E2E-062: Learning without a denial feed fails fast ([FW-INV5](#fw-inv5)/[FW-INV6](#fw-inv6)).** `formwork learn -- cmd` on a host with no wired denial feed. Pass: the invocation errors *before* the workload spawns, naming the missing feed and the alternatives (`run` + hand-authored grants, `--observe-anyway`); no proposal file appears; with `--observe-anyway` the run is enforced, the absence of observation is reported loudly, and still no proposal is written. Fail: the workload runs and the missing feed is only announced afterwards, or an empty proposal pretends observation happened.
+
+<a id="fw-e2e-063"></a>**FW-E2E-063: Review loop closes over the proposal ([FW-DISC5](#fw-disc5)/[FW-DISC6](#fw-disc6)).** From a proposal holding needs-review candidates, driven entirely through the CLI: listing prints the candidates numbered on stdout (the result stream, present under quiet telemetry); accepting by 1-based number and by exact pattern moves exactly the selected entries into the discovered layer with discovery provenance and rewrites the proposal without them; `--accept-all` consumes the remainder; a credential-floor-matching entry is refused at accept regardless of what the proposal claims ([FW-INV8](#fw-inv8)). Dry-run on any host — the proposal file is input, no kernel needed. Pass: each behavior as stated. Fail: a listing lost to the telemetry channel, an unselected entry consumed, provenance missing, or a floored entry accepted.
+
+<a id="fw-e2e-064"></a>**FW-E2E-064: Short-lived workload denials are captured ([FW-DISC1](#fw-disc1)/[FW-DISC2](#fw-disc2)).** A learning run whose workload dies on its first denial (`cat` of an ungranted file — exiting in well under a second, the canonical discovery shape). Pass: the denied path still appears in the proposal, despite denial-feed persistence latency exceeding the workload's lifetime (collection is anchored to the run start, held open for a minimum settle window — an empty read repeated is never trusted before it — and polled to quiescence under a cap). Fail: an empty proposal because collection read a window the feed had not yet flushed.
+
 ### 7.10 Adversarial
 
 <a id="fw-adv-001"></a>**FW-ADV-001: Sandbox shedding.** The confined process attempts, in sequence: `execve` of a setuid binary, `prctl` to clear `NO_NEW_PRIVS`, and re-exec to try to drop the seccomp filter. Pass: all fail; confinement persists across every attempt. Fail: any attempt restores access or relaxes the filter.
@@ -567,12 +573,12 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-CRED7](#fw-cred7) Channel split | [FW-E2E-045](#fw-e2e-045), 046 | ADV-012, INV9 |
 | [FW-CRED8](#fw-cred8) Report mechanism | [FW-E2E-050](#fw-e2e-050) | ADV-014 |
 | [FW-CRED9](#fw-cred9) Floor enforceability | [FW-E2E-050](#fw-e2e-050) | INV5; Linux kernel enforcement deferred |
-| [FW-DISC1](#fw-disc1) Learning mode | [FW-E2E-051](#fw-e2e-051) | 054 |
-| [FW-DISC2](#fw-disc2) Reverse compile | [FW-E2E-051](#fw-e2e-051) | 052, 053 |
+| [FW-DISC1](#fw-disc1) Learning mode | [FW-E2E-051](#fw-e2e-051) | 054, 062, 064 |
+| [FW-DISC2](#fw-disc2) Reverse compile | [FW-E2E-051](#fw-e2e-051) | 052, 053, 064 |
 | [FW-DISC3](#fw-disc3) Catalog floor | [FW-ADV-013](#fw-adv-013), 015 | 051, INV8 |
 | [FW-DISC4](#fw-disc4) Auto-widen zone | [FW-E2E-052](#fw-e2e-052) | 054 |
-| [FW-DISC5](#fw-disc5) Review diff | [FW-E2E-051](#fw-e2e-051) | 053 |
-| [FW-DISC6](#fw-disc6) Provenance | [FW-E2E-053](#fw-e2e-053) | — |
+| [FW-DISC5](#fw-disc5) Review diff | [FW-E2E-051](#fw-e2e-051), 063 | 053 |
+| [FW-DISC6](#fw-disc6) Provenance | [FW-E2E-053](#fw-e2e-053) | 063 |
 | Launcher arm (§2) | [FW-E2E-046](#fw-e2e-046), 050 | 047, INV7, ADV-014 |
 
 ## 11. Open questions
@@ -589,7 +595,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 
 **Linux gateway egress isolation build-vs-buy.** Whether the gateway's own network confinement reuses `bubblewrap`/`pasta`/`slirp4netns` for its netns setup or drives `unshare`/nftables directly. Out of the agent's confinement path ([FW-XR7](#fw-xr7)), but a real implementation decision for [FW-GW7](#fw-gw7).
 
-**Host-scoped egress and violation streaming.** The net axis today is `Deny | Ports`. A host-allowlist posture (FW-EGR — so a blueprint can say "reach the model API and nothing else") and a real-time violation stream for embedding hosts ([FW-FID5](fep-1.md#fw-fid5)) are specified in `fep-1.md`, deferred pending the gateway forward-proxy and log-tap subsystems they require.
+**Host-scoped egress and violation streaming.** The net axis today is `Deny | Ports`. A host-allowlist posture (FW-EGR — so a blueprint can say "reach the model API and nothing else") and a real-time violation stream for embedding hosts ([FW-FID5](docs/fep-1.md#fw-fid5)) are specified in `docs/fep-1.md`, deferred pending the gateway forward-proxy and log-tap subsystems they require.
 
 **Windows.** Out of scope for this proposal. If needed later, the analogous primitives (AppContainer, Restricted Tokens, Named Pipes for the fd seam) would be a third backend behind the same compiler.
 
@@ -604,7 +610,7 @@ Kernel-mechanism-first, honesty-first, reuse-validated-early:
 5. **fd-injection transport** and the seam tests ([FW-E2E-010](#fw-e2e-010), 011, 012), establishing that the agent never depends on in-sandbox connect or socket-path gating.
 6. **Gateway** (transport-agnostic backends, shading, full-surface policy, transparent passthrough, backend-confinement recursion) with [FW-E2E-013](#fw-e2e-013)..019 and ADV-003, 004, 005.
 7. **Degraded-host honesty and optional tiers** ([FW-E2E-009](#fw-e2e-009), 025, ADV-006), confirming Formwork reports rather than pretends when a kernel cannot enforce a requested capability.
-8. **Capability-model hardening** (FEP-1): the env axis ([FW-ENV1](#fw-env1)/2), execution-vector write-subtract ([FW-TRA7](#fw-tra7)), sensitive-set metadata denial ([FW-CAP7](#fw-cap7)), any-depth patterns ([FW-CAP6](#fw-cap6)), extended sensitive set ([FW-TRA8](#fw-tra8)), and the anti-escalation guarantee ([FW-XR8](#fw-xr8)) — landed and compiled/enforced on both backends. The fs additions are real-Seatbelt verified ([FW-E2E-037](#fw-e2e-037)..039); the env axis (a CLI-shell spawn transform, not a kernel capability) by unit tests plus the FidelityReport. Host-scoped egress (FW-EGR) and the violation stream ([FW-FID5](fep-1.md#fw-fid5)) remain deferred in `fep-1.md`.
+8. **Capability-model hardening** (FEP-1): the env axis ([FW-ENV1](#fw-env1)/2), execution-vector write-subtract ([FW-TRA7](#fw-tra7)), sensitive-set metadata denial ([FW-CAP7](#fw-cap7)), any-depth patterns ([FW-CAP6](#fw-cap6)), extended sensitive set ([FW-TRA8](#fw-tra8)), and the anti-escalation guarantee ([FW-XR8](#fw-xr8)) — landed and compiled/enforced on both backends. The fs additions are real-Seatbelt verified ([FW-E2E-037](#fw-e2e-037)..039); the env axis (a CLI-shell spawn transform, not a kernel capability) by unit tests plus the FidelityReport. Host-scoped egress (FW-EGR) and the violation stream ([FW-FID5](docs/fep-1.md#fw-fid5)) remain deferred in `docs/fep-1.md`.
 
 9. **Blueprints, the credential catalog, and discovery** (FEP-2): the layered Blueprint model with `extends`, a CLI override surface, and path sigils ([FW-BP1](#fw-bp1)–5), the typed credential catalog enforced across the confiner and the launcher arm with per-type report labels and per-platform honesty ([FW-CRED1](#fw-cred1)–9), and observe-then-widen discovery bounded by the catalog floor ([FW-DISC1](#fw-disc1)–6; [FW-INV7](#fw-inv7)–10) — landed and folded into this document (§2, §4, §5.8–5.10, §6, §7.7–7.10), verified on real Seatbelt + the unified-log denial feed ([FW-E2E-041](#fw-e2e-041)..055, [FW-ADV-012](#fw-adv-012)..015). On Linux the catalog's path arm rides whatever carries fs enforcement, with any-depth floor rows reported Partial per [FW-CRED9](#fw-cred9). Credential brokering remains deferred (§11).
 
