@@ -27,9 +27,14 @@ _CONNECT_PROBE = textwrap.dedent(
 
 @pytest.mark.fw_e2e("FW-E2E-006")
 def test_direct_egress_denied(cli, workspace, tmp_path):
+    # Broad reads so the interpreter can load whatever it needs to start -- notably the GitHub macOS
+    # runner's /usr/bin/python3 is an Xcode CLT stub that dlopens libxcrun from /Applications/Xcode,
+    # which a tight grant would block, killing python3 before it reaches connect(). This test is the
+    # *net* axis (net = "deny"); fs breadth is irrelevant to it, and the credential floor still holds.
     blueprint = write_blueprint(
         tmp_path / "blueprint.toml",
-        reads=[f"{workspace.granted}/**"],
+        read_mode="ambient-minus-subtract",
+        reads=["/**"],
         writes=[f"{workspace.granted}/**"],
     )
     # cwd inside the granted dir so the interpreter's sys.path scan doesn't trip on an unreadable cwd.
