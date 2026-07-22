@@ -16,17 +16,16 @@ pub enum DenialAccess {
     Write,
 }
 
-/// One observed access: a kernel-resolved absolute path and the access grade. The observation
-/// source is not encoded here -- a denial the kernel logged under enforcement (`learn`) and an open
-/// a permissive recording watched are the same shape, so they feed one reverse compiler.
+/// A kernel-resolved absolute path and its access grade. The source is deliberately not encoded: an
+/// enforced-`learn` denial and a permissive recording's open are one shape, so both feed one reverse
+/// compiler.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessRecord {
     pub path: String,
     pub access: DenialAccess,
 }
 
-/// The observation source that predates permissive recording spoke of "denials"; kept as an alias
-/// so the enforced-`learn` call sites read in their own terms.
+/// Kept so the enforced-`learn` call sites, which observe denials, read in their own terms.
 pub type DenialRecord = AccessRecord;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,12 +144,10 @@ pub fn reverse_compile(
     }
 }
 
-/// Observed accesses -> a standalone, tight Blueprint: the "locked-down blueprint" a permissive
-/// recording produces. Where `reverse_compile` yields a discovered-layer *diff*, this assembles a
-/// closed-read Blueprint whose explicit read/write grants are exactly the folded accesses observed,
-/// ready to enforce directly. It shares the same reverse compiler, so the credential floor still
-/// withholds catalog matches (FW-DISC3 / FW-INV8): a recorded credential access never becomes a
-/// grant, however permissive the run that observed it.
+/// Observed accesses -> a standalone, enforceable Blueprint, where `reverse_compile` yields a
+/// discovered-layer *diff*. Shares that reverse compiler, so the credential floor still withholds
+/// catalog matches (FW-DISC3 / FW-INV8): a recorded credential access never becomes a grant, however
+/// permissive the run that observed it.
 pub fn synthesize_blueprint(
     records: &[AccessRecord],
     catalog: &ResolvedCatalog,

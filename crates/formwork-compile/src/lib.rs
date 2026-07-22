@@ -589,9 +589,8 @@ mod tests {
 
     #[test]
     fn floor_only_permissive_allows_everything_but_the_credential_floor() {
-        // The policy enforced *during* a permissive recording: an open base (ambient reads + an open
-        // `/**` write) with the credential floor still denied on BOTH axes -- so a recording can
-        // never read or write a credential though the workload is otherwise unconfined.
+        // The recording-time floor guarantee: the open base still denies a credential on both axes
+        // (the structural floor, FW-INV11).
         let catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
         let policy = super::compile(
             &Blueprint::floor_only_permissive(),

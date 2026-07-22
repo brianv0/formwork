@@ -313,16 +313,3 @@ detail to confirm in the same spike, not a deciding factor.
 - **Freeze in v1 or later.** Whether `--out` blueprint freeze (`FW-DISC10`) ships in v1 or the first
   cut stops at proposal/accept into the discovered layer (which is already enforceable alongside the
   base blueprint).
-
-## 8. Phasing
-
-1. **This FEP + the constitution amendment** (§5), reviewed. No code value lost by stopping here.
-2. **Pure core** — `AccessRecord` rename + Blueprint synthesis in `formwork-blueprint`, with unit
-   tests; portable, no OS, no spike risk.
-3. **Spike** the macOS mechanism (§7) and record the decision in `docs/spikes.md`.
-4. **`detect` `trace-feed`** + honest Linux gap.
-5. **Floor-only permissive compile path** + the macOS report toggle in `formwork-confine`.
-6. **`learn --permissive` wiring** + feed tap + the E2E tests (`FW-E2E-065`..067).
-
-Steps 1–2 land immediately and carry no mechanism risk; step 3 is the real unknown and is timeboxed
-before 4–6 commit.
