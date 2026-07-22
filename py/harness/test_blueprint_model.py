@@ -426,3 +426,35 @@ def test_mcp_empty_table_fails_loud(cli, tmp_path):
     res = cli("compile", "--blueprint", bp, "--target", "linux-v6")
     assert res.code != 0, "an empty policy table must not compile"
     assert "empty MCP policy table" in (res.stderr + res.stdout)
+
+
+# ---- FW-BP8: implicit blueprint resolution stays inside the trust boundary ----------------------
+
+
+@pytest.mark.fw_e2e("FW-E2E-070")
+def test_discovery_walk_stops_at_a_symlinked_home(cli, tmp_path):
+    """With $HOME set to a symlink, the walk's home stop compares resolved paths (FW-BP8): a
+    FORMWORK.toml planted above the real home must not govern, and the launch directory's own
+    file still resolves. The ownership arms of FW-E2E-070 are unit-level (chown needs root)."""
+    real_home = tmp_path / "real-home"
+    project = real_home / "proj"
+    project.mkdir(parents=True)
+    link_home = tmp_path / "link-home"
+    link_home.symlink_to(real_home)
+    # The escape target sits above home, in territory this test controls.
+    (tmp_path / "FORMWORK.toml").write_text('net = "deny"\n[fs]\nread-mode = "closed"\n')
+
+    escaped = cli(
+        "compile", "--target", "linux-v6", "--report-only",
+        cwd=project, env={"HOME": str(link_home)},
+    )
+    assert escaped.code != 0, "the walk escaped above a symlinked $HOME"
+    assert "no blueprint" in escaped.stderr, escaped.stderr
+
+    (project / "FORMWORK.toml").write_text('net = "deny"\n[fs]\nread-mode = "closed"\n')
+    own = cli(
+        "compile", "--target", "linux-v6", "--report-only",
+        cwd=project, env={"HOME": str(link_home)},
+    )
+    assert own.code == 0, own.stderr
+    assert json.loads(own.stdout)["blueprint"]["source"] == "auto-discovered"

@@ -63,7 +63,7 @@ The sandbox holds for the whole process tree — a `git` or `python` the agent s
 walls. Denials surface as ordinary `EACCES`/`EPERM`, credentials stay unreadable even under broad
 read grants, and a deny always beats an allow, from any layer.
 
-On macOS, `formwork learn` runs a workload enforced while recording what the kernel denied, then
+`formwork learn` runs a workload enforced while recording what the kernel denied, then
 proposes grants for review — nothing is widened until you accept it:
 
 ```sh
@@ -83,7 +83,7 @@ and wiring for Claude Code, codex, and opencode.
 | Default-deny network, port tier | ✅ | ✅ (best on kernel 6.7+) |
 | Exec allow-lists | ✅ | ✅ |
 | MCP gateway shading | ✅ | ✅ |
-| `learn` (denial observation) | ✅ unified-log feed | ❌ fails fast with the reason — Landlock's audit feed (kernel 6.15+) is not wired yet |
+| `learn` (denial observation) | ✅ unified-log feed | ✅ ptrace feed (needs `strace` installed; fails fast with the reason otherwise) |
 | `compile` / `explain` dry-run | ✅ any host | ✅ any host, cross-platform (compile a Linux policy on a Mac) |
 
 On a host that can't carry a capability (an older kernel, a missing mechanism), Formwork reports

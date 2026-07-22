@@ -8,7 +8,10 @@ use formwork_compile::{Backend, Fidelity, FidelityReport};
 use formwork_detect::{HostProfile, Os};
 
 /// One line answering "will this machine enforce, and can `learn` observe?".
-pub fn host_summary(profile: &HostProfile) -> String {
+/// `strace_on_path` is the CLI edge's answer to [`crate::learn::find_strace`]: strace is a
+/// userspace tool, not a kernel capability, so it stays out of the HostProfile data model and
+/// rides in as the one extra fact the Linux feed line needs.
+pub fn host_summary(profile: &HostProfile, strace_on_path: bool) -> String {
     match profile.os {
         Os::MacOs => format!(
             "macOS ({}) -- Seatbelt: kernel enforcement ready; `learn` denial feed: unified log",
@@ -17,10 +20,15 @@ pub fn host_summary(profile: &HostProfile) -> String {
         Os::Linux => {
             match profile.landlock_abi {
                 Some(abi) => format!(
-                "Linux {} -- Landlock ABI v{abi} + seccomp: kernel enforcement ready; no denial \
-                 feed (`formwork learn` unavailable)",
-                profile.os_version
-            ),
+                    "Linux {} -- Landlock ABI v{abi} + seccomp: kernel enforcement ready; `learn` \
+                 denial feed: {}",
+                    profile.os_version,
+                    if strace_on_path {
+                        "ptrace (strace)"
+                    } else {
+                        "install strace to enable"
+                    }
+                ),
                 None => {
                     format!(
                 "Linux {} -- no Landlock (kernel 5.13+ needed){}: fs enforcement unavailable; \
@@ -156,20 +164,22 @@ mod tests {
 
     #[test]
     fn host_summary_states_enforcement_and_learn_availability() {
-        let mac = host_summary(&HostProfile::synthetic_macos());
+        let mac = host_summary(&HostProfile::synthetic_macos(), false);
         assert!(
             mac.contains("Seatbelt") && mac.contains("unified log"),
             "{mac}"
         );
 
-        let linux_v6 = host_summary(&HostProfile::synthetic_linux(Some(6)));
+        let linux_v6 = host_summary(&HostProfile::synthetic_linux(Some(6)), true);
         assert!(
-            linux_v6.contains("Landlock ABI v6")
-                && linux_v6.contains("`formwork learn` unavailable"),
+            linux_v6.contains("Landlock ABI v6") && linux_v6.contains("ptrace (strace)"),
             "{linux_v6}"
         );
 
-        let degraded = host_summary(&HostProfile::synthetic_linux(None));
+        let no_strace = host_summary(&HostProfile::synthetic_linux(Some(6)), false);
+        assert!(no_strace.contains("install strace"), "{no_strace}");
+
+        let degraded = host_summary(&HostProfile::synthetic_linux(None), false);
         assert!(
             degraded.contains("no Landlock") && degraded.contains("compile/dry-run still work"),
             "{degraded}"

@@ -74,21 +74,67 @@ pub fn resolve_blueprint(flag: Option<&Path>, cwd: &Path, home: &str) -> Option<
 /// project never silently inherits a file from above the user's own tree, and never consulting
 /// the filesystem root for a nested cwd (a root-owned policy file governing every launch would
 /// be a surprise, not a convenience).
+///
+/// The walk stays inside the invoking user's trust boundary (FW-BP8):
+/// an ancestor directory the user does not own ends the walk before it is consulted (so a
+/// world-writable `/tmp` or a root-owned `/srv` can never plant an implicit policy), and a
+/// candidate file the user does not own is refused with a warning, fail-closed -- `--blueprint`
+/// remains the explicit door for a file discovery will not trust. The `$HOME` boundary compares
+/// symlink-resolved paths, so a symlinked home (macOS `/var` vs `/private/var`) cannot let the
+/// walk escape above the real home directory.
 pub fn find_default_blueprint(cwd: &Path, home: &str) -> Option<PathBuf> {
-    let home = Path::new(home);
+    find_default_blueprint_trusting(cwd, home, &user_controls)
+}
+
+/// The walk with the ownership check injected -- the same pure-function substitution the
+/// constitution allows for the compiler's HostProfile, so the trust-boundary control flow is
+/// testable without chown/root. Production goes through [`find_default_blueprint`].
+fn find_default_blueprint_trusting(
+    cwd: &Path,
+    home: &str,
+    trusted: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    // Boundary comparisons happen in symlink-resolved coordinates; the returned candidate keeps
+    // the caller's (as-given) coordinates, which the loader canonicalizes itself.
+    let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let home = resolve(Path::new(home));
     for dir in cwd.ancestors() {
         if dir.parent().is_none() && cwd.parent().is_some() {
             break;
         }
+        if !trusted(dir) {
+            break;
+        }
         let candidate = dir.join(DEFAULT_BLUEPRINT_NAME);
         if candidate.is_file() {
-            return Some(candidate);
+            if trusted(&candidate) {
+                return Some(candidate);
+            }
+            // Fail-closed, not fail-open-through-a-foreign-file: the nearer suspicious file also
+            // shadows anything above it -- silently skipping to a farther match would leave the
+            // planted file looking effective.
+            tracing::warn!(
+                candidate = %candidate.display(),
+                "ignoring a {DEFAULT_BLUEPRINT_NAME} not owned by the invoking user (FW-BP8); \
+                 pass --blueprint to use it explicitly"
+            );
+            return None;
         }
-        if dir == home {
+        if resolve(dir) == home {
             break;
         }
     }
     None
+}
+
+/// Implicit policy may come only from territory the invoking user controls (FW-BP8): the path is
+/// owned by the effective uid. An unreadable path is untrusted (fail-closed).
+fn user_controls(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        // SAFETY: geteuid is a trivial always-successful syscall with no memory effects.
+        .map(|m| m.uid() == unsafe { libc::geteuid() })
+        .unwrap_or(false)
 }
 
 /// Load the file's layer stack (extends chain flattened, bases first) and merge, with no CLI
@@ -996,6 +1042,82 @@ mod tests {
         assert_eq!(
             find_default_blueprint(&outside, home_str),
             Some(dir.path().join(DEFAULT_BLUEPRINT_NAME))
+        );
+    }
+
+    /// FW-BP8: the walk ends at the first ancestor the invoking user does not control, BEFORE
+    /// consulting it -- a policy file planted in a world-writable or foreign-owned ancestor
+    /// (`/tmp`, a root-owned `/srv`) never governs a session implicitly. Ownership is injected
+    /// (chown needs root); the real check is `user_controls`.
+    #[test]
+    fn discovery_stops_at_the_first_untrusted_ancestor() {
+        let dir = Scratch::new("discover-trust");
+        let home = dir.path().join("home");
+        let shared = dir.path().join("shared"); // plays the foreign-owned ancestor
+        let project = shared.join("proj");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(shared.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
+        let home_str = home.to_str().unwrap();
+        let foreign = shared.clone();
+        let trusted = move |p: &Path| p != foreign;
+
+        // The planted file sits in the untrusted ancestor: never consulted.
+        assert_eq!(
+            find_default_blueprint_trusting(&project, home_str, &trusted),
+            None
+        );
+
+        // The user's own launch directory still works below the same untrusted ancestor.
+        std::fs::write(project.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
+        assert_eq!(
+            find_default_blueprint_trusting(&project, home_str, &trusted),
+            Some(project.join(DEFAULT_BLUEPRINT_NAME))
+        );
+    }
+
+    /// FW-BP8: a candidate file the user does not own -- inside territory they DO own -- is
+    /// refused fail-closed rather than governing the session, and does not fall through to a
+    /// farther (owned) match it shadows.
+    #[test]
+    fn discovery_refuses_a_foreign_owned_candidate_file() {
+        let dir = Scratch::new("discover-foreign-file");
+        let home = dir.path().join("home");
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let planted = project.join(DEFAULT_BLUEPRINT_NAME);
+        std::fs::write(&planted, "").unwrap();
+        std::fs::write(home.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
+        let home_str = home.to_str().unwrap();
+        let foreign = planted.clone();
+        let trusted = move |p: &Path| p != foreign;
+
+        assert_eq!(
+            find_default_blueprint_trusting(&project, home_str, &trusted),
+            None,
+            "a refused candidate must not fall through to the file it shadows"
+        );
+    }
+
+    /// FW-BP8: the $HOME stop compares symlink-resolved paths. With `$HOME` set to a symlink
+    /// (macOS `/var/root` -> `/private/var/root`), a textual comparison never matches the
+    /// resolved cwd ancestors, and the walk would escape above the real home -- where a planted
+    /// file waits.
+    #[test]
+    fn discovery_home_stop_holds_through_a_symlinked_home() {
+        let dir = Scratch::new("discover-symhome");
+        let real_home = dir.path().join("real-home");
+        let project = real_home.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let link_home = dir.path().join("link-home");
+        std::os::unix::fs::symlink(&real_home, &link_home).unwrap();
+        // The escape target: a file ABOVE home, inside territory the user owns.
+        std::fs::write(dir.path().join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
+
+        assert_eq!(
+            find_default_blueprint(&project, link_home.to_str().unwrap()),
+            None,
+            "the walk escaped above a symlinked $HOME"
         );
     }
 }

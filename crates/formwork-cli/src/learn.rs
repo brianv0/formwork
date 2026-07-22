@@ -2,13 +2,21 @@
 //!
 //! A learning run is an ENFORCED run plus observation: the policy is compiled and installed
 //! exactly as `run` would (FW-INV10 -- observation never weakens the live session), and the
-//! denials the kernel logged during the run window are collected afterwards and reverse-compiled
-//! into a proposal (FW-DISC2). On macOS the denial feed is the unified log's Sandbox records,
-//! collected post-hoc with `log show` so there is no stream-startup race. Attribution is the run
-//! window plus dedup -- deliberately tolerant of over-capture, because a candidate has no effect
-//! until accepted (FW-INV10), credentials are floored regardless (FW-DISC3), and everything else
-//! waits for review. On hosts without a denial feed, learning says so loudly and proposes
-//! nothing -- never a silent pretend (FW-INV5/6).
+//! denials the kernel produced during the run are collected and reverse-compiled into a proposal
+//! (FW-DISC2). Two feeds exist (FW-XR6 parity on the discovery axis):
+//!
+//! - **macOS**: the unified log's Sandbox records, collected post-hoc with `log show` so there is
+//!   no stream-startup race. Attribution is the run window plus dedup -- deliberately tolerant of
+//!   over-capture, because a candidate has no effect until accepted (FW-INV10), credentials are
+//!   floored regardless (FW-DISC3), and everything else waits for review.
+//! - **Linux**: the workload runs under an *unconfined* `strace` ancestor (FW-E2E-071) that
+//!   traces a `run --confine-self` shim; denied file syscalls (`= -1 EACCES/EPERM`) are the
+//!   kernel's Landlock denials. Attribution is exact -- only this run's process tree is traced --
+//!   and the trace is complete when the tracee exits, so no persistence latency exists to poll
+//!   away.
+//!
+//! On hosts with neither feed, learning says so loudly and proposes nothing -- never a silent
+//! pretend (FW-INV5/6, FW-XR9).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -112,7 +120,7 @@ const QUIESCENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 /// Collect the run window's denials, polling until the log store stops yielding new records.
 /// Anchored to the run's start (the window is recomputed as elapsed-since-start each poll), never
 /// to collection time -- a `--last N` fixed at collection would drift off the run it brackets.
-fn collect_denials_quiescent(run_started: std::time::Instant) -> Result<Vec<DenialRecord>> {
+pub fn collect_denials_quiescent(run_started: std::time::Instant) -> Result<Vec<DenialRecord>> {
     collect_until_quiescent(
         || collect_denials(run_started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS),
         QUIESCENCE_POLL,
@@ -185,18 +193,96 @@ fn collect_denials(window_secs: u64) -> Result<Vec<DenialRecord>> {
     Ok(records)
 }
 
-/// The learn phase after the confined child has exited: collect, reverse-compile, merge into
-/// the proposal, self-accept in-zone candidates into the discovered layer, and itemize on the
-/// operator channel.
+/// Locate `strace`, the Linux denial feed's tap (FW-E2E-071). PATH-based on purpose: feed
+/// availability must be decidable *before* the workload runs (FW-XR9), and PATH is the honest
+/// answer to "would the spawn below find it".
+pub fn find_strace() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("strace"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Parse an strace `-f -e trace=%file` log into denial records: only *failed* file syscalls with
+/// `EACCES`/`EPERM` -- the errno a Landlock denial surfaces as -- and only syscall families
+/// Landlock actually governs. `stat`/`access` probes are excluded: Landlock does not hook them,
+/// so their failures are ordinary unix-permission noise, not discovery material.
+pub fn parse_strace_denials(trace: &str, cwd: &Path) -> Vec<DenialRecord> {
+    trace
+        .lines()
+        .filter_map(|line| parse_strace_denial(line, cwd))
+        .map(|record| DenialRecord {
+            // Symlink-resolve like the macOS feed's kernel-resolved paths, so the credential
+            // floor's shape match (FW-DISC3) sees the real location, not an alias of it.
+            path: std::fs::canonicalize(&record.path)
+                .map(|p| p.display().to_string())
+                .unwrap_or(record.path),
+            ..record
+        })
+        .collect()
+}
+
+/// One strace line: `pid  openat(AT_FDCWD, "/path", O_RDONLY) = -1 EACCES (Permission denied)`.
+fn parse_strace_denial(line: &str, cwd: &Path) -> Option<DenialRecord> {
+    let eq = line.rfind(" = -1 ")?;
+    let errno = line[eq + 6..].trim_start();
+    if !(errno.starts_with("EACCES") || errno.starts_with("EPERM")) {
+        return None;
+    }
+    let head = &line[..eq];
+    let paren = head.find('(')?;
+    let syscall = head[..paren].split_whitespace().next_back()?;
+    let args = &head[paren + 1..];
+    // The write grade comes from the real open flags / the mutating verb, mirroring the macOS
+    // feed's file-write* vs file-read* split.
+    let access = match syscall {
+        "open" | "openat" | "openat2" => {
+            if ["O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC"]
+                .iter()
+                .any(|flag| args.contains(flag))
+            {
+                DenialAccess::Write
+            } else {
+                DenialAccess::Read
+            }
+        }
+        // An exec denial is a read-grant gap in the unrestricted-exec default, as on macOS.
+        "execve" | "execveat" => DenialAccess::Read,
+        "creat" | "mkdir" | "mkdirat" | "unlink" | "unlinkat" | "rmdir" | "rename" | "renameat"
+        | "renameat2" | "truncate" | "link" | "linkat" | "symlink" | "symlinkat" => {
+            DenialAccess::Write
+        }
+        _ => return None,
+    };
+    let quote = args.find('"')?;
+    let raw = &args[quote + 1..];
+    let path = &raw[..raw.find('"')?];
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else if args[..quote].contains("AT_FDCWD") || !args[..quote].contains(char::is_numeric) {
+        // Relative through AT_FDCWD (or a plain-path syscall): the launch directory is the base.
+        cwd.join(path).display().to_string()
+    } else {
+        // Relative to a real dirfd: not attributable to an absolute path from the trace alone.
+        // Dropping it under-captures, which just means another learning run (FW-INV10 makes
+        // over- and under-capture both safe).
+        return None;
+    };
+    Some(DenialRecord { path, access })
+}
+
+/// The learn phase after the confined child has exited: reverse-compile the feed's records, merge
+/// into the proposal, self-accept in-zone candidates into the discovered layer, and itemize on
+/// the operator channel. Feed-agnostic -- the caller collected `records` from whichever tap this
+/// host carries (unified log or strace), and both are one shape here.
 pub fn conclude_learning_run(
     blueprint: &Blueprint,
     blueprint_path: &Path,
     catalog: &ResolvedCatalog,
     run_id: &str,
-    run_started: std::time::Instant,
+    records: Vec<DenialRecord>,
     workload_status: &std::process::ExitStatus,
 ) -> Result<()> {
-    let records = collect_denials_quiescent(run_started)?;
     let outcome = reverse_compile(
         &records,
         catalog,
@@ -658,5 +744,79 @@ mod tests {
         // Non-fs denials and unparsable lines yield nothing.
         assert!(parse_sandbox_denial("Sandbox: x(1) deny(1) mach-lookup com.apple.foo").is_none());
         assert!(parse_sandbox_denial("unrelated log line").is_none());
+    }
+
+    #[test]
+    fn parses_real_strace_denials() {
+        // Shapes captured from `strace -f -e trace=%file` on Linux 6.x.
+        let cwd = Path::new("/work/proj");
+        let denied = parse_strace_denial(
+            "12345 openat(AT_FDCWD, \"/home/x/.ssh/id_rsa\", O_RDONLY) = -1 EACCES (Permission denied)",
+            cwd,
+        )
+        .unwrap();
+        assert_eq!(denied.path, "/home/x/.ssh/id_rsa");
+        assert_eq!(denied.access, DenialAccess::Read);
+
+        let write = parse_strace_denial(
+            "12345 openat(AT_FDCWD, \"/srv/out.txt\", O_WRONLY|O_CREAT|O_TRUNC, 0666) = -1 EACCES (Permission denied)",
+            cwd,
+        )
+        .unwrap();
+        assert_eq!(write.access, DenialAccess::Write);
+
+        let exec = parse_strace_denial(
+            "9 execve(\"/opt/tool/bin/run\", [\"run\"], 0x7ffd deadbeef) = -1 EACCES (Permission denied)",
+            cwd,
+        )
+        .unwrap();
+        assert_eq!(
+            exec.access,
+            DenialAccess::Read,
+            "exec denial is a read-grant gap"
+        );
+        assert_eq!(exec.path, "/opt/tool/bin/run");
+
+        let mkdir = parse_strace_denial(
+            "9 mkdir(\"/srv/newdir\", 0777) = -1 EACCES (Permission denied)",
+            cwd,
+        )
+        .unwrap();
+        assert_eq!(mkdir.access, DenialAccess::Write);
+    }
+
+    #[test]
+    fn strace_relative_paths_resolve_against_the_launch_directory() {
+        let cwd = Path::new("/work/proj");
+        let rel = parse_strace_denial(
+            "7 openat(AT_FDCWD, \"data/input.csv\", O_RDONLY) = -1 EACCES (Permission denied)",
+            cwd,
+        )
+        .unwrap();
+        assert_eq!(rel.path, "/work/proj/data/input.csv");
+
+        // A real (numeric) dirfd base is unattributable from the trace alone: dropped, never
+        // guessed (under-capture is safe; a wrong absolute path would poison the proposal).
+        assert!(parse_strace_denial(
+            "7 openat(5, \"nested.txt\", O_RDONLY) = -1 EACCES (Permission denied)",
+            cwd,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn strace_noise_is_not_discovery_material() {
+        let cwd = Path::new("/w");
+        // Successful opens, ENOENT probes, and stat/access failures (unix perms, not Landlock).
+        for line in [
+            "1 openat(AT_FDCWD, \"/etc/ld.so.cache\", O_RDONLY|O_CLOEXEC) = 3",
+            "1 openat(AT_FDCWD, \"/missing\", O_RDONLY) = -1 ENOENT (No such file or directory)",
+            "1 access(\"/etc/shadow\", R_OK) = -1 EACCES (Permission denied)",
+            "1 newfstatat(AT_FDCWD, \"/root/x\", 0x7ffc, 0) = -1 EACCES (Permission denied)",
+            "1 +++ exited with 1 +++",
+            "unrelated",
+        ] {
+            assert!(parse_strace_denial(line, cwd).is_none(), "{line}");
+        }
     }
 }

@@ -61,7 +61,7 @@ struct Cli {
 fn parse_cli() -> Cli {
     let epilogue = format!(
         "{AFTER_HELP}\n\nThis host: {}",
-        render::host_summary(&detect())
+        render::host_summary(&detect(), learn::find_strace().is_some())
     );
     let matches = Cli::command().after_help(epilogue).get_matches();
     match Cli::from_arg_matches(&matches) {
@@ -134,8 +134,9 @@ enum Cmd {
         /// <blueprint>.proposal.toml).
         #[arg(long)]
         proposal: Option<PathBuf>,
-        /// On a host with no denial feed (currently: everything but macOS), run enforced anyway.
-        /// No proposal will be written -- observation is impossible, not just skipped.
+        /// On a host with no denial feed (a Linux kernel without Landlock, or Linux without
+        /// `strace` installed), run enforced anyway. No proposal will be written -- observation
+        /// is impossible, not just skipped.
         #[arg(long)]
         observe_anyway: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -239,15 +240,7 @@ impl BlueprintArgs {
     /// none is discoverable. The resolved source travels into logs and `compile`/`explain` output
     /// so auto-discovery is never silent.
     fn resolve(&self) -> Result<ResolvedBlueprint> {
-        self.try_resolve()?.ok_or_else(|| {
-            anyhow!(
-                "no blueprint: pass --blueprint <file>, or create a {name} in this directory (or \
-                 a parent, up to $HOME). A minimal {name}:\n\n    \
-                 extends = [\"builtin:default\"]\n    \
-                 rules = [\"readwrite:$CWD/**\"]\n",
-                name = blueprint_load::DEFAULT_BLUEPRINT_NAME
-            )
-        })
+        self.try_resolve()?.ok_or_else(no_blueprint_error)
     }
 
     /// As [`Self::resolve`], but `Ok(None)` when nothing is named or discoverable -- for the one
@@ -274,6 +267,42 @@ impl BlueprintArgs {
             && self.extends.is_empty())
             || self.net.is_some()
             || self.mode.is_some()
+    }
+
+    /// Re-emit the override surface as argv for the `run --confine-self` shim the Linux learning
+    /// run traces, so the shim compiles the same session this invocation described. Lossless by
+    /// construction: flags are one surface onto the one model (FW-BP1), and the shim re-parses
+    /// them with this very parser.
+    fn forward_overrides(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let repeatable: [(&str, &[String]); 7] = [
+            ("--set", &self.set),
+            ("--read", &self.read),
+            ("--write", &self.write),
+            ("--subtract", &self.subtract),
+            ("--write-subtract", &self.write_subtract),
+            ("--allow-cred", &self.allow_cred),
+            ("--rule", &self.rule),
+        ];
+        for (flag, values) in repeatable {
+            for value in values {
+                out.push(flag.to_string());
+                out.push(value.clone());
+            }
+        }
+        for extend in &self.extends {
+            out.push("--extends".to_string());
+            out.push(extend.clone());
+        }
+        if let Some(net) = &self.net {
+            out.push("--net".to_string());
+            out.push(net.clone());
+        }
+        if let Some(mode) = &self.mode {
+            out.push("--mode".to_string());
+            out.push(mode.clone());
+        }
+        out
     }
 
     /// Resolve the full layer stack and merge (FW-BP2). Path sigils (`~`, `$CWD`) in flag values
@@ -498,7 +527,24 @@ fn main() -> Result<()> {
                      (--list/--accept/--accept-all), not both"
                 );
             }
+            // Every flag is honored or refused, never silently dropped (the FW-INV6 shape at the
+            // CLI surface): a mode that ignores expressed intent teaches the wrong contract.
             if review {
+                if blueprint.has_overrides() {
+                    bail!(
+                        "review mode (--list/--accept/--accept-all) reads the proposal; blueprint \
+                         override flags (--rule, --set, --allow-cred, …) shape a run and would be \
+                         ignored here (the acceptance floor check ignores exclusions by design, \
+                         FW-INV8). Overrides belong on the observing run (`formwork learn -- cmd \
+                         …`) or in the blueprint file."
+                    );
+                }
+                if observe_anyway {
+                    bail!(
+                        "--observe-anyway applies to an observing run (`formwork learn -- cmd …`), \
+                         not to review mode -- review reads a proposal and needs no denial feed"
+                    );
+                }
                 let proposal = match proposal {
                     Some(p) => p,
                     None => learn::proposal_path(&blueprint.resolve()?.path),
@@ -510,6 +556,14 @@ fn main() -> Result<()> {
                      review the proposal (--list, --accept <n|pattern>, --accept-all)"
                 );
             } else {
+                if proposal.is_some() {
+                    bail!(
+                        "--proposal names a proposal file for review mode; an observing run \
+                         always writes <blueprint>.proposal.toml beside its blueprint, so the \
+                         flag would be ignored. Review with `formwork learn --list --proposal \
+                         <file>` instead."
+                    );
+                }
                 learn_run(blueprint, argv, observe_anyway)?;
             }
         }
@@ -530,6 +584,18 @@ fn main() -> Result<()> {
         } => explain(blueprint, paths, json)?,
     }
     Ok(())
+}
+
+/// The teaching error for "no blueprint anywhere" -- one constructor, so the two places that can
+/// hit it (resolution, and `explain`'s override-without-base arm) cannot drift apart.
+fn no_blueprint_error() -> anyhow::Error {
+    anyhow!(
+        "no blueprint: pass --blueprint <file>, or create a {name} in this directory (or \
+         a parent, up to $HOME). A minimal {name}:\n\n    \
+         extends = [\"builtin:default\"]\n    \
+         rules = [\"readwrite:$CWD/**\"]\n",
+        name = blueprint_load::DEFAULT_BLUEPRINT_NAME
+    )
 }
 
 /// Stamp which blueprint the output reflects, and how it was chosen, into a `compile`/`explain`
@@ -632,7 +698,10 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
                     serde_json::to_string_pretty(&serde_json::json!({ "host": host }))?
                 );
             } else {
-                println!("host: {}", render::host_summary(&host));
+                println!(
+                    "host: {}",
+                    render::host_summary(&host, learn::find_strace().is_some())
+                );
                 println!(
                     "\nno blueprint found (no --blueprint, no {} here or in a parent); showing \
                      host capabilities only",
@@ -641,7 +710,10 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
             }
             return Ok(());
         }
-        None => return Err(args.resolve().unwrap_err()),
+        // Overrides (or an explicit --blueprint that resolved to nothing) need a base blueprint;
+        // no second resolution here -- re-resolving could succeed if a file appeared meanwhile,
+        // and `unwrap_err` on that success was a panic waiting for the race.
+        None => return Err(no_blueprint_error()),
     };
     let blueprint = args.load(&resolved.path, &home())?;
     let catalog =
@@ -657,7 +729,10 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
             resolved.path.display(),
             resolved.source.as_str()
         );
-        println!("host: {}", render::host_summary(&host));
+        println!(
+            "host: {}",
+            render::host_summary(&host, learn::find_strace().is_some())
+        );
         print!("{}", render::report_summary(&policy.report));
     }
     Ok(())
@@ -762,28 +837,59 @@ fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<
     }
 }
 
+/// Which denial feed this host carries (FW-XR6 parity on the discovery axis), or -- as the error
+/// -- why none does, phrased for the fail-fast message (FW-XR9).
+enum DenialFeed {
+    /// macOS: post-hoc `log show` over the run window, polled to quiescence.
+    MacosUnifiedLog,
+    /// Linux: the workload runs under an unconfined `strace` at this path (FW-E2E-071).
+    LinuxPtrace(PathBuf),
+}
+
+fn denial_feed(host: &formwork_detect::HostProfile) -> Result<DenialFeed, String> {
+    match host.os {
+        formwork_detect::Os::MacOs => Ok(DenialFeed::MacosUnifiedLog),
+        formwork_detect::Os::Linux => {
+            if host.landlock_abi.is_none() {
+                Err(
+                    "this Linux kernel has no Landlock (5.13+ needed), so nothing is enforced \
+                     and no denial exists to observe."
+                        .to_string(),
+                )
+            } else if let Some(strace) = learn::find_strace() {
+                Ok(DenialFeed::LinuxPtrace(strace))
+            } else {
+                Err(
+                    "the Linux feed traces the workload with `strace` (ptrace), and no `strace` \
+                     is on PATH -- install strace to enable learning here."
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
+
 /// `formwork learn`: an enforced run bracketed by observation (FW-DISC1). Visibly distinct from
 /// a plain run, changes nothing about the live policy, and concludes by writing the proposal /
 /// self-accepting in-zone candidates for the NEXT run. On a host with no denial feed this fails
-/// BEFORE the workload runs (FW-INV5): running an entire session and only then announcing that
-/// observation was impossible would waste the run while looking like it worked.
+/// BEFORE the workload runs (FW-XR9/FW-INV5): running an entire session and only then announcing
+/// that observation was impossible would waste the run while looking like it worked.
 fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) -> Result<()> {
     let host = detect();
-    let has_denial_feed = matches!(host.os, formwork_detect::Os::MacOs);
-    if !has_denial_feed && !observe_anyway {
-        bail!(
-            "`formwork learn` needs a kernel denial feed, and this host has none (the macOS \
-             unified-log tap is the only wired source; Landlock audit needs kernel 6.15+ and is \
-             not wired yet). The policy itself is enforceable: use `formwork run` and author \
-             grants by hand, or pass --observe-anyway to run enforced without observation (no \
-             proposal will be written)."
-        );
+    let feed = denial_feed(&host);
+    match (&feed, observe_anyway) {
+        (Err(reason), false) => bail!(
+            "`formwork learn` needs a kernel denial feed: {reason} The policy itself may still \
+             be enforceable: use `formwork run` and author grants by hand, or pass \
+             --observe-anyway to run enforced without observation (no proposal will be written)."
+        ),
+        // A feed exists, so the flag would silently change nothing -- refuse it (FW-DISC11).
+        (Ok(_), true) => bail!(
+            "--observe-anyway is for hosts without a denial feed, and this host has one; drop \
+             the flag to learn normally"
+        ),
+        _ => {}
     }
-    let session = prepare_session(&blueprint)?;
-    tracing::info!(
-        "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
-    );
-    let started = std::time::Instant::now();
     let run_id = format!(
         "learn-{}-{}",
         std::process::id(),
@@ -792,23 +898,105 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    let (program, args) = argv.split_first().expect("argv is non-empty");
-    let status = spawn_confined_child(&session, program, args)?;
-
-    if has_denial_feed {
-        learn::conclude_learning_run(
-            &session.blueprint,
-            &session.blueprint_path,
-            &session.catalog,
-            &run_id,
-            started,
-            &status,
-        )?;
-    } else {
-        tracing::warn!(
-            "--observe-anyway: ran enforced, but this host has no denial feed -- no proposal was written (FW-INV5: reported, not pretended)"
-        );
+    let feed = match feed {
+        Ok(feed) => feed,
+        Err(_) => {
+            // --observe-anyway: enforced run, loudly observation-free, no proposal (FW-E2E-062).
+            let session = prepare_session(&blueprint)?;
+            let (program, args) = argv.split_first().expect("argv is non-empty");
+            let status = spawn_confined_child(&session, program, args)?;
+            tracing::warn!(
+                "--observe-anyway: ran enforced, but this host has no denial feed -- no proposal was written (FW-INV5: reported, not pretended)"
+            );
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    };
+    match feed {
+        DenialFeed::MacosUnifiedLog => {
+            let session = prepare_session(&blueprint)?;
+            tracing::info!(
+                "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
+            );
+            let started = std::time::Instant::now();
+            let (program, args) = argv.split_first().expect("argv is non-empty");
+            let status = spawn_confined_child(&session, program, args)?;
+            let records = learn::collect_denials_quiescent(started)?;
+            learn::conclude_learning_run(
+                &session.blueprint,
+                &session.blueprint_path,
+                &session.catalog,
+                &run_id,
+                records,
+                &status,
+            )?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        DenialFeed::LinuxPtrace(strace) => learn_run_linux(strace, &blueprint, &argv, &run_id),
     }
+}
+
+/// The Linux learning run (FW-E2E-071): the enforced workload runs under an UNCONFINED `strace`
+/// ancestor, which spawns a `formwork run --confine-self` shim; the shim applies Landlock/seccomp
+/// to itself and execs the workload, so the tracer stays outside the wall it observes and needs
+/// no grant, no ptrace hole in the policy, and no Yama exception (it is the tracee's ancestor).
+/// Session preparation, env construction, and the operator itemization all happen once, in the
+/// shim -- this side only resolves what `conclude_learning_run` needs. Unlike the macOS window
+/// there is no persistence latency: the trace file is complete when strace exits, and only this
+/// run's process tree is in it.
+fn learn_run_linux(
+    strace: PathBuf,
+    args: &BlueprintArgs,
+    argv: &[String],
+    run_id: &str,
+) -> Result<()> {
+    let resolved = args.resolve()?;
+    let home = home();
+    let loaded = args.load(&resolved.path, &home)?;
+    // Kernel-resolved coordinates for the auto-widen zone and the catalog floor, exactly as the
+    // shim will enforce them (FW-DISC3/FW-DISC4).
+    let blueprint = blueprint_load::canonicalize_for_enforcement(&loaded)
+        .context("canonicalizing grant paths")?;
+    let catalog =
+        ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
+    let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
+        .context("canonicalizing credential catalog paths")?;
+
+    tracing::info!(
+        "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
+    );
+    let trace_path = std::env::temp_dir().join(format!("formwork-{run_id}.strace"));
+    let current_exe = std::env::current_exe()
+        .context("locating the formwork binary for the confine-self shim")?;
+    let mut command = Command::new(&strace);
+    command
+        // -s 4096: strace abbreviates strings at 32 bytes by default, which would truncate real
+        // paths and silently lose their denials (the FW-INV6 shape).
+        .args(["-f", "-qq", "-s", "4096", "-e", "trace=%file", "-o"])
+        .arg(&trace_path)
+        .arg("--")
+        .arg(&current_exe)
+        .args(["run", "--confine-self", "--blueprint"])
+        .arg(&resolved.path)
+        .args(args.forward_overrides())
+        .arg("--")
+        .args(argv);
+    tracing::info!(tracer = %strace.display(), "spawning the workload under the ptrace denial feed");
+    let status = command.status().context("spawning strace")?;
+    log_exit("traced workload exited", &status);
+
+    let trace = std::fs::read_to_string(&trace_path)
+        .with_context(|| format!("reading the strace log {}", trace_path.display()))?;
+    let _ = std::fs::remove_file(&trace_path);
+    let cwd = cwd()?;
+    let records = learn::parse_strace_denials(&trace, std::path::Path::new(&cwd));
+    learn::conclude_learning_run(
+        &blueprint,
+        &resolved.path,
+        &catalog,
+        run_id,
+        records,
+        &status,
+    )?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
