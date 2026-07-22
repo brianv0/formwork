@@ -35,13 +35,14 @@ def _req(msg_id, method, params):
     return {"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params}
 
 
-def _drive(formwork_bin, backend, requests, expect, timeout=20):
+def _drive(formwork_bin, backend, requests, expect, timeout=20,
+           blueprint=EXAMPLE_BLUEPRINT, server="files"):
     """Send `requests` to a `formwork gateway` fronting `backend`; collect `expect` id-bearing
     replies keyed by id. Keeps stdin open until the replies are in, so backend round-trips finish
     before the connection closes."""
     proc = subprocess.Popen(
-        [str(formwork_bin), "gateway", "--blueprint", str(EXAMPLE_BLUEPRINT),
-         "--server", "files", "--", str(backend)],
+        [str(formwork_bin), "gateway", "--blueprint", str(blueprint),
+         "--server", server, "--", str(backend)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1,
     )
@@ -111,3 +112,43 @@ def test_example_gateway_passes_granted_call_through(formwork_bin, fixture_bin):
     assert 1 in responses, f"no read_file reply; stderr={stderr!r}"
     assert responses[1]["result"]["content"][0]["text"] == "ok:read_file"
     assert responses[1]["result"]["isError"] is False
+
+
+PATTERN_BLUEPRINT = """\
+net = "deny"
+[fs]
+read-mode = "ambient-minus-subtract"
+reads = ["/**"]
+writes = []
+[mcp.patterns]
+tools = { allow = ["/.*_file/", "list_dir"], deny = ["/delete_.*/"] }
+resources = "deny"
+prompts = "deny"
+"""
+
+
+@pytest.mark.fw_e2e("FW-E2E-066")
+def test_example_gateway_shades_by_pattern(formwork_bin, fixture_bin, tmp_path):
+    """The real `formwork gateway` binary shades by a regex allow/deny policy (FW-GW9): allow
+    `/.*_file/` + `list_dir`, deny `/delete_.*/`. delete_file matches both, so the deny wins."""
+    bp = tmp_path / "patterns.toml"
+    bp.write_text(PATTERN_BLUEPRINT)
+    responses, stderr = _drive(
+        formwork_bin,
+        fixture_bin,
+        [
+            _req(1, "tools/list", {}),
+            _req(2, "tools/call", {"name": "delete_file", "arguments": {}}),
+            _req(3, "tools/call", {"name": "read_file", "arguments": {}}),
+        ],
+        expect=3,
+        blueprint=bp,
+        server="patterns",
+    )
+    assert {1, 2, 3} <= responses.keys(), f"missing replies {responses}; stderr={stderr!r}"
+
+    visible = sorted(t["name"] for t in responses[1]["result"]["tools"])
+    assert visible == ["list_dir", "read_file", "write_file"], visible
+
+    assert "error" in responses[2], "delete_file matches the deny pattern; deny is terminal"
+    assert responses[3]["result"]["content"][0]["text"] == "ok:read_file"

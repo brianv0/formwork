@@ -25,3 +25,17 @@ writes = []
 tools = { allow = ["read_file"] }
 resources = "deny"
 prompts = "deny"
+
+# Pattern shading (FW-GW9). Every axis accepts exact names OR anchored regex written `/…/` (matched
+# against the whole identifier), plus a terminal `deny` that always wins over `allow` -- the same
+# deny-terminal bias as the filesystem rules, here over tool/resource/prompt names. This is a
+# userspace match in the gateway, not a kernel path rule, so a real regex is sound where a general
+# filesystem glob is not. Illustrative (front a real server by swapping the backend command):
+#
+#   [mcp.github]
+#   # allow the read-only surface, but never the destructive tools -- deny beats the allow overlap:
+#   tools = { allow = ["/^(get|list|search)_.*/"], deny = ["/^delete_.*/", "merge_pull_request"] }
+#
+#   [mcp.everything]
+#   # expose everything the server offers EXCEPT anything that can sample the model or print env:
+#   tools = { deny = ["/^sample.*/", "printEnv"] }   # omitting `allow` means "all"

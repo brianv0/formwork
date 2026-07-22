@@ -5,8 +5,8 @@
 
 use crate::path::{canonicalize_set, PathPattern};
 use crate::{
-    Blueprint, DiscoveryBlueprint, EnvPosture, EnvScrub, ExecPosture, FsBlueprint, Gate, McpPolicy,
-    NetPosture, ReadMode, Visibility,
+    AllowScope, Blueprint, DiscoveryBlueprint, EnvPosture, EnvScrub, ExecPosture, FsBlueprint,
+    Gate, McpPolicy, NetPosture, Pattern, ReadMode, Visibility,
 };
 
 fn clamp_to(subject: &[PathPattern], bound: &[PathPattern]) -> Vec<PathPattern> {
@@ -149,15 +149,32 @@ fn narrow_mcp_policy(parent: &McpPolicy, req: &McpPolicy) -> McpPolicy {
 }
 
 fn narrow_visibility(parent: &Visibility, req: &Visibility) -> Visibility {
+    let allow = narrow_allow(&parent.allow, &req.allow);
+    // A deny from *either* layer applies: deny holes only grow under narrowing, like the fs
+    // `subtract`/`write_subtract` sets, so the deny lists union (deny is terminal, FW-GW9/FW-CAP8).
+    let mut deny = parent.deny.clone();
+    for p in &req.deny {
+        if !deny.contains(p) {
+            deny.push(p.clone());
+        }
+    }
+    Visibility { allow, deny }.canonicalize()
+}
+
+fn narrow_allow(parent: &AllowScope, req: &AllowScope) -> AllowScope {
     match (parent, req) {
-        (Visibility::Deny, _) | (_, Visibility::Deny) => Visibility::Deny,
-        (Visibility::AllowAll, other) | (other, Visibility::AllowAll) => other.clone(),
-        (Visibility::Allow(a), Visibility::Allow(b)) => {
-            let names: Vec<String> = a.iter().filter(|n| b.contains(n)).cloned().collect();
-            if names.is_empty() {
-                Visibility::Deny
+        (AllowScope::Nothing, _) | (_, AllowScope::Nothing) => AllowScope::Nothing,
+        (AllowScope::All, other) | (other, AllowScope::All) => other.clone(),
+        (AllowScope::Only(a), AllowScope::Only(b)) => {
+            // Sound subset: keep the entries present in *both* lists (by authoring form). For exact
+            // names this is set intersection; for regexes it is conservative -- only identical
+            // sources survive -- which under-approximates but never widens (FW-CAP2 forbids only
+            // widening).
+            let both: Vec<Pattern> = a.iter().filter(|p| b.contains(p)).cloned().collect();
+            if both.is_empty() {
+                AllowScope::Nothing
             } else {
-                Visibility::Allow(names)
+                AllowScope::Only(both)
             }
         }
     }
@@ -280,7 +297,7 @@ mod tests {
         req_mcp.insert(
             "secret".to_string(),
             McpPolicy {
-                tools: Visibility::AllowAll,
+                tools: Visibility::all(),
                 ..Default::default()
             },
         );
@@ -308,12 +325,46 @@ mod tests {
                 ..Blueprint::empty()
             }
         };
-        let n = mk(Visibility::Allow(vec!["a".into(), "b".into()]))
-            .narrow(&mk(Visibility::Allow(vec!["b".into(), "c".into()])));
-        assert_eq!(n.mcp["s"].tools, Visibility::Allow(vec!["b".into()]));
+        let n = mk(Visibility::allow_exact(["a", "b"]))
+            .narrow(&mk(Visibility::allow_exact(["b", "c"])));
+        assert_eq!(n.mcp["s"].tools, Visibility::allow_exact(["b"]));
 
-        let n2 = mk(Visibility::AllowAll).narrow(&mk(Visibility::Allow(vec!["x".into()])));
-        assert_eq!(n2.mcp["s"].tools, Visibility::Allow(vec!["x".into()]));
+        let n2 = mk(Visibility::all()).narrow(&mk(Visibility::allow_exact(["x"])));
+        assert_eq!(n2.mcp["s"].tools, Visibility::allow_exact(["x"]));
+    }
+
+    #[test]
+    fn mcp_deny_unions_and_wins_under_narrowing() {
+        // A deny from *either* side survives (deny is terminal, FW-GW9): the child cannot un-deny a
+        // tool its parent denied, and the parent inherits the child's deny too.
+        let mk = |v: Visibility| {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "s".to_string(),
+                McpPolicy {
+                    tools: v,
+                    ..Default::default()
+                },
+            );
+            Blueprint {
+                mcp: m,
+                ..Blueprint::empty()
+            }
+        };
+        let parent = mk(Visibility::all()
+            .with_deny(&["/delete_.*/".into()])
+            .unwrap());
+        let child = mk(Visibility::parse(&["/(get|delete)_.*/".into()], &[]).unwrap());
+        let n = parent.narrow(&child);
+        let tools = &n.mcp["s"].tools;
+        assert!(
+            tools.permits("get_item"),
+            "child's allow, not denied by either"
+        );
+        assert!(
+            !tools.permits("delete_item"),
+            "parent's deny is terminal even under the child's allow"
+        );
     }
 
     #[test]

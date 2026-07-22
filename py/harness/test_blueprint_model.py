@@ -372,3 +372,57 @@ def test_explain_names_winning_rule_and_provenance(cli, tmp_path):
     assert execd["exec"]["decision"] == "granted"
     assert execd["exec"]["source"] == {"origin": "cli"}
     assert execd["read"]["decision"] == "hidden", "exec confers execute only, not read"
+
+
+# ---- FW-GW9: regex allow/deny patterns for MCP tool shading -------------------------------------
+
+
+def _servers(result):
+    """The compiled per-server MCP policy map (`gateway.servers`)."""
+    return json.loads(result.stdout)["gateway"]["servers"]
+
+
+@pytest.mark.fw_e2e("FW-E2E-069")
+def test_mcp_regex_policy_compiles_and_round_trips(cli, tmp_path):
+    """A regex allow/deny tools policy compiles, the patterns survive verbatim into the compiled
+    gateway policy, and recompiling is byte-identical (FW-GW9/FW-FID4)."""
+    bp = tmp_path / "patterns.toml"
+    bp.write_text(
+        """\
+net = "deny"
+[fs]
+read-mode = "closed"
+[mcp.gh]
+tools = { allow = ["/get_.*/", "add"], deny = ["/delete_.*/"] }
+resources = { deny = ["/secret_.*/"] }
+"""
+    )
+    out = cli("compile", "--blueprint", bp, "--target", "linux-v6")
+    assert out.code == 0, out.stderr
+    tools = _servers(out)["gh"]["tools"]
+    assert tools == {"allow": ["/get_.*/", "add"], "deny": ["/delete_.*/"]}, tools
+    # A deny-only table (resources) reads as all-except; it serializes with no `allow` key.
+    assert _servers(out)["gh"]["resources"] == {"deny": ["/secret_.*/"]}
+
+    again = cli("compile", "--blueprint", bp, "--target", "linux-v6")
+    assert again.stdout == out.stdout, "pattern compile must be byte-deterministic (FW-FID4)"
+
+
+@pytest.mark.fw_e2e("FW-E2E-069")
+def test_mcp_bad_pattern_fails_loud(cli, tmp_path):
+    """An uncompilable `/re/` is a loud config error, never a silent deny-all (FW-GW9/FW-INV6)."""
+    bp = tmp_path / "bad.toml"
+    bp.write_text('net = "deny"\n[mcp.s]\ntools = { allow = ["/get_(/"] }\n')
+    res = cli("compile", "--blueprint", bp, "--target", "linux-v6")
+    assert res.code != 0, "a malformed pattern must not compile"
+    assert "invalid MCP pattern" in (res.stderr + res.stdout)
+
+
+@pytest.mark.fw_e2e("FW-E2E-069")
+def test_mcp_empty_table_fails_loud(cli, tmp_path):
+    """An ambiguous empty `{}` policy table is refused, not silently read as allow-all (FW-GW9)."""
+    bp = tmp_path / "empty.toml"
+    bp.write_text('net = "deny"\n[mcp.s]\ntools = {}\n')
+    res = cli("compile", "--blueprint", bp, "--target", "linux-v6")
+    assert res.code != 0, "an empty policy table must not compile"
+    assert "empty MCP policy table" in (res.stderr + res.stdout)

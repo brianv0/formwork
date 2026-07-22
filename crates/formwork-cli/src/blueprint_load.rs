@@ -738,7 +738,7 @@ mod tests {
         // A tool name that isn't `~/`-prefixed is untouched.
         assert_eq!(
             blueprint.mcp["s"].tools,
-            formwork_blueprint::Visibility::Allow(vec!["~weird_but_left_alone".into()])
+            formwork_blueprint::Visibility::allow_exact(["~weird_but_left_alone"])
         );
     }
 
