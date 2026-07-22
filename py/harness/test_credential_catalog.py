@@ -74,6 +74,11 @@ def test_path_credential_denied_and_itemized(cli, fake_home, tmp_path):
     # Operator channel names the type (FW-CRED7)...
     operator = _operator_lines(denied.stderr)
     assert '"aws"' in operator, f"operator channel must name type aws: {operator!r}"
+    # ...and announces the active backstop, the one floor row that also denies inside a granted
+    # tree (FW-CRED6), so its otherwise-invisible EACCES has a named cause.
+    assert "credential backstop active" in operator, (
+        f"operator channel must announce the active backstop: {operator!r}"
+    )
     # ...while the agent-facing denial is the kernel's plain errno, no catalog annotation. The
     # path the agent itself asked for legitimately echoes back (cat prints it), so it is removed
     # before scanning for annotation words.

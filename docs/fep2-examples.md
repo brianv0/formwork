@@ -90,6 +90,28 @@ cat: project/.env.production: Operation not permitted
 
 No curated type names `.env.production`; the backstop's shape rules do ([FW-CRED6](../formwork.md#fw-cred6)).
 
+The catch is that the backstop is location-independent: a file named `credentials` or `id_rsa`
+*inside your own granted working set* is denied too (deny beats allow, [FW-CAP8](../formwork.md#fw-cap8)), and the confined
+tool only ever sees a bare `EACCES` ([FW-CRED7](../formwork.md#fw-cred7)). Two operator-channel surfaces name the cause so it
+is not folklore. At spawn, `run`/`learn` log the backstop by name; and `explain` answers "why did
+my file fail to stage?" pointing straight at the shape and the lift (a bare relative path resolves
+against cwd, so the path you'd naturally type just works):
+
+```console
+$ formwork explain ./credentials
+/home/me/project/credentials
+  read:  denied by credential floor (backstop) (built-in)
+  write: denied by credential floor (backstop) (built-in)
+  exec:  allowed by default (no rule names it)
+  hint: credential backstop (shape **/credentials) -- fires at any depth, even inside a granted
+        directory. Lift with allow-credentials = ["backstop"] (coarse: un-denies every backstop
+        shape everywhere; prefer narrowing a real type when one fits).
+```
+
+The lift is deliberately coarse — one pseudo-type turns the whole backstop off ([FW-CRED6](../formwork.md#fw-cred6)); there is
+no per-path exception (the typed exclude is the only un-deny, [FW-CRED5](../formwork.md#fw-cred5)/[FW-INV8](../formwork.md#fw-inv8)). The no-path
+`explain` summary carries the same backstop line up front, so the collision is visible before a run.
+
 ## 6. The report labels each arm and discloses the launcher contingency
 
 ```console
