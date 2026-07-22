@@ -588,6 +588,40 @@ mod tests {
     }
 
     #[test]
+    fn floor_only_permissive_allows_everything_but_the_credential_floor() {
+        // The policy enforced *during* a permissive recording: an open base (ambient reads + an open
+        // `/**` write) with the credential floor still denied on BOTH axes -- so a recording can
+        // never read or write a credential though the workload is otherwise unconfined.
+        let catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let policy = super::compile(
+            &Blueprint::floor_only_permissive(),
+            &HostProfile::synthetic_macos(),
+            &catalog,
+        );
+        let sbpl = match &policy.confiner {
+            ConfinerPolicy::Macos(m) => &m.sbpl,
+            other => panic!("expected a Seatbelt policy, got {other:?}"),
+        };
+        assert!(sbpl.contains("(allow default)"), "permissive base");
+        assert!(
+            sbpl.contains("(allow file-write* (subpath \"/\"))"),
+            "open writes so the workload's writes are observable"
+        );
+        let denies = |verb: &str| {
+            sbpl.lines()
+                .any(|l| l.starts_with(verb) && l.contains("/home/x/.ssh"))
+        };
+        assert!(
+            denies("(deny file-read*"),
+            "a credential read stays floored under the permissive base"
+        );
+        assert!(
+            denies("(deny file-write*"),
+            "a credential write stays floored under the open /** grant"
+        );
+    }
+
+    #[test]
     fn env_posture_reported_honestly() {
         use formwork_blueprint::{EnvPosture, EnvScrub};
         // Passthrough asks for nothing -> no row.

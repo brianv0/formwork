@@ -34,7 +34,7 @@ rebase on #18. No calendar commitment.
 
 - `reverse_compile(records, catalog, allow, auto_widen)` in `crates/formwork-blueprint/src/discovery.rs`
   is pure and source-agnostic — it takes `DenialRecord { path, access }` and applies the floor
-  (`FW-DISC3`/[FW-INV8](formwork.md#fw-inv8)), sibling→`parent/**` folding, and zone tagging. It does
+  (`FW-DISC3`/[FW-INV8](../formwork.md#fw-inv8)), sibling→`parent/**` folding, and zone tagging. It does
   not care whether records came from denials or opens.
 - The macOS feed tap already lives in the CLI, not the confiner:
   `crates/formwork-cli/src/learn.rs` parses `log show --style ndjson`. Precedent for a CLI-owned tap.
@@ -75,7 +75,7 @@ rebase on #18. No calendar commitment.
   children), or preselect by **audit session ID**. Attribution matters more here than for `learn`
   (record's goal is a *tight* Blueprint).
 - Output flows through the existing proposal → accept pipeline; stays non-authoritative
-  ([FW-INV10](formwork.md#fw-inv10)).
+  ([FW-INV10](../formwork.md#fw-inv10)).
 - **Open sub-decision:** recording enforces the *catalog floor* — does it also apply the default
   profile's protective subtracts (`.env`, agent-state, tamper vectors)? Leaning **bare-floor-only** so
   coverage is not silently narrowed (the catalog still protects secret shapes). Confirm in §5.4.
@@ -118,7 +118,7 @@ rebase on #18. No calendar commitment.
 - Add `--permissive` (spelling: `--permissive` vs `--unconfined`, pin on landing) to the `learn`
   command in `main.rs`; loud UNCONFINED banner.
 - New `permissive_record_run` beside `learn_run`: gate on `trace-feed`; `None` → fail loud, write
-  nothing (`FW-DISC9`/[FW-INV6](formwork.md#fw-inv6)). Spawn floor-only `spawn_confined`; run the feed;
+  nothing (`FW-DISC9`/[FW-INV6](../formwork.md#fw-inv6)). Spawn floor-only `spawn_confined`; run the feed;
   `reverse_compile` / `synthesize`; route through the existing proposal + `--list/--accept`.
 - Feed tap module (extend `learn.rs` if SBPL-report; new module if fs_usage/auditpipe).
 - `--out app.blueprint.toml` freeze (`FW-DISC10`) — or defer (open decision).
@@ -134,7 +134,7 @@ rebase on #18. No calendar commitment.
 - **Real-boundary (macOS, no mocking the kernel — constitution Testing):**
   - `FW-E2E-065` — spawn a workload under the floor-only policy; observed opens synthesize a
     Blueprint; **re-enforcing it runs the same workload clean, and a path it never touched is denied**
-    (paired allow/deny, [FW-E2E-024](formwork.md#fw-e2e-024) pattern).
+    (paired allow/deny, [FW-E2E-024](../formwork.md#fw-e2e-024) pattern).
   - `FW-E2E-066` — a workload reading a credential during recording is denied at the kernel and the
     credential is absent from proposal and synthesized Blueprint.
   - `FW-E2E-067` — on `trace-feed: none`, `learn --permissive` fails loud and writes nothing.
@@ -160,7 +160,7 @@ rebase on #18. No calendar commitment.
   exception (closed on FEP-4 landing) per constitution Precedence & Conflicts.
 - Two structural mitigations, both tested: credential floor **kernel-enforced** during recording
   (`FW-DISC8`) and **withheld** from synthesis by `reverse_compile` (`FW-INV12`); output
-  **non-authoritative** until accepted ([FW-INV10](formwork.md#fw-inv10)).
+  **non-authoritative** until accepted ([FW-INV10](../formwork.md#fw-inv10)).
 - **New footprint:** the feed may require `sudo` (fs_usage/auditpipe). This is an escalation over
   today's root-free macOS path — occasional, operator-driven, amortized (record once, enforce many).
   Called out honestly; it does not touch the enforced-`run` path.

@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{PathPattern, ResolvedCatalog};
+use crate::{canonicalize_set, Blueprint, FsBlueprint, PathPattern, ReadMode, ResolvedCatalog};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -16,12 +16,18 @@ pub enum DenialAccess {
     Write,
 }
 
-/// One observed denial: a kernel-resolved absolute path and the access that failed.
+/// One observed access: a kernel-resolved absolute path and the access grade. The observation
+/// source is not encoded here -- a denial the kernel logged under enforcement (`learn`) and an open
+/// a permissive recording watched are the same shape, so they feed one reverse compiler.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DenialRecord {
+pub struct AccessRecord {
     pub path: String,
     pub access: DenialAccess,
 }
+
+/// The observation source that predates permissive recording spoke of "denials"; kept as an alias
+/// so the enforced-`learn` call sites read in their own terms.
+pub type DenialRecord = AccessRecord;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -139,6 +145,40 @@ pub fn reverse_compile(
     }
 }
 
+/// Observed accesses -> a standalone, tight Blueprint: the "locked-down blueprint" a permissive
+/// recording produces. Where `reverse_compile` yields a discovered-layer *diff*, this assembles a
+/// closed-read Blueprint whose explicit read/write grants are exactly the folded accesses observed,
+/// ready to enforce directly. It shares the same reverse compiler, so the credential floor still
+/// withholds catalog matches (FW-DISC3 / FW-INV8): a recorded credential access never becomes a
+/// grant, however permissive the run that observed it.
+pub fn synthesize_blueprint(
+    records: &[AccessRecord],
+    catalog: &ResolvedCatalog,
+    allow: &[String],
+) -> Blueprint {
+    // No auto-widen zone: synthesis is a full grant set, not a proposal to tag/review.
+    let outcome = reverse_compile(records, catalog, allow, &[]);
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    for candidate in &outcome.candidates {
+        match candidate.access {
+            // Write grants imply read at compile time, so a write need not also list a read.
+            DenialAccess::Read => reads.push(candidate.pattern.clone()),
+            DenialAccess::Write => writes.push(candidate.pattern.clone()),
+        }
+    }
+    Blueprint {
+        fs: FsBlueprint {
+            read_mode: ReadMode::Closed,
+            reads: canonicalize_set(&reads),
+            writes: canonicalize_set(&writes),
+            ..FsBlueprint::default()
+        },
+        allow_credentials: allow.to_vec(),
+        ..Blueprint::empty()
+    }
+}
+
 /// FW-INV8: would this folded subtree grant cover a path the floor withheld? A `true` keeps the
 /// members granular so a withheld credential is never re-granted through a covering subtree.
 fn fold_would_cover_withheld(folded: &PathPattern, withheld: &[WithheldEntry]) -> bool {
@@ -181,6 +221,61 @@ mod tests {
 
     fn pp(s: &str) -> PathPattern {
         PathPattern::parse(s).unwrap()
+    }
+
+    fn write(path: &str) -> AccessRecord {
+        AccessRecord {
+            path: path.to_string(),
+            access: DenialAccess::Write,
+        }
+    }
+
+    #[test]
+    fn synthesize_yields_a_closed_blueprint_with_credentials_withheld() {
+        // The permissive-recording property at the unit level: a credential the run observed never
+        // enters the synthesized grant, and the result is a tight closed blueprint (FW-DISC3/FW-INV8).
+        let records = vec![
+            read("/home/x/.ssh/id_ed25519"),
+            read("/opt/toolchain/lib.py"),
+        ];
+        let bp = synthesize_blueprint(&records, &catalog(), &[]);
+        assert_eq!(bp.fs.read_mode, ReadMode::Closed);
+        let reads: Vec<String> = bp.fs.reads.iter().map(|p| p.canonical()).collect();
+        assert_eq!(reads, vec!["/opt/toolchain/lib.py"]);
+        assert!(bp.fs.writes.is_empty());
+        assert!(!reads.iter().any(|r| r.contains(".ssh")));
+    }
+
+    #[test]
+    fn synthesize_splits_read_and_write_grades() {
+        let records = vec![read("/work/in.txt"), write("/work/out.txt")];
+        let bp = synthesize_blueprint(&records, &catalog(), &[]);
+        let reads: Vec<String> = bp.fs.reads.iter().map(|p| p.canonical()).collect();
+        let writes: Vec<String> = bp.fs.writes.iter().map(|p| p.canonical()).collect();
+        assert_eq!(reads, vec!["/work/in.txt"]);
+        assert_eq!(writes, vec!["/work/out.txt"]);
+    }
+
+    #[test]
+    fn synthesize_folds_observed_siblings_into_a_subtree() {
+        let records = vec![read("/opt/tc/a.py"), read("/opt/tc/b.py")];
+        let bp = synthesize_blueprint(&records, &catalog(), &[]);
+        let reads: Vec<String> = bp.fs.reads.iter().map(|p| p.canonical()).collect();
+        assert_eq!(reads, vec!["/opt/tc/**"]);
+    }
+
+    #[test]
+    fn synthesize_carries_the_credential_exclusions() {
+        // With aws excluded, the aws path is an ordinary grant AND the blueprint records the lift,
+        // so the frozen artifact is self-consistent: the grant it carries is one it justifies.
+        let bp = synthesize_blueprint(
+            &[read("/home/x/.aws/config")],
+            &catalog(),
+            &["aws".to_string()],
+        );
+        assert_eq!(bp.allow_credentials, vec!["aws".to_string()]);
+        let reads: Vec<String> = bp.fs.reads.iter().map(|p| p.canonical()).collect();
+        assert_eq!(reads, vec!["/home/x/.aws/config"]);
     }
 
     #[test]

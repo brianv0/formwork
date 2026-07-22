@@ -11,8 +11,8 @@ mod provenance;
 
 pub use catalog::{Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP};
 pub use discovery::{
-    reverse_compile, Candidate, CandidateTag, DenialAccess, DenialRecord, ProposalOutcome,
-    WithheldEntry,
+    reverse_compile, synthesize_blueprint, AccessRecord, Candidate, CandidateTag, DenialAccess,
+    DenialRecord, ProposalOutcome, WithheldEntry,
 };
 pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
@@ -44,6 +44,28 @@ pub struct Blueprint {
     pub allow_credentials: Vec<String>,
     #[serde(default)]
     pub discovery: DiscoveryBlueprint,
+}
+
+impl Blueprint {
+    /// The policy enforced *during* a permissive recording: everything is allowed, so the workload
+    /// runs unconfined and its accesses can be observed -- except the credential floor, which the
+    /// compiler still denies (`ResolvedCatalog::denied_paths`) for read *and* write. Open ambient
+    /// reads plus an open `/**` write grant; the floor's deny wins by last-match over the broad
+    /// write, so a recording can never read or write a credential (the recording-run half of the
+    /// floor guarantee FW-INV8). The observed accesses are floored again at synthesis
+    /// (`synthesize_blueprint`), so the floor holds whether or not enforcement is present.
+    pub fn floor_only_permissive() -> Self {
+        Blueprint {
+            fs: FsBlueprint {
+                read_mode: ReadMode::AmbientMinusSubtract,
+                writes: vec![
+                    PathPattern::parse("/**").expect("/** is a constant, valid open-write pattern")
+                ],
+                ..FsBlueprint::default()
+            },
+            ..Blueprint::empty()
+        }
+    }
 }
 
 /// The merged discovery posture (FW-DISC4): the operator-drawn zone inside which a learning run
