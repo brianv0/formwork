@@ -161,6 +161,17 @@ EGR — a new family is a Concepts-grade amendment), `FW-INV<n>` for invariants,
 - Tests are named for the requirements they discharge, and the `formwork.md`
   §10 traceability table is the requirement→test map; a new requirement lands
   with its row.
+- **Documents have audiences, and vocabulary flows inward only.** The layers,
+  outermost first: `README.md` (users deciding/starting — plain claims, no
+  requirement IDs), `examples/` (operators integrating — recipes and rule
+  vocabulary), `formwork.md`/`constitution.md`/`docs/STATUS.md` (contributors —
+  IDs, phases, doctrine), `docs/fep-*.md` and plans (design record — draft
+  numbering, amendments). A document may cite vocabulary from its own layer or
+  deeper, never from a layer outside it: a contributor convention stated only
+  in a user document is a dangling pointer the moment that document is made
+  honest for users (the precedent: this section once pointed at the README for
+  the ID convention). *(Amended from the usability review's unstated-requirements
+  pass.)*
 Rationale: requirement IDs are the review currency of this repo — a reviewer
 following FW-CRED6 from a diff to its definition should be one click, not a
 grep expedition — and identifiers that can silently dangle, fork, or get
@@ -195,7 +206,13 @@ terminates the program. No failure is silently absorbed.
 Doctrine: **fail closed or fail loud, never fail-open-silent ([FW-INV6](formwork.md#fw-inv6)).**
 This is the load-bearing rule of a sandboxing tool: a capability that cannot be
 faithfully enforced is reported `Partial`/`Unenforceable` or errors — it is
-never silently downgraded ([FW-XR1](formwork.md#fw-xr1)). Named boundaries where failure is handled:
+never silently downgraded ([FW-XR1](formwork.md#fw-xr1)). Honesty is bidirectional: documents are a
+claims surface, and *under*-claiming (an implemented capability described as a
+stub) misleads its audience into a wrong decision exactly as over-claiming
+does — where a prose claim is mechanically checkable against `detect`-able
+facts or the test suite, prefer a canary that fails CI on drift (the
+`test_requirements.py` pattern). *(Amended from the unstated-requirements
+pass.)* Named boundaries where failure is handled:
 the CLI shell (`formwork-cli`), the `enforce` install, and the Gateway
 connection. In Rust terms:
 - typed errors (`thiserror`) at the library/domain layers — `PathError`,
@@ -263,6 +280,11 @@ Landlock crates stay unwired until a real kernel verifies them. An abstraction
 with one implementation and no second consumer is a Growth violation; typed-error
 variants are API surface and count. Pruning is event-triggered: at each release /
 version bump, not calendar-driven.
+A release binary is self-contained: every documented feature works from the
+shipped binary alone, and a feature that needs the repo checkout present is a
+dev tool and is documented as one. `profiles/` is a source of build-time
+embedded artifacts (`builtin:` — the [FW-CRED1](formwork.md#fw-cred1) catalog precedent), never a
+runtime dependency. *(Amended from the unstated-requirements pass.)*
 Rationale: surface area only ever grows unless refusal is the
 default, reuse precedes creation, and deletion has a trigger;
 restraint is what made good tools good. Reuse is also the product
@@ -296,6 +318,15 @@ exercises a pure function on a chosen input, not a mock of enforcement. MCP
 fixtures are real subprocess servers, not mocks. Tests are deterministic; a
 flaky test is a bug in the test, and [FW-FID4](formwork.md#fw-fid4) (byte-identical compile) is the
 strict form of that.
+
+Tests exercise the boundary **in its least convenient realistic shape**, not a
+comfortable one: for any observe/collect feature the primary case is the
+fastest-failing workload (a process that dies on its first denial in a
+millisecond — the canonical discovery shape), and a mechanism with a latency
+window is tested *inside* that window ([FW-E2E-064](formwork.md#fw-e2e-064) is the precedent — a suite
+that only ran workloads long enough for the feed to flush had proven nothing
+about the runs users actually do). *(Amended from the unstated-requirements
+pass.)*
 Rationale: a fully mocked test verifies that the code does what the
 code does; only behavior exercised at the real boundary catches
 real regressions — and for this project, "the report is honest" is
@@ -316,7 +347,14 @@ deviation, not a solution.
 Justified exceptions are recorded, never smuggled. Each records the
 rule it suspends, the reason, and an expiry (a release or a date) — in the PR
 that introduces it and, if long-lived, here. An expired, unresolved exception is
-itself a conflict and triggers the STOP above. There are none at present.
+itself a conflict and triggers the STOP above. **Deprecated surface rides the
+same rail**: a compat shim (a hidden alias, a kept flag) is an exception to the
+command-surface rule it violates, so it records its removal event and is
+pruned at that event like any exception — otherwise hidden surface accretes
+invisibly, the exact failure Growth exists to stop. The live register is the
+deprecations table in `docs/STATUS.md` (today: the hidden `detect` /
+`enforce-self` / `accept` aliases and `--spec`, expiring at the first tagged
+release). *(Amended from the unstated-requirements pass.)*
 Rationale: a constitution with no legal escape hatch teaches its
 users to invent illegal ones; a tracked, expiring exception keeps
 every deviation visible and temporary.

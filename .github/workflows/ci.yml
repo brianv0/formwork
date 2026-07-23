@@ -58,9 +58,11 @@ jobs:
       matrix:
         # Native OS backends differ (Seatbelt on macOS; Landlock/seccomp on Linux), so the
         # suite must run on both. Integration tests that need a real kernel mechanism are cfg-gated
-        # to their OS, so a stock runner exercises exactly what it can enforce. The macOS job also
-        # carries the learn-usefulness probe (FW-E2E-064: a millisecond workload's denial must
-        # survive unified-log persistence latency) against the real Seatbelt + `log show` feed.
+        # to their OS, so a stock runner exercises exactly what it can enforce. Each job carries
+        # its learn-usefulness probe against its real feed: macOS FW-E2E-064 (a millisecond
+        # workload's denial must survive unified-log persistence latency) via Seatbelt +
+        # `log show`; Linux FW-E2E-071 (the same millisecond shape) via Landlock + the strace
+        # ptrace feed.
         os: [ubuntu-22.04, macos-14]
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +71,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
+
+      # The Linux learn feed (FW-E2E-071) traces the workload with strace; installing it here is
+      # what lets the ubuntu job EXECUTE the ptrace-feed tests instead of skipping them -- a
+      # platform-marked test that never runs on its platform is a claim, not a verification.
+      - name: Install strace (Linux denial feed)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y strace
 
       - uses: actions/cache@v4
         with:

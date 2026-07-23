@@ -302,6 +302,75 @@ fn learn_rejects_mixing_review_flags_with_a_command() {
     assert!(out.stderr.contains("not both"), "{}", out.stderr);
 }
 
+/// Flags outside a mode's matrix are refused, never silently dropped: expressed intent that a
+/// mode would ignore is the CLI-surface FW-INV6 shape.
+#[test]
+fn learn_rejects_flags_the_mode_would_ignore() {
+    let dir = Scratch::new("learn-matrix");
+    std::fs::write(dir.path().join("bp.toml"), MINIMAL_BLUEPRINT).unwrap();
+
+    // Review mode + a blueprint override: the override would shape nothing.
+    let overridden = formwork(
+        dir.path(),
+        dir.path(),
+        &[
+            "learn",
+            "--blueprint",
+            "bp.toml",
+            "--list",
+            "--allow-cred",
+            "aws",
+        ],
+    );
+    assert_ne!(overridden.code, 0);
+    assert!(
+        overridden.stderr.contains("override"),
+        "{}",
+        overridden.stderr
+    );
+
+    // Review mode + --observe-anyway: review needs no feed; the flag would be ignored.
+    let observe = formwork(
+        dir.path(),
+        dir.path(),
+        &[
+            "learn",
+            "--blueprint",
+            "bp.toml",
+            "--list",
+            "--observe-anyway",
+        ],
+    );
+    assert_ne!(observe.code, 0);
+    assert!(
+        observe.stderr.contains("--observe-anyway"),
+        "{}",
+        observe.stderr
+    );
+
+    // Observe mode + --proposal: the run writes beside the blueprint regardless.
+    let proposal = formwork(
+        dir.path(),
+        dir.path(),
+        &[
+            "learn",
+            "--blueprint",
+            "bp.toml",
+            "--proposal",
+            "elsewhere.toml",
+            "--",
+            "/bin/true",
+        ],
+    );
+    assert_ne!(proposal.code, 0);
+    assert!(
+        proposal.stderr.contains("--proposal"),
+        "{}",
+        proposal.stderr
+    );
+    assert!(proposal.stderr.contains("review"), "{}", proposal.stderr);
+}
+
 /// FW-E2E-064 at the cargo-test boundary, so the stock macOS CI job (`cargo test --workspace`)
 /// verifies learn is useful for the canonical discovery shape: a workload that dies on its first
 /// denial in about a millisecond, while the unified log persists the record only seconds later.
@@ -357,29 +426,94 @@ fn learn_captures_a_millisecond_workloads_denial() {
     assert!(out.stdout.contains("proposal:"), "{}", out.stdout);
 }
 
-/// FW-E2E-062 / FW-INV5 at the CLI edge: on a host with no denial feed, `learn` refuses BEFORE
+/// FW-E2E-062 / FW-XR9 at the CLI edge: on a host with no denial feed, `learn` refuses BEFORE
 /// the workload runs instead of running it and admitting afterwards that nothing could be
-/// observed.
+/// observed. The Linux feed needs `strace` on PATH, so an empty PATH makes the feed reliably
+/// unavailable here whatever the kernel carries (no Landlock is the other unavailable arm).
 #[cfg(target_os = "linux")]
 #[test]
 fn learn_fails_fast_without_a_denial_feed() {
     let dir = Scratch::new("learn-fast");
     let marker = dir.path().join("ran");
     std::fs::write(dir.path().join("bp.toml"), MINIMAL_BLUEPRINT).unwrap();
-    let out = formwork(
-        dir.path(),
-        dir.path(),
-        &[
+    let out = Command::new(env!("CARGO_BIN_EXE_formwork"))
+        .args([
             "learn",
             "--blueprint",
             "bp.toml",
             "--",
             "/bin/touch",
             marker.to_str().unwrap(),
+        ])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("PATH", "")
+        .output()
+        .expect("running formwork");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("denial feed"), "{stderr}");
+    assert!(stderr.contains("--observe-anyway"), "{stderr}");
+    assert!(!marker.exists(), "the workload must not have run");
+}
+
+/// FW-E2E-071 at the cargo-test boundary: the Linux learning run captures a millisecond
+/// workload's denial through the real chain -- strace tracing a `run --confine-self` shim that
+/// enforces with real Landlock -- and writes the proposal. Skips (loudly) where the host cannot
+/// carry the chain: no Landlock, or no strace.
+#[cfg(target_os = "linux")]
+#[test]
+fn learn_captures_a_denial_through_the_ptrace_feed() {
+    if formwork_detect::detect().landlock_abi.is_none() {
+        eprintln!("skip: no Landlock on this kernel (nothing enforces, so nothing denies)");
+        return;
+    }
+    let dir = Scratch::new("learn-ptrace");
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let denied = root.join("denied.txt");
+    std::fs::write(&denied, "nope\n").unwrap();
+    // Broad reads minus the subtract hole: the toolchain loads (execve's kernel-internal open of
+    // the workload binary needs a Landlock ReadFile grant), exactly one path denies. `reads` must
+    // be explicit: on Linux, ambient-minus-subtract does not self-grant `/**` the way macOS
+    // `(allow default)` does -- the same shape the net-egress E2E uses.
+    std::fs::write(
+        root.join("bp.toml"),
+        format!(
+            "net = \"deny\"\n[fs]\nread-mode = \"ambient-minus-subtract\"\nreads = [\"/**\"]\n\
+             subtract = [\"{}\"]\n",
+            denied.display()
+        ),
+    )
+    .unwrap();
+
+    let out = formwork(
+        &root,
+        &root,
+        &[
+            "learn",
+            "--blueprint",
+            "bp.toml",
+            "--",
+            "/bin/cat",
+            denied.to_str().unwrap(),
         ],
     );
-    assert_ne!(out.code, 0);
-    assert!(out.stderr.contains("denial feed"), "{}", out.stderr);
-    assert!(out.stderr.contains("--observe-anyway"), "{}", out.stderr);
-    assert!(!marker.exists(), "the workload must not have run");
+    if out.stderr.contains("no `strace` is on PATH") {
+        eprintln!("skip: strace not installed on this host");
+        return;
+    }
+    assert_ne!(
+        out.code, 0,
+        "cat of the subtracted file failing IS the scenario: {}",
+        out.stderr
+    );
+    let proposal = root.join("bp.toml.proposal.toml");
+    assert!(proposal.exists(), "no proposal written:\n{}", out.stderr);
+    let text = std::fs::read_to_string(&proposal).unwrap();
+    assert!(
+        text.contains(denied.to_str().unwrap()),
+        "the denied read must be a candidate:\n{text}\n{}",
+        out.stderr
+    );
+    assert!(out.stdout.contains("proposal:"), "{}", out.stdout);
 }

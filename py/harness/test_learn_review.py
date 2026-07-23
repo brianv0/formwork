@@ -5,6 +5,7 @@ an attacker could fabricate one -- it is untrusted input, which is exactly why a
 the floor (FW-INV8)."""
 
 import json
+import shutil
 import sys
 
 import pytest
@@ -147,10 +148,12 @@ def test_accept_through_a_symlinked_blueprint_reaches_the_next_run(tmp_path, cli
 
 
 @pytest.mark.fw_e2e("FW-E2E-062")
-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS has a wired denial feed")
+@pytest.mark.skipif(sys.platform == "darwin", reason="macOS's feed needs no userspace tool")
 def test_learn_without_a_denial_feed_fails_before_the_workload(review, tmp_path):
+    # The Linux feed requires `strace` on PATH (FW-E2E-071), so an empty PATH makes the feed
+    # reliably unavailable whatever the kernel carries; no Landlock is the other unavailable arm.
     marker = tmp_path / "ran"
-    result = review("--", "/bin/touch", str(marker))
+    result = review("--", "/bin/touch", str(marker), extra_env={"PATH": ""})
     assert result.code != 0
     assert "denial feed" in result.stderr, result.stderr
     assert "--observe-anyway" in result.stderr, result.stderr
@@ -160,7 +163,7 @@ def test_learn_without_a_denial_feed_fails_before_the_workload(review, tmp_path)
 
 
 @pytest.mark.fw_e2e("FW-E2E-062")
-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS has a wired denial feed")
+@pytest.mark.skipif(sys.platform == "darwin", reason="macOS's feed needs no userspace tool")
 def test_observe_anyway_runs_enforced_but_writes_no_proposal(cli, tmp_path):
     detect = cli("detect")
     if json.loads(detect.stdout).get("landlock-abi") is None:
@@ -170,10 +173,27 @@ def test_observe_anyway_runs_enforced_but_writes_no_proposal(cli, tmp_path):
         'net = "deny"\n[fs]\nread-mode = "closed"\n'
         f'reads = ["/usr/**", "/bin/**", "/lib/**", "/lib64/**"]\n'
     )
+    # PATH emptied so the feed is genuinely absent: with one available, --observe-anyway is
+    # refused instead (it would silently change nothing -- FW-DISC11).
     result = cli(
         "learn", "--blueprint", blueprint, "--observe-anyway", "--", "/bin/true",
-        cwd=tmp_path, env={"HOME": str(tmp_path)},
+        cwd=tmp_path, env={"HOME": str(tmp_path), "PATH": ""},
     )
     assert result.code == 0, result.stderr
     assert "no denial feed" in result.stderr, result.stderr
     assert not (tmp_path / "bp.toml.proposal.toml").exists(), "no proposal may be pretended"
+
+
+@pytest.mark.fw_e2e("FW-E2E-062")
+def test_observe_anyway_is_refused_where_a_feed_exists(review, cli):
+    """With a working feed, --observe-anyway would silently change nothing: refused, never
+    silently dropped (FW-DISC11)."""
+    if sys.platform != "darwin":
+        if shutil.which("strace") is None:
+            pytest.skip("no feed on this host (Linux without strace)")
+        if json.loads(cli("detect").stdout).get("landlock-abi") is None:
+            pytest.skip("no feed on this host (no Landlock, so nothing is enforced or denied)")
+    result = review("--observe-anyway", "--", "/bin/true")
+    assert result.code != 0
+    assert "--observe-anyway" in result.stderr, result.stderr
+    assert "this host has one" in result.stderr, result.stderr
