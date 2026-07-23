@@ -32,9 +32,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use blueprint_load::ResolvedBlueprint;
-use formwork_blueprint::{
-    Blueprint, BlueprintLayer, McpPolicy, NetPosture, PathPattern, ResolvedCatalog,
-};
+use formwork_blueprint::{Blueprint, BlueprintLayer, NetPosture, PathPattern, ResolvedCatalog};
 use formwork_compile::compile;
 use formwork_detect::{detect, HostProfile};
 
@@ -1090,34 +1088,9 @@ fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Resul
     apply_env(&mut backend, &session.blueprint, &session.catalog);
 
     tracing::info!(server = %server, backend = %program, "starting MCP gateway");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("building async runtime")?;
-    runtime.block_on(proxy(backend, policy))
-}
-
-async fn proxy(backend: Command, policy: McpPolicy) -> Result<()> {
-    use std::process::Stdio;
-
-    let mut backend = tokio::process::Command::from(backend);
-    backend.stdin(Stdio::piped()).stdout(Stdio::piped());
-    let mut child = backend.spawn().context("spawning confined backend")?;
-    let backend_read = child.stdout.take().expect("stdout is piped");
-    let backend_write = child.stdin.take().expect("stdin is piped");
-
-    formwork_gateway::Gateway::new(policy)
-        .run(
-            tokio::io::stdin(),
-            tokio::io::stdout(),
-            backend_read,
-            backend_write,
-        )
-        .await
-        .context("proxying MCP traffic")?;
-    let status = child.wait().await.context("awaiting confined backend")?;
-    tracing::info!(exit_code = ?status.code(), "confined MCP backend exited");
-    Ok(())
+    // The async runtime lives entirely in `formwork-gateway` (constitution Layers): the CLI stays
+    // synchronous and hands the confined backend over as a plain command.
+    formwork_gateway::serve_stdio(backend, policy).context("proxying MCP traffic")
 }
 
 #[cfg(unix)]
