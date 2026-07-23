@@ -12,8 +12,9 @@ alias), `synthesize_blueprint`, and the `floor_only_permissive` Blueprint constr
 confinement exercised only through the pure compiler and tests. The **deviating** parts — a run
 without a full wall — stay unlanded (§6). New identifiers are draft numbering (written as inline code, which the
 requirements canary skips) until they are anchored on landing; the draft test IDs are renumbered to
-sit above the highest landed number (`FW-E2E-069` today) so no landed or drafted number collides —
-see §4 and §6 (they moved off `FW-E2E-065`..067 once PR #19 landed the MCP-shading tests there).
+sit above the highest landed number (`FW-E2E-071` today) so no landed or drafted number collides —
+see §4 and §6 (they are now `FW-E2E-072`..074, having been bumped off `065`..067 and then `070`..071
+as PRs #19 and #22 landed tests at those numbers).
 
 ---
 
@@ -119,7 +120,10 @@ Growth requires it: "the Phase-2 Landlock crates stay unwired until a real kerne
 unverifiable Linux observer would be the same violation, and Linux enforcement itself is still a stub
 here. So v1 is **macOS** (Seatbelt is real and end-to-end verifiable — record→enforce round-trips on
 the same host). Linux reports `trace-feed: none` and `learn --permissive` **fails loud, writing
-nothing** ([FW-INV6](formwork.md#fw-inv6)), exactly as `learn`-on-Linux fails fast today. When Linux
+nothing** ([FW-INV6](formwork.md#fw-inv6)) — the surface fail-fast the CLI owes any host missing a
+feed ([FW-XR9](formwork.md#fw-xr9)). Note this is the *open*-feed gap, separate from the denial feed
+plain `learn` now taps on Linux via ptrace ([FW-E2E-071](formwork.md#fw-e2e-071)): recording needs
+every open, which ptrace-of-denials does not give. When Linux
 lands, `fanotify` (`FAN_OPEN` + `FAN_REPORT_DFID_NAME`, PID-subtree filtered) is the intended feed,
 and it **extends `formwork-confine`** rather than adding a crate (Growth's hardest *no* is on deps).
 
@@ -175,21 +179,23 @@ Invariant:
   [FW-CRED](formwork.md#fw-cred1)-matched location. The recording-mode strengthening of
   [FW-INV8](formwork.md#fw-inv8), tested to falsify.
 
-Tests (draft, above the landed spec's `FW-E2E-069`). These were originally drafted as
-`FW-E2E-065`..067, but PR #19 landed the MCP-pattern-shading tests at exactly those numbers
-(`FW-E2E-065`..067, [FW-GW9](formwork.md#fw-gw9)); per the constitution (Requirements & identifiers:
-"never renumbered, never reused") the collision is resolved by renumbering the *unlanded* draft up
-past the highest landed number, never the landed spec:
+Tests (draft, above the highest landed number — `FW-E2E-071` today). These draft numbers chase the
+landed spec: first drafted as `FW-E2E-065`..067, then bumped to `070`..072 once PR #19 landed the
+MCP-shading tests at `065`..067, and now `072`..074 because PR #22 landed the discovery-trust and
+Linux-ptrace tests at `FW-E2E-070`/`071`. Per the constitution (Requirements & identifiers: "never
+renumbered, never reused") each collision is resolved by renumbering the *unlanded* draft up past the
+highest landed number, never the landed spec — the numbers finalize into a reserved block only at
+adoption:
 
-- `FW-E2E-070` **Recording round-trip (macOS).** Spawn a workload under the floor-only permissive
+- `FW-E2E-072` **Recording round-trip (macOS).** Spawn a workload under the floor-only permissive
   policy; the opens it makes are observed and synthesized into a Blueprint; re-enforcing that
   Blueprint runs the same workload clean, while a path it never touched is denied. Paired allow/deny
   against real Seatbelt ([FW-INV5](formwork.md#fw-inv5), like [FW-E2E-024](formwork.md#fw-e2e-024)).
-- `FW-E2E-071` **Recording floor (`FW-INV12`).** A workload that reads a credential during a
+- `FW-E2E-073` **Recording floor (`FW-INV12`).** A workload that reads a credential during a
   permissive recording is denied at the kernel, and that credential is absent from both the proposal
   and any synthesized Blueprint. (The recording-mode analogue of
   [FW-E2E-051](formwork.md#fw-e2e-051)'s floor property.)
-- `FW-E2E-072` **No-feed fail-loud.** On a host reporting `trace-feed: none` (Linux today),
+- `FW-E2E-074` **No-feed fail-loud.** On a host reporting `trace-feed: none` (Linux today),
   `learn --permissive` fails loud and writes nothing ([FW-INV6](formwork.md#fw-inv6)); no empty or
   partial Blueprint is emitted.
 
@@ -230,11 +236,11 @@ explicitly narrower sibling of the main threat model, with its two structural mi
 
 | Requirement | Primary test | Also |
 |---|---|---|
-| `FW-DISC7` Permissive recording | `FW-E2E-070` | `FW-E2E-072` |
-| `FW-DISC8` Floor-enforced recording | `FW-E2E-071` | `FW-INV12` |
-| `FW-DISC9` Open-feed honesty | `FW-E2E-072` | `FW-E2E-070` |
-| `FW-DISC10` Blueprint synthesis/freeze | `FW-E2E-070` | — |
-| `FW-INV12` Recording floor | `FW-E2E-071` | `FW-ADV`-class, TBD |
+| `FW-DISC7` Permissive recording | `FW-E2E-072` | `FW-E2E-074` |
+| `FW-DISC8` Floor-enforced recording | `FW-E2E-073` | `FW-INV12` |
+| `FW-DISC9` Open-feed honesty | `FW-E2E-074` | `FW-E2E-072` |
+| `FW-DISC10` Blueprint synthesis/freeze | `FW-E2E-072` | — |
+| `FW-INV12` Recording floor | `FW-E2E-073` | `FW-ADV`-class, TBD |
 
 ## 6. Decisions (recorded per constitution Precedence & Conflicts)
 
@@ -261,13 +267,15 @@ explicitly narrower sibling of the main threat model, with its two structural mi
   permissive policy (§2.2); the feed tap is a CLI responsibility by existing precedent (§2.6).
 - **macOS-first is required, not merely pragmatic.** Growth forbids shipping an unverifiable Linux
   observer; Linux is an honest `trace-feed: none` gap until `fanotify` can be verified end-to-end.
-- **Number renumbering.** Draft test IDs sit above the highest landed number. They were first drafted
-  as `FW-E2E-065`..067 (above PR #18's `FW-E2E-062`..064), but PR #19 then landed the MCP-pattern
-  tests at `FW-E2E-065`..067 and the gateway compile tests through `FW-E2E-069`. The collision is
-  resolved by renumbering the *unlanded* draft up to `FW-E2E-070`..072, never the landed spec
-  (Requirements & identifiers: "never renumbered, never reused"; precedent: FEP-2,
-  `docs/fep2-plan.md` §0). The draft requirement IDs (`FW-DISC7`..10 above the landed `FW-DISC6`,
-  `FW-INV12` above the landed `FW-INV11`) do not collide.
+- **Number renumbering.** Draft test IDs sit above the highest landed number and are bumped whenever a
+  merge lands new tests below them: `FW-E2E-065`..067 (above PR #18's `FW-E2E-062`..064) → `070`..072
+  after PR #19 landed the MCP-pattern tests at `065`..067 → `072`..074 after PR #22 landed the
+  discovery-trust and Linux-ptrace tests at `FW-E2E-070`/`071`. Each collision is resolved by
+  renumbering the *unlanded* draft, never the landed spec (Requirements & identifiers: "never
+  renumbered, never reused"; precedent: FEP-2, `docs/fep2-plan.md` §0); the block finalizes at
+  adoption. The draft requirement IDs do not collide and are stable — the landed spec even reserves
+  them (`FW-DISC7`..10 above the landed `FW-DISC6`/`FW-DISC11`, per the note on
+  [FW-DISC11](formwork.md#fw-disc11); `FW-INV12` above the landed `FW-INV11`).
 
 ## 7. Open questions (a spike decides, before any mechanism code)
 
