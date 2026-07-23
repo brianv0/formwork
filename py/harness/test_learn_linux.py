@@ -36,8 +36,11 @@ def test_millisecond_workload_denial_is_captured(ptrace_feed, cli, tmp_path):
     denied = tmp_path / "denied.txt"
     denied.write_text("nope\n")
     blueprint = tmp_path / "bp.toml"
+    # `reads = ["/**"]` is explicit: on Linux, ambient-minus-subtract does not self-grant the
+    # universe the way macOS `(allow default)` does, and execve's kernel-internal open of the
+    # workload binary needs a ReadFile grant.
     blueprint.write_text(
-        'net = "deny"\n[fs]\nread-mode = "ambient-minus-subtract"\n'
+        'net = "deny"\n[fs]\nread-mode = "ambient-minus-subtract"\nreads = ["/**"]\n'
         f'subtract = ["{denied}"]\n'
     )
 
@@ -68,7 +71,7 @@ def test_credential_denial_is_withheld_not_proposed(ptrace_feed, cli, tmp_path):
     plain.write_text("data\n")
     blueprint = tmp_path / "bp.toml"
     blueprint.write_text(
-        'net = "deny"\n[fs]\nread-mode = "ambient-minus-subtract"\n'
+        'net = "deny"\n[fs]\nread-mode = "ambient-minus-subtract"\nreads = ["/**"]\n'
         f'subtract = ["{plain}"]\n'
     )
 
