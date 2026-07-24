@@ -115,6 +115,6 @@ Where each level runs (be honest about it):
 ## Open questions
 
 - **Case-insensitive / inline flags.** The engine supports `(?i)`; we neither block nor document it
-  yet. If it proves a footgun on case-sensitive tool names we may pin flags off.
+  yet. If it proves error-prone on case-sensitive tool names we may pin flags off.
 - **Resource URI patterns.** Regex over a `uri`/`uriTemplate` works today but is unexercised beyond
   unit level; a real resource-heavy server would be the next integration target.

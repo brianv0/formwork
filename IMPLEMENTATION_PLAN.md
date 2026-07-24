@@ -335,7 +335,7 @@ reproduced by `formwork detect + compile` on each CI target.**
 
 ## 7. Resolved-here open questions (from §11)
 
-- **fd-minting default:** pre-open at spawn; on-demand `SCM_RIGHTS` as escape hatch (3.4).
+- **fd-minting default:** pre-open at spawn; on-demand `SCM_RIGHTS` as fallback (3.4).
 - **Exec restriction in v1:** ships enabled-optional in Phase 7 (cheap once confiners exist).
 - **Sensitive-set discovery:** superseded by FEP-2's typed credential catalog
   (`profiles/credential-catalog.toml`, embedded; [FW-CRED1](formwork.md#fw-cred1)) plus the generic backstop,

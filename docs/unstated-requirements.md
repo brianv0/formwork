@@ -156,7 +156,7 @@ platform-marked test that has never run on its platform is reported, not assumed
 observe → list → accept → next-run loop from one command's `--help`, and never needs to know
 that `<blueprint>.proposal.toml` / `.discovered.toml` exist or where they live (they surface in
 *output* as provenance, not as required *input* knowledge). Derived-path flags (`--proposal`)
-are escape hatches, not the paved road.
+are fallbacks, not the paved road.
 
 **Mint?** DISC family candidate, one sentence: "the discovery loop is drivable end-to-end
 without naming its artifact files."

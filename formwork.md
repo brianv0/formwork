@@ -8,13 +8,13 @@ Formwork is standalone. It takes a capability blueprint and produces an enforced
 
 ## 1. Design philosophy: good isolation, maximal reuse
 
-The load-bearing decision in this design is that Formwork targets **good isolation, not perfect isolation**. This is a deliberate scoping choice, not a limitation to be apologized for, and it drives most of the requirements below.
+The load-bearing decision in this design is that Formwork targets **good isolation, not perfect isolation** — a scoping choice that drives most of the requirements below.
 
 The goal is a boundary that reliably contains an agent — and code the agent runs, and MCP servers it fronts — from casually or accidentally reading, writing, or exfiltrating things outside its lane, including when the agent is driven by a prompt-injected or otherwise adversarial instruction stream. The goal is **not** to withstand an adversary writing kernel exploits against Landlock or Seatbelt. Formwork raises the bar a great deal and fails closed on egress; it does not claim to be an airtight security boundary against local privilege escalation or a kernel zero-day. Section 3 states this threat model precisely, and every enforcement claim in this document is scoped to it.
 
-The second half of the philosophy is **transparency and reuse**. Formwork is not a minimal-from-empty jail that the agent must have a bespoke image built for. It starts from the real, ambient environment — the host's interpreters, toolchains, shared libraries, and language package caches — and *subtracts* a sensitive set (credentials, keys, other projects, browser profiles). The confined agent should be able to run `pytest`, `npm test`, `git`, and a normal build against the environment that is already there, with zero denials on the common path. Isolation the agent constantly trips over is isolation that gets turned off. Formwork earns its keep by being nearly invisible to well-behaved work while remaining a hard wall around the sensitive set and all network egress.
+The second half of the philosophy is **transparency and reuse**. Formwork is not a minimal-from-empty jail that the agent must have a bespoke image built for. It starts from the real, ambient environment — the host's interpreters, toolchains, shared libraries, and language package caches — and *subtracts* a sensitive set (credentials, keys, other projects, browser profiles). The confined agent should be able to run `pytest`, `npm test`, `git`, and a normal build against the environment that is already there, with zero denials in the common case. Isolation the agent constantly trips over is isolation that gets turned off. Formwork earns its keep by being nearly invisible to well-behaved work while remaining a hard wall around the sensitive set and all network egress.
 
-These two halves are in tension, and the resolution is the third principle: **honesty**. Formwork always reports what it actually enforces on the current platform and kernel, and never silently claims containment it cannot deliver. A caller that needs a stronger guarantee than the current host can provide learns that from the fidelity report rather than discovering it in an incident.
+These two halves are in tension, and the resolution is the third principle: **honesty**. Formwork always reports what it enforces on the current platform and kernel, and never silently claims containment it cannot deliver. A caller that needs a stronger guarantee than the current host can provide learns that from the fidelity report rather than discovering it in an incident.
 
 ## 2. Architecture overview
 
@@ -140,7 +140,7 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 
 | Req | Requirement |
 |---|---|
-| <a id="fw-xr1"></a>**FW-XR1** Fidelity honesty | Every enforcement Formwork claims is backed by a real mechanism on the current host, or is reported as Partial/Unenforceable. `enforce()` never silently downgrades a claim made by `compile()`. |
+| <a id="fw-xr1"></a>**FW-XR1** Fidelity honesty | Every enforcement Formwork claims is backed by a mechanism on the current host, or is reported as Partial/Unenforceable. `enforce()` never silently downgrades a claim made by `compile()`. |
 | <a id="fw-xr2"></a>**FW-XR2** Good-not-perfect boundary | Formwork is a containment boundary against accidental, careless, and prompt-injected overreach and against untrusted code the agent runs — not against kernel/LSM exploitation. Every guarantee in this document is scoped to section 3. |
 | <a id="fw-xr3"></a>**FW-XR3** Fail-closed egress | Absent a working confiner, network defaults to full deny. The agent reaches the world only through the gateway fd. No configuration and no capability-detection failure produces silent open egress. |
 | <a id="fw-xr4"></a>**FW-XR4** Descendant inheritance | Confinement applies to the confined process and every descendant. A child cannot shed, relax, or widen it. |
@@ -199,7 +199,7 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 | Req | Requirement |
 |---|---|
 | <a id="fw-tra1"></a>**FW-TRA1** Ambient reuse | The confined process reuses host interpreters, toolchains, shared libraries, and language package caches, read-only by default. |
-| <a id="fw-tra2"></a>**FW-TRA2** Toolchains run clean | Under the default profile, common toolchains (python/pytest, node/npm, git, a C build) run unmodified with zero denials on the happy path. |
+| <a id="fw-tra2"></a>**FW-TRA2** Toolchains run clean | Under the default profile, common toolchains (python/pytest, node/npm, git, a C build) run unmodified with zero denials in the common case. |
 | <a id="fw-tra3"></a>**FW-TRA3** Sensitive-set subtraction | Credentials, SSH/cloud config, keychains, other projects, and browser profiles are denied/hidden by default even under broad grants. *(Superseded and expanded by the typed credential catalog — §5.9, [FW-CRED1](#fw-cred1)..9 — which adds the env-var arm and exclude-by-type.)* |
 | <a id="fw-tra4"></a>**FW-TRA4** Graceful denial | Denials surface as standard errno, never as sandbox-specific crashes; a tool probing an optional ungranted path continues rather than aborting. |
 | <a id="fw-tra5"></a>**FW-TRA5** Writable working set | The project directory, a scratch/tmp area, and (optionally) build caches are writable, so the agent can do real work and persist within scope. |
@@ -254,14 +254,14 @@ A versioned, typed catalog of credential **locations only** — dotfiles, well-k
 | <a id="fw-cred3"></a>**FW-CRED3** Env-points-to-file types | A type may carry both an env var and the file it references (e.g. `GOOGLE_APPLICATION_CREDENTIALS`). Excluding the type strips the variable **and** denies the referenced file. |
 | <a id="fw-cred4"></a>**FW-CRED4** Deny-superset by default | The whole known catalog is blocked/stripped by default (fail-closed); exclusion is opt-in per type ([FW-CRED5](#fw-cred5)). Coverage of uncatalogued secrets is [FW-CRED6](#fw-cred6)'s job. |
 | <a id="fw-cred5"></a>**FW-CRED5** Exclude-by-type is un-blocking | `allow-credentials: [aws]` (CLI `--allow-cred aws`) deliberately and visibly lets one type through; nothing adjacent is affected. This is the knob for when the agent genuinely needs a credential. |
-| <a id="fw-cred6"></a>**FW-CRED6** Generic backstop | Beyond curated types, a generic rule denies known-sensitive *shapes* — files literally named like credentials or SSH private keys — at any depth, anywhere. A catch-all is location-independent by nature: it must reach the containers, CI runners, and project trees where uncatalogued secrets actually live, not just `$HOME`, and it stays denied even under a broad grant. Liftable only as the whole named pseudo-type `backstop`. |
+| <a id="fw-cred6"></a>**FW-CRED6** Generic backstop | Beyond curated types, a generic rule denies known-sensitive *shapes* — files literally named like credentials or SSH private keys — at any depth, anywhere. A catch-all is location-independent by nature: it must reach the containers, CI runners, and project trees where uncatalogued secrets live, not just `$HOME`, and it stays denied even under a broad grant. Liftable only as the whole named pseudo-type `backstop`. |
 | <a id="fw-cred7"></a>**FW-CRED7** Operator/agent channel split | The operator sees itemized "denied/stripped X (type: …)". The confined agent sees a plain EACCES / an absent variable with no catalog annotation — no oracle. |
 | <a id="fw-cred8"></a>**FW-CRED8** Report names the mechanism | The FidelityReport marks each covered type `enforced-via-launcher` (env) or `enforced-via-OS-sandbox` (path), and states plainly that env-shading holds only while Formwork is the launching process — the guarantee is launcher-contingent, and the report must not overclaim it as independent of the launcher. |
 | <a id="fw-cred9"></a>**FW-CRED9** Floor enforceability is honest per platform | Any-depth floor rows — the `**/…` form, its anchored refinement `<prefix>/**/<suffix>`, and the generic backstop ([FW-CRED6](#fw-cred6)) — are enforceable as a Seatbelt regex (start-pinned for the anchored form, floating for the plain `**/…`) but cannot be rooted by Landlock. Where a floor row is unenforceable on the host it is withheld from the compiled deny set and the affected types (and the backstop) are reported **Partial**, never silently claimed `Enforced` ([FW-INV5](#fw-inv5)). |
 
 ### 5.10 Discovery (FW-DISC)
 
-Discovery observes what a confined workload actually tries to touch and turns denials into candidate grants, so you start tight and let real behavior write the Blueprint — the single most valuable ergonomic feature for the reuse goal, and the one with the sharpest tradeoff, because auto-granting an agent's *attempts* is a confused-deputy machine. Two properties resolve it. First, the default posture is **observe-then-widen**, never live prompting: a marked learning run records denials without granting them, produces a reviewable proposal, and the accepted result applies to *subsequent* runs — the human decision stays out of the hot path, and no syscall interception is needed on either platform. Second, and load-bearing: **the credential catalog is the floor discovery cannot erode** ([FW-DISC3](#fw-disc3)/[FW-INV8](#fw-inv8)).
+Discovery observes what a confined workload tries to touch and turns denials into candidate grants, so you start tight and let observed behavior write the Blueprint. Auto-granting an agent's *attempts* is a confused-deputy machine, and two properties resolve it. First, the default posture is **observe-then-widen**, never live prompting: a marked learning run records denials without granting them, produces a reviewable proposal, and the accepted result applies to *subsequent* runs — the human decision stays out of the hot path, and no syscall interception is needed on either platform. Second, and load-bearing: **the credential catalog is the floor discovery cannot erode** ([FW-DISC3](#fw-disc3)/[FW-INV8](#fw-inv8)).
 
 | Req | Requirement |
 |---|---|
@@ -271,7 +271,7 @@ Discovery observes what a confined workload actually tries to touch and turns de
 | <a id="fw-disc4"></a>**FW-DISC4** Auto-widen zone | An operator-authored scope in the Blueprint within which discovered grants may be auto-accepted (e.g. project dir, language caches). Outside the zone, review is required. Empty by default — nothing self-grants out of the box. |
 | <a id="fw-disc5"></a>**FW-DISC5** Review as itemized diff | Proposals surface on the operator channel as a diff showing what widens and what was withheld and why. Acceptance is per-entry. |
 | <a id="fw-disc6"></a>**FW-DISC6** Provenance | An accepted discovered grant is recorded with provenance (added-via-discovery, run id), so audit distinguishes authored from learned grants. |
-| <a id="fw-disc11"></a>**FW-DISC11** Loop drivability | The discovery loop — observe, list, accept, next run — is drivable end-to-end from the `learn` surface without the user naming its artifact files: `<blueprint>.proposal.toml` and `<blueprint>.discovered.toml` are implementation conventions that surface in *output* as provenance, never as required *input* knowledge. Derived-path flags (`--proposal`) are escape hatches, not the paved road, and a flag a mode would ignore is refused, never silently dropped ([FW-INV6](#fw-inv6) at the CLI surface). *(`FW-DISC7`–`FW-DISC10` are reserved by the in-flight FEP-4 draft and are not landed numbers.)* |
+| <a id="fw-disc11"></a>**FW-DISC11** Loop drivability | The discovery loop — observe, list, accept, next run — is drivable end-to-end from the `learn` surface without the user naming its artifact files: `<blueprint>.proposal.toml` and `<blueprint>.discovered.toml` are implementation conventions that surface in *output* as provenance, never as required *input* knowledge. Derived-path flags (`--proposal`) are fallbacks, not the paved road, and a flag a mode would ignore is refused, never silently dropped ([FW-INV6](#fw-inv6) at the CLI surface). *(`FW-DISC7`–`FW-DISC10` are reserved by the in-flight FEP-4 draft and are not landed numbers.)* |
 
 "Formwork never runs a real workload in a grant-whatever-is-attempted mode" is not a separate requirement — it is the combined consequence of [FW-DISC1](#fw-disc1) and [FW-DISC4](#fw-disc4), stated as a guarantee in [FW-INV10](#fw-inv10). Sticky learning within a trust boundary is the recommended workflow: accumulate proposals across runs, auto-accept only inside the operator-drawn zone, review everything else — discovery does the tedious enumeration; the human keeps the perimeter.
 
@@ -287,7 +287,7 @@ These hold for every session under every backend, and are the properties the tes
 
 <a id="fw-inv4"></a>**FW-INV4 — Shading completeness.** No ungranted tool, resource, or prompt is invocable, whether or not it appears in any listing. Fuzzed over guessed names and out-of-band identifiers.
 
-<a id="fw-inv5"></a>**FW-INV5 — Report soundness.** Anything reported `Enforced` is actually enforced, verified by paired allow/deny probes; anything the platform cannot enforce is reported, not claimed. This is the load-bearing invariant — it is what makes "good, not perfect" honest rather than hand-wavy.
+<a id="fw-inv5"></a>**FW-INV5 — Report soundness.** Anything reported `Enforced` is enforced, verified by paired allow/deny probes; anything the platform cannot enforce is reported, not claimed.
 
 <a id="fw-inv6"></a>**FW-INV6 — No silent open.** No capability-detection failure yields a running-but-unconfined session without an explicit, surfaced `Unenforceable`. Formwork fails closed or fails loud, never fails open-silent.
 
@@ -373,7 +373,7 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-020"></a>**FW-E2E-020: pytest reuse, zero denials.** A real Python repository with installed dependencies and a populated cache is present on the host. Under the default profile with the project writable and the interpreter/site-packages/cache read-only, the session runs `pytest`. Pass: the suite runs to its normal result with no sandbox-induced denials in the run log. Fail: any denial forces a test error that would not occur outside the sandbox.
 
-<a id="fw-e2e-021"></a>**FW-E2E-021: node/npm reuse.** The session runs `npm test` (or a node script) against host `node_modules` and the npm cache, read-only. Pass: the script runs as it would unsandboxed, modulo network, with no denials on the happy path. Fail: a denial breaks an otherwise-passing run.
+<a id="fw-e2e-021"></a>**FW-E2E-021: node/npm reuse.** The session runs `npm test` (or a node script) against host `node_modules` and the npm cache, read-only. Pass: the script runs as it would unsandboxed, modulo network, with no denials in the common case. Fail: a denial breaks an otherwise-passing run.
 
 <a id="fw-e2e-022"></a>**FW-E2E-022: git works; push gated.** The session runs `git status`, `git diff`, and `git commit` within the project (succeed) and `git push` (network). Pass: local git operations succeed within scope; `git push` is blocked unless routed through the gateway. Fail: local git is broken by confinement, or push egresses directly.
 
@@ -494,7 +494,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 - Exec restriction: Landlock `FS_EXECUTE` on allowed paths, or seccomp on `execve`. Optional ([FW-ISO4](#fw-iso4)).
 - Net default-deny: no Landlock net grants; deny is the absence of grant plus scope flags.
 - Net port allowlist: Landlock `ACCESS_NET_CONNECT_TCP` (ABI v4+, port-only, no host filtering). Reported Unenforceable below v4.
-- Cross-domain socket scoping: `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` and the pathname-socket scope are recent and coarse (they block sockets created outside the domain by parent/child relationship, not per-path allowlisting). Formwork uses them where present for [FW-ADV-006](#fw-adv-006) and reports the gap otherwise — and, critically, does **not** rely on them for the transport (that is the injected fd, [FW-XR7](#fw-xr7)).
+- Cross-domain socket scoping: `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` and the pathname-socket scope are recent and coarse (they block sockets created outside the domain by parent/child relationship, not per-path allowlisting). Formwork uses them where present for [FW-ADV-006](#fw-adv-006) and reports the gap otherwise — and does **not** rely on them for the transport (that is the injected fd, [FW-XR7](#fw-xr7)).
 - Anti-shedding: `NO_NEW_PRIVS` + seccomp baseline ([FW-ISO8](#fw-iso8)).
 
 **macOS — Seatbelt (SBPL via `sandbox_init`).**
@@ -614,7 +614,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 
 **Exec restriction in v1.** [FW-ISO4](#fw-iso4) is off by default and nearly free to implement. Whether it ships enabled-optional in v1 or is deferred is a scope call; confining fs + net already contains most of what a rogue exec could do.
 
-**fd-minting default.** Whether the default is pre-open-all-known-fds at spawn (simple, requires the connection set to be known up front) or a control-fd with on-demand `SCM_RIGHTS` minting (general, slightly more machinery). Likely pre-open as default with on-demand as the escape hatch.
+**fd-minting default.** Whether the default is pre-open-all-known-fds at spawn (simple, requires the connection set to be known up front) or a control-fd with on-demand `SCM_RIGHTS` minting (general, slightly more machinery). Likely pre-open as default with on-demand as the fallback.
 
 **Credential brokering.** Excluding a type ([FW-CRED5](#fw-cred5)) exposes the file/var to the agent. The stronger alternative — the gateway brokers the credential's *use* without the agent ever seeing the bytes — fits the single-privileged-broker shape but presupposes TLS termination and a secret-handling path through the broker. Deferred to a later FEP. *(The older sensitive-set-discovery question — auto-detect vs configure the subtracted set — was resolved by the typed catalog + backstop, §5.9, deny-the-superset by default, and observe-then-widen discovery, §5.10.)*
 
