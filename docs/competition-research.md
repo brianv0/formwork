@@ -172,7 +172,7 @@ nothing to build that UX on.
    `working_directory`) and Codex's CVE-2025-59532 (model-supplied cwd became the
    writable root) exploited. Our canonicalize-then-compile-from-declared-paths
    design structurally avoids the "model input flows into policy synthesis" bug class.
-5. **No self-escape hatch.** The Ona writeup and `sandbox-runtime` issue #97
+5. **No self-escape path.** The Ona writeup and `sandbox-runtime` issue #97
    document Claude Code auto-retrying with `dangerouslyDisableSandbox` — the agent
    reasons its way out. Formwork-the-enforcer has no such path; escalation is the
    embedder's problem by design.

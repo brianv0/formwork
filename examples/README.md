@@ -16,7 +16,7 @@ opencode's `permission: "allow"` / `--auto`. Those modes are dangerous precisely
 thing standing between the model and your filesystem/network is the agent's own in-app confirmation.
 
 Axis A moves the wall down to the kernel. Once reads, writes, exec, and egress are boundaries the OS
-enforces on the process, the in-app prompt is no longer load-bearing — so you can turn it off and let
+enforces on the process, the in-app prompt is no longer what protects you — so you can turn it off and let
 the agent run uninterrupted, while credentials, other projects, and the network stay unreachable.
 Each host's `sandbox-agent.sh` shows the exact invocation.
 

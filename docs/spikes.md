@@ -5,7 +5,7 @@ assumptions (plan §4, Phase 0). Each entry records the question, the finding, a
 amendment. macOS spikes run natively here. The Linux spikes (3 and 4) have since been implemented and
 kernel-verified (Docker, ABI-v6); their status notes below record what actually remains.
 
-## Spike 1 — Seatbelt vs. inherited connected fds (macOS) — **load-bearing for the fd seam**
+## Spike 1 — Seatbelt vs. inherited connected fds (macOS) — **essential to the fd seam**
 
 **Question.** Under an SBPL profile with `(deny network*)`, does read/write on an *already
 connected* inherited socket still work? The entire fd-seam design ([FW-XR7](../formwork.md#fw-xr7)) assumes yes: the gateway

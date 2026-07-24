@@ -3,7 +3,7 @@
 ## Axis A — let Formwork be the sandbox, then bypass codex's own
 
 codex has built-in `sandbox_mode` (`read-only` | `workspace-write` | `danger-full-access`) and
-`approval_policy` (`untrusted` | `on-request` | `never`). Its "just run everything" escape hatch is
+`approval_policy` (`untrusted` | `on-request` | `never`). Its "just run everything" bypass is
 `--dangerously-bypass-approvals-and-sandbox` (alias `--yolo`), which turns **both** off. On its own
 that leaves nothing scoping the process. Run codex under `formwork run` and Formwork's kernel wall
 takes over that job:

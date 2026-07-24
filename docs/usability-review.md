@@ -44,7 +44,7 @@ identically on both OSes but silently delivers nothing on one.
   enforcement is implemented and tested in Docker/Lima; `learn` is macOS-only.
 - **P2 — `learn` on Linux fails fast.** Move the "no denial feed" check *before* spawning
   the workload and make it an error (`bail!`) naming the reason and the alternative
-  (`run` + hand-authoring, or macOS). An `--observe-anyway` escape hatch can keep the
+  (`run` + hand-authoring, or macOS). An `--observe-anyway` fallback can keep the
   current run-enforced-anyway behavior for anyone who wants it. Running a whole workload
   and then announcing the observation half was impossible wastes the user's time.
 - **P3 (longer-term) — a Linux denial feed.** Landlock audit (kernel 6.15+) is the
@@ -98,7 +98,7 @@ formwork gateway  [--blueprint …] --server …   # MCP shading
 
 ### 3.1 `detect`
 
-Keep the capability, move the surface. `detect` is load-bearing for scripts (the justfile
+Keep the capability, move the surface. `detect` is essential for scripts (the justfile
 and the Docker/Lima harness gate test tiers on it) and for the capture-and-ship
 `detect > host.json` → `compile --host` flow, so it cannot simply become help text. But as
 a *top-level human door* it earns little.
@@ -135,7 +135,7 @@ the user must learn the artifact-file convention just to continue what `learn` s
   - `formwork learn --blueprint b.toml --list` — list pending candidates by number.
   - `formwork learn --blueprint b.toml --accept 1 --accept '~/foo/**'` / `--accept-all`
     — accept into the discovered layer (same floor re-check, FW-INV8).
-  - `--proposal` stays as an escape hatch for a proposal that moved.
+  - `--proposal` stays as a fallback for a proposal that moved.
   - `accept` remains a hidden alias for a release.
   - The trailing `-- cmd` and the review flags are mutually exclusive; clap can enforce
     that.
@@ -179,7 +179,7 @@ Every blueprint-taking subcommand currently requires `--blueprint`. Proposal:
   3. otherwise a loud error that teaches: name both options and show a minimal
      `FORMWORK.toml` (see P11).
 
-  **Transparency is the load-bearing half.** Auto-discovery must never be silent:
+  **Transparency is the essential half.** Auto-discovery must never be silent:
   - every command logs `blueprint: /path/FORMWORK.toml (auto-discovered)` vs `(from
     --blueprint)` at info;
   - `compile` and `explain` include the resolved path *and* how it was chosen in their

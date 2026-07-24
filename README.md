@@ -49,7 +49,7 @@ rules = ["readwrite:$CWD/**"]        # the project directory is the writable wor
 ```
 
 ```sh
-# Run your agent behind the kernel wall — its in-app permission prompts stop being load-bearing:
+# Run your agent behind the kernel wall — its in-app permission prompts stop being what protects you:
 formwork run -- claude --dangerously-skip-permissions
 
 # What does this host enforce, and what would this session's policy be?

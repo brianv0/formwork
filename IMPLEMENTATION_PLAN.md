@@ -6,7 +6,7 @@ to the design doc.
 
 ## 1. Language split
 
-**Rust** carries everything load-bearing: the blueprint types, the pure compiler, both confiners,
+**Rust** carries everything essential: the blueprint types, the pure compiler, both confiners,
 the fd seam, the gateway, and the CLI. Rationale: the confiner does `pre_exec`-window syscall
 work (fork-safety matters), the gateway is the single privileged broker (memory safety
 matters), and the compiler must be deterministic ([FW-FID4](formwork.md#fw-fid4)).
@@ -335,7 +335,7 @@ reproduced by `formwork detect + compile` on each CI target.**
 
 ## 7. Resolved-here open questions (from §11)
 
-- **fd-minting default:** pre-open at spawn; on-demand `SCM_RIGHTS` as escape hatch (3.4).
+- **fd-minting default:** pre-open at spawn; on-demand `SCM_RIGHTS` as fallback (3.4).
 - **Exec restriction in v1:** ships enabled-optional in Phase 7 (cheap once confiners exist).
 - **Sensitive-set discovery:** superseded by FEP-2's typed credential catalog
   (`profiles/credential-catalog.toml`, embedded; [FW-CRED1](formwork.md#fw-cred1)) plus the generic backstop,

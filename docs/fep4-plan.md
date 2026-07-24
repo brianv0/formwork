@@ -70,7 +70,7 @@ rebase on #18. No calendar commitment.
   location.
 - Tests `FW-E2E-072` (round-trip), `FW-E2E-073` (floor), `FW-E2E-074` (no-feed fail-loud).
 
-## 4. Design decisions (load-bearing; full rationale in `fep-4.md`)
+## 4. Design decisions (essential; full rationale in `fep-4.md`)
 
 - `learn --permissive`, not a new command (Growth; user constraint).
 - Recording is `spawn_confined` of a **floor-only permissive Blueprint**, not a new Posture.

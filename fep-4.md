@@ -44,8 +44,8 @@ deliberately narrower threat model than `learn`'s, and it must be stated:
 > that will confine *future, untrusted* runs. The wall protects the enforced run, not the recording
 > run. Recording is loud, opt-in, and never a default; it never presents itself as confinement.
 
-Two structural mitigations keep this defensible rather than a "grant-whatever-is-attempted" footgun
-(the mode `formwork.md` §5.10 exists to forbid):
+Two structural mitigations keep this defensible rather than a "grant-whatever-is-attempted" mode
+(the one `formwork.md` §5.10 exists to forbid):
 
 1. **The credential floor is enforced *during* the recording** (`FW-DISC8`/`FW-INV12`). The catalog
    ([FW-CRED4](formwork.md#fw-cred4)) compiles into a hard deny even in permissive mode, so a
@@ -59,7 +59,7 @@ Two structural mitigations keep this defensible rather than a "grant-whatever-is
 
 ## 2. Design
 
-The load-bearing decision is that permissive recording is **not a new concept** — it is a **second
+The central decision is that permissive recording is **not a new concept** — it is a **second
 observation source for discovery**, and it reuses the existing machinery almost entirely.
 
 ### 2.1 It folds into `learn` (no new top-level command)
@@ -224,7 +224,7 @@ explicit, loud choice to run without a wall in order to *produce* one. The §5.1
 run whose opens are observed to synthesize a Blueprint (`FW-DISC7`); distinct from **learn** (an
 *enforced* run plus denial observation). Both are surfaced under one command (`learn --permissive`).
 
-**(d) Constitution — Concepts / Data model.** Note that `HostProfile` gains a `trace-feed` field
+**(d) Constitution — Concepts / Data model.** `HostProfile` gains a `trace-feed` field
 (what the host can *observe*, beside what it can *enforce*), and that a frozen `*.blueprint.toml` is a
 machine-written discovery artifact of the existing Blueprint schema. Both are additive/expand-only
 and pre-release, so no version bump (precedent: FEP-3 "Adopted").
@@ -256,7 +256,7 @@ explicitly narrower sibling of the main threat model, with its two structural mi
   through the pure compiler and tests, citing only landed IDs. That core creates no unconfined run,
   so it opens no seam and triggers no exception; the constitution's "there are none at present" holds
   until the mechanism lands. The `learn --permissive` CLI, the feed tap, and the floor-only *spawn* —
-  the parts that actually run without a wall — remain gated on the spike (§7) and land together with
+  the parts that run without a wall — remain gated on the spike (§7) and land together with
   the §5 amendment and this tracked exception.
 - **No new top-level command.** Recording is `learn --permissive`, honoring Growth and the CLI-surface
   reduction already in flight (PR #18). A standalone `record`/`trace`/`profile` verb was rejected as a
@@ -295,7 +295,7 @@ explicitly narrower sibling of the main threat model, with its two structural mi
     data-open-only trace would synthesize a Blueprint too tight for the enforced run.
     Mechanism-independent (no reliance on the undocumented SBPL facilities). The parse-fragility and
     under-load event-loss knocks are **not** weighed against it: this is a bootstrap run made a
-    handful of times, and `FW-DISC9` already forbids claiming the trace is complete. The real cost is
+    handful of times, and `FW-DISC9` already forbids claiming the trace is complete. The cost that remains is
     `sudo` (Seatbelt needs none — a footprint escalation, though amortized: record once, enforce many
     times without root) and **attribution** (§7.1). `FW-INV12` still holds: a floor-denied credential
     open that fs_usage records as an *attempt* is withheld by the reverse-compile floor
@@ -308,14 +308,14 @@ explicitly narrower sibling of the main threat model, with its two structural mi
   built — fs_usage for completeness, (B) for cost/reuse; the decision is whether metadata-op coverage
   is worth the root requirement.
 
-### 7.1 Attribution — the load-bearing part of a system-wide feed
+### 7.1 Attribution — the decisive part of a system-wide feed
 
 fs_usage (and any system-wide feed) captures everything, so recording is a **capture → resolve →
 filter** pipeline: capture system-wide, reconstruct the workload's process subtree, keep only its
-events. Two properties make this correct — and note that attribution matters *more* here than for
+events. Two properties make this correct, and attribution matters *more* here than for
 denial-learn, because record's whole purpose is a **tight** Blueprint: over-capture that leaks
 unrelated processes' paths doesn't just add review noise, it loosens the allowlist against the tool's
-own goal, so the filter is load-bearing, not hygiene.
+own goal, so the filter is essential, not hygiene.
 
 1. **Build the subtree from captured lifecycle events, never a live `ps`.** A post-hoc process-table
    query misses every child that already spawned and exited — for a build/test workload, exactly the
@@ -332,7 +332,7 @@ own goal, so the filter is load-bearing, not hygiene.
    session and attribute by ASID with zero lineage reconstruction and zero race. It needs root
    (already paid) and the audit subsystem enabled, and OpenBSM is a rustier subsystem than fs_usage.
 
-The spike's real question is therefore **fs_usage + fork-event lineage vs ASID-preselected
+The spike's question is therefore **fs_usage + fork-event lineage vs ASID-preselected
 auditpipe**: the former is lighter and reuses a familiar tool; the latter is the "correct"
 race-free attribution at the cost of a heavier subsystem. Path resolution (fs_usage occasionally
 reports CWD-relative paths; the resolved absolute form is what `PathPattern` needs) is a Phase-3

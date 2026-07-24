@@ -45,7 +45,7 @@ document and reality diverge.
 cheap mechanical start: a canary asserting the README support-matrix rows against `detect`-able
 facts and the test suite's platform markers.
 
-## 3. Audience separation of documents (stated nowhere, now load-bearing)
+## 3. Audience separation of documents (stated nowhere, now essential)
 
 "Requirements shouldn't leak into the README — important for contributors... not so important
 for users" established a document hierarchy the repo never wrote down:
@@ -156,7 +156,7 @@ platform-marked test that has never run on its platform is reported, not assumed
 observe → list → accept → next-run loop from one command's `--help`, and never needs to know
 that `<blueprint>.proposal.toml` / `.discovered.toml` exist or where they live (they surface in
 *output* as provenance, not as required *input* knowledge). Derived-path flags (`--proposal`)
-are escape hatches, not the paved road.
+are fallbacks, not the default path.
 
 **Mint?** DISC family candidate, one sentence: "the discovery loop is drivable end-to-end
 without naming its artifact files."

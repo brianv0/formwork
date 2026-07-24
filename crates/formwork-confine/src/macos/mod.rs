@@ -1,4 +1,4 @@
-//! macOS Seatbelt backend: confinement via `sandbox_init(3)` -- the deprecated-but-load-bearing API
+//! macOS Seatbelt backend: confinement via `sandbox_init(3)` -- the deprecated-but-essential API
 //! still under `sandbox-exec`, Chromium, and Bazel. spawn-confined installs the profile in the
 //! forked child via `pre_exec` before `execve` (Seatbelt is inherited by descendants, FW-XR4);
 //! confine-self installs it in place. If `sandbox_init` fails the operation fails -- no unconfined

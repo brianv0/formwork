@@ -2,7 +2,7 @@
 #
 # The philosophy (design §1): start from the real ambient environment and *subtract* a sensitive
 # set, rather than build a grant up from empty. Under this profile a well-behaved agent runs
-# pytest / npm / git / a C build with zero denials on the happy path (FW-TRA2), while credentials,
+# pytest / npm / git / a C build with zero denials in the common case (FW-TRA2), while credentials,
 # keys, other projects, and browser profiles stay denied even though reads are broad (FW-TRA3).
 #
 # `~` is expanded against $HOME when the CLI loads this file. Callers are expected to narrow this
