@@ -6,7 +6,7 @@ to the design doc.
 
 ## 1. Language split
 
-**Rust** carries everything load-bearing: the blueprint types, the pure compiler, both confiners,
+**Rust** carries everything essential: the blueprint types, the pure compiler, both confiners,
 the fd seam, the gateway, and the CLI. Rationale: the confiner does `pre_exec`-window syscall
 work (fork-safety matters), the gateway is the single privileged broker (memory safety
 matters), and the compiler must be deterministic ([FW-FID4](formwork.md#fw-fid4)).

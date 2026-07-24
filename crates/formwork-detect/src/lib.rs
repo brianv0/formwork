@@ -26,7 +26,7 @@ pub struct HostProfile {
     pub seccomp: bool,
     #[serde(default)]
     pub seatbelt: bool,
-    /// For the report only; not load-bearing.
+    /// For the report only; nothing depends on it.
     #[serde(default)]
     pub os_version: String,
 }

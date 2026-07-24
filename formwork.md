@@ -8,7 +8,7 @@ Formwork is standalone. It takes a capability blueprint and produces an enforced
 
 ## 1. Design philosophy: good isolation, maximal reuse
 
-The load-bearing decision in this design is that Formwork targets **good isolation, not perfect isolation** — a scoping choice that drives most of the requirements below.
+The central decision in this design is that Formwork targets **good isolation, not perfect isolation** — a scoping choice that drives most of the requirements below.
 
 The goal is a boundary that reliably contains an agent — and code the agent runs, and MCP servers it fronts — from casually or accidentally reading, writing, or exfiltrating things outside its lane, including when the agent is driven by a prompt-injected or otherwise adversarial instruction stream. The goal is **not** to withstand an adversary writing kernel exploits against Landlock or Seatbelt. Formwork raises the bar a great deal and fails closed on egress; it does not claim to be an airtight security boundary against local privilege escalation or a kernel zero-day. Section 3 states this threat model precisely, and every enforcement claim in this document is scoped to it.
 
@@ -261,7 +261,7 @@ A versioned, typed catalog of credential **locations only** — dotfiles, well-k
 
 ### 5.10 Discovery (FW-DISC)
 
-Discovery observes what a confined workload tries to touch and turns denials into candidate grants, so you start tight and let observed behavior write the Blueprint. Auto-granting an agent's *attempts* is a confused-deputy machine, and two properties resolve it. First, the default posture is **observe-then-widen**, never live prompting: a marked learning run records denials without granting them, produces a reviewable proposal, and the accepted result applies to *subsequent* runs — the human decision stays out of the hot path, and no syscall interception is needed on either platform. Second, and load-bearing: **the credential catalog is the floor discovery cannot erode** ([FW-DISC3](#fw-disc3)/[FW-INV8](#fw-inv8)).
+Discovery observes what a confined workload tries to touch and turns denials into candidate grants, so you start tight and let observed behavior write the Blueprint. Auto-granting an agent's *attempts* is a confused-deputy machine, and two properties resolve it. First, the default posture is **observe-then-widen**, never live prompting: a marked learning run records denials without granting them, produces a reviewable proposal, and the accepted result applies to *subsequent* runs — the human decision stays out of the hot path, and no syscall interception is needed on either platform. Second, and central: **the credential catalog is the floor discovery cannot erode** ([FW-DISC3](#fw-disc3)/[FW-INV8](#fw-inv8)).
 
 | Req | Requirement |
 |---|---|
@@ -271,7 +271,7 @@ Discovery observes what a confined workload tries to touch and turns denials int
 | <a id="fw-disc4"></a>**FW-DISC4** Auto-widen zone | An operator-authored scope in the Blueprint within which discovered grants may be auto-accepted (e.g. project dir, language caches). Outside the zone, review is required. Empty by default — nothing self-grants out of the box. |
 | <a id="fw-disc5"></a>**FW-DISC5** Review as itemized diff | Proposals surface on the operator channel as a diff showing what widens and what was withheld and why. Acceptance is per-entry. |
 | <a id="fw-disc6"></a>**FW-DISC6** Provenance | An accepted discovered grant is recorded with provenance (added-via-discovery, run id), so audit distinguishes authored from learned grants. |
-| <a id="fw-disc11"></a>**FW-DISC11** Loop drivability | The discovery loop — observe, list, accept, next run — is drivable end-to-end from the `learn` surface without the user naming its artifact files: `<blueprint>.proposal.toml` and `<blueprint>.discovered.toml` are implementation conventions that surface in *output* as provenance, never as required *input* knowledge. Derived-path flags (`--proposal`) are fallbacks, not the paved road, and a flag a mode would ignore is refused, never silently dropped ([FW-INV6](#fw-inv6) at the CLI surface). *(`FW-DISC7`–`FW-DISC10` are reserved by the in-flight FEP-4 draft and are not landed numbers.)* |
+| <a id="fw-disc11"></a>**FW-DISC11** Loop drivability | The discovery loop — observe, list, accept, next run — is drivable end-to-end from the `learn` surface without the user naming its artifact files: `<blueprint>.proposal.toml` and `<blueprint>.discovered.toml` are implementation conventions that surface in *output* as provenance, never as required *input* knowledge. Derived-path flags (`--proposal`) are fallbacks, not the default path, and a flag a mode would ignore is refused, never silently dropped ([FW-INV6](#fw-inv6) at the CLI surface). *(`FW-DISC7`–`FW-DISC10` are reserved by the in-flight FEP-4 draft and are not landed numbers.)* |
 
 "Formwork never runs a real workload in a grant-whatever-is-attempted mode" is not a separate requirement — it is the combined consequence of [FW-DISC1](#fw-disc1) and [FW-DISC4](#fw-disc4), stated as a guarantee in [FW-INV10](#fw-inv10). Sticky learning within a trust boundary is the recommended workflow: accumulate proposals across runs, auto-accept only inside the operator-drawn zone, review everything else — discovery does the tedious enumeration; the human keeps the perimeter.
 

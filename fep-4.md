@@ -59,7 +59,7 @@ Two structural mitigations keep this defensible rather than a "grant-whatever-is
 
 ## 2. Design
 
-The load-bearing decision is that permissive recording is **not a new concept** — it is a **second
+The central decision is that permissive recording is **not a new concept** — it is a **second
 observation source for discovery**, and it reuses the existing machinery almost entirely.
 
 ### 2.1 It folds into `learn` (no new top-level command)
@@ -308,14 +308,14 @@ explicitly narrower sibling of the main threat model, with its two structural mi
   built — fs_usage for completeness, (B) for cost/reuse; the decision is whether metadata-op coverage
   is worth the root requirement.
 
-### 7.1 Attribution — the load-bearing part of a system-wide feed
+### 7.1 Attribution — the decisive part of a system-wide feed
 
 fs_usage (and any system-wide feed) captures everything, so recording is a **capture → resolve →
 filter** pipeline: capture system-wide, reconstruct the workload's process subtree, keep only its
 events. Two properties make this correct, and attribution matters *more* here than for
 denial-learn, because record's whole purpose is a **tight** Blueprint: over-capture that leaks
 unrelated processes' paths doesn't just add review noise, it loosens the allowlist against the tool's
-own goal, so the filter is load-bearing, not hygiene.
+own goal, so the filter is essential, not hygiene.
 
 1. **Build the subtree from captured lifecycle events, never a live `ps`.** A post-hoc process-table
    query misses every child that already spawned and exited — for a build/test workload, exactly the

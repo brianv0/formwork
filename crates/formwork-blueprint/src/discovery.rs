@@ -1,5 +1,5 @@
 //! Reverse compilation (FW-DISC2): observed denials -> a tagged proposal. Pure -- the unified-log
-//! tap and all file IO live in the CLI -- so the load-bearing safety property is testable in
+//! tap and all file IO live in the CLI -- so the essential safety property is testable in
 //! isolation: a denial matching the credential catalog is *never* a candidate, no matter the
 //! zone, the attempt count, or who asks (FW-DISC3 / FW-INV8). Everything else is either inside
 //! the operator-drawn auto-widen zone (FW-DISC4) or needs review (FW-DISC5). Observation never

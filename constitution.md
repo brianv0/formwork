@@ -39,7 +39,7 @@ This system has exactly these concepts, each with one name and one Rust type:
   write-protects the blueprint/proposal files the session was launched from ([FW-XR8](formwork.md#fw-xr8)). All of
   this holds only when Formwork does the launching, and the report says so ([FW-CRED8](formwork.md#fw-cred8)).
 - **HostProfile** (`formwork_detect::HostProfile`) — what the current kernel can
-  actually enforce; the one impure input to compilation.
+  enforce; the one impure input to compilation.
 - **CompiledPolicy** (`formwork_compile::CompiledPolicy`) — a `ConfinerPolicy`
   plus a `GatewayPolicy`, produced purely from a Blueprint and a HostProfile.
 - **FidelityReport** (`formwork_compile::FidelityReport`) — per-`Capability`
@@ -58,7 +58,7 @@ This system has exactly these concepts, each with one name and one Rust type:
 Every feature is expressed in terms of these. If a feature doesn't fit, STOP
 (see Precedence & Conflicts) — never invent a parallel concept. A path that
 reaches the network around the Gateway, or an fs grant that bypasses the
-Confiner, is not a new concept; it is the threat model (§3) walking in the door.
+Confiner, is not a new concept; it is the threat model (§3).
 Rationale: features expressed through a shared concept set keep the
 system learnable; silently invented parallel concepts are how
 architecture drifts.
@@ -124,7 +124,7 @@ compatibility discipline concentrate here.
 - **fail-closed** (deny on absence), **fail-loud** (surface an error/report),
   **fail-open-silent** (forbidden, [FW-INV6](formwork.md#fw-inv6)) are precise, non-interchangeable.
 Rationale: literate code depends on one name per idea; naming drift
-across sessions is a bug, and the fix is an entry here, not a lecture.
+across sessions is a bug, and the fix is an entry here.
 
 ## Requirements & identifiers   [stable IDs; minted once; links are checked]
 Every normative statement — requirement, invariant, end-to-end or adversarial
@@ -174,7 +174,7 @@ EGR — a new family is a Concepts-grade amendment), `FW-INV<n>` for invariants,
   pass.)*
 Rationale: requirement IDs are the review currency of this repo — a reviewer
 following FW-CRED6 from a diff to its definition should be one click, not a
-grep expedition — and identifiers that can silently dangle, fork, or get
+manual search — and identifiers that can silently dangle, fork, or get
 renumbered are worse than prose.
 
 ## Requirements authoring   [the statement is the unit; prose reads as spec]
@@ -271,7 +271,7 @@ type system the durable record of what is known.
 Invariant: every failure is either handled at a named boundary or
 terminates the program. No failure is silently absorbed.
 Doctrine: **fail closed or fail loud, never fail-open-silent ([FW-INV6](formwork.md#fw-inv6)).**
-This is the load-bearing rule of a sandboxing tool: a capability that cannot be
+This is the central rule of a sandboxing tool: a capability that cannot be
 faithfully enforced is reported `Partial`/`Unenforceable` or errors — it is
 never silently downgraded ([FW-XR1](formwork.md#fw-xr1)). Honesty is bidirectional: documents are a
 claims surface, and *under*-claiming (an implemented capability described as a
@@ -353,9 +353,8 @@ dev tool and is documented as one. `profiles/` is a source of build-time
 embedded artifacts (`builtin:` — the [FW-CRED1](formwork.md#fw-cred1) catalog precedent), never a
 runtime dependency. *(Amended from the unstated-requirements pass.)*
 Rationale: surface area only ever grows unless refusal is the
-default, reuse precedes creation, and deletion has a trigger;
-restraint is what made good tools good. Reuse is also the product
-thesis (§1): isolation the agent constantly trips over gets turned off.
+default, reuse precedes creation, and deletion has a trigger. Reuse is also
+the product thesis (§1): isolation the agent constantly trips over gets turned off.
 
 ## Comments   [why-only; prefer renaming over commenting]
 No comments that describe what the code does. Only why, and only
@@ -392,12 +391,12 @@ fastest-failing workload (a process that dies on its first denial in a
 millisecond — the canonical discovery shape), and a mechanism with a latency
 window is tested *inside* that window ([FW-E2E-064](formwork.md#fw-e2e-064) is the precedent — a suite
 that only ran workloads long enough for the feed to flush had proven nothing
-about the runs users actually do). *(Amended from the unstated-requirements
+about the runs users do). *(Amended from the unstated-requirements
 pass.)*
 Rationale: a fully mocked test verifies that the code does what the
 code does; only behavior exercised at the real boundary catches
-real regressions — and for this project, "the report is honest" is
-only true if a real probe says so.
+regressions — and for this project, "the report is honest" is
+only true if a probe says so.
 
 ## Precedence & Conflicts
 Precedence, highest first: (1) the universal sections above; (2) the merged Rust
@@ -422,6 +421,6 @@ invisibly, the exact failure Growth exists to stop. The live register is the
 deprecations table in `docs/STATUS.md` (today: the hidden `detect` /
 `enforce-self` / `accept` aliases and `--spec`, expiring at the first tagged
 release). *(Amended from the unstated-requirements pass.)*
-Rationale: a constitution with no legal escape hatch teaches its
+Rationale: a constitution with no lawful exception teaches its
 users to invent illegal ones; a tracked, expiring exception keeps
 every deviation visible and temporary.
