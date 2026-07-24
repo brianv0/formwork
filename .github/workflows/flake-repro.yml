@@ -1,9 +1,15 @@
 # TEMPORARY -- flake reproduction harness for the FW-E2E-064 macOS log-persistence race.
 # Not part of the normal CI matrix; triggers only on this investigation branch (and manual
-# dispatch). Delete before merge. It runs a controlled A/B on ONE macOS runner under identical
-# background load: the same learn E2E is stressed N times against the FIXED binary, then again
-# with learn.rs reverted to the pre-fix commit (single settle floor). If the fix works, the OLD
-# column shows intermittent failures and the FIXED column shows none.
+# dispatch). Delete before merge.
+#
+# Controlled A/B on ONE macos-14 runner under identical MODERATE load (ncpu-1 cores saturated,
+# leaving one free -- 3-core saturation pushes log persistence past any fixed floor and measures
+# nothing). Each version is selected by EXPLICIT SHA (not HEAD~N, which shifts as commits are
+# added -- the bug in run 1), so the arms are unambiguous:
+#   FIXED    = 3c392b4  (two settle floors: empty windows held to 15s)
+#   BASELINE = 57f98bb  (single 6s floor -- pre-fix)
+# Each is stressed N times against the real Seatbelt + `log show` feed (no `macos` marker, so the
+# test is not skipped). Every iteration is timed; failures dump the CLI stderr (look for withheld=0).
 name: flake-repro (temporary)
 
 on:
@@ -17,19 +23,19 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  ITERATIONS: "30"
-  # The single test that flakes (FW-ADV-015); runs against the real Seatbelt + `log show` feed
-  # on macOS (no `macos` marker, so it is not skipped here).
+  ITERATIONS: "40"
+  FIXED_SHA: "3c392b4"
+  BASELINE_SHA: "57f98bb"
   TARGET: "harness/test_discovery.py::test_fold_does_not_transitively_grant_a_non_home_credential"
 
 jobs:
   stress:
     runs-on: macos-14
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # need the parent commit to revert learn.rs for the A/B
+          fetch-depth: 0 # need both SHAs present
 
       - name: Install Rust (stable)
         run: |
@@ -43,58 +49,55 @@ jobs:
         working-directory: py
         run: uv sync
 
-      # Saturate every core for the duration of the run: the flake needs a *loaded* Mac, where the
-      # log daemon is contended and a short-lived process's buffered Sandbox denial takes longer to
-      # persist to the store `log show` reads. A quiet runner may not reproduce it at all.
-      - name: Start background CPU load
+      # Moderate load: saturate all-but-one core so the log daemon is contended and a short-lived
+      # process's buffered Sandbox denial persists slowly -- but not so hard that latency always
+      # exceeds 15s (which would sink both arms and measure nothing).
+      - name: Start background CPU load (ncpu-1 cores)
         run: |
           cores=$(sysctl -n hw.ncpu)
-          echo "saturating $cores cores"
-          for _ in $(seq 1 "$cores"); do yes > /dev/null & done
+          load=$(( cores > 1 ? cores - 1 : 1 ))
+          echo "cores=$cores, saturating $load"
+          for _ in $(seq 1 "$load"); do yes > /dev/null & done
           echo "LOAD_PIDS=$(jobs -p | tr '\n' ' ')" >> "$GITHUB_ENV"
 
-      - name: Build FIXED binary
-        run: cargo build -q -p formwork-cli --locked
-
-      - name: Stress FIXED (two settle floors)
+      # A reusable stress loop: $1 = SHA to test, $2 = label. Writes "<label>_FAILS=<n>" to GITHUB_ENV.
+      - name: Stress FIXED (3c392b4, two settle floors)
         working-directory: py
         run: |
+          git -C .. checkout "$FIXED_SHA" -- crates/formwork-cli/src/learn.rs
+          cargo build -q -p formwork-cli --locked --manifest-path ../Cargo.toml
           fails=0
           for i in $(seq 1 "$ITERATIONS"); do
+            start=$SECONDS
             if uv run pytest -q "$TARGET" > "/tmp/fixed-$i.log" 2>&1; then
-              printf 'F%02d ok  ' "$i"
+              printf 'F%02d ok %2ds | ' "$i" "$((SECONDS-start))"
             else
-              fails=$((fails+1)); printf 'F%02d FAIL' "$i"
-              tail -n 20 "/tmp/fixed-$i.log" | sed 's/^/    | /'
+              fails=$((fails+1)); printf 'F%02d FAIL %2ds\n' "$i" "$((SECONDS-start))"
+              grep -E "withheld=|1 failed|AssertionError" "/tmp/fixed-$i.log" | head -3 | sed 's/^/    | /'
             fi
             [ $((i % 5)) -eq 0 ] && echo
           done
-          echo
+          echo; echo "==> FIXED: $fails / $ITERATIONS failed"
           echo "FIXED_FAILS=$fails" >> "$GITHUB_ENV"
-          echo "==> FIXED: $fails / $ITERATIONS failed"
 
-      - name: Revert learn.rs to the pre-fix commit (single floor)
-        run: |
-          git show HEAD~1:crates/formwork-cli/src/learn.rs > crates/formwork-cli/src/learn.rs
-          echo "reverted learn.rs to $(git rev-parse --short HEAD~1)"
-          cargo build -q -p formwork-cli
-
-      - name: Stress OLD (single settle floor)
+      - name: Stress BASELINE (57f98bb, single 6s floor)
         working-directory: py
         run: |
+          git -C .. checkout "$BASELINE_SHA" -- crates/formwork-cli/src/learn.rs
+          cargo build -q -p formwork-cli --locked --manifest-path ../Cargo.toml
           fails=0
           for i in $(seq 1 "$ITERATIONS"); do
-            if uv run pytest -q "$TARGET" > "/tmp/old-$i.log" 2>&1; then
-              printf 'O%02d ok  ' "$i"
+            start=$SECONDS
+            if uv run pytest -q "$TARGET" > "/tmp/base-$i.log" 2>&1; then
+              printf 'B%02d ok %2ds | ' "$i" "$((SECONDS-start))"
             else
-              fails=$((fails+1)); printf 'O%02d FAIL' "$i"
-              tail -n 20 "/tmp/old-$i.log" | sed 's/^/    | /'
+              fails=$((fails+1)); printf 'B%02d FAIL %2ds\n' "$i" "$((SECONDS-start))"
+              grep -E "withheld=|1 failed|AssertionError" "/tmp/base-$i.log" | head -3 | sed 's/^/    | /'
             fi
             [ $((i % 5)) -eq 0 ] && echo
           done
-          echo
-          echo "==> OLD:   $fails / $ITERATIONS failed"
-          echo "==> FIXED was $FIXED_FAILS / $ITERATIONS (same runner, same load)"
+          echo; echo "==> BASELINE: $fails / $ITERATIONS failed"
+          echo "BASELINE_FAILS=$fails" >> "$GITHUB_ENV"
 
       - name: Stop background load
         if: always()
@@ -102,7 +105,9 @@ jobs:
 
       - name: Verdict
         run: |
-          echo "FIXED failures: ${FIXED_FAILS:-?} / $ITERATIONS"
-          echo "See the two stress steps above for the OLD count."
-          echo "Reproduction is demonstrated when OLD > 0 and FIXED == 0."
-          echo "OLD == 0 too means the runner stayed too quiet to trip the race (inconclusive)."
+          echo "===================== flake-repro verdict ====================="
+          echo "FIXED    (3c392b4, empty floor 15s): $FIXED_FAILS / $ITERATIONS failed"
+          echo "BASELINE (57f98bb, single floor 6s): $BASELINE_FAILS / $ITERATIONS failed"
+          echo "Fix is demonstrated when BASELINE > FIXED (fewer empty proposals with the longer empty floor)."
+          echo "If BASELINE == FIXED == 0, the load was too light to trip the race (raise load/iterations)."
+          echo "If both are high and equal, latency exceeded 15s (load too heavy, or 15s is insufficient)."
