@@ -177,6 +177,73 @@ following FW-CRED6 from a diff to its definition should be one click, not a
 grep expedition — and identifiers that can silently dangle, fork, or get
 renumbered are worse than prose.
 
+## Requirements authoring   [the statement is the unit; prose reads as spec]
+A requirement is an object, not a paragraph: a stable ID (Requirements &
+identifiers), one binding statement, and — as needed — a non-binding discussion
+and its traceability. Connective prose that implies an obligation is a bug: if it
+binds it gets an ID; otherwise it is marked background. The statement is testable
+on its own; rationale, intent, candidate implementations, and open questions live
+in the discussion beside it, never inside it. Requirements state *what* and *how
+well*; design states *how* — an algorithm, schema, or technology is bound only
+when the statement cites a decided standard or interface by reference (the MCP
+wire format is such a foreign schema — Boundaries). The worked exemplar is
+`formwork.md` §5: one requirement per row, an `FW-<FAMILY><n>` anchor plus a
+single statement, rendered as a compact table, not a heavyweight template. Match
+that shape, and never restate a rule already stated once — Vocabulary owns term
+spellings, Requirements & identifiers owns IDs, Precedence & Conflicts owns the
+deprecation rail — cite it instead. There is no priority scheme: a line binds or
+it is background, and gating lives in the phases (`docs/STATUS.md`) and the
+`formwork.md` §10 traceability table.
+
+The binding statement has one shape: *the [actor] shall [verb] [object] [under
+conditions] [to a stated level]*.
+- Active voice, named actor; one obligation per ID — an obligation that could be
+  met, waived, or verified on its own is split into a sibling ID.
+- Every statement is verifiable by inspection, demonstration, analysis, or test,
+  and the method is nameable. Words that defer the judgment — *appropriate,
+  adequate, sufficient, fast, robust, seamless, user-friendly, as needed,
+  minimize, maximize* — are quantified, defined in Vocabulary, or demoted to
+  discussion. Escape hatches (*where possible, if feasible, whenever practical*)
+  are replaced by a quantified condition, not kept.
+- Every clock names its start event ("from readout completion," not "after
+  processing"); conditions and exceptions live inside the statement; an
+  unconditioned statement applies always.
+- List semantics are explicit — "at least" (a floor) or "exactly" (exhaustive).
+  "Shall be able to X" (a capability, demonstrated once) and "shall X for every
+  input" (a continuous obligation) are different statements; choose deliberately.
+- Limits, embargoes, and prohibitions are first-class requirements and carry the
+  same quantified boundary as any other (the threat model, §Concepts, is written
+  this way).
+- A quantitative value is self-describing and defined once — named where Formwork
+  already names config (the Blueprint schema, a parameter), not hardcoded twice in
+  prose. An unknown value is TBD with an open question carrying an owner and a
+  closure milestone (an FEP); values, parents, and references are cited, never
+  invented. A statement with no genuine parent surfaces the gap — a missing parent
+  tier, or a design choice that belongs a level down — rather than papering it with
+  a fabricated one.
+
+Prose style governs all connective text — scope, discussion, these rationale
+lines. Declarative present tense; mechanism before rhetoric; a sentence that only
+asserts significance is cut. No intensifiers or self-description (*real, actual,
+deeply, critically, "it is important to note," "deliberate choice"*), no aphorism
+or running metaphor, no personification (tools do not fight, decisions do not fail
+dramatically). The "not X — Y" contrast earns its place only where X is a
+plausible misreading, and rarely. Plain words over jargon-idiom: **error-prone**
+not "footgun," **fallback** not "escape hatch," **scope of impact** not "blast
+radius," **the common case** not "happy path." **Bold** marks defined terms,
+parameter names, and table keys — nothing else. A document ends when its content
+ends; there is no summary.
+
+Per-requirement conformance — one obligation, named actor, verifiable method,
+numbers self-described, clocks and exceptions in the statement, genuine parents,
+terms exact — is review judgment. The mechanical part — a dangling ID, a missing
+or duplicate anchor, a link to the wrong file — already fails CI through
+`py/harness/test_requirements.py` and is not restated as prose.
+Rationale: a requirement a reader can test without its author present is the whole
+asset; prose that hides obligations in adjectives, or states one rule three ways,
+is what makes a spec unfalsifiable and unmaintainable — the DRY-and-honesty
+discipline the rest of this document applies to code, applied to the words.
+
 ## Boundaries   [parse, don't validate]
 External data — the blueprint file, the host probe, MCP JSON-RPC from the agent and
 backends, grant paths, CLI arguments — is parsed into internal types exactly
