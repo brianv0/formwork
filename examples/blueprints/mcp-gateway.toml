@@ -3,9 +3,9 @@
 #   [mcp.files]   shades the MCP protocol — only `read_file` is visible and callable; every other
 #                 tool (write_file, http_fetch), plus all resources and prompts, is absent from
 #                 listings and non-invocable. A hidden-but-real name and a nonexistent one get the
-#                 same refusal, so the shading is not an oracle (FW-GW2/GW3, FW-ADV-004).
+#                 same refusal, so the shading is not an oracle.
 #
-#   fs / net      confine the spawned backend process itself (FW-GW5): the server runs behind the
+#   fs / net      confine the spawned backend process itself: the server runs behind the
 #                 same wall, so even a compromised or over-eager backend cannot read outside its
 #                 grant or open the network.
 #
@@ -26,7 +26,7 @@ tools = { allow = ["read_file"] }
 resources = "deny"
 prompts = "deny"
 
-# Pattern shading (FW-GW9). Every axis accepts exact names OR anchored regex written `/…/` (matched
+# Pattern shading. Every axis accepts exact names OR anchored regex written `/…/` (matched
 # against the whole identifier), plus a terminal `deny` that always wins over `allow` -- the same
 # deny-terminal bias as the filesystem rules, here over tool/resource/prompt names. This is a
 # userspace match in the gateway, not a kernel path rule, so a real regex is sound where a general

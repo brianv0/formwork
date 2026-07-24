@@ -434,7 +434,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(
 }
 
 /// Build a `std::process::Command` for a stdio MCP backend confined to its own grant (FW-GW5), so a
-/// spawned server is no more privileged than its policy (FW-E2E-019). The caller converts to a
+/// spawned server is no more privileged than its policy (FW-E2E-019). [`serve_stdio`] converts to a
 /// `tokio::process::Command` and spawns; the `pre_exec` confinement hook survives the conversion.
 pub fn confined_command(
     program: &str,
@@ -445,6 +445,42 @@ pub fn confined_command(
     command.args(args);
     formwork_confine::spawn_confined(&mut command, backend_policy)?;
     Ok(command)
+}
+
+/// Drive the stdio MCP proxy to completion: spawn the confined `backend`, wire this process's
+/// stdin/stdout to it through the [`Gateway`], and run until either side hangs up. Owns the async
+/// runtime so tokio stays inside this crate (constitution Layers: the one runtime lives only here) --
+/// the CLI hands over a plain `std::process::Command` and stays synchronous.
+pub fn serve_stdio(backend: std::process::Command, policy: McpPolicy) -> Result<(), GatewayError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(proxy_stdio(backend, policy))
+}
+
+async fn proxy_stdio(
+    backend: std::process::Command,
+    policy: McpPolicy,
+) -> Result<(), GatewayError> {
+    use std::process::Stdio;
+
+    let mut backend = tokio::process::Command::from(backend);
+    backend.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = backend.spawn()?;
+    let backend_read = child.stdout.take().expect("stdout is piped");
+    let backend_write = child.stdin.take().expect("stdin is piped");
+
+    Gateway::new(policy)
+        .run(
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+            backend_read,
+            backend_write,
+        )
+        .await?;
+    let status = child.wait().await?;
+    tracing::info!(exit_code = ?status.code(), "confined MCP backend exited");
+    Ok(())
 }
 
 #[cfg(test)]

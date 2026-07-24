@@ -53,7 +53,7 @@ examples/
 
 The blueprints above use the nested `[fs]` table. The same filesystem grants can be written as a
 flat list of **verb rules** — one `"<verb>:<path>"` string per rule — which is the *same vocabulary*
-on a `--rule` flag and a file line, so a policy reads the same however you author it (`FW-BP1`). See
+on a `--rule` flag and a file line, so a policy reads the same however you author it. See
 `blueprints/rules-demo.toml` and `formwork.md` (§4, §5) for the full grammar.
 
 | Verb | Grants | Nested-`[fs]` equivalent |
@@ -89,11 +89,11 @@ its logs and in `compile`/`explain` output. A project's `FORMWORK.toml` can star
 compiled-in default with `extends = ["builtin:default"]`, no repo checkout needed.)
 
 ```sh
-# Add extra denies for one run — safe from any layer, since deny is terminal (FW-CAP8):
+# Add extra denies for one run — safe from any layer, since deny is terminal:
 formwork run --blueprint examples/blueprints/agent-session.toml \
   --rule "deny:$CWD/secrets" --rule "deny:$CWD/.env.production" -- claude --dangerously-skip-permissions
 
-# Let the agent EDIT existing files but not CREATE new ones (create/write split, FW-CAP9):
+# Let the agent EDIT existing files but not CREATE new ones (the create/write split):
 formwork run --blueprint examples/blueprints/agent-session.toml \
   --rule "modify:$CWD/var/log/app.log" -- <agent>
 
@@ -105,11 +105,11 @@ formwork run --blueprint examples/blueprints/agent-session.toml --mode unveil \
 formwork run --blueprint examples/blueprints/agent-session.toml \
   --rule "exec:/usr/bin/git" --rule "exec:/usr/bin/python3" -- <agent>
 
-# Let one credential type through the floor AND grant its directory, in one invocation (FW-CRED5):
+# Let one credential type through the floor AND grant its directory, in one invocation:
 formwork run --blueprint examples/blueprints/agent-session.toml \
   --allow-cred aws --rule "readonly:$HOME/.aws/**" -- <agent>
 
-# Mix verb rules with a `--set` TOML fragment — both parse as the same model (FW-BP1):
+# Mix verb rules with a `--set` TOML fragment — both parse as the same model:
 formwork compile --blueprint examples/blueprints/rules-demo.toml \
   --set 'net = { ports = [443] }' --rule "deny:$HOME/.npmrc" --target linux-v6 --report-only
 
@@ -119,9 +119,9 @@ formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos 
 # Compile a Linux policy on a Mac (or vice-versa) to review it before enforcing — pure, no kernel:
 formwork compile --blueprint examples/blueprints/rules-demo.toml --target linux-v6 --report-only
 
-# Ask why one path is granted or denied — the deciding rule and the layer it came from (FW-FID6):
+# Ask why one path is granted or denied — the deciding rule and the layer it came from:
 formwork explain --blueprint examples/blueprints/rules-demo.toml '$CWD/.env'
-# Overrides apply here too, so you can check a deny before running under it (deny is terminal, FW-CAP8):
+# Overrides apply here too, so you can check a deny before running under it (deny is terminal):
 formwork explain --blueprint examples/blueprints/agent-session.toml \
   --rule "deny:$CWD/secrets/**" "$CWD/secrets/key"
 ```
@@ -134,7 +134,7 @@ loud error, never a silent no-op.
 
 Each `[mcp.<server>]` axis — `tools`, `resources`, `prompts` — takes an **allow** scope and a
 terminal **deny** list. Entries are exact identifiers or anchored regex written `/…/`, matched
-against the *whole* name (`FW-GW9`). A deny always wins over an allow, so you can open a family and
+against the *whole* name. A deny always wins over an allow, so you can open a family and
 carve the dangerous members back out:
 
 ```toml

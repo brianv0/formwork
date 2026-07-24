@@ -6,10 +6,10 @@
 # default in the axes this agent needs -- :443 egress for the model API, this agent's own ~/.claude
 # kept writable, and two model-API-key env vars re-admitted -- while every other secret stays denied.
 # `~` expands against $HOME when the CLI loads the blueprint. Narrowing a grant is always safe; these
-# widenings are deliberate, so review them before use (FW-CAP2).
+# widenings are deliberate, so review them before use.
 #
 #   reads   the whole ambient environment MINUS the compiled-in credential floor (keys, cloud
-#           creds, keychains, browser profiles -- profiles/credential-catalog.toml, FW-CRED4).
+#           creds, keychains, browser profiles -- profiles/credential-catalog.toml).
 #   writes  one project tree + scratch. Point this at your repo.
 #   net     HTTPS egress only, so the agent still reaches its model API. This is port-scoped, not
 #           host-scoped: formwork does not (yet) allowlist egress by host, so treat :443 as "any
@@ -18,10 +18,10 @@
 
 net = { ports = [443] }
 exec = "unrestricted"
-# Scrub secret-shaped env vars but keep the model auth the agent needs (FW-ENV2). Egress is open
+# Scrub secret-shaped env vars but keep the model auth the agent needs. Egress is open
 # to any HTTPS host, so this stops e.g. AWS_SECRET_ACCESS_KEY being exfiltrated via the environment.
 env = { scrub = { allow = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] } }
-# The two DELIBERATE widenings (FW-CRED5), reviewed here so they are visible: `anthropic` lets the
+# The two DELIBERATE widenings, reviewed here so they are visible: `anthropic` lets the
 # model API key through the launcher strip (the scrub allow above alone cannot -- the catalog floor
 # partitions first), and `claude` lets THIS agent read/write its own ~/.claude state. Every other
 # catalog type -- aws, ssh, gcp, other agents' state, ... -- stays denied/stripped.
@@ -33,12 +33,12 @@ reads = ["/**"]
 # project + scratch + this agent's own state dir, so Claude can persist history/settings/auth.
 writes = ["~/project/**", "~/.claude/**", "/tmp/**", "/private/tmp/**", "/var/tmp/**"]
 # Credential locations are NOT listed here: the compiled-in catalog floor denies them all under
-# every blueprint (FW-CRED4), minus exactly the `allow-credentials` above. Add project-specific
+# every blueprint, minus exactly the `allow-credentials` above. Add project-specific
 # denies here if you need them; credential locations belong in the catalog.
 subtract = []
 
 # Tamper vectors: write-denied but readable, so the agent can't plant a git hook / .mcp.json / IDE
-# task that later runs unsandboxed, yet git and tooling still read them (FW-TRA7).
+# task that later runs unsandboxed, yet git and tooling still read them.
 write-subtract = [
     "**/.git/hooks/**",
     "**/.git/config",
