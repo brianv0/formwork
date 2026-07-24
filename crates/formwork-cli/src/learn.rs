@@ -107,14 +107,25 @@ fn parse_sandbox_denial(event_message: &str) -> Option<DenialRecord> {
 /// and a workload that dies on its first denied read in a millisecond (the canonical discovery
 /// case) is exactly the shape that loses its records to that latency. So collection polls to
 /// quiescence with a floor: re-read the whole run window until two consecutive reads agree, but
-/// never conclude before MIN_SETTLE of observation -- two equal reads two seconds apart prove the
-/// store was briefly quiet, not that a millisecond workload's buffered records ever flushed
-/// (an empty read repeated is the trap: it looks quiescent precisely when nothing has landed
-/// yet). Bounded by a cap. Over-capture is safe by design (candidates are inert until accepted,
-/// credentials floored regardless), so the slack, floor, and cap can all be generous.
+/// never conclude before a settle floor of observation -- two equal reads two seconds apart prove
+/// the store was briefly quiet, not that a millisecond workload's buffered records ever flushed.
+///
+/// An *empty* repeated read is the trap: it looks quiescent precisely when nothing has landed yet,
+/// and it is indistinguishable at the read level from a run that genuinely denied nothing. Under
+/// CI load the Sandbox denial can miss the ordinary floor -- the failing run's own timeline
+/// (workload exit -> "complete" ~= 6.5s) landed right on the old 6-second floor and concluded
+/// empty. So an all-empty window is held to a SEPARATE, longer floor (EMPTY_MIN_SETTLE): a
+/// non-empty agreement is self-evidencing (records exist, the feed is flowing), but an empty
+/// agreement proves nothing until enough time has passed that a slow flush would have shown up.
+/// Both are bounded by the same cap, and the empty floor sits below it so an empty run still
+/// concludes on its own. Over-capture is safe by design (candidates are inert until accepted,
+/// credentials floored regardless), so the slack, floors, and cap can all be generous -- the cost
+/// of the longer empty floor is a few extra seconds on a genuinely clean run, paid to never
+/// silently drop a denial that was merely slow to persist (FW-INV5/6).
 const PERSISTENCE_SLACK_SECS: u64 = 2;
 const QUIESCENCE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 const QUIESCENCE_MIN_SETTLE: std::time::Duration = std::time::Duration::from_secs(6);
+const QUIESCENCE_EMPTY_MIN_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
 const QUIESCENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Collect the run window's denials, polling until the log store stops yielding new records.
@@ -125,6 +136,7 @@ pub fn collect_denials_quiescent(run_started: std::time::Instant) -> Result<Vec<
         || collect_denials(run_started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS),
         QUIESCENCE_POLL,
         QUIESCENCE_MIN_SETTLE,
+        QUIESCENCE_EMPTY_MIN_SETTLE,
         QUIESCENCE_CAP,
     )
 }
@@ -133,10 +145,17 @@ pub fn collect_denials_quiescent(run_started: std::time::Instant) -> Result<Vec<
 /// stabilization-with-floor property (FW-E2E-064's mechanism) is testable as a pure function of a
 /// chosen record sequence -- the same substitution the constitution allows for the compiler's
 /// HostProfile; the feed itself is exercised by the macOS E2E tests, never mocked there.
+///
+/// Two settle floors, because the two agreements carry different evidence: a repeated *non-empty*
+/// read is self-evidencing (the feed produced records and then stopped growing), so `min_settle`
+/// suffices; a repeated *empty* read proves nothing -- it is what a still-flushing feed looks like
+/// -- so it is held to the longer `empty_min_settle` before it is trusted as "this run denied
+/// nothing". Both are bounded by `cap`.
 fn collect_until_quiescent(
     mut collect: impl FnMut() -> Result<Vec<DenialRecord>>,
     poll: std::time::Duration,
     min_settle: std::time::Duration,
+    empty_min_settle: std::time::Duration,
     cap: std::time::Duration,
 ) -> Result<Vec<DenialRecord>> {
     let polling_started = std::time::Instant::now();
@@ -151,7 +170,15 @@ fn collect_until_quiescent(
         }
         std::thread::sleep(poll);
         let next = collect()?;
-        if next == last && polling_started.elapsed() >= min_settle {
+        // An empty agreement is the millisecond-workload trap: it looks quiescent precisely when a
+        // buffered denial has not landed yet, so it must clear the longer floor before it is
+        // trusted. A non-empty agreement already has its records in hand and needs only min_settle.
+        let floor = if next.is_empty() {
+            empty_min_settle
+        } else {
+            min_settle
+        };
+        if next == last && polling_started.elapsed() >= floor {
             return Ok(next);
         }
         last = next;
@@ -628,6 +655,7 @@ mod tests {
             },
             std::time::Duration::from_millis(1),
             std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
             std::time::Duration::from_secs(30),
         )
         .unwrap();
@@ -636,23 +664,63 @@ mod tests {
     }
 
     /// The millisecond-workload trap (FW-E2E-064): before anything has flushed, the store reads
-    /// empty and "stable" -- the floor forbids trusting that until real settle time has passed.
+    /// empty and "stable" -- the *empty* floor forbids trusting that until real settle time has
+    /// passed, and it is the empty floor (not the shorter non-empty min_settle) that governs.
     #[test]
     fn quiescence_does_not_trust_empty_reads_before_the_floor() {
-        let floor = std::time::Duration::from_millis(300);
+        let empty_floor = std::time::Duration::from_millis(300);
         let started = std::time::Instant::now();
         let result = collect_until_quiescent(
             || Ok(Vec::new()),
             std::time::Duration::from_millis(25),
-            floor,
+            // A tiny non-empty floor that would conclude almost immediately if it applied to
+            // empty reads -- it must not; the empty floor is what holds.
+            std::time::Duration::from_millis(1),
+            empty_floor,
             std::time::Duration::from_secs(5),
         )
         .unwrap();
         assert!(result.is_empty());
         assert!(
-            started.elapsed() >= floor,
-            "an all-empty feed concluded after {:?}, before the {floor:?} floor",
+            started.elapsed() >= empty_floor,
+            "an all-empty feed concluded after {:?}, before the {empty_floor:?} empty floor",
             started.elapsed()
+        );
+    }
+
+    /// The CI-load regression this fix targets: a denial that persists to the store only AFTER the
+    /// ordinary (non-empty) floor would have elapsed. With one shared floor the loop concludes on
+    /// two agreeing empty reads and returns withheld=0; the separate, longer empty floor keeps
+    /// polling until the slow flush lands, so the record is captured.
+    #[test]
+    fn quiescence_empty_floor_outlasts_a_denial_that_persists_after_min_settle() {
+        let min_settle = std::time::Duration::from_millis(40);
+        let empty_min_settle = std::time::Duration::from_millis(500);
+        let flushed_at = std::time::Duration::from_millis(200); // past min_settle, before the cap
+        let record = DenialRecord {
+            path: "/private/tmp/x/.ssh/id_rsa".to_string(),
+            access: DenialAccess::Read,
+        };
+        let started = std::time::Instant::now();
+        let expected = record.clone();
+        let result = collect_until_quiescent(
+            move || {
+                if started.elapsed() < flushed_at {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![record.clone()])
+                }
+            },
+            std::time::Duration::from_millis(20),
+            min_settle,
+            empty_min_settle,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            vec![expected],
+            "the empty floor must outlast a denial that flushes after the non-empty min_settle"
         );
     }
 
@@ -676,6 +744,7 @@ mod tests {
                 }
             },
             std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(400),
             std::time::Duration::from_millis(400),
             std::time::Duration::from_secs(5),
         )
@@ -703,6 +772,7 @@ mod tests {
             },
             std::time::Duration::from_millis(1),
             std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
             std::time::Duration::from_millis(20),
         )
         .unwrap();
@@ -720,6 +790,7 @@ mod tests {
         let result = collect_until_quiescent(
             || bail!("log show failed"),
             std::time::Duration::from_millis(1),
+            std::time::Duration::ZERO,
             std::time::Duration::ZERO,
             std::time::Duration::from_millis(10),
         );
