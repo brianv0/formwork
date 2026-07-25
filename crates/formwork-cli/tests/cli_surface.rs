@@ -472,15 +472,12 @@ fn learn_captures_a_denial_through_the_ptrace_feed() {
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let denied = root.join("denied.txt");
     std::fs::write(&denied, "nope\n").unwrap();
-    // Broad reads minus the subtract hole: the toolchain loads (execve's kernel-internal open of
-    // the workload binary needs a Landlock ReadFile grant), exactly one path denies. `reads` must
-    // be explicit: on Linux, ambient-minus-subtract does not self-grant `/**` the way macOS
-    // `(allow default)` does -- the same shape the net-egress E2E uses.
+    // Ambient reads minus the subtract hole (FW-E2E-072: ambient self-grants on Linux too): the
+    // toolchain loads, exactly one path denies.
     std::fs::write(
         root.join("bp.toml"),
         format!(
-            "net = \"deny\"\n[fs]\nread-mode = \"ambient-minus-subtract\"\nreads = [\"/**\"]\n\
-             subtract = [\"{}\"]\n",
+            "net = \"deny\"\n[fs]\nread-mode = \"ambient-minus-subtract\"\nsubtract = [\"{}\"]\n",
             denied.display()
         ),
     )

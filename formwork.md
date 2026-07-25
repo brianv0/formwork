@@ -325,6 +325,8 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-039"></a>**FW-E2E-039: Tamper vectors are read-through, write-denied.** Under a writable project grant, a `write-subtract` set masks execution/policy-tampering vectors (`.git/hooks/**`, `.git/config`, `.mcp.json`, `.vscode/**`, shell rc). Pass: writing `<proj>/.git/config` is denied though the surrounding tree is writable, while reading it still succeeds so git and tooling keep working. Fail: any tamper path is writable under a normal project grant ([FW-TRA7](#fw-tra7)).
 
+<a id="fw-e2e-072"></a>**FW-E2E-072: Ambient read mode is ambient on every backend ([FW-XR6](#fw-xr6)/[FW-BP7](#fw-bp7)).** A blueprint with `read-mode = "ambient-minus-subtract"` and **no explicit read grants**, enforced natively: an ordinary ungranted path is readable, the workload binary execs, a `subtract` hole and the credential floor still deny. Pass on both backends — macOS via Seatbelt `(allow default)`, Linux via Landlock granting the filesystem root minus the same holes (Landlock has no allow-default, so the mode compiles to its equivalent rather than to governed-but-ungranted deny-everything). Fail: the identical blueprint yields a different read universe per platform — the exact silent divergence found live when an ambient learning run's `execve` was denied on Linux while the same blueprint read everything on macOS.
+
 ### 7.2 Network / egress
 
 <a id="fw-e2e-006"></a>**FW-E2E-006: Direct egress denied.** With `net: Deny`, the session runs `curl https://example.com`. Pass: the connection fails closed (no route to a network the process can reach). Fail: any bytes leave the host by a path other than the gateway fd.
@@ -535,7 +537,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-XR3](#fw-xr3) Fail-closed egress | [FW-E2E-006](#fw-e2e-006), 025 | 007, 008, ADV-003 |
 | [FW-XR4](#fw-xr4) Descendant inheritance | [FW-E2E-005](#fw-e2e-005) | ADV-001, 005, INV2 |
 | [FW-XR5](#fw-xr5) Single privileged broker | [FW-E2E-019](#fw-e2e-019) | 010, ADV-005 |
-| [FW-XR6](#fw-xr6) Behavioral parity | [FW-E2E-028](#fw-e2e-028) | 024, 071 |
+| [FW-XR6](#fw-xr6) Behavioral parity | [FW-E2E-028](#fw-e2e-028), 072 | 024, 071 |
 | [FW-XR7](#fw-xr7) fd-injection transport | [FW-E2E-010](#fw-e2e-010), 012 | 011, ADV-006 |
 | [FW-XR8](#fw-xr8) No agent-influenced escalation | [FW-ADV-001](#fw-adv-001) | [FW-E2E-005](#fw-e2e-005), INV1 |
 | [FW-XR9](#fw-xr9) Surface fail-fast | [FW-E2E-062](#fw-e2e-062) | INV5, INV6 |
@@ -588,7 +590,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | [FW-BP4](#fw-bp4) allow/deny/subtract | [FW-E2E-042](#fw-e2e-042) | 045, 049 |
 | [FW-BP5](#fw-bp5) Path sigils | [FW-E2E-055](#fw-e2e-055) | — |
 | [FW-BP6](#fw-bp6) Flat verb rules | [FW-E2E-058](#fw-e2e-058), 061 | [FW-CAP9](#fw-cap9) |
-| [FW-BP7](#fw-bp7) Mode posture | [FW-E2E-057](#fw-e2e-057), 060 | — |
+| [FW-BP7](#fw-bp7) Mode posture | [FW-E2E-057](#fw-e2e-057), 060 | 072 |
 | [FW-BP8](#fw-bp8) Discovery trust scope | [FW-E2E-070](#fw-e2e-070) | [FW-XR8](#fw-xr8) |
 | [FW-CRED1](#fw-cred1) Typed catalog | [FW-E2E-045](#fw-e2e-045), 046 | 049 |
 | [FW-CRED2](#fw-cred2) Two kinds, two arms | [FW-E2E-045](#fw-e2e-045), 046 | 050 |

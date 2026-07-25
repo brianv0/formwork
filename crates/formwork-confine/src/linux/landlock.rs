@@ -210,6 +210,13 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     if policy.read_mode == ReadMode::Closed {
         read_roots.extend(READ_ESSENTIALS.iter().map(PathBuf::from));
         read_roots.extend(RW_DEVICES.iter().map(PathBuf::from)); // readable; write handled below
+    } else {
+        // Ambient-minus-subtract means AMBIENT: reads default-allow, only the holes carve. Landlock
+        // has no allow-default, so ambient is the root granted read minus the same holes -- without
+        // this, the identical blueprint reads everything on macOS (`(allow default)`) and nothing
+        // here (governed-but-ungranted), the silent per-platform divergence FW-XR6 forbids
+        // (FW-E2E-072 pins the parity; found live when an ambient learn run's execve was denied).
+        read_roots.push(PathBuf::from("/"));
     }
     let read_paths = expand_all(&read_roots, &read_holes);
     let write_paths = expand_all(
