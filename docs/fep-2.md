@@ -27,8 +27,8 @@ fix, [FW-BP4](../formwork.md#fw-bp4) pinned to the [FW-CAP6](../formwork.md#fw-c
 explicit ([FW-BP5](../formwork.md#fw-bp5), [FW-CRED9](../formwork.md#fw-cred9), the [FW-DISC3](../formwork.md#fw-disc3)/INV8 strengthening), the backstop-anchoring
 review round and its revert, and the resolved open decisions (TOML stays;
 observe-then-widen; curated catalog + backstop; auto-widen empty by default) — lives in
-`docs/fep2-plan.md`. The full proposal text as adopted is in git history
-(`git log -- fep2.md`, prior to the reintegration commit).
+`docs/fep-2-plan.md`. The full proposal text as adopted is in git history
+(`git log -- fep-2.md`, prior to the reintegration commit).
 
 ## Deferred beyond this FEP
 

@@ -33,5 +33,5 @@ Compat shims are exceptions to the command-surface rule and expire at a named ev
 | `--spec` alias | `--blueprint` | first tagged release |
 
 Adopted enhancement proposals and their planning docs live in this directory: `fep-1.md`
-(deferred egress/violation-stream reservations), `fep2.md` + `fep2-plan.md` (credential catalog,
+(deferred egress/violation-stream reservations), `fep-2.md` + `fep-2-plan.md` (credential catalog,
 launcher, discovery), `fep-3.md`, and `competition-research.md`.

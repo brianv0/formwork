@@ -1,26 +1,26 @@
 # FEP-2 execution plan
 
-Companion to `fep2.md` (what and why). This says how, in what order, with which mechanisms —
+Companion to `fep-2.md` (what and why). This says how, in what order, with which mechanisms —
 the same role `IMPLEMENTATION_PLAN.md` plays for `formwork.md`. Requirement IDs refer to
-`fep2.md`; test IDs use the **renumbered** scheme below.
+`fep-2.md`; test IDs use the **renumbered** scheme below.
 
 > **Historical record.** FEP-2 landed in full and its requirements were reintegrated into
-> `formwork.md` (§2, §4, §5.8–5.10, §6, §7.7–7.10); `fep2.md` is now a short landed-and-folded
-> pointer. Section references to `fep2.md` below resolve against the proposal as adopted —
-> `git log --follow -- docs/fep2.md`, prior to the reintegration commit.
+> `formwork.md` (§2, §4, §5.8–5.10, §6, §7.7–7.10); `fep-2.md` is now a short landed-and-folded
+> pointer. Section references to `fep-2.md` below resolve against the proposal as adopted —
+> `git log --follow -- docs/fep-2.md`, prior to the reintegration commit.
 
 ## 0. Conflicts found during planning, and their resolutions
 
 Planning against the current tree (post-FEP-1 main) surfaced three drafting conflicts in
-`fep2.md`. Each is resolved by amending the FEP — visibly, per the constitution's
+`fep-2.md`. Each is resolved by amending the FEP — visibly, per the constitution's
 Precedence & Conflicts — not by silently deviating.
 
-**C1 — Test-ID collisions.** `fep2.md` §9 assumed the base sequence ended at [FW-E2E-028](../formwork.md#fw-e2e-028) /
+**C1 — Test-ID collisions.** `fep-2.md` §9 assumed the base sequence ended at [FW-E2E-028](../formwork.md#fw-e2e-028) /
 [FW-ADV-006](../formwork.md#fw-adv-006). In fact FEP-1 landed [FW-E2E-036](../formwork.md#fw-e2e-036)..039 into `formwork.md`, and `fep-1.md` reserves
 [FW-E2E-029](fep-1.md#fw-e2e-029)..032 + 040 and [FW-ADV-007](fep-1.md#fw-adv-007)..009 + 011 for the deferred egress/violation-stream work.
 FEP-2's tests are renumbered to the next free contiguous blocks:
 
-| fep2.md draft | final ID | scenario |
+| fep-2.md draft | final ID | scenario |
 |---|---|---|
 | `FW-E2E-029` | **FW-E2E-041** | rename regression |
 | `FW-E2E-030` | **FW-E2E-042** | override precedence |
@@ -58,7 +58,7 @@ would make presets unusable. Amended to the conventional, coherent order (lowest
 fail-closed floor + catalog, not `profiles/default.toml`. The broad-read subtractive profile
 remains a preset a Blueprint opts into via `extends` (or `--blueprint profiles/default.toml`).
 This keeps closed-mode Blueprints expressible (a union-merged implicit `reads = ["/**"]`
-would make `read-mode = "closed"` meaningless) and matches fep2.md §11's own statement that
+would make `read-mode = "closed"` meaningless) and matches fep-2.md §11's own statement that
 [FW-CAP3](../formwork.md#fw-cap3) is "now realized concretely by the catalog + backstop".
 
 **C3 — "glob path patterns" ([FW-BP4](../formwork.md#fw-bp4)) vs the [FW-CAP6](../formwork.md#fw-cap6) grammar.** The pattern grammar stays
@@ -143,7 +143,7 @@ paths = ["**/.env", "**/.env.local", "**/.env.production", …, "**/credentials"
          "**/credentials.json", "**/.netrc", "**/id_rsa", "**/id_ed25519", …]
 ```
 
-The catalog absorbs `profiles/sensitive-set.toml` (fep2.md §11: [FW-TRA3](../formwork.md#fw-tra3) is superseded);
+The catalog absorbs `profiles/sensitive-set.toml` (fep-2.md §11: [FW-TRA3](../formwork.md#fw-tra3) is superseded);
 the old file is deleted and `default.toml`'s prose points at the catalog. `~` expansion
 happens at load/compile boundary against the same `$HOME` the CLI already uses.
 
@@ -190,7 +190,7 @@ that a formwork-less run indeed sees the variable.
 
 ## 4. Discovery (Part D)
 
-**Posture: observe-then-widen** (fep2.md §12.2 resolved as recommended). Learning is an
+**Posture: observe-then-widen** (fep-2.md §12.2 resolved as recommended). Learning is an
 *enforced* run plus observation — enforcement is never weakened by learning ([FW-INV10](../formwork.md#fw-inv10);
 policy is installed pre-exec and immutable, [FW-XR8](../formwork.md#fw-xr8)). What learning adds is a denial feed
 and a reverse compiler.
@@ -306,7 +306,7 @@ zone boundary), proposal/provenance round-trip.
 
 ## 6. Order of work
 
-Follows fep2.md §13 (catalog before discovery — the floor must exist before the feature
+Follows fep-2.md §13 (catalog before discovery — the floor must exist before the feature
 that must respect it):
 
 1. **FW-BP** — layer/merge/extends/CLI (tests 041–044).
@@ -317,20 +317,20 @@ that must respect it):
 4. **FW-DISC** — log tap, reverse compile, zone, proposal/accept, provenance (tests
    051–054, ADV-013).
 5. **Docs** — `formwork.md` §2/§4/§5/§10 impact, constitution amendments (Concepts:
-   Catalog + Launcher; Vocabulary; Data model), profiles migration, examples, fep2.md
+   Catalog + Launcher; Vocabulary; Data model), profiles migration, examples, fep-2.md
    status flip + traceability.
 6. **Verification + constitutional review** — fmt/clippy/tests/py suite/Linux
    cross-compile, then a section-by-section review of the diff against `constitution.md`.
 
 Each phase lands compiling, clippy-clean, and green before the next begins.
 
-## 7. Resolved open decisions (fep2.md §12)
+## 7. Resolved open decisions (fep-2.md §12)
 
 1. **Serialization: stay on TOML.** The pain TOML causes is at MCP nesting depth, which
    FEP-2 does not deepen; layering + `extends` fixes composition; strictness
    (`deny_unknown_fields`) is a security asset; and the file format is a published,
    human-reviewed surface (Data model) — switching costs a migration no requirement pays
-   for. Revisit only with a concrete need for logic, per fep2.md §4.
+   for. Revisit only with a concrete need for logic, per fep-2.md §4.
 2. **Discovery default: observe-then-widen.** Interactive `SECCOMP_USER_NOTIF` prompting
    stays out of scope (confirmed), documented as a Linux-only future.
 3. **Catalog v1: curated set + generic backstop** (the recommendation), absorbing the
@@ -384,7 +384,7 @@ Reviewed section-by-section against `constitution.md`, over the full branch diff
   denial feed is the real unified log. The pure-input carve-out is used only for compile
   determinism (fixed home) and unit isolation (`empty_no_floor`, loudly named). Traceability
   is generated from markers: [FW-E2E-041](../formwork.md#fw-e2e-041)..054 and [FW-ADV-012](../formwork.md#fw-adv-012)..014, 17/17 implemented and green.
-- **Precedence & conflicts.** The three fep2.md drafting conflicts were resolved by visible
+- **Precedence & conflicts.** The three fep-2.md drafting conflicts were resolved by visible
   amendment (§0), never silent deviation. Known, *reported* residuals — honesty-pattern gaps,
   not suspended rules: (a) any-depth floor rows are withheld on Linux and the affected types
   + backstop reported Partial ([FW-INV5](../formwork.md#fw-inv5)); (b) the denial feed is macOS-only, Linux learning

@@ -22,7 +22,7 @@ Everything this FEP proposed has been implemented and **folded into `formwork.md
 ## Decisions (recorded per constitution Precedence & Conflicts)
 
 - **`deny` is a verb, not the rejected `subtract` synonym.** FEP-2 declined a free-floating `deny`
-  alias for `subtract` (`docs/fep2-plan.md` §8). In the verb model `deny` is a *first-class verb*
+  alias for `subtract` (`docs/fep-2-plan.md` §8). In the verb model `deny` is a *first-class verb*
   with a distinct meaning inherited from the unveil lineage: an additive override to **zero
   permissions** — a tombstone — evaluated in the terminal deny layer ([FW-CAP8](../formwork.md#fw-cap8)).
   It desugars to `subtract` because that is the mechanism, exactly as `readwrite` desugars to

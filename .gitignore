@@ -14,6 +14,3 @@ py/.venv/
 /scratch
 .DS_Store
 .dev-session.toml
-
-# constitution template (the source we materialize constitution.md from; not checked in)
-constitution.md.tpl
