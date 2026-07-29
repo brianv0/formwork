@@ -17,8 +17,9 @@ the seam needs a scoped allowance and we must find that out now, not in Phase 5.
 pair; forks; child applies a `(deny network*)` profile via `sandbox_init`; child then `read`/`write`
 on the inherited fds. Also test whether a fresh `connect()` inside is denied (it must be).
 
-**Status.** Pending native run as part of Phase 3 wiring. Recorded here so the result is captured
-against the assumption it protects.
+**Status.** Resolved — the assumption held. The fd seam (Phase 5) shipped and its transport is
+verified on macOS *and* Linux ([`FW-E2E-010/011/012`](../formwork.md#fw-e2e-010)); read/write on an
+inherited connected fd works under `(deny network*)`, and a fresh `connect()` inside is denied.
 
 ## Spike 2 — `sandbox_init` from Rust in a forked child (macOS)
 
