@@ -69,12 +69,15 @@ bench:
 
 # --- dogfood & unattended dev ---------------------------------------------------------------
 
-# One gate for unattended runs: format check, lint, and the native test suite (real Seatbelt on
-# macOS). A green `just check` is the bar every checkpoint commit should clear. Mirrors CI.
+# One gate for unattended runs: format check, locked lint, and the native test suite (real Seatbelt
+# on macOS). A green `just check` is the bar every checkpoint commit should clear. Mirrors CI's
+# lint + test jobs (same `--locked` flags); the networked mcp-integration test (`just
+# test-integration-mcp`), the Python harness (`just test-e2e`), the MSRV check, and the full OS
+# matrix stay CI-only.
 check:
     cargo fmt --all --check
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo test --workspace --locked
 
 # Self-host: run Claude Code confined by Formwork against THIS checkout — prompts off, kernel wall
 # on. Renders examples/blueprints/dev-session.toml.tpl (with your checkout path) into a gitignored
