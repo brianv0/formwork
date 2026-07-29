@@ -7,7 +7,6 @@ loud, never silent passes."""
 import json
 import shutil
 import subprocess
-import sys
 
 import pytest
 
@@ -19,7 +18,7 @@ def ptrace_feed(cli):
     """Skip unless this host carries the whole Linux feed chain."""
     if shutil.which("strace") is None:
         pytest.skip("strace not installed")
-    if json.loads(cli("detect").stdout).get("landlock-abi") is None:
+    if json.loads(cli("explain", "--json").stdout)["host"].get("landlock-abi") is None:
         pytest.skip("no Landlock on this kernel (nothing enforces, so nothing denies)")
     probe = subprocess.run(
         ["strace", "-qq", "-o", "/dev/null", "/bin/true"], capture_output=True

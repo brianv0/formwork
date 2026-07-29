@@ -1,8 +1,9 @@
 # First-line local Linux test image (plan §5). The kernel is the Docker VM's, not this image's, so
-# the harness gates on `formwork detect` and skips tiers the kernel can't carry. Run the container
+# the harness gates on `formwork explain --json` and skips tiers the kernel can't carry. Run the container
 # with `--security-opt seccomp=unconfined --security-opt apparmor=unconfined` (see the justfile) so
 # Docker's own sandbox never masks the sandbox under test.
-FROM rust:1-bookworm
+# Pinned to the workspace MSRV (Cargo.toml rust-version) for a reproducible image.
+FROM rust:1.85-bookworm
 
 # Toolchains the reuse tests exercise (FW-E2E-020..023): python, node, git, a C compiler.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -13,13 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # uv for the modern-Python harness.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.8.17 /uv /uvx /usr/local/bin/
 
 WORKDIR /src
 COPY . .
 
-# Build and install the formwork binary onto PATH so `formwork detect` works in the container.
+# Build and install the formwork binary onto PATH so `formwork explain` works in the container.
 RUN cargo build --workspace --release \
     && install -m 0755 target/release/formwork /usr/local/bin/formwork
 
-CMD ["bash", "-lc", "formwork detect && cargo test --workspace"]
+CMD ["bash", "-lc", "formwork explain --json && cargo test --workspace"]

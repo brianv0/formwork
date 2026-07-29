@@ -9,17 +9,17 @@
 //! formwork gateway [--blueprint s.toml] --server files -- cmd…  # MCP policy proxy over stdio
 //! ```
 //!
-//! The blueprint is `--blueprint` (alias `--spec`), or a `FORMWORK.toml` discovered from the
-//! launch directory upward -- always announced, never silent. Every blueprint-taking subcommand
-//! accepts the same override surface (FW-BP1/BP2): `--set '<toml>'` fragments and the sugar flags
+//! The blueprint is `--blueprint`, or a `FORMWORK.toml` discovered from the launch directory
+//! upward -- always announced, never silent. Every blueprint-taking subcommand accepts the same
+//! override surface (FW-BP1/BP2): `--set '<toml>'` fragments and the sugar flags
 //! (`--read/--write/--subtract/--write-subtract/--allow-cred/--net/--extends`) layer over the
 //! file, additively, deny-beats-allow.
 //!
-//! `compile`/`explain` (and the hidden `detect`) don't enforce and run on any host (including
-//! compiling a Linux policy on a Mac); `run`/`gateway` need a real confiner and error honestly
-//! where the backend is unimplemented. `detect` and `enforce-self`/`accept` remain as hidden
-//! plumbing / back-compat aliases of `explain`'s host summary, `run --confine-self`, and
-//! `learn --accept`.
+//! `compile`/`explain` don't enforce and run on any host (including compiling a Linux policy on a
+//! Mac); `run`/`gateway` need a real confiner and error honestly where the backend is
+//! unimplemented. The machine-readable host profile is `explain --json` (the `host` field);
+//! `run --confine-self` and `learn --list`/`--accept` carry what the retired `enforce-self` and
+//! `accept` plumbing aliases used to.
 
 mod blueprint_load;
 mod learn;
@@ -70,11 +70,6 @@ fn parse_cli() -> Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Probe this host's enforcement capabilities and print a HostProfile as JSON. Hidden
-    /// plumbing: scripts gate on it and `detect > host.json` feeds `compile --host`; humans get
-    /// the same answer from `formwork explain` (or the `--help` epilogue).
-    #[command(hide = true)]
-    Detect,
     /// Compile a blueprint into a policy + fidelity report without enforcing (dry-run, JSON).
     Compile {
         #[command(flatten)]
@@ -97,14 +92,6 @@ enum Cmd {
         /// PID-preserving, no launcher left in the tree). Default is the safer spawn posture.
         #[arg(long)]
         confine_self: bool,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        argv: Vec<String>,
-    },
-    /// Hidden back-compat alias of `run --confine-self`.
-    #[command(hide = true)]
-    EnforceSelf {
-        #[command(flatten)]
-        blueprint: BlueprintArgs,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
@@ -139,19 +126,6 @@ enum Cmd {
         observe_anyway: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
-    },
-    /// Hidden back-compat alias of `formwork learn --list` / `--accept`.
-    #[command(hide = true)]
-    Accept {
-        #[arg(long)]
-        proposal: PathBuf,
-        /// Accept one candidate by its 1-based number or exact pattern (repeatable). With no
-        /// selection at all, lists the candidates by number.
-        #[arg(long)]
-        entry: Vec<String>,
-        /// Accept every needs-review candidate.
-        #[arg(long)]
-        all: bool,
     },
     /// Front a stdio MCP backend with the policy gateway: shade its tools/resources/prompts per the
     /// blueprint's `[mcp.<server>]` entry and confine the spawned backend to the blueprint's fs/net grant.
@@ -193,7 +167,7 @@ enum Cmd {
 struct BlueprintArgs {
     /// The blueprint file. Omitted: a FORMWORK.toml discovered from the launch directory upward
     /// (announced, never silent).
-    #[arg(long, visible_alias = "spec")]
+    #[arg(long)]
     blueprint: Option<PathBuf>,
     /// Override layer as a TOML fragment in blueprint syntax (repeatable, applied in order),
     /// e.g. --set 'net = "deny"' or --set '[fs]
@@ -460,22 +434,15 @@ fn main() -> Result<()> {
     init_telemetry();
     let cli = parse_cli();
     let cmd = match &cli.command {
-        Cmd::Detect => "detect",
         Cmd::Compile { .. } => "compile",
         Cmd::Run { .. } => "run",
-        Cmd::EnforceSelf { .. } => "enforce-self",
         Cmd::Learn { .. } => "learn",
-        Cmd::Accept { .. } => "accept",
         Cmd::Gateway { .. } => "gateway",
         Cmd::Explain { .. } => "explain",
     };
     // One correlation id per invocation, propagated to every layer's events via the current span.
     let _root = tracing::info_span!("formwork", run_id = std::process::id(), cmd).entered();
     match cli.command {
-        Cmd::Detect => {
-            let profile = detect();
-            println!("{}", serde_json::to_string_pretty(&profile)?);
-        }
         Cmd::Compile {
             blueprint,
             host,
@@ -508,7 +475,6 @@ fn main() -> Result<()> {
             };
             run(blueprint, argv, posture)?
         }
-        Cmd::EnforceSelf { blueprint, argv } => run(blueprint, argv, Posture::Self_)?,
         Cmd::Learn {
             blueprint,
             list,
@@ -565,11 +531,6 @@ fn main() -> Result<()> {
                 learn_run(blueprint, argv, observe_anyway)?;
             }
         }
-        Cmd::Accept {
-            proposal,
-            entry,
-            all,
-        } => learn::accept(&proposal, &entry, all, &home())?,
         Cmd::Gateway {
             blueprint,
             server,

@@ -29,20 +29,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable + rustfmt + clippy)
-        run: |
-          rustup toolchain install stable --profile minimal \
-            --component rustfmt --component clippy --no-self-update
-          rustup default stable
-
-      - uses: actions/cache@v4
+      - uses: ./.github/actions/setup-rust
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: lint-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: lint-${{ runner.os }}-cargo-
+          components: rustfmt clippy
+          cache-prefix: lint
 
       - name: Format
         run: cargo fmt --all --check
@@ -67,10 +57,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-prefix: test
 
       # The Linux learn feed (FW-E2E-071) traces the workload with strace; installing it here is
       # what lets the ubuntu job EXECUTE the ptrace-feed tests instead of skipping them -- a
@@ -78,15 +67,6 @@ jobs:
       - name: Install strace (Linux denial feed)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y strace
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: test-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: test-${{ runner.os }}-cargo-
 
       - name: Build
         run: cargo build --workspace --locked
@@ -115,19 +95,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-
-      - uses: actions/cache@v4
+      - uses: ./.github/actions/setup-rust
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: mcp-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: mcp-${{ runner.os }}-cargo-
+          cache-prefix: mcp
 
       - name: Show node version (preinstalled on the runner)
         run: node --version && npx --version
@@ -136,3 +106,19 @@ jobs:
       # @modelcontextprotocol/server-everything and drives it through the gateway with a regex policy.
       - name: Regex shading against a real MCP server
         run: cargo test -p formwork-gateway --test real_server --locked -- --ignored --nocapture
+
+  # Enforce the declared MSRV (Cargo.toml `rust-version`). Without this the pin is documentation
+  # only: every other job uses stable, so post-1.85 code could merge green while violating it.
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: "1.85"
+          cache-prefix: msrv
+
+      - name: Check on the declared minimum supported Rust version
+        run: cargo check --workspace --locked

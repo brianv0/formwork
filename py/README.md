@@ -13,11 +13,8 @@ uv run pytest -v
 
 `uv` creates the venv and installs `pytest` on first run, and the `formwork_bin` fixture builds the
 CLI once per session (`cargo build -p formwork-cli`). Every run ends with a generated
-requirements↔tests traceability section (from the markers). Standalone form:
-
-```sh
-uv run python harness/traceability.py
-```
+requirements↔tests traceability section (from the markers), printed by the conftest
+`pytest_terminal_summary` hook.
 
 ## Markers
 
@@ -31,11 +28,19 @@ Each scenario carries its design-doc ID and its platform requirement:
 
 ## Coverage today
 
-- `test_fs_confinement.py` — [FW-E2E-001](../formwork.md#fw-e2e-001)/002/003 (macOS): granted vs. ungranted reads, write scope,
-  sensitive-set subtraction under a broad grant.
-- `test_net_egress.py` — [FW-E2E-006](../formwork.md#fw-e2e-006) (macOS): direct egress denied at `connect()` (not a startup
-  artifact — the interpreter runs and the syscall is what fails).
-- `test_compile.py` — [FW-E2E-026](../formwork.md#fw-e2e-026)/027 (any host): cross-platform dry-run compile, degraded-host
-  honesty, deterministic byte-identical compile, and `formwork detect`.
+The suite tracks the design-doc IDs it exercises via the `fw_e2e`/`fw_adv` markers; the generated
+traceability section (printed at the end of every run) is the authoritative map. By area:
 
-MCP fixture servers and the gateway shading tests ([FW-E2E-013](../formwork.md#fw-e2e-013)..019) land with Phase 6.
+- **Enforcement** — `test_fs_confinement.py` (granted vs. ungranted reads, write scope,
+  sensitive-set subtraction), `test_net_egress.py` (egress denied at `connect()`). macOS-gated.
+- **Compile / dry-run** — `test_compile.py` (cross-platform compile, degraded-host honesty,
+  deterministic byte-identical output), `test_blueprint_model.py`, `test_examples_blueprints.py`
+  (the shipped `examples/` blueprints compile and behave). Any host.
+- **Credentials** — `test_credential_catalog.py`, `test_adv_credentials.py` (catalog floor holds
+  under broad grants; operator/agent channel separation).
+- **Gateway (MCP shading)** — `test_examples_gateway.py` drives a real `fw-mcp-fixture` backend
+  through the gateway ([FW-E2E-013](../formwork.md#fw-e2e-013)/018/066).
+- **Discovery / `learn`** — `test_discovery.py`, `test_learn_review.py`, `test_learn_linux.py`
+  (the enforced-run → proposal → accept loop, both feeds).
+- **Meta** — `test_requirements.py` is the requirement-identifier canary: every cited `FW-*` ID
+  resolves to exactly one anchored definition, and every markdown requirement link lands on it.

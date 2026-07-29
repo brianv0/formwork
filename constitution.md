@@ -139,7 +139,7 @@ EGR — a new family is a Concepts-grade amendment), `FW-INV<n>` for invariants,
 - **Never renumbered, never reused.** Sequences are monotonic and shared
   across documents; an FEP continues them and reserves blocks at adoption. A
   collision discovered at planning is resolved by renumbering the *unlanded*
-  draft, never the landed spec (precedent: FEP-2, `docs/fep2-plan.md` §0). A
+  draft, never the landed spec (precedent: FEP-2, `docs/fep-2-plan.md` §0). A
   retired requirement's number stays retired.
 - **Citations link in markdown, stay bare in code.** A markdown file cites an
   ID as a relative link to its defining anchor —

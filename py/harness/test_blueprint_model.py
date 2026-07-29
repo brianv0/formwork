@@ -1,6 +1,6 @@
-"""Blueprint model and format E2E (FEP-2 §9.1): layering, extends, CLI/file parity, rename
-regression -- all black-box through the `formwork` CLI. Compile-level tests pin the host with
---target so byte-comparisons are meaningful on any machine."""
+"""Blueprint model and format E2E (FEP-2 §9.1): layering, extends, CLI/file parity -- all
+black-box through the `formwork` CLI. Compile-level tests pin the host with --target so
+byte-comparisons are meaningful on any machine."""
 
 import json
 from pathlib import Path
@@ -17,40 +17,6 @@ def compiled_policy(result):
     body = json.loads(result.stdout)
     body.pop("blueprint", None)
     return body
-
-RICH_BLUEPRINT = """\
-net = { ports = [443] }
-exec = "unrestricted"
-env = { scrub = { allow = ["ANTHROPIC_API_KEY"] } }
-
-[fs]
-read-mode = "closed"
-reads = ["/work/**"]
-writes = ["/work/project/**"]
-subtract = ["/work/.ssh/**"]
-write-subtract = ["**/.git/config"]
-
-[mcp.files]
-tools = { allow = ["read_file"] }
-resources = "allow-all"
-"""
-
-
-@pytest.mark.fw_e2e("FW-E2E-041")
-def test_rename_regression_spec_alias_and_stability(cli, tmp_path):
-    """The renamed surface (--blueprint) and the back-compat --spec alias compile a pre-FEP-2
-    single-file blueprint to byte-identical output, deterministically (FW-FID4)."""
-    bp = tmp_path / "session.toml"
-    bp.write_text(RICH_BLUEPRINT)
-
-    via_blueprint = cli("compile", "--blueprint", bp, "--target", "macos")
-    via_spec = cli("compile", "--spec", bp, "--target", "macos")
-    assert via_blueprint.code == 0, via_blueprint.stderr
-    assert via_spec.code == 0, via_spec.stderr
-    assert via_blueprint.stdout == via_spec.stdout, "rename must not change compilation"
-
-    again = cli("compile", "--blueprint", bp, "--target", "macos")
-    assert again.stdout == via_blueprint.stdout, "compile must be byte-deterministic"
 
 
 @pytest.mark.fw_e2e("FW-E2E-042")

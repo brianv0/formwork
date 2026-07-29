@@ -4,7 +4,8 @@
 set shell := ["bash", "-uc"]
 
 # Docker image used for first-line local Linux testing (plan §5). The kernel is the Docker VM's,
-# not the image's, so the harness gates on `formwork detect` and skips tiers the kernel can't carry.
+# not the image's, so the harness gates on `formwork explain --json` (the host profile) and skips
+# tiers the kernel can't carry.
 linux_image := "formwork-linux-test"
 # Unconfined so Docker's own seccomp/AppArmor never masks the sandbox under test (plan §5).
 docker_test_flags := "--security-opt seccomp=unconfined --security-opt apparmor=unconfined"
@@ -30,7 +31,7 @@ test-macos: test
 test-linux:
     docker build -t {{linux_image}} -f docker/Dockerfile.linux-test .
     docker run --rm {{docker_test_flags}} {{linux_image}} \
-        bash -lc 'formwork detect && cargo test --workspace'
+        bash -lc 'formwork explain --json && cargo test --workspace'
 
 # Full-matrix fallback for tiers Docker's VM kernel can't provide (e.g. Landlock ABI v6
 # socket/signal scoping, which needs 6.12+). Requires Lima with a pinned kernel image.
@@ -49,8 +50,9 @@ test-integration-mcp:
 
 # --- inspection -----------------------------------------------------------------------------
 
-detect:
-    cargo run -q -p formwork-cli -- detect
+# Print this host's enforcement profile as JSON (the machine-readable `host` field of `explain`).
+host:
+    cargo run -q -p formwork-cli -- explain --json
 
 # Compile the default profile against a synthetic target and print the fidelity report.
 compile-default target="macos":
@@ -67,12 +69,15 @@ bench:
 
 # --- dogfood & unattended dev ---------------------------------------------------------------
 
-# One gate for unattended runs: format check, lint, and the native test suite (real Seatbelt on
-# macOS). A green `just check` is the bar every checkpoint commit should clear. Mirrors CI.
+# One gate for unattended runs: format check, locked lint, and the native test suite (real Seatbelt
+# on macOS). A green `just check` is the bar every checkpoint commit should clear. Mirrors CI's
+# lint + test jobs (same `--locked` flags); the networked mcp-integration test (`just
+# test-integration-mcp`), the Python harness (`just test-e2e`), the MSRV check, and the full OS
+# matrix stay CI-only.
 check:
     cargo fmt --all --check
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo test --workspace --locked
 
 # Self-host: run Claude Code confined by Formwork against THIS checkout — prompts off, kernel wall
 # on. Renders examples/blueprints/dev-session.toml.tpl (with your checkout path) into a gitignored

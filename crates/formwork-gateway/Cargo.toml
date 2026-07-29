@@ -14,7 +14,7 @@ formwork-blueprint = { workspace = true }
 formwork-compile = { workspace = true }
 formwork-confine = { workspace = true }
 tracing = { workspace = true }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util", "process", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "sync"] }
 
 [dev-dependencies]
 formwork-detect = { workspace = true }

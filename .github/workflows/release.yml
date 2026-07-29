@@ -73,18 +73,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable) + target
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustup target add ${{ matrix.target }}
-
-      - uses: actions/cache@v4
+      - uses: ./.github/actions/setup-rust
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: release-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          target: ${{ matrix.target }}
+          cache-prefix: release-${{ matrix.target }}
 
       - name: Build
         env:

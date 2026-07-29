@@ -11,16 +11,17 @@ the fd seam, the gateway, and the CLI. Rationale: the confiner does `pre_exec`-w
 work (fork-safety matters), the gateway is the single privileged broker (memory safety
 matters), and the compiler must be deterministic ([FW-FID4](formwork.md#fw-fid4)).
 
-**Python** carries everything that sits *outside* the trust boundary:
+**Python** carries the black-box test harness that sits *outside* the trust boundary:
 
-- the end-to-end / adversarial test harness (`pytest`), which orchestrates the Rust binaries
-  and asserts the FW-E2E-* / FW-ADV-* pass/fail conditions;
-- probe scripts that run *inside* the sandbox (which doubles as a continuous test of ambient
-  interpreter reuse, [FW-TRA1](formwork.md#fw-tra1));
-- fixture MCP servers (stdio and streamable-http, via the official `mcp` Python SDK) used by
-  the gateway tests;
-- reuse-workload fixtures (a real pytest project, an npm project, a git repo, a small C build)
-  for [FW-E2E-020](formwork.md#fw-e2e-020)..023.
+- the end-to-end / adversarial harness (`pytest`), which drives the `formwork` CLI exactly as an
+  embedder would (it never links the crates) and asserts the FW-E2E-* / FW-ADV-* conditions;
+- small inline probe snippets it runs *inside* the sandbox, which double as a continuous test of
+  ambient interpreter reuse ([FW-TRA1](formwork.md#fw-tra1)).
+
+Two things this plan first assigned to Python moved into Rust once built: the fixture MCP backend
+is a Rust bin (`crates/formwork-gateway/src/bin/fw-mcp-fixture.rs`), and the confined syscall
+probes are Rust bins under `crates/formwork-confine/src/bin/`. The reuse-workload fixtures (a real
+pytest/npm/git/C build for [FW-E2E-020](formwork.md#fw-e2e-020)..023) are Phase-4 work, still owed.
 
 Optional later: `pyo3`-based Python bindings for embedding (`formwork.compile()`,
 `formwork.run()`). Not in v1 — the CLI is the v1 embedding surface.
@@ -29,9 +30,10 @@ Optional later: `pyo3`-based Python bindings for embedding (`formwork.compile()`
 
 ```
 formwork/
-├── Cargo.toml                    # workspace
+├── Cargo.toml                    # workspace (7 crates, no umbrella library — the CLI is the
+│                                 # v1 embedding surface)
 ├── crates/
-│   ├── formwork-blueprint/            # capability blueprint: types, serde, canonical form,
+│   ├── formwork-blueprint/       # capability blueprint: types, serde, canonical form,
 │   │                             # narrowing algebra (FW-CAP1, FW-CAP2)
 │   ├── formwork-compile/         # pure blueprint → {ConfinerPolicy, GatewayPolicy,
 │   │                             # FidelityReport}; no kernel calls (FW-CAP5, FW-FID*)
@@ -39,25 +41,23 @@ formwork/
 │   │                             # Seatbelt, OS version) — the only impure input
 │   ├── formwork-confine/         # Confiner trait + spawn-confined / confine-self;
 │   │   ├── src/linux/            # Landlock + seccomp + NO_NEW_PRIVS
-│   │   └── src/macos/            # Seatbelt: SBPL generation + sandbox_init FFI
+│   │   ├── src/macos/            # Seatbelt: SBPL generation + sandbox_init FFI
+│   │   └── src/bin/              # confined probe bins (connect/udp/ioctl/resolve)
 │   ├── formwork-seam/            # fd injection: socketpair setup at spawn, control
 │   │                             # protocol, SCM_RIGHTS minting (FW-XR7, FW-GW6)
-│   ├── formwork-gateway/         # MCP-aware policy proxy (tokio)
-│   ├── formwork/                 # umbrella library API: detect / compile / enforce /
-│   │                             # spawn_confined / run_gateway
-│   └── formwork-cli/             # `formwork` binary: detect, compile, run, gateway, probe
+│   ├── formwork-gateway/         # MCP-aware policy proxy (tokio); src/bin/fw-mcp-fixture
+│   │                             # is the test backend
+│   └── formwork-cli/             # `formwork` binary: compile, run, learn, gateway, explain
 ├── profiles/
 │   ├── default.toml              # subtractive default profile (FW-CAP3)
 │   └── credential-catalog.toml   # typed credential-location catalog (FW-CRED1; embedded)
 ├── py/
 │   ├── pyproject.toml            # uv-managed; dev-only, never shipped
-│   ├── harness/                  # pytest suite, one module per §7 group, markers = test IDs
-│   ├── probes/                   # scripts run inside the sandbox (fs/net/exec/shed probes)
-│   ├── mcp_fixtures/             # fixture MCP servers (stdio + streamable-http)
-│   └── workloads/                # pytest/npm/git/C reuse fixtures (FW-E2E-020..023)
+│   └── harness/                  # pytest black-box suite, one module per §7 group,
+│                                 # markers = test IDs (drives the CLI; never links the crates)
 ├── docs/
 └── justfile                      # build, test-linux (Docker first, Lima fallback),
-                                  # test-macos, bench
+                                  # test-macos, test-e2e, bench
 ```
 
 ## 3. Key technical decisions
@@ -290,11 +290,12 @@ reproduced by `formwork detect + compile` on each CI target.**
 ## 5. Test and CI strategy
 
 - **Harness:** every FW-E2E/FW-ADV test is a pytest with a marker carrying its ID; the
-  traceability table in §10 of the design doc is *generated* from markers by a small script,
-  so it cannot drift.
+  traceability table in §10 of the design doc is *generated* from those markers by the conftest
+  `pytest_terminal_summary` hook, so it cannot drift.
 - **Probes run in Python inside the sandbox** (exercising interpreter reuse for free); the
   few probes needing exact syscalls (raw `socket(2)`, `prctl`, `execve` of setuid) are tiny
-  Rust helpers under `formwork-cli probe`.
+  Rust bins under `crates/formwork-confine/src/bin/` (`fw-connect-probe`, `fw-udp-probe`,
+  `fw-ioctl-probe`, `fw-resolve-probe`).
 - **CI matrix:** `macos-15` (Seatbelt), `ubuntu-24.04` (kernel 6.8 → Landlock ABI v4: fs +
   net-port tests), a 6.12+ runner or container-in-VM job for ABI v6 scoping tests, and a
   deliberately old-kernel job (no Landlock) for [FW-E2E-025](formwork.md#fw-e2e-025)/026 honesty tests. Platform-gated
@@ -312,7 +313,7 @@ reproduced by `formwork detect + compile` on each CI target.**
     unconfined options keep test failures attributable.
   - **The kernel is the VM's, not the image's.** On Docker Desktop the Landlock ABI is
     whatever the linuxkit VM kernel provides (recent versions are 6.x, typically ABI v4+).
-    The harness therefore starts every containerized run with `formwork detect` and
+    The harness therefore starts every containerized run with `formwork explain --json` and
     skips-with-reason any test the detected ABI cannot carry, same as CI.
 
   When the Docker VM kernel is too old for a test tier (ABI v6 socket/signal scoping needs

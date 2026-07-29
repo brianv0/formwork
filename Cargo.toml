@@ -29,6 +29,11 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Unix syscall FFI, shared by every crate that touches the kernel directly (cli/detect/confine/seam).
+libc = "0.2"
+# Async runtime for the gateway broker; the base feature set here, consumers add what they need.
+# Constitution Layers: only formwork-gateway links it in the product; the CLI uses it dev-only.
+tokio = { version = "1", features = ["rt", "io-util", "process", "time"] }
 
 # Linux confiner backends (Phase 2). Linux-only; referenced under a target cfg so the macOS build
 # never pulls them. Every crate here widens the trust base (Growth), so these two are the whole of it:

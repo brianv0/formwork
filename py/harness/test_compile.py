@@ -44,9 +44,10 @@ def test_deterministic_compile_byte_identical(cli, tmp_path):
 
 
 @pytest.mark.fw_e2e("FW-E2E-026")
-def test_detect_runs_on_this_host(cli):
-    result = cli("detect")
+def test_host_profile_runs_on_this_host(cli):
+    # The machine-readable host profile is the `host` field of `explain --json`.
+    result = cli("explain", "--json")
     assert result.code == 0, result.stderr
-    profile = json.loads(result.stdout)
+    profile = json.loads(result.stdout)["host"]
     assert profile["os"] in ("macos", "linux")
     assert "seccomp" in profile and "seatbelt" in profile

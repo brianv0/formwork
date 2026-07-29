@@ -1,0 +1,43 @@
+# Repo-local composite action (first-party, no third-party supply-chain surface — see ci.yml).
+# Installs a rustup toolchain and restores the shared cargo/target cache. Factors the rustup +
+# actions/cache blocks that every workspace job needs into one place so they cannot drift.
+name: Set up Rust
+description: Install a rustup toolchain and restore the cargo registry/git/target cache.
+
+inputs:
+  toolchain:
+    description: rustup toolchain to install and default (e.g. stable, 1.85).
+    required: false
+    default: stable
+  components:
+    description: Space-separated rustup components (e.g. "rustfmt clippy").
+    required: false
+    default: ""
+  target:
+    description: Cross-compilation target to add (e.g. aarch64-apple-darwin). Empty = host only.
+    required: false
+    default: ""
+  cache-prefix:
+    description: Cache key namespace so unlike jobs don't clobber each other's target dir.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust (${{ inputs.toolchain }})
+      shell: bash
+      run: |
+        components=""
+        for c in ${{ inputs.components }}; do components="$components --component $c"; done
+        rustup toolchain install ${{ inputs.toolchain }} --profile minimal $components --no-self-update
+        rustup default ${{ inputs.toolchain }}
+        if [ -n "${{ inputs.target }}" ]; then rustup target add ${{ inputs.target }}; fi
+
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ inputs.cache-prefix }}-${{ runner.os }}-cargo-

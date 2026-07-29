@@ -54,11 +54,11 @@ fn help_epilogue_reports_this_host() {
     let out = formwork(dir.path(), dir.path(), &["--help"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert!(out.stdout.contains("This host: "), "{}", out.stdout);
-    // The demoted plumbing/aliases stay callable but out of the listing.
-    for hidden in ["detect", "enforce-self", "accept"] {
+    // The retired back-compat aliases are gone from the surface entirely.
+    for gone in ["detect", "enforce-self", "accept"] {
         assert!(
-            !out.stdout.contains(&format!("\n  {hidden}")),
-            "`{hidden}` should be hidden from help:\n{}",
+            !out.stdout.contains(&format!("\n  {gone}")),
+            "`{gone}` should not appear in help:\n{}",
             out.stdout
         );
     }
@@ -244,15 +244,6 @@ fn explain_without_any_blueprint_degrades_to_host_only() {
     let json = formwork(dir.path(), dir.path(), &["explain", "--json"]);
     let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
     assert!(value["host"]["os"].is_string(), "{}", json.stdout);
-}
-
-#[test]
-fn hidden_detect_still_prints_the_host_profile() {
-    let dir = Scratch::new("detect");
-    let out = formwork(dir.path(), dir.path(), &["detect"]);
-    assert_eq!(out.code, 0, "{}", out.stderr);
-    let profile: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
-    assert!(matches!(profile["os"].as_str(), Some("macos" | "linux")));
 }
 
 /// The listing half of FW-E2E-063 at the Rust boundary; the full review loop (accept by number /

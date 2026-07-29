@@ -7,7 +7,7 @@
 constitution (Requirements & identifiers; Precedence & Conflicts), a draft lives in its FEP until
 adoption, and the landed docs stay stable. The amendments in §5 are written as apply-on-landing
 blocks for review. Code-wise, the **non-deviating pure core** has landed ahead of the mechanism per
-the work plan (`docs/fep4-plan.md` §5.1) — the `AccessRecord` rename (with its `DenialRecord`
+the work plan (`fep-4-plan.md` §5.1) — the `AccessRecord` rename (with its `DenialRecord`
 alias), `synthesize_blueprint`, and the `floor_only_permissive` Blueprint constructor, all ordinary
 confinement exercised only through the pure compiler and tests. The **deviating** parts — a run
 without a full wall — stay unlanded (§6). New identifiers are draft numbering (written as inline code, which the
@@ -20,7 +20,7 @@ as PRs #19 and #22 landed tests at those numbers).
 
 ## 1. Problem
 
-Discovery today ([FW-DISC1](formwork.md#fw-disc1)–6) is *enforce-then-widen*: a `learn` run is
+Discovery today ([FW-DISC1](../formwork.md#fw-disc1)–6) is *enforce-then-widen*: a `learn` run is
 enforced unchanged, the kernel logs **denials**, and those reverse-compile into a reviewable
 proposal. This is the right default — the wall never drops — but the denial feed is an **indirect,
 lossy, platform-specific** signal: you only learn a workload needs a path when the kernel *denies*
@@ -48,11 +48,11 @@ Two structural mitigations keep this defensible rather than a "grant-whatever-is
 (the one `formwork.md` §5.10 exists to forbid):
 
 1. **The credential floor is enforced *during* the recording** (`FW-DISC8`/`FW-INV12`). The catalog
-   ([FW-CRED4](formwork.md#fw-cred4)) compiles into a hard deny even in permissive mode, so a
+   ([FW-CRED4](../formwork.md#fw-cred4)) compiles into a hard deny even in permissive mode, so a
    credential the workload touches is denied at the kernel and therefore never appears as an
    observed open — it cannot enter the proposal or the synthesized Blueprint. This is the structural
    answer to "permissive tracing launders your secrets into the policy."
-2. **The output stays non-authoritative** ([FW-INV10](formwork.md#fw-inv10)). Observed opens flow
+2. **The output stays non-authoritative** ([FW-INV10](../formwork.md#fw-inv10)). Observed opens flow
    through the *same* proposal → accept pipeline as denial-learning. The recording proposes; the
    operator disposes. A recording is not a live widening of anything — there is no enforced session
    to weaken, because the operator explicitly and loudly ran without one.
@@ -73,7 +73,7 @@ formwork learn            -- <cmd> …        # today: enforced; observe denials
 formwork learn --list / --accept <N|pat> / --accept-all
 ```
 
-One observation concept, two sources; the entire review/accept UI ([FW-DISC5](formwork.md#fw-disc5))
+One observation concept, two sources; the entire review/accept UI ([FW-DISC5](../formwork.md#fw-disc5))
 is reused verbatim. `--permissive` is loud by construction — the operator must type it — satisfying
 "opt-in, never default." (The brasher `--unconfined` spelling is an open naming call, §7.)
 
@@ -87,8 +87,8 @@ the backend surfaces the opens it allows.
 
 This keeps every concept intact:
 
-- It is a real [CompiledPolicy](formwork.md#fw-cap5) from a Blueprint (the floor) + a HostProfile —
-  the compiler stays pure ([FW-CAP2](formwork.md#fw-cap2)/[FW-E2E-026](formwork.md#fw-e2e-026)).
+- It is a real [CompiledPolicy](../formwork.md#fw-cap5) from a Blueprint (the floor) + a HostProfile —
+  the compiler stays pure ([FW-CAP2](../formwork.md#fw-cap2)/[FW-E2E-026](../formwork.md#fw-e2e-026)).
 - It is genuine confinement (the floor *is* enforced), so `spawn_confined` / `confine` keep their
   vocabulary meaning; the run is weak, not absent.
 - On macOS the mechanism is the same Seatbelt/SBPL the Confiner already installs, in a permissive
@@ -98,16 +98,16 @@ This keeps every concept intact:
 
 `formwork_blueprint::reverse_compile` already takes `{path, access}` records and is agnostic to
 whether they came from denials or opens. Feeding observed opens through it inherits, for free: the
-credential floor ([FW-DISC3](formwork.md#fw-disc3)/[FW-INV8](formwork.md#fw-inv8)) — a second line
+credential floor ([FW-DISC3](../formwork.md#fw-disc3)/[FW-INV8](../formwork.md#fw-inv8)) — a second line
 of defence behind the kernel-enforced floor of §2.2 — sibling→`parent/**` folding, and auto-widen
-zone tagging ([FW-DISC4](formwork.md#fw-disc4)). The only rename is `DenialRecord` → `AccessRecord`
+zone tagging ([FW-DISC4](../formwork.md#fw-disc4)). The only rename is `DenialRecord` → `AccessRecord`
 (with a kept alias; both are the same shape). This is the largest reuse and the reason the feature
 is small.
 
 ### 2.4 Output: proposal, then optional freeze
 
 Recorded grants land in the existing proposal and, on accept, the provenance-carrying discovered
-layer ([FW-DISC6](formwork.md#fw-disc6)) — reusing the sticky accumulation across runs so an
+layer ([FW-DISC6](../formwork.md#fw-disc6)) — reusing the sticky accumulation across runs so an
 operator profiles several code paths before deciding. A recording is therefore, like denial-learning,
 **non-authoritative until accepted**. As a convenience, `learn --permissive --out app.blueprint.toml`
 **freezes** the accepted grants into a standalone Blueprint (the *existing* schema, a new file
@@ -120,9 +120,9 @@ Growth requires it: "the Phase-2 Landlock crates stay unwired until a real kerne
 unverifiable Linux observer would be the same violation, and Linux enforcement itself is still a stub
 here. So v1 is **macOS** (Seatbelt is real and end-to-end verifiable — record→enforce round-trips on
 the same host). Linux reports `trace-feed: none` and `learn --permissive` **fails loud, writing
-nothing** ([FW-INV6](formwork.md#fw-inv6)) — the surface fail-fast the CLI owes any host missing a
-feed ([FW-XR9](formwork.md#fw-xr9)). Note this is the *open*-feed gap, separate from the denial feed
-plain `learn` now taps on Linux via ptrace ([FW-E2E-071](formwork.md#fw-e2e-071)): recording needs
+nothing** ([FW-INV6](../formwork.md#fw-inv6)) — the surface fail-fast the CLI owes any host missing a
+feed ([FW-XR9](../formwork.md#fw-xr9)). Note this is the *open*-feed gap, separate from the denial feed
+plain `learn` now taps on Linux via ptrace ([FW-E2E-071](../formwork.md#fw-e2e-071)): recording needs
 every open, which ptrace-of-denials does not give. When Linux
 lands, `fanotify` (`FAN_OPEN` + `FAN_REPORT_DFID_NAME`, PID-subtree filtered) is the intended feed,
 and it **extends `formwork-confine`** rather than adding a crate (Growth's hardest *no* is on deps).
@@ -157,27 +157,27 @@ one invariant. Draft IDs, renumbered above PR #18:
 - `FW-DISC7` **Permissive recording.** A second, explicitly-unconfined discovery observation source
   (`learn --permissive`): the run is not enforced except for the credential floor, its file opens
   are observed and reverse-compiled, and it is loud, opt-in, and never a default. The alternative to
-  enforced denial-learning ([FW-DISC1](formwork.md#fw-disc1)) when the operator trusts the workload
+  enforced denial-learning ([FW-DISC1](../formwork.md#fw-disc1)) when the operator trusts the workload
   and wants complete coverage rather than a baseline's denial gaps (§1.1 threat model).
 - `FW-DISC8` **Floor-enforced recording.** During a permissive recording the credential catalog
-  ([FW-CRED4](formwork.md#fw-cred4)) is compiled and enforced as a hard deny; only non-floor opens
+  ([FW-CRED4](../formwork.md#fw-cred4)) is compiled and enforced as a hard deny; only non-floor opens
   are observable, so a credential is denied at the kernel and never enters the proposal or a
   synthesized Blueprint — belt-and-suspenders with the reverse-compile floor
-  ([FW-DISC3](formwork.md#fw-disc3)).
+  ([FW-DISC3](../formwork.md#fw-disc3)).
 - `FW-DISC9` **Open-feed honesty.** A host with no open-observation feed makes recording fail loud
-  and write nothing ([FW-INV5](formwork.md#fw-inv5)/[FW-INV6](formwork.md#fw-inv6)); a recording
+  and write nothing ([FW-INV5](../formwork.md#fw-inv5)/[FW-INV6](../formwork.md#fw-inv6)); a recording
   never claims complete coverage (it observed only the paths the run executed), and its output is
-  non-authoritative ([FW-INV10](formwork.md#fw-inv10)) until accepted or frozen.
+  non-authoritative ([FW-INV10](../formwork.md#fw-inv10)) until accepted or frozen.
 - `FW-DISC10` **Blueprint synthesis / freeze.** Accepted recorded grants may be frozen into a
   standalone Blueprint of the existing schema — a machine-written, human-reviewed discovery artifact
-  alongside the proposal and discovered layer, carrying provenance ([FW-DISC6](formwork.md#fw-disc6)).
+  alongside the proposal and discovered layer, carrying provenance ([FW-DISC6](../formwork.md#fw-disc6)).
 
 Invariant:
 
 - `FW-INV12` **Recording floor.** Even an unconfined recording enforces the credential floor: no
   permissive recording can observe, propose, or synthesize access to a
-  [FW-CRED](formwork.md#fw-cred1)-matched location. The recording-mode strengthening of
-  [FW-INV8](formwork.md#fw-inv8), tested to falsify.
+  [FW-CRED](../formwork.md#fw-cred1)-matched location. The recording-mode strengthening of
+  [FW-INV8](../formwork.md#fw-inv8), tested to falsify.
 
 Tests (draft, above the highest landed number — `FW-E2E-071` today). These draft numbers chase the
 landed spec: first drafted as `FW-E2E-065`..067, then bumped to `070`..072 once PR #19 landed the
@@ -190,13 +190,13 @@ adoption:
 - `FW-E2E-072` **Recording round-trip (macOS).** Spawn a workload under the floor-only permissive
   policy; the opens it makes are observed and synthesized into a Blueprint; re-enforcing that
   Blueprint runs the same workload clean, while a path it never touched is denied. Paired allow/deny
-  against real Seatbelt ([FW-INV5](formwork.md#fw-inv5), like [FW-E2E-024](formwork.md#fw-e2e-024)).
+  against real Seatbelt ([FW-INV5](../formwork.md#fw-inv5), like [FW-E2E-024](../formwork.md#fw-e2e-024)).
 - `FW-E2E-073` **Recording floor (`FW-INV12`).** A workload that reads a credential during a
   permissive recording is denied at the kernel, and that credential is absent from both the proposal
   and any synthesized Blueprint. (The recording-mode analogue of
-  [FW-E2E-051](formwork.md#fw-e2e-051)'s floor property.)
+  [FW-E2E-051](../formwork.md#fw-e2e-051)'s floor property.)
 - `FW-E2E-074` **No-feed fail-loud.** On a host reporting `trace-feed: none` (Linux today),
-  `learn --permissive` fails loud and writes nothing ([FW-INV6](formwork.md#fw-inv6)); no empty or
+  `learn --permissive` fails loud and writes nothing ([FW-INV6](../formwork.md#fw-inv6)); no empty or
   partial Blueprint is emitted.
 
 ## 5. Proposed amendments to the landed docs (apply on landing)
@@ -205,16 +205,16 @@ None of these are applied yet. On adoption they fold into `formwork.md`/`constit
 draft IDs above gain anchors (either by adding `fep-4.md` to the requirements canary's `DEFINING`
 list, as `fep-1.md` is, or by folding the definitions into `formwork.md`).
 
-**(a) Scope [FW-DISC1](formwork.md#fw-disc1) so "enforced run" admits the recording alternative.**
+**(a) Scope [FW-DISC1](../formwork.md#fw-disc1) so "enforced run" admits the recording alternative.**
 Current text pins learning to an enforced run. Proposed replacement:
 
 > **FW-DISC1** Observation source. Discovery observes what a workload touches by one of two sources:
 > an **enforced** run whose denials are recorded (the default; the policy is enforced unchanged,
-> [FW-INV10](formwork.md#fw-inv10)), or an explicitly **permissive** recording whose opens are
+> [FW-INV10](../formwork.md#fw-inv10)), or an explicitly **permissive** recording whose opens are
 > recorded (`FW-DISC7`; unconfined except the credential floor, `FW-DISC8`). Both are visibly
 > distinct from a plain run; neither widens a live enforced session.
 
-**(b) Scope [FW-INV10](formwork.md#fw-inv10)** — no wording change to the guarantee, but a clarifying
+**(b) Scope [FW-INV10](../formwork.md#fw-inv10)** — no wording change to the guarantee, but a clarifying
 clause: a permissive recording is not a "live enforced session" being weakened; it is an operator's
 explicit, loud choice to run without a wall in order to *produce* one. The §5.10 guarantee
 ("never … grant-whatever-is-attempted") is preserved because recorded opens remain non-authoritative
@@ -245,13 +245,13 @@ explicitly narrower sibling of the main threat model, with its two structural mi
 ## 6. Decisions (recorded per constitution Precedence & Conflicts)
 
 - **The one genuine deviation — a run without a full wall — is a tracked exception, not a silent
-  workaround.** [FW-DISC1](formwork.md#fw-disc1) as landed says learning is an *enforced* run.
+  workaround.** [FW-DISC1](../formwork.md#fw-disc1) as landed says learning is an *enforced* run.
   Permissive recording conflicts with that clause. Resolution per Precedence & Conflicts: STOP, state
   it, amend (§5a/§5b), and record the exception with the mitigations that bound it (floor enforced,
   output non-authoritative) and an expiry (adoption of FEP-4 folds the amendment in and closes the
   exception). Until then, no *deviating* code lands — nothing that runs a workload without the full
   wall. The pure, non-deviating core has landed ahead of the mechanism per the work plan
-  (`docs/fep4-plan.md` §5.1): the `AccessRecord` rename (with its `DenialRecord` alias),
+  (`fep-4-plan.md` §5.1): the `AccessRecord` rename (with its `DenialRecord` alias),
   `synthesize_blueprint`, and the `floor_only_permissive` Blueprint constructor — all exercised only
   through the pure compiler and tests, citing only landed IDs. That core creates no unconfined run,
   so it opens no seam and triggers no exception; the constitution's "there are none at present" holds
@@ -272,10 +272,10 @@ explicitly narrower sibling of the main threat model, with its two structural mi
   after PR #19 landed the MCP-pattern tests at `065`..067 → `072`..074 after PR #22 landed the
   discovery-trust and Linux-ptrace tests at `FW-E2E-070`/`071`. Each collision is resolved by
   renumbering the *unlanded* draft, never the landed spec (Requirements & identifiers: "never
-  renumbered, never reused"; precedent: FEP-2, `docs/fep2-plan.md` §0); the block finalizes at
+  renumbered, never reused"; precedent: FEP-2, `fep-2-plan.md` §0); the block finalizes at
   adoption. The draft requirement IDs do not collide and are stable — the landed spec even reserves
   them (`FW-DISC7`..10 above the landed `FW-DISC6`/`FW-DISC11`, per the note on
-  [FW-DISC11](formwork.md#fw-disc11); `FW-INV12` above the landed `FW-INV11`).
+  [FW-DISC11](../formwork.md#fw-disc11); `FW-INV12` above the landed `FW-INV11`).
 
 ## 7. Open questions (a spike decides, before any mechanism code)
 
@@ -283,7 +283,7 @@ explicitly narrower sibling of the main threat model, with its two structural mi
   the floor-only Seatbelt policy (§2.2) enforces regardless, and the feed only *observes* on top, so
   these compose with the floor rather than replace it. Candidates, on a completeness-vs-cost axis:
   - **(A) SBPL `(trace "file")` profile-generation mode** — a profile *generator*, subtree-scoped for
-    free (Seatbelt inheritance, [FW-XR4](formwork.md#fw-xr4)), no root; but private/undocumented and
+    free (Seatbelt inheritance, [FW-XR4](../formwork.md#fw-xr4)), no root; but private/undocumented and
     version-drifting.
   - **(B) allow-default with a `(with report)` modifier on file rules** — reuses the existing
     structured ndjson `log show` tap (`learn.rs`) to parse *allow* records the way it parses *deny*
@@ -291,7 +291,7 @@ explicitly narrower sibling of the main threat model, with its two structural mi
     ops). Depends on that modifier firing.
   - **fs_usage** (front-runner) — kdebug/ktrace-based, so it captures the **broadest** set: every fs
     syscall including metadata ops (`stat`/`access`/`readlink`/`getattrlist`), which matters here
-    because formwork itself enforces metadata denial ([FW-CAP7](formwork.md#fw-cap7)) — a
+    because formwork itself enforces metadata denial ([FW-CAP7](../formwork.md#fw-cap7)) — a
     data-open-only trace would synthesize a Blueprint too tight for the enforced run.
     Mechanism-independent (no reliance on the undocumented SBPL facilities). The parse-fragility and
     under-load event-loss knocks are **not** weighed against it: this is a bootstrap run made a
@@ -299,12 +299,12 @@ explicitly narrower sibling of the main threat model, with its two structural mi
     `sudo` (Seatbelt needs none — a footprint escalation, though amortized: record once, enforce many
     times without root) and **attribution** (§7.1). `FW-INV12` still holds: a floor-denied credential
     open that fs_usage records as an *attempt* is withheld by the reverse-compile floor
-    ([FW-DISC3](formwork.md#fw-disc3)) regardless of source.
+    ([FW-DISC3](../formwork.md#fw-disc3)) regardless of source.
 
   Endpoint Security (`ES_EVENT_TYPE_NOTIFY_OPEN`) is the supported, structured, complete path but
   carries an Apple entitlement + root + code-signing cost that breaks curl-and-run distribution; it
   stays a reported `Unavailable`/future, not v1. The spike (recorded in `docs/spikes.md`, the same way
-  the denial-feed choice was made in `docs/fep2-plan.md` §4) picks the feed before §2.2's mechanism is
+  the denial-feed choice was made in `fep-2-plan.md` §4) picks the feed before §2.2's mechanism is
   built — fs_usage for completeness, (B) for cost/reuse; the decision is whether metadata-op coverage
   is worth the root requirement.
 

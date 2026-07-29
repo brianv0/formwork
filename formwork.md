@@ -395,7 +395,7 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 ### 7.7 Blueprint model & format
 
-<a id="fw-e2e-041"></a>**FW-E2E-041: Rename regression.** *(Regression guard for the spec → Blueprint rename; not tied to a numbered requirement.)* A Blueprint that is the renamed form of a prior spec compiles to the same policy and report. Pass: no behavioral change attributable to the rename. Fail: any policy difference.
+<a id="fw-e2e-041"></a>**FW-E2E-041: Rename regression.** *(Retired with the `--spec` compat alias. This was a transitional regression guard for the spec → Blueprint rename — never tied to a numbered requirement — and its number stays retired now that the alias is gone. Byte-deterministic compile is covered by [FW-E2E-026](#fw-e2e-026)/027.)*
 
 <a id="fw-e2e-042"></a>**FW-E2E-042: Override precedence.** A path allowed in the file is denied by a CLI `--subtract` layered over it; a deny and an allow at equal precedence resolve to deny. Pass: merge follows baseline → extends → file → CLI ([FW-BP2](#fw-bp2)), postures last-set-wins, path sets additive, with deny-beats-allow at ties. Fail: any ordering or tie deviation.
 

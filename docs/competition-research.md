@@ -4,6 +4,14 @@
 (fetched from upstream repos on `main`), vendor docs, and disclosed advisories.
 Formwork claims are traced to this repo's code with `file:line` citations.*
 
+> **Update (2026-07): two of the three "real gaps" below have since closed.** Linux enforcement
+> is real (Landlock + seccomp, kernel-verified — see [`docs/linux-backend.md`](linux-backend.md)
+> and [STATUS.md](STATUS.md)), and the tamper-vector write-protection (`.git/hooks`, agent config
+> dirs) now ships in `profiles/default.toml`. Only the domain-level egress gap (gap #1) remains
+> open (deferred to [FEP-1](fep-1.md) Part A). The competitor findings are a 2026-07-06 snapshot
+> and are not re-verified here; treat the Formwork rows as the current source of truth and the rest
+> as dated.
+
 ## TL;DR
 
 Formwork's **defaults and credential posture are stronger than every shipping
@@ -14,13 +22,13 @@ credential deny list"; Cursor leaks `~/.npmrc` by default (demonstrated token
 exfiltration); OpenAI Codex returns full-disk-read `true` in every mode. Only
 VS Code approaches us, by denying `$HOME` reads by default.
 
-Our three real gaps:
+Our three original gaps (see the Update banner above — only #1 is still open):
 
 1. **No domain-level network egress** — table stakes everywhere else and the #1
-   exfiltration control. We do TCP-port granularity only.
-2. **No write-protection for code-execution vectors** (`.git/hooks`, shell rc,
-   agent config dirs) — every competitor hardcodes these.
-3. **No Linux enforcement** — everyone ships Linux; ours is an honest stub.
+   exfiltration control. We do TCP-port granularity only. *(Still open; deferred to FEP-1 Part A.)*
+2. ~~**No write-protection for code-execution vectors**~~ — *closed:* the tamper-vector
+   write-subtracts (`.git/hooks`, shell rc, agent config dirs) now ship in `profiles/default.toml`.
+3. ~~**No Linux enforcement**~~ — *closed:* Landlock + seccomp enforce for real, kernel-verified.
 
 ---
 
@@ -28,7 +36,7 @@ Our three real gaps:
 
 | Tool | Mechanism (macOS / Linux / Win) | On by default? | FS reads default | FS writes default | Net default | Domain allowlist? |
 |---|---|---|---|---|---|---|
-| **Formwork** | Seatbelt / *stub (Landlock+seccomp compiled, unenforced)* / — | n/a (CLI wrapper) | **Deny-all** (schema); ambient-minus-subtract in shipped profile | **Deny-all, always** | Deny-all | **No — TCP port only** |
+| **Formwork** | Seatbelt / Landlock+seccomp (kernel-enforced) / — | n/a (CLI wrapper) | **Deny-all** (schema); ambient-minus-subtract in shipped profile | **Deny-all, always** | Deny-all | **No — TCP port only** |
 | **Anthropic srt / Claude Code** | Seatbelt / bwrap+socat+seccomp / WSL2 | **Off** (`sandbox.enabled: false`) | **Allow-all** | Deny-all (CC: cwd+tmp) | Deny-all → per-domain prompt | Yes (host-side HTTP CONNECT + SOCKS5 proxy) |
 | **OpenAI Codex CLI** | Seatbelt / bwrap+seccomp (Landlock legacy) / **native Windows** | **Yes** (workspace-write preset) | **Allow-all, unconditionally** | cwd+`/tmp`+`$TMPDIR`; `.git`/`.codex`/`.agents` carved out | Off in workspace-write | Yes (network-proxy crate) |
 | **Google Gemini CLI** | Seatbelt profiles / Docker-only (legacy) / Docker | **Off** | Allow-all (default `permissive-open`) | cwd+caches | **Open** in default profile | Only via a proxy you supply |
@@ -116,21 +124,22 @@ gateway is an MCP stdio shader, not an egress filter ([FW-GW7](../formwork.md#fw
 industry's credential story is "reads open, egress gated," and *our* story is
 "reads closed," adding domain egress would make us strictly stronger than everyone.
 
-**2. No write-protection for code-execution / policy-tampering vectors.** The one
-hardcoded list *everyone* has and we don't: `sandbox-runtime`'s `DANGEROUS_FILES`/
+**2. No write-protection for code-execution / policy-tampering vectors.** *(Closed since this
+snapshot — the write-subtract list below now ships in `profiles/default.toml`.)* The one
+hardcoded list *everyone* has: `sandbox-runtime`'s `DANGEROUS_FILES`/
 `DANGEROUS_DIRECTORIES` (shell rc, `.gitconfig`, `.mcp.json`, `.git/hooks`,
 `.vscode`, `.idea`, `.claude/{commands,agents}`), Codex's forced-read-only
 `.git`/`.agents`/`.codex` inside every writable root, Cursor's protected
 `.cursor/*.json`/`.git/hooks`/`.cursorignore`, Zed's git-metadata protection.
-With our `agent-session.toml`, `.git/hooks/**` inside the granted workspace is
-writable — an agent can plant a hook the user later runs *unsandboxed*. Our
-subtract mechanism can express this today; the sensitive set just omits it.
+Formwork's subtract mechanism always expressed this; the shipped default profile now
+carries it, so `.git/hooks/**` and the agent-config dirs are write-subtracted out of an
+otherwise-granted workspace.
 
-**3. Linux enforcement unbuilt.** All major competitors ship Linux (bwrap or
+**3. Linux enforcement unbuilt.** *(Closed since this snapshot — Linux now enforces for real:
+Landlock fs + net tiers and a seccomp baseline, kernel-verified; see
+[`docs/linux-backend.md`](linux-backend.md).)* All major competitors ship Linux (bwrap or
 direct Landlock+seccomp). Cursor validates our exact direct-Landlock design choice
-at production scale. Being macOS-only is the main "not production-comparable" mark
-against us. Our confiner is an honest stub
-(`crates/formwork-confine/src/linux/mod.rs:9-18`).
+at production scale — the same direction Formwork took.
 
 **4. No violation observability.** `sandbox-runtime` tails the unified log
 (`sandbox-exec` predicate with an embedded log-tag) and Claude Code turns
