@@ -23,14 +23,15 @@ carry them). Clippy is clean under `-D warnings`, and the whole workspace cross-
 ## Deprecations
 
 Compat shims are exceptions to the command-surface rule and expire at a named event (constitution:
-*Precedence & Conflicts*). The live register:
+*Precedence & Conflicts*). The live register is **empty** — the pre-release back-compat shims below
+were removed ahead of the first tagged release; each surface now has exactly one spelling:
 
-| Surface | Replacement | Removal event |
-|---|---|---|
-| hidden `formwork detect` | `formwork explain` (JSON via `--json`; host line in `--help`) | first tagged release |
-| hidden `formwork enforce-self` | `formwork run --confine-self` | first tagged release |
-| hidden `formwork accept` | `formwork learn --list` / `--accept` | first tagged release |
-| `--spec` alias | `--blueprint` | first tagged release |
+| Removed surface | Use instead |
+|---|---|
+| hidden `formwork detect` | `formwork explain --json` (the `host` field) |
+| hidden `formwork enforce-self` | `formwork run --confine-self` |
+| hidden `formwork accept` | `formwork learn --list` / `--accept` |
+| `--spec` alias | `--blueprint` |
 
 Adopted enhancement proposals and their planning docs live in this directory: `fep-1.md`
 (deferred egress/violation-stream reservations), `fep-2.md` + `fep-2-plan.md` (credential catalog,

@@ -165,8 +165,8 @@ def test_learn_without_a_denial_feed_fails_before_the_workload(review, tmp_path)
 @pytest.mark.fw_e2e("FW-E2E-062")
 @pytest.mark.skipif(sys.platform == "darwin", reason="macOS's feed needs no userspace tool")
 def test_observe_anyway_runs_enforced_but_writes_no_proposal(cli, tmp_path):
-    detect = cli("detect")
-    if json.loads(detect.stdout).get("landlock-abi") is None:
+    host = json.loads(cli("explain", "--json").stdout)["host"]
+    if host.get("landlock-abi") is None:
         pytest.skip("host cannot enforce (no Landlock); the enforced-run half needs a real confiner")
     blueprint = tmp_path / "bp.toml"
     blueprint.write_text(
@@ -191,7 +191,7 @@ def test_observe_anyway_is_refused_where_a_feed_exists(review, cli):
     if sys.platform != "darwin":
         if shutil.which("strace") is None:
             pytest.skip("no feed on this host (Linux without strace)")
-        if json.loads(cli("detect").stdout).get("landlock-abi") is None:
+        if json.loads(cli("explain", "--json").stdout)["host"].get("landlock-abi") is None:
             pytest.skip("no feed on this host (no Landlock, so nothing is enforced or denied)")
     result = review("--observe-anyway", "--", "/bin/true")
     assert result.code != 0
