@@ -9,14 +9,16 @@ from helpers import write_blueprint
 pytestmark = pytest.mark.macos
 
 # Exit 0 = connected (LEAK); 7 = denied at connect(); 8 = other failure. Require 7 so a startup
-# failure can't masquerade as a denial.
+# failure can't masquerade as a denial. The target is a stable, globally-routable anycast address
+# (Cloudflare 1.1.1.1) so the LEAK branch is real: if the sandbox failed open, connect() would
+# actually succeed rather than time out into the ambiguous exit-8 bucket.
 _CONNECT_PROBE = textwrap.dedent(
     """
     import socket, sys
     s = socket.socket()
     s.settimeout(3)
     try:
-        s.connect(('93.184.216.34', 80)); sys.exit(0)
+        s.connect(('1.1.1.1', 80)); sys.exit(0)
     except PermissionError:
         sys.exit(7)
     except Exception:

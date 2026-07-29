@@ -7,7 +7,6 @@ loud, never silent passes."""
 import json
 import shutil
 import subprocess
-import sys
 
 import pytest
 

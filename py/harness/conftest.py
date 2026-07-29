@@ -33,20 +33,24 @@ def workspace(tmp_path) -> Workspace:
     return make_workspace(tmp_path)
 
 
-def _fw_id(item) -> str | None:
+def _fw_ids(item) -> list[str]:
+    """Every FW-E2E/FW-ADV id on a test. A test may carry several (one scenario that discharges
+    two requirements, e.g. FW-E2E-071 + FW-E2E-051); get_closest_marker would silently drop all
+    but one, defeating the point of a generated table."""
+    ids = []
     for name in ("fw_e2e", "fw_adv"):
-        marker = item.get_closest_marker(name)
-        if marker and marker.args:
-            return marker.args[0]
-    return None
+        for marker in item.iter_markers(name):
+            if marker.args:
+                ids.append(marker.args[0])
+    return ids
 
 
 def pytest_collection_modifyitems(config, items):
     """Skip platform-backend tests off their platform; stash FW IDs for the traceability report."""
     is_macos = sys.platform == "darwin"
     is_linux = sys.platform.startswith("linux")
-    skip_macos = pytest.mark.skip(reason="needs the macOS Seatbelt backend (Phase 3)")
-    skip_linux = pytest.mark.skip(reason="needs the Linux Landlock/seccomp backend (Phase 2)")
+    skip_macos = pytest.mark.skip(reason="needs the macOS Seatbelt backend")
+    skip_linux = pytest.mark.skip(reason="needs the Linux Landlock/seccomp backend")
 
     traceability = {}
     for item in items:
@@ -54,8 +58,7 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_macos)
         if item.get_closest_marker("linux") and not is_linux:
             item.add_marker(skip_linux)
-        fw_id = _fw_id(item)
-        if fw_id:
+        for fw_id in _fw_ids(item):
             traceability.setdefault(fw_id, []).append(item.nodeid)
     config._fw_traceability = traceability
 
