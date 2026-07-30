@@ -266,10 +266,6 @@ fn compile_macos(
             }
         }
     };
-    let seatbelt = || Fidelity::Enforced {
-        backend: Backend::Seatbelt,
-    };
-
     let fs_net_reason = "Seatbelt unavailable on this host; filesystem/network scope cannot be \
                          enforced";
     caps.insert(Capability::FsRead, fidelity(fs_net_reason));
@@ -290,12 +286,18 @@ fn compile_macos(
 
     let mut direct_ports = Vec::new();
     if let NetPosture::Ports(ports) = &input.net {
-        caps.insert(Capability::NetPortTier, seatbelt());
+        caps.insert(
+            Capability::NetPortTier,
+            fidelity("Seatbelt unavailable on this host; direct port tier cannot be enforced"),
+        );
         sem.insert(Capability::NetPortTier, DenialSemantics::Deny);
         direct_ports = ports.clone();
     }
     if let ExecPosture::Allowlist(_) = &input.exec {
-        caps.insert(Capability::Exec, seatbelt());
+        caps.insert(
+            Capability::Exec,
+            fidelity("Seatbelt unavailable on this host; exec allowlist cannot be enforced"),
+        );
         sem.insert(Capability::Exec, DenialSemantics::Deny);
     }
     let _ = blueprint;
@@ -533,25 +535,75 @@ mod tests {
         assert!(policy.report.per_capability[&Capability::McpShading].is_enforced());
     }
 
+    /// A blueprint exercising every Seatbelt-carried macOS capability at once: fs reads + writes
+    /// (FsRead/FsWrite), a default-deny net posture with a direct port tier (NetDefaultDeny/
+    /// CrossDomainSocket/NetPortTier), and an exec allowlist (Exec). Used to prove all six caps
+    /// track `host.seatbelt` together -- both the deny arm (unavailable -> Unenforceable) and the
+    /// allow arm (available -> Enforced{Seatbelt}), a paired report-soundness check (FW-INV5).
+    fn macos_all_caps_blueprint() -> Blueprint {
+        Blueprint {
+            fs: FsBlueprint {
+                read_mode: ReadMode::Closed,
+                reads: vec![pp("/work/**")],
+                writes: vec![pp("/work/project/**")],
+                writes_no_create: vec![],
+                subtract: vec![],
+                write_subtract: vec![],
+            },
+            net: NetPosture::Ports(vec![443]),
+            exec: ExecPosture::Allowlist(vec![pp("/usr/bin/git")]),
+            ..Blueprint::empty()
+        }
+    }
+
+    /// The six macOS capabilities that ride Seatbelt; all must appear in a report compiled from
+    /// `macos_all_caps_blueprint`.
+    const MACOS_SEATBELT_CAPS: [Capability; 6] = [
+        Capability::FsRead,
+        Capability::FsWrite,
+        Capability::NetDefaultDeny,
+        Capability::CrossDomainSocket,
+        Capability::NetPortTier,
+        Capability::Exec,
+    ];
+
     #[test]
     fn macos_without_seatbelt_reports_unenforceable_not_enforced() {
-        // A macOS host lacking Seatbelt must not silently over-claim (FW-INV5/FW-XR1); the fs/net
-        // caps degrade to Unenforceable, mirroring the Linux no-Landlock branch.
+        // A macOS host lacking Seatbelt must not silently over-claim (FW-INV5/FW-XR1); ALL six
+        // Seatbelt-carried caps -- including the direct port tier and the exec allowlist -- degrade
+        // to Unenforceable, mirroring the Linux no-Landlock branch. Never a silent Enforced.
         let mut host = HostProfile::synthetic_macos();
         host.seatbelt = false;
-        let policy = compile(&sample_blueprint(), &host);
-        for cap in [
-            Capability::FsRead,
-            Capability::FsWrite,
-            Capability::NetDefaultDeny,
-            Capability::CrossDomainSocket,
-        ] {
+        let policy = compile(&macos_all_caps_blueprint(), &host);
+        for cap in MACOS_SEATBELT_CAPS {
             assert!(
                 matches!(
                     policy.report.per_capability[&cap],
                     Fidelity::Unenforceable { .. }
                 ),
                 "{cap:?} should be Unenforceable without Seatbelt, got {:?}",
+                policy.report.per_capability[&cap]
+            );
+        }
+    }
+
+    #[test]
+    fn macos_with_seatbelt_reports_all_caps_enforced() {
+        // The paired allow arm (FW-INV5 report soundness): the SAME six caps that degrade above are
+        // reported Enforced{Seatbelt} when the host carries Seatbelt -- not self-agreement, a real
+        // allow/deny split against the identical blueprint.
+        let host = HostProfile::synthetic_macos();
+        assert!(host.seatbelt, "synthetic macOS host has Seatbelt");
+        let policy = compile(&macos_all_caps_blueprint(), &host);
+        for cap in MACOS_SEATBELT_CAPS {
+            assert!(
+                matches!(
+                    policy.report.per_capability[&cap],
+                    Fidelity::Enforced {
+                        backend: Backend::Seatbelt
+                    }
+                ),
+                "{cap:?} should be Enforced{{Seatbelt}} with Seatbelt, got {:?}",
                 policy.report.per_capability[&cap]
             );
         }
