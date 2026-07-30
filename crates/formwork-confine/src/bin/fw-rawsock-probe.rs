@@ -1,7 +1,9 @@
 //! Test-support binary: the raw-socket probe (FW-INV3). A confined process has no network path
 //! except the injected gateway fd, so a direct raw socket -- a classic way to hand-roll egress and
 //! sidestep connect() -- must fail closed. Under net-deny the seccomp inet-family filter rejects
-//! socket(AF_INET, SOCK_RAW) at creation. Reports purely via exit code:
+//! socket(AF_INET, SOCK_RAW) at creation. FW-INV3: this is only load-bearing under CAP_NET_RAW
+//! (the root-in-container test matrix) -- an unprivileged process is denied SOCK_RAW by ordinary
+//! capability checks anyway, so off that matrix a pass here is vacuous. Reports purely via exit code:
 //!   0  raw socket creation was denied (fail-closed, expected)
 //!   4  a raw socket was created -- a direct egress path (LEAK/FAIL)
 //!

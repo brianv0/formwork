@@ -152,8 +152,9 @@ async fn fw_e2e_014_adv_004_ungranted_call_refused_no_oracle() {
 /// not it appears in any listing. With exactly one grant on each axis, every other identity is
 /// non-invocable: a hidden-*real* backend item (exists but ungranted) and a fully out-of-band guessed
 /// name both fail on tools/call, resources/read, and prompts/get. The granted identity on each axis
-/// still works, so the deny is shading, not a blanket outage. This is the targeted assertion standing
-/// in for the spec's fuzzing over guessed names and out-of-band identifiers.
+/// still works, so the deny is shading, not a blanket outage. FW-INV4: this is a targeted case
+/// standing in for the spec's fuzzing over guessed names and out-of-band identifiers, tracked as an
+/// exception in docs/STATUS.md.
 #[tokio::test]
 async fn fw_inv4_shading_completeness() {
     let policy = McpPolicy {
