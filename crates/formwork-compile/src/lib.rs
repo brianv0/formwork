@@ -245,25 +245,47 @@ fn credential_report(
 
 fn compile_macos(
     input: &CompileInput,
-    _host: &HostProfile,
+    host: &HostProfile,
     blueprint: &Blueprint,
     caps: &mut BTreeMap<Capability, Fidelity>,
     sem: &mut BTreeMap<Capability, DenialSemantics>,
 ) -> (ConfinerPolicy, Vec<u16>) {
     let sbpl = sbpl::render(input);
 
+    // Every macOS enforcement rides Seatbelt. When the host lacks it, report honestly rather than
+    // silently over-claim (FW-INV5/FW-XR1) -- mirroring the Linux `has_landlock=false` branch.
+    let has_seatbelt = host.seatbelt;
+    let fidelity = |reason: &str| -> Fidelity {
+        if has_seatbelt {
+            Fidelity::Enforced {
+                backend: Backend::Seatbelt,
+            }
+        } else {
+            Fidelity::Unenforceable {
+                reason: reason.to_string(),
+            }
+        }
+    };
     let seatbelt = || Fidelity::Enforced {
         backend: Backend::Seatbelt,
     };
-    caps.insert(Capability::FsRead, seatbelt());
-    caps.insert(Capability::FsWrite, seatbelt());
-    caps.insert(Capability::NetDefaultDeny, seatbelt());
+
+    let fs_net_reason = "Seatbelt unavailable on this host; filesystem/network scope cannot be \
+                         enforced";
+    caps.insert(Capability::FsRead, fidelity(fs_net_reason));
+    caps.insert(Capability::FsWrite, fidelity(fs_net_reason));
+    caps.insert(Capability::NetDefaultDeny, fidelity(fs_net_reason));
     sem.insert(Capability::FsRead, DenialSemantics::Deny);
     sem.insert(Capability::FsWrite, DenialSemantics::Deny);
     sem.insert(Capability::NetDefaultDeny, DenialSemantics::Deny);
 
-    // Seatbelt path-gates UNIX sockets, so cross-domain socket control is clean here.
-    caps.insert(Capability::CrossDomainSocket, seatbelt());
+    // Seatbelt path-gates UNIX sockets, so cross-domain socket control is clean here -- when present.
+    caps.insert(
+        Capability::CrossDomainSocket,
+        fidelity(
+            "Seatbelt unavailable on this host; cross-domain socket control cannot be enforced",
+        ),
+    );
     sem.insert(Capability::CrossDomainSocket, DenialSemantics::Deny);
 
     let mut direct_ports = Vec::new();
@@ -509,6 +531,30 @@ mod tests {
         assert!(policy.report.per_capability[&Capability::FsRead].is_enforced());
         assert!(policy.report.per_capability[&Capability::NetDefaultDeny].is_enforced());
         assert!(policy.report.per_capability[&Capability::McpShading].is_enforced());
+    }
+
+    #[test]
+    fn macos_without_seatbelt_reports_unenforceable_not_enforced() {
+        // A macOS host lacking Seatbelt must not silently over-claim (FW-INV5/FW-XR1); the fs/net
+        // caps degrade to Unenforceable, mirroring the Linux no-Landlock branch.
+        let mut host = HostProfile::synthetic_macos();
+        host.seatbelt = false;
+        let policy = compile(&sample_blueprint(), &host);
+        for cap in [
+            Capability::FsRead,
+            Capability::FsWrite,
+            Capability::NetDefaultDeny,
+            Capability::CrossDomainSocket,
+        ] {
+            assert!(
+                matches!(
+                    policy.report.per_capability[&cap],
+                    Fidelity::Unenforceable { .. }
+                ),
+                "{cap:?} should be Unenforceable without Seatbelt, got {:?}",
+                policy.report.per_capability[&cap]
+            );
+        }
     }
 
     #[test]
