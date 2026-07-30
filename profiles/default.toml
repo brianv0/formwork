@@ -55,4 +55,10 @@ write-subtract = [
     "**/.mcp.json",
     "**/.vscode/**",
     "**/.idea/**",
+    "**/.claude/**",
+    "**/.bashrc",
+    "**/.zshrc",
+    "**/.zshenv",
+    "**/.bash_profile",
+    "**/.profile",
 ]
