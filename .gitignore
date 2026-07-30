@@ -14,3 +14,6 @@ py/.venv/
 /scratch
 .DS_Store
 .dev-session.toml
+
+# Claude Code local state / transient agent worktrees
+.claude/
