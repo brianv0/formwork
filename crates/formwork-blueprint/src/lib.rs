@@ -247,9 +247,9 @@ impl EnvScrub {
 /// high-confidence secret shape (FW-ENV2). Coarse by design -- the `allow` list handles false
 /// positives; the fail-closed default is to drop.
 fn env_is_secret_shaped(name: &str, value: &str) -> bool {
-    // The normative FW-ENV2 name set: TOKEN|SECRET|PASSWORD|KEY|AUTH|CREDENTIAL|CERT. The bare
-    // `KEY` marker subsumes the narrower `APIKEY`/`API_KEY`/`ACCESS_KEY`/`PRIVATE_KEY` shapes via the
-    // `contains` match, so they need not be listed separately.
+    // The normative FW-ENV2 name set (TOKEN|SECRET|PASSWORD|KEY|AUTH|CREDENTIAL|CERT), plus PASSWD.
+    // The bare `KEY` marker subsumes the narrower `APIKEY`/`API_KEY`/`ACCESS_KEY`/`PRIVATE_KEY`
+    // shapes via the `contains` match, so they need not be listed separately.
     const NAME_MARKERS: &[&str] = &[
         "TOKEN",
         "SECRET",
