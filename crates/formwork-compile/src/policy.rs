@@ -60,9 +60,24 @@ pub enum LinuxNetPlan {
     /// for any outright net-deny (Landlock net governs only TCP), not just a sub-ABI-v4 fallback.
     /// Inherited connected fds still work -- that is the seam (FW-XR7).
     SeccompDenyInet,
-    /// The per-port TCP allow-list -- the port tier (ABI v4+). Outright deny uses `SeccompDenyInet`
-    /// instead, which also covers UDP.
-    LandlockTcp { ports: Vec<u16> },
+    /// The per-port TCP allow-list -- the port tier (ABI v4+). Landlock net governs *only* TCP, so a
+    /// bare Landlock port tier would leave inet UDP/raw `socket(2)` wide open -- an arbitrary-egress
+    /// hole (DNS tunneling). This plan therefore pairs the Landlock per-port TCP allow with a seccomp
+    /// filter that denies inet DGRAM/RAW `socket(2)` while allowing STREAM, so Landlock still governs
+    /// which TCP ports connect and direct UDP/raw egress fails closed (FW-ISO3/FW-INV3). Direct DNS is
+    /// unavailable under the port tier; resolution goes through the gateway (FW-E2E-007).
+    LandlockTcpSeccompDgramRawDeny { ports: Vec<u16> },
+}
+
+impl LinuxNetPlan {
+    /// The TCP ports the Landlock net ruleset should allow-connect, when this plan carries a port
+    /// tier. `None` for the pure seccomp inet deny (no Landlock net rules).
+    pub fn landlock_tcp_ports(&self) -> Option<&[u16]> {
+        match self {
+            LinuxNetPlan::LandlockTcpSeccompDgramRawDeny { ports } => Some(ports),
+            LinuxNetPlan::SeccompDenyInet => None,
+        }
+    }
 }
 
 /// Off unless the blueprint asks (FW-ISO4).
@@ -80,8 +95,15 @@ pub enum ExecPlan {
 pub struct SeccompPlan {
     /// Sorted, for deterministic output.
     pub deny_syscalls: Vec<String>,
-    /// Empty when net-deny is via Landlock.
+    /// Socket domains (arg0 of `socket(2)`) denied outright. Carries the full inet deny
+    /// (Inet/Inet6/Packet/non-route Netlink); under the port tier it carries only Packet + non-route
+    /// Netlink, and the inet DGRAM/RAW deny rides `deny_inet_dgram_raw` instead.
     pub deny_socket_families: Vec<SocketFamily>,
+    /// The port tier: deny inet/inet6 DGRAM and RAW `socket(2)` (type masked to `SOCK_TYPE_MASK`, so
+    /// `SOCK_NONBLOCK`/`SOCK_CLOEXEC` cannot evade it) while allowing STREAM, so the Landlock per-port
+    /// TCP rules govern TCP and direct UDP/raw egress fails closed (FW-ISO3/FW-INV3). False when the
+    /// inet deny is carried at the family level (`deny_socket_families`) or net is Landlock-open.
+    pub deny_inet_dgram_raw: bool,
     /// Deny new user namespaces (`CLONE_NEWUSER`, `setns`), which would hand back capabilities the
     /// baseline is removing. A flag because it is an argument-conditioned rule, not a whole deny.
     pub restrict_userns: bool,

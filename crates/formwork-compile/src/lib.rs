@@ -319,20 +319,20 @@ fn compile_linux(
     sem.insert(Capability::FsRead, DenialSemantics::Deny);
     sem.insert(Capability::FsWrite, DenialSemantics::Deny);
 
-    let (net_plan, net_via_seccomp, tier) = linux::net_plan(host, &input.net);
-    let net_fidelity = if net_via_seccomp {
-        if host.seccomp {
-            Fidelity::Enforced {
-                backend: Backend::Seccomp,
-            }
-        } else {
-            Fidelity::Unenforceable {
-                reason: "neither Landlock net rules nor seccomp available; direct egress cannot be denied".to_string(),
-            }
+    let (net_plan, inet_deny, tier) = linux::net_plan(host, &input.net);
+    // Net default-deny is seccomp-carried on every Linux path: an outright deny blocks the whole inet
+    // family, and the port tier still needs seccomp for the inet DGRAM/RAW deny (Landlock net governs
+    // TCP only). So a working seccomp filter is required to claim it Enforced -- Landlock alone would
+    // over-claim, leaving UDP/raw open (FW-ISO3/FW-INV3/FW-INV5).
+    let net_fidelity = if host.seccomp {
+        Fidelity::Enforced {
+            backend: Backend::Seccomp,
         }
     } else {
-        Fidelity::Enforced {
-            backend: Backend::Landlock,
+        Fidelity::Unenforceable {
+            reason:
+                "neither Landlock net rules nor seccomp available; direct egress cannot be denied"
+                    .to_string(),
         }
     };
     caps.insert(Capability::NetDefaultDeny, net_fidelity);
@@ -422,7 +422,7 @@ fn compile_linux(
         return (confiner, Vec::new());
     }
 
-    let seccomp = linux::seccomp_plan(net_via_seccomp);
+    let seccomp = linux::seccomp_plan(inet_deny);
     // The floor's absolute rows ride the subtract holes. Any-depth (`**/`) floor rows cannot be
     // rooted Landlock rules (formwork-confine rejects them loud); they are withheld here and the
     // credentials report marks the affected types Partial -- reported, never silently pretended
@@ -530,19 +530,72 @@ mod tests {
     }
 
     #[test]
-    fn linux_port_tier_uses_landlock_tcp() {
+    fn linux_port_tier_uses_landlock_tcp_plus_seccomp_dgram_raw_deny() {
         let blueprint = Blueprint {
             net: NetPosture::Ports(vec![443]),
             ..Blueprint::empty()
         };
         let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(6)));
         match &policy.confiner {
-            ConfinerPolicy::Linux(l) => assert!(
-                matches!(&l.net, LinuxNetPlan::LandlockTcp { ports } if ports == &vec![443]),
-                "the TCP port tier is carried by Landlock net"
-            ),
+            ConfinerPolicy::Linux(l) => {
+                // The TCP port tier is carried by Landlock net...
+                assert!(
+                    matches!(&l.net, LinuxNetPlan::LandlockTcpSeccompDgramRawDeny { ports } if ports == &vec![443]),
+                    "the TCP port tier is carried by Landlock net"
+                );
+                // ...and the inet DGRAM/RAW deny is carried by seccomp, so direct UDP/raw egress
+                // (DNS tunneling) is closed while STREAM survives for Landlock to govern (FW-INV3).
+                assert!(
+                    l.seccomp.deny_inet_dgram_raw,
+                    "the port tier must seccomp-deny inet UDP/raw, not leave them open"
+                );
+                assert!(
+                    !l.seccomp.deny_socket_families.contains(&SocketFamily::Inet)
+                        && !l
+                            .seccomp
+                            .deny_socket_families
+                            .contains(&SocketFamily::Inet6),
+                    "the inet families must not be denied wholesale, or TCP dies too"
+                );
+            }
             other => panic!("expected Linux confiner, got {other:?}"),
         }
+    }
+
+    /// The report must NOT over-claim (FW-INV5): under the Landlock TCP port tier, net default-deny is
+    /// genuinely Enforced -- because the port tier now seccomp-denies inet UDP/raw (not TCP-only
+    /// Landlock, which would leave UDP open). And it degrades honestly to Unenforceable if the host
+    /// carries no seccomp to install that deny.
+    #[test]
+    fn linux_port_tier_net_default_deny_is_honestly_enforced() {
+        let blueprint = Blueprint {
+            net: NetPosture::Ports(vec![443]),
+            ..Blueprint::empty()
+        };
+        // ABI 6 host with seccomp: UDP/raw are actually denied, so Enforced (via seccomp) is honest.
+        let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(6)));
+        assert_eq!(
+            policy.report.per_capability[&Capability::NetDefaultDeny],
+            Fidelity::Enforced {
+                backend: Backend::Seccomp
+            },
+            "net-deny under the port tier is carried by seccomp (UDP/raw) + Landlock (TCP)"
+        );
+        assert!(policy.report.per_capability[&Capability::NetPortTier].is_enforced());
+        assert!(policy.report.net_is_fail_closed());
+
+        // Same ABI but no seccomp: the DGRAM/RAW deny cannot install, so net-deny must NOT be claimed
+        // Enforced -- the report degrades rather than silently leaving UDP/raw open.
+        let mut no_seccomp = HostProfile::synthetic_linux(Some(6));
+        no_seccomp.seccomp = false;
+        let policy = compile(&blueprint, &no_seccomp);
+        assert!(
+            matches!(
+                policy.report.per_capability[&Capability::NetDefaultDeny],
+                Fidelity::Unenforceable { .. }
+            ),
+            "without seccomp the UDP/raw deny cannot hold; net-deny must not over-claim Enforced"
+        );
     }
 
     #[test]

@@ -19,8 +19,11 @@ seccomp=unconfined --security-opt apparmor=unconfined` so only Formwork's sandbo
   in `apply` (runtimes read `/proc/self/{maps,exe,status}` and would otherwise die under Closed mode).
 - **Net-deny is carried by seccomp, not Landlock.** Landlock net governs only TCP; carrying deny with
   it left UDP/raw open (an exfil channel). Deny now denies inet `socket(2)` creation at the family
-  level (TCP + UDP + raw), matching macOS `(deny network*)`. Landlock net is reserved for the port
-  tier, where per-port TCP *allow* is required.
+  level (TCP + UDP + raw), matching macOS `(deny network*)`. Landlock net carries the port tier, where
+  per-port TCP *allow* is required -- but even there seccomp still denies inet DGRAM/RAW `socket(2)`
+  (type masked to `SOCK_TYPE_MASK`, STREAM allowed), so the TCP-only Landlock grant cannot be
+  sidestepped with a UDP/raw socket. Direct DNS under the port tier goes through the gateway, not a
+  direct UDP:53 hole ([FW-ISO3](../formwork.md#fw-iso3)/[FW-INV3](../formwork.md#fw-inv3)/[FW-E2E-007](../formwork.md#fw-e2e-007)).
 - **Abstract-UNIX-socket + signal scoping is enforced at ABI v6+** via the `Scope` handle — closing a
   pathless escape the fs rules cannot reach — matching the compiler's CrossDomainSocket = Partial.
 - **Device ioctls are *not* governed** (`IOCTL_DEV` excluded from `handled_fs`). Governing it denies
@@ -83,7 +86,10 @@ Key decisions:
 - **Net default-deny via seccomp (all ABIs), *not* Landlock.** Landlock net governs only TCP, so a
   Landlock-carried deny leaves UDP/raw open. Deny denies inet `socket(2)` at the family level instead
   (TCP + UDP + raw); Landlock net (`handle_access(AccessNet::from_all(abi))` + `NetPort` allows) is
-  reserved for the **port tier** (ABI ≥ v4), which needs per-port TCP *allow*.
+  reserved for the **port tier** (ABI ≥ v4), which needs per-port TCP *allow*. The port tier still
+  seccomp-denies inet **DGRAM/RAW** `socket(2)` (type masked to `SOCK_TYPE_MASK` so
+  `SOCK_NONBLOCK`/`SOCK_CLOEXEC` cannot evade it) while allowing STREAM, so UDP/raw egress fails
+  closed and only the granted TCP ports connect ([FW-ISO3](../formwork.md#fw-iso3)/[FW-INV3](../formwork.md#fw-inv3)).
 - **UNIX-socket / signal scoping (ABI ≥ v6):** the `Scope` handle (`.scope(Scope::from_all(abi))`)
   blocks abstract-UNIX-socket and signal reach-out of the domain ([FW-ADV-006](../formwork.md#fw-adv-006)). Coarse (domain-
   relative, not per-path); reported Partial at v6+, Unenforceable below — matches the compiler.
