@@ -376,8 +376,8 @@ fn fw_adv_001_full_sandbox_shedding_sequence() {
 /// FW-INV2 (Linux): descendant containment. Confinement is inherited by descendants and cannot be
 /// relaxed anywhere in a spawn tree (FW-XR4). A shell forks a nested child down to the shed-probe
 /// leaf; the probe (itself re-execing once) proves NO_NEW_PRIVS and the seccomp filter still hold at
-/// depth -- no descendant escaped or relaxed the confiner. This is the targeted assertion standing
-/// in for the spec's fuzzing over random spawn trees; true fuzz infra is out of scope.
+/// depth -- no descendant escaped or relaxed the confiner. FW-INV2: this is a targeted case standing
+/// in for the spec's fuzzing over random spawn trees, tracked as an exception in docs/STATUS.md.
 #[test]
 fn fw_inv2_descendant_containment_over_spawn_tree() {
     let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-shed-probe"));
@@ -420,6 +420,11 @@ fn fw_inv3_egress_only_via_gateway_fd() {
         7,
         "direct DNS (UDP:53) must fail closed (EPERM -> exit 7)"
     );
+    // FW-INV3: this arm is only load-bearing under CAP_NET_RAW (the root-in-container Docker/Lima
+    // matrix Testing mandates). An unprivileged process is denied SOCK_RAW by ordinary Linux
+    // capability checks regardless of the seccomp filter, so off that matrix this is a vacuous pass
+    // and the connect()/UDP arms above carry the verdict. The probe stays: raw sockets are a distinct
+    // egress vector.
     assert_eq!(
         run(&policy, Command::new(&raw)),
         0,
