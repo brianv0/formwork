@@ -148,6 +148,71 @@ async fn fw_e2e_014_adv_004_ungranted_call_refused_no_oracle() {
         .contains("denied"));
 }
 
+/// FW-INV4 (shading completeness): no ungranted tool, resource, or prompt is invocable -- whether or
+/// not it appears in any listing. With exactly one grant on each axis, every other identity is
+/// non-invocable: a hidden-*real* backend item (exists but ungranted) and a fully out-of-band guessed
+/// name both fail on tools/call, resources/read, and prompts/get. The granted identity on each axis
+/// still works, so the deny is shading, not a blanket outage. FW-INV4: this is a targeted case
+/// standing in for the spec's fuzzing over guessed names and out-of-band identifiers, tracked as an
+/// exception in docs/STATUS.md.
+#[tokio::test]
+async fn fw_inv4_shading_completeness() {
+    let policy = McpPolicy {
+        tools: Visibility::allow_exact(["read_file"]),
+        resources: Visibility::allow_exact(["file:///pub"]),
+        prompts: Visibility::allow_exact(["greeting"]),
+        ..Default::default()
+    };
+    let mut agent = start(policy);
+
+    // Each row: (method, a hidden-REAL ungranted item, an OUT-OF-BAND guess). http_fetch /
+    // file:///secret / secret_prompt exist on the fixture backend but are ungranted; the zzz_guessed_*
+    // identities never existed at all. Every one must be refused -- none invocable.
+    let cases = [
+        (
+            "tools/call",
+            json!({"name": "http_fetch", "arguments": {}}),
+            json!({"name": "zzz_guessed_tool", "arguments": {}}),
+        ),
+        (
+            "resources/read",
+            json!({"uri": "file:///secret"}),
+            json!({"uri": "file:///zzz_guessed"}),
+        ),
+        (
+            "prompts/get",
+            json!({"name": "secret_prompt", "arguments": {}}),
+            json!({"name": "zzz_guessed_prompt", "arguments": {}}),
+        ),
+    ];
+    let mut id = 0;
+    for (method, hidden_real, out_of_band) in cases {
+        for params in [hidden_real, out_of_band] {
+            id += 1;
+            agent.request(id, method, params).await;
+            let resp = agent.recv().await;
+            assert!(
+                resp["error"].is_object() && resp.get("result").is_none(),
+                "{method} on an ungranted identity must be refused, not invoked: {resp}"
+            );
+        }
+    }
+
+    // Control: the one granted identity IS invocable, proving the deny-all is shading, not an outage.
+    id += 1;
+    agent
+        .request(
+            id,
+            "tools/call",
+            json!({"name": "read_file", "arguments": {}}),
+        )
+        .await;
+    assert_eq!(
+        agent.recv().await["result"]["content"][0]["text"],
+        "ok:read_file"
+    );
+}
+
 /// FW-E2E-015: resources and prompts are shaded like tools, on both list and fetch.
 #[tokio::test]
 async fn fw_e2e_015_resource_and_prompt_shading() {
