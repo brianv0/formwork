@@ -247,17 +247,18 @@ impl EnvScrub {
 /// high-confidence secret shape (FW-ENV2). Coarse by design -- the `allow` list handles false
 /// positives; the fail-closed default is to drop.
 fn env_is_secret_shaped(name: &str, value: &str) -> bool {
+    // The normative FW-ENV2 name set (TOKEN|SECRET|PASSWORD|KEY|AUTH|CREDENTIAL|CERT), plus PASSWD.
+    // The bare `KEY` marker subsumes the narrower `APIKEY`/`API_KEY`/`ACCESS_KEY`/`PRIVATE_KEY`
+    // shapes via the `contains` match, so they need not be listed separately.
     const NAME_MARKERS: &[&str] = &[
         "TOKEN",
         "SECRET",
         "PASSWORD",
         "PASSWD",
-        "APIKEY",
-        "API_KEY",
-        "ACCESS_KEY",
-        "PRIVATE_KEY",
+        "KEY",
         "AUTH",
         "CREDENTIAL",
+        "CERT",
     ];
     let upper = name.to_ascii_uppercase();
     if NAME_MARKERS.iter().any(|m| upper.contains(m)) {
@@ -825,6 +826,38 @@ mod tests {
         assert!(dropped.contains(&"AWS_SECRET_ACCESS_KEY".to_string()));
         assert!(dropped.contains(&"DEPLOY".to_string()));
         assert!(dropped.contains(&"EDITOR".to_string()));
+    }
+
+    #[test]
+    fn env_scrub_covers_bare_key_and_cert_markers() {
+        // FW-ENV2's normative name set is TOKEN|SECRET|PASSWORD|KEY|AUTH|CREDENTIAL|CERT. The bare
+        // `KEY`/`CERT` markers must catch names the narrower `*KEY` entries missed.
+        let scrub = EnvPosture::Scrub(EnvScrub {
+            allow: vec!["ANTHROPIC_API_KEY".into()],
+            deny: vec![],
+        });
+        let vars = vec![
+            ("SIGNING_KEY".into(), "s".into()), // bare KEY -> dropped
+            ("DEPLOY_KEY".into(), "d".into()),  // bare KEY -> dropped
+            ("CLIENT_CERT".into(), "c".into()), // CERT -> dropped
+            ("TLS_CERT".into(), "t".into()),    // CERT -> dropped
+            ("ANTHROPIC_API_KEY".into(), "sk-abc".into()), // allowlisted -> survives by name
+            ("PATH".into(), "/usr/bin".into()), // ordinary -> kept
+        ];
+        let kept: Vec<String> = scrub
+            .apply(vars.clone())
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(kept, vec!["ANTHROPIC_API_KEY", "PATH"]);
+        let dropped = scrub.dropped_names(&vars);
+        for name in ["SIGNING_KEY", "DEPLOY_KEY", "CLIENT_CERT", "TLS_CERT"] {
+            assert!(
+                dropped.contains(&name.to_string()),
+                "{name} should be scrubbed by name"
+            );
+        }
+        assert!(!dropped.contains(&"ANTHROPIC_API_KEY".to_string()));
     }
 
     #[test]

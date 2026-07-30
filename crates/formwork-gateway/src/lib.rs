@@ -59,6 +59,20 @@ enum Frame {
         target: String,
         raw: Vec<u8>,
     },
+    /// `resources/subscribe` and `resources/unsubscribe`: gated by `uri` on the resource axis, exactly
+    /// like `resources/read`, so an ungranted uri cannot be subscribed (FW-GW3/FW-INV4).
+    ResourceSubscribe {
+        id: Value,
+        target: String,
+        raw: Vec<u8>,
+    },
+    /// `completion/complete`: gated on the referenced ref -- a `ref/prompt` on the prompt axis by
+    /// `name`, a `ref/resource` on the resource axis by `uri` -- refusing oracle-free when ungranted.
+    Completion {
+        id: Value,
+        reference: CompletionRef,
+        raw: Vec<u8>,
+    },
     ListRequest {
         id: Value,
         kind: ListKind,
@@ -77,6 +91,14 @@ enum Frame {
         raw: Vec<u8>,
     },
     Passthrough(Vec<u8>),
+}
+
+/// The target a `completion/complete` frame refers to, on whichever axis governs it.
+enum CompletionRef {
+    Prompt(String),
+    Resource(String),
+    /// A malformed or unknown ref: no valid grant can name it, so it is refused fail-closed.
+    Unknown,
 }
 
 impl Frame {
@@ -113,6 +135,21 @@ impl Frame {
                 target: pointer_str("/params/name"),
                 raw,
             },
+            (Some("resources/subscribe" | "resources/unsubscribe"), Some(id)) => {
+                Frame::ResourceSubscribe {
+                    id,
+                    target: pointer_str("/params/uri"),
+                    raw,
+                }
+            }
+            (Some("completion/complete"), Some(id)) => {
+                let reference = match pointer_str("/params/ref/type").as_str() {
+                    "ref/prompt" => CompletionRef::Prompt(pointer_str("/params/ref/name")),
+                    "ref/resource" => CompletionRef::Resource(pointer_str("/params/ref/uri")),
+                    _ => CompletionRef::Unknown,
+                };
+                Frame::Completion { id, reference, raw }
+            }
             (Some("tools/list"), Some(id)) => Frame::ListRequest {
                 id,
                 kind: ListKind::Tools,
@@ -145,6 +182,8 @@ impl Frame {
             Frame::ToolCall { raw, .. }
             | Frame::ResourceRead { raw, .. }
             | Frame::PromptGet { raw, .. }
+            | Frame::ResourceSubscribe { raw, .. }
+            | Frame::Completion { raw, .. }
             | Frame::ListRequest { raw, .. }
             | Frame::Sampling { raw, .. }
             | Frame::Elicitation { raw, .. }
@@ -268,6 +307,63 @@ where
                     .await?;
                 }
             }
+            Frame::ResourceSubscribe { id, target, raw } => {
+                if policy.resources.permits(&target) {
+                    write_frame(&backend_w, &raw).await?;
+                } else {
+                    // -32002 "resource not found" -- identical to a genuine absence (FW-ADV-004).
+                    refuse(
+                        &agent_w,
+                        &id,
+                        -32002,
+                        "resource",
+                        &target,
+                        format!("Resource not found: {target}"),
+                    )
+                    .await?;
+                }
+            }
+            Frame::Completion { id, reference, raw } => match reference {
+                CompletionRef::Prompt(name) if policy.prompts.permits(&name) => {
+                    write_frame(&backend_w, &raw).await?;
+                }
+                CompletionRef::Resource(uri) if policy.resources.permits(&uri) => {
+                    write_frame(&backend_w, &raw).await?;
+                }
+                CompletionRef::Prompt(name) => {
+                    refuse(
+                        &agent_w,
+                        &id,
+                        -32602,
+                        "prompt",
+                        &name,
+                        format!("Unknown prompt: {name}"),
+                    )
+                    .await?;
+                }
+                CompletionRef::Resource(uri) => {
+                    refuse(
+                        &agent_w,
+                        &id,
+                        -32002,
+                        "resource",
+                        &uri,
+                        format!("Resource not found: {uri}"),
+                    )
+                    .await?;
+                }
+                CompletionRef::Unknown => {
+                    refuse(
+                        &agent_w,
+                        &id,
+                        -32602,
+                        "completion",
+                        "",
+                        "Invalid completion reference".to_string(),
+                    )
+                    .await?;
+                }
+            },
             Frame::ListRequest { id, kind, raw } => {
                 pending.lock().await.insert(id_key(&id), kind);
                 write_frame(&backend_w, &raw).await?;
