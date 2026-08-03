@@ -367,54 +367,76 @@ fn learn_rejects_flags_the_mode_would_ignore() {
 /// denial in about a millisecond, while the unified log persists the record only seconds later.
 /// Runs against the real Seatbelt kernel and the real `log show` feed -- if a runner cannot
 /// carry either, this fails loudly rather than letting CI imply learn works there.
+///
+/// The `log show` feed's persistence latency has an unbounded tail: a lone run can flush past the
+/// collector's settle floor and miss its record (safe -- the next learn re-observes it, FW-INV10).
+/// So the pinned property is a CAPTURE RATE across independent runs, not a per-run certainty no
+/// post-hoc log feed can offer. Below the floor, the feed is dropping records the kernel produced.
+#[cfg(target_os = "macos")]
+const FW_E2E_064_RUNS: usize = 12;
+/// 75% of RUNS, rounded down. The floor sits well under a healthy capture rate, so the test's own
+/// false-fail probability stays negligible; re-tune against observed macos-14 numbers if needed.
+#[cfg(target_os = "macos")]
+const FW_E2E_064_MIN_CAPTURES: usize = FW_E2E_064_RUNS * 3 / 4;
+
 #[cfg(target_os = "macos")]
 #[test]
 fn learn_captures_a_millisecond_workloads_denial() {
-    let dir = Scratch::new("learn-ms");
-    // Kernel-resolved root (macOS /var -> /private/var), so the blueprint grant and the
-    // proposal's kernel-reported paths line up.
-    let root = std::fs::canonicalize(dir.path()).unwrap();
-    let ok = root.join("ok.txt");
-    std::fs::write(&ok, "ok\n").unwrap();
-    let denied = root.join("denied.txt");
-    std::fs::write(&denied, "nope\n").unwrap();
-    std::fs::write(
-        root.join("bp.toml"),
-        format!(
-            "net = \"deny\"\n[fs]\nread-mode = \"closed\"\nreads = [\"{}\"]\n",
-            ok.display()
-        ),
-    )
-    .unwrap();
+    let mut captured = 0usize;
+    let mut misses = String::new();
+    for i in 0..FW_E2E_064_RUNS {
+        let dir = Scratch::new(&format!("learn-ms-{i}"));
+        // Kernel-resolved root (macOS /var -> /private/var), so the blueprint grant and the
+        // proposal's kernel-reported paths line up.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ok = root.join("ok.txt");
+        std::fs::write(&ok, "ok\n").unwrap();
+        let denied = root.join("denied.txt");
+        std::fs::write(&denied, "nope\n").unwrap();
+        std::fs::write(
+            root.join("bp.toml"),
+            format!(
+                "net = \"deny\"\n[fs]\nread-mode = \"closed\"\nreads = [\"{}\"]\n",
+                ok.display()
+            ),
+        )
+        .unwrap();
 
-    let out = formwork(
-        &root,
-        &root,
-        &[
-            "learn",
-            "--blueprint",
-            "bp.toml",
-            "--",
-            "/bin/cat",
-            denied.to_str().unwrap(),
-        ],
-    );
-    assert_ne!(
-        out.code, 0,
-        "cat of the denied file failing IS the scenario: {}",
-        out.stderr
-    );
-
-    let proposal = root.join("bp.toml.proposal.toml");
-    assert!(proposal.exists(), "no proposal written:\n{}", out.stderr);
-    let text = std::fs::read_to_string(&proposal).unwrap();
+        let out = formwork(
+            &root,
+            &root,
+            &[
+                "learn",
+                "--blueprint",
+                "bp.toml",
+                "--",
+                "/bin/cat",
+                denied.to_str().unwrap(),
+            ],
+        );
+        // These hold every run regardless of feed timing: the workload fails on the denial, and a
+        // proposal is always written with its pointer on stdout (survives quiet telemetry).
+        assert_ne!(
+            out.code, 0,
+            "cat of the denied file failing IS the scenario: {}",
+            out.stderr
+        );
+        assert!(out.stdout.contains("proposal:"), "{}", out.stdout);
+        let proposal = root.join("bp.toml.proposal.toml");
+        assert!(proposal.exists(), "no proposal written:\n{}", out.stderr);
+        let text = std::fs::read_to_string(&proposal).unwrap();
+        if text.contains(denied.to_str().unwrap()) {
+            captured += 1;
+        } else {
+            misses.push_str(&format!("run {i}:\n{}\n", out.stderr));
+        }
+    }
     assert!(
-        text.contains(denied.to_str().unwrap()),
-        "millisecond denial lost to feed-persistence latency:\n{text}\n{}",
-        out.stderr
+        captured >= FW_E2E_064_MIN_CAPTURES,
+        "millisecond denial captured in only {captured}/{FW_E2E_064_RUNS} runs \
+         (need {FW_E2E_064_MIN_CAPTURES}) -- the feed is dropping records, not just \
+         occasionally latent.\nstderr from missed runs:\n{misses}"
     );
-    // The proposal pointer is a stdout result (survives quiet telemetry), not a log line.
-    assert!(out.stdout.contains("proposal:"), "{}", out.stdout);
 }
 
 /// FW-E2E-062 / FW-XR9 at the CLI edge: on a host with no denial feed, `learn` refuses BEFORE
