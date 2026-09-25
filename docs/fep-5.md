@@ -71,7 +71,11 @@ On Linux, when a user session is running, an unmediated socket permits:
 - the X11 or Wayland sockets: clipboard access and input injection.
 
 Container and CI hosts usually run no user session, which is why the Linux evaluation did not see
-this.
+this: the probe host had nothing to reach, so the gap was found by reading code, not by a denial.
+That is a blind spot in the evaluation method, and it would also be a blind spot in CI, whose
+runners are headless too. This FEP closes it twice: the test suite brings its own session
+(§4.1), and `detect` tells each operator which of these facilities *their* host has (`FW-FID10`),
+so the residual is stated concretely on a desktop and stated as absent on a server.
 
 This FEP closes G1–G8 within the closed concept list:
 - G1, G3 and G4 use one Linux mechanism, a `connect()` supervisor. It is the on-demand form of fd
@@ -430,6 +434,14 @@ Each one is explainable with the tools the operator already uses, and discoverab
   - A supervised `connect()` refusal gets `EACCES` plus one operator-channel line with the
     destination and the `explain` command.
   - A TLS client that rejects the session CA gets the §3.2 diagnosis.
+- **Host-session disclosure** (`FW-FID10`). `detect` probes the facilities that make host-service
+  channels reachable: on Linux the session bus, the user manager, display sockets and a keyring
+  service under `$XDG_RUNTIME_DIR` and `/tmp/.X11-unix`; on macOS whether a GUI login session owns
+  the process (`SessionGetInfo`). The report's channel lines then say, per channel, `reachable on
+  this host` with the socket found, or `not present on this host`. A `Partial` that names
+  `/run/user/1000/bus` is actionable; a `Partial` that names nothing on a headless server is
+  correctly reassuring. The line is emitted with the same wording by `run`, `explain` and `compile
+  --report-only`, so an embedder can gate on it.
 - **Resolved-input disclosure** ([FW-FID7](../formwork.md#fw-fid7)). `compile` and `explain` output
   names every value this FEP auto-chooses:
   - the Gateway listener endpoint;
@@ -495,6 +507,7 @@ These continue existing families: EGR, ISO, CRED, FID, DISC and XR.
 | `FW-ISO16` **Process-environment disclosure** | In every blueprint, the Confiner shall deny a confined process reading the environment of any process outside the session where the platform provides a mechanism (macOS `kern.procargs2` deny; Linux PID namespace under `isolate`). Where it does not (Linux without `isolate`), the FidelityReport shall mark it `Partial` and name the residual. |
 | `FW-FID8` **Per-backend report lines** | The FidelityReport shall carry per-backend verdicts for: host scoping, inspection (with the client-trust caveat), UDP, pathname sockets, resolver closure, brokering, each `isolate` member, each channel, and privileged interfaces. |
 | `FW-FID9` **Self-explaining refusals** | For each refusal this FEP introduces, Formwork shall emit, within the run, one line naming what was refused, the deciding rule, and the `explain` invocation that reproduces the verdict. The refusals are: Gateway 403s, supervised-connect denials, and TLS `unknown_ca` rejections of the session CA. The line goes in the HTTP 403 body, or on the operator channel. |
+| `FW-FID10` **Host-session disclosure** | `detect` shall probe for the host facilities that make each §3.4 channel reachable (session bus, user manager, display server, keyring service; GUI session on macOS), and the FidelityReport shall state per channel whether it is reachable on this host and through which socket or service, or that it is not present. |
 | `FW-DISC12` **Host and channel discovery** | `learn` shall reverse-compile Gateway egress violations and channel denials into proposal entries (`net.hosts`, `channels`) on both backends. It shall withhold, and itemize to the operator, metadata and private-IP destinations and credential-typed channels. |
 | `FW-XR10` **Exit-code contract** | Wrapper subcommands shall exit with the workload's status. A Formwork failure after the workload is spawned shall exit `125` and emit a result-channel line attributing the failure to Formwork. |
 
@@ -540,9 +553,23 @@ these rules:
   - Where a TCC consent would be needed for the *control* run on a hosted runner, the test asserts
     only the confined-side sandbox deny record. It declares itself `deny-record-only` in the
     traceability table, so the evidence level is visible.
+- **The runner is headless, like the evaluation host, so the suite brings the session.** The
+  Omnigent evaluation missed the Linux host-service gap because its container had no session bus,
+  display or keyring to reach. A CI runner has none either, so a test that merely tries `xdg-open`
+  or `gdbus` on a bare runner passes vacuously. Every Linux channel test therefore:
+  - starts its own session `dbus-daemon` (with `DBUS_SESSION_BUS_ADDRESS` set for the control run
+    only);
+  - starts a fixture socket service that runs commands it receives, a stand-in for `systemd --user`
+    with the same socket shape, listening under a per-test `$XDG_RUNTIME_DIR`;
+  - starts `Xvfb` for a display socket under `/tmp/.X11-unix`;
+  - proves each is live with the control run before asserting the confined denial.
+
+  The traceability table records, per test, which facilities the run provided. A desktop-only
+  facility that CI cannot provide (a real `systemd --user` instance, a Wayland compositor) is listed
+  as `fixture-only` evidence, and the requirement's report line is what covers the difference on a
+  real desktop (`FW-FID10`).
 - **Fixture services, not mocks.**
-  - The Linux channel tests start a session `dbus-daemon`, plus a fixture socket service that runs
-    commands it receives: a stand-in for `systemd --user` with the same socket shape.
+  - The Linux channel tests use the session facilities above; none is mocked.
   - The egress tests use FEP-1's loopback fixtures and resolver fixture.
   - These are real subprocess servers, as the MCP fixtures are.
 - **Traceability.** Every test carries its `fw_e2e` / `fw_adv` marker and `macos` / `linux` marker,
@@ -554,7 +581,7 @@ these rules:
 |---|---|
 | Add `macos-15` to the test matrix alongside `macos-14` | Seatbelt service names and `sysctl` behavior change across releases. Characterization runs on the current and previous major. |
 | Add `ubuntu-24.04` alongside `ubuntu-22.04` | 24.04 restricts unprivileged user namespaces through AppArmor, so the `isolate` refusal path (XR9) is exercised on a runner, not assumed |
-| Install `dbus` on Linux runners | Session-bus fixture for `FW-E2E-082` |
+| Install `dbus` and `xvfb` on Linux runners | Session-bus and display fixtures for `FW-E2E-082` and `FW-E2E-087`; both are distribution packages, not third-party actions |
 | Set `FW_REQUIRE_EXERCISED=1` in CI | Not-exercised fails instead of skipping |
 | Run the README quickstart and each `examples/` agent blueprint on both OSes | D1, and `FW-E2E-084` |
 
@@ -632,6 +659,12 @@ the requirement tests below depend on it.
   does two things and exits: hits `blocked.test` through the proxy, and touches the clipboard.
   - It proposes `net.hosts = ["blocked.test"]` and `channels = ["clipboard"]`.
   - A workload that hits `169.254.169.254` produces a withheld line, not a proposal.
+- `FW-E2E-087` **Host-session disclosure (both).**
+  - Linux, bare runner: `detect` reports each channel `not present on this host`.
+  - Linux, with the §4.1 fixture session running under a per-test `$XDG_RUNTIME_DIR`: `detect`
+    names the bus socket, the user-manager socket and the display socket, and `run` prints the
+    matching `Partial` line naming them. The same run under supervised connect prints `Enforced`.
+  - macOS runner: `detect` reports the GUI-session verdict, and the channel lines match `FW-E2E-081`.
 - `FW-E2E-086` **Exit-code contract (both).**
   - A workload exiting 3 makes `run` exit 3.
   - Killing the Gateway mid-run makes `run` exit 125, with the attribution line on stdout.
@@ -840,4 +873,5 @@ changed the text above.
 | Results vs telemetry | Violation and diagnosis lines had no channel assigned | Refusal explanations go on the operator channel (stderr). The exit-code attribution line is a result (stdout), since a script needs it under `RUST_LOG=warn` |
 | Exit codes (item 12) | Two new failure modes after spawn (Gateway, supervisor) made "agent failed" and "sandbox failed" indistinguishable to an embedder | Minted as `FW-XR10`: exit `125` plus an attribution line |
 | Least-convenient test shape (item 4) | Tests used comfortable workloads, and channel tests depended on Safari, Finder and TCC grants | Millisecond probes, a fixture app as the marker, `deny-record-only` evidence declared (§4.1) |
+| Evaluation blind spot (honesty is bidirectional; item 10) | The Linux evaluation ran in a headless container and did not see the session-bus, user-manager and display-socket escape; the same blind spot exists on CI runners, and an operator on a desktop had no way to learn the residual applied to them | The suite starts its own session facilities and records which it provided (§4.1); `detect` names the reachable facilities per host (`FW-FID10`, `FW-E2E-087`) |
 | Verification states where it ran (item 10) | Claims marked "spike" had no execution plan; a skipped test could look like a pass | Characterization suite in CI on two macOS majors; `FW_REQUIRE_EXERCISED=1`; `ubuntu-24.04` added to exercise the user-namespace refusal path |

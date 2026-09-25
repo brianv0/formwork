@@ -4,6 +4,16 @@ Status: research note, 2026-09-25. Omnigent at `omnigent-ai/omnigent@8ff455b` (2
 Formwork at `8a340c4`. Claims are from reading both codebases, plus live probes on a Linux 6.18 host
 (Landlock ABI 7, bubblewrap 0.x). macOS claims come from the code only and were not run.
 
+**What the Linux host did not have.** The probe host was a headless container: no session D-Bus,
+no `systemd --user`, no X11 or Wayland socket, no Secret Service. Those are the services through
+which a confined process can ask something *outside* the sandbox to run a command, open a URL, or
+hand over a secret. Omnigent closes them structurally (bwrap does not mount `$XDG_RUNTIME_DIR`,
+and it strips `DBUS_*`). Formwork does not mediate pathname-socket `connect()` on Linux, so on a
+developer desktop they are reachable. That finding is from code reading and did not show up in the
+probes here, because there was nothing to reach. §5 items 7–8 record it, and [FEP-5](fep-5.md)
+§4.1 makes the test suite start a session of its own so CI (also headless) exercises it, and adds a
+`detect` line so an operator sees which of these facilities their own host has.
+
 ## TL;DR
 
 - **Don't replace Omnibox with Formwork. Stack them.** Omnigent's sandbox is built around mount,
@@ -197,8 +207,12 @@ Gains from stacking (Option B), or from replacement (Option A) except where note
    filter by destination IP.
 3. **UDP control.** Formwork's port mode leaves all UDP open.
 4. **PID, IPC and UTS isolation.** Other processes stay visible: their `cmdline` (which often holds
-   tokens), and pids that can be signalled below Landlock ABI 6. Measured on this host: 78 vs 4
-   visible PIDs.
+   tokens), their `environ` for same-uid processes (verified: a confined process read a sibling's
+   `FW_CANARY` variable — `ptrace_may_access` decides this, and Landlock does not govern it), and
+   pids that can be signalled below Landlock ABI 6. Measured on this host: 78 vs 4 visible PIDs.
+4a. **Host-service channels.** Under bwrap the session bus, `systemd --user`, display-server and
+   keyring sockets do not exist in the sandbox. Under Formwork on Linux they are reachable if
+   present on the host (code reading; the probe host had none — see the status note at the top).
 5. **Invisibility.** bwrap makes unmounted paths not exist (ENOENT). Formwork returns EACCES, and
    `stat` still works on Linux, which leaks that the path exists.
 6. **Private `/tmp` and scratch.** Formwork grants the host `/tmp`, which is shared across sessions.
@@ -241,6 +255,13 @@ Gains from stacking (Option B), or from replacement (Option A) except where note
 6. **Gateway passthrough frames.** Non-JSON frames, JSON-RPC batch arrays, and `tools/call` without
    an `id` are forwarded unfiltered (`formwork-gateway/src/lib.rs:84-139`). This needs a test
    against real MCP SDKs before Option C is trusted.
+
+7. **Same-uid process environments are readable on Linux.** Verified. The FidelityReport has no
+   line for it. Landlock cannot express "every `/proc/<pid>` but the caller's" because each
+   descendant's `/proc/self` is a different inode; only a PID namespace closes it.
+8. **Desktop-session sockets are unmediated on Linux** (item 4a above). Not probed here — no
+   session existed on the host. This is the kind of gap a headless evaluation cannot see, and the
+   test suite has to bring its own session (FEP-5 `FW-E2E-082`) rather than hope the runner has one.
 
 ## 6. Recommended plan
 
