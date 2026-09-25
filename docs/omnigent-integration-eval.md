@@ -191,6 +191,8 @@ Gains from stacking (Option B), or from replacement (Option A) except where note
 1. **L7 egress control.** Host, method and path rules, credential injection (the agent never holds
    the token), private-IP and metadata blocking, and DNS pinning. This is the headline Omnigent
    feature, and Formwork has no equivalent (host-scoped egress is deferred, formwork.md §11).
+   Omnigent's path matching does not normalize, so a `/repos/acme/**` rule also admits
+   `/repos/acme/../other/x` and `/repos/acme/%2e%2e/other/x` (verified against `rules.py`).
 2. **Proxy that can't be bypassed.** Only the netns makes the proxy mandatory, and Landlock can't
    filter by destination IP.
 3. **UDP control.** Formwork's port mode leaves all UDP open.
@@ -241,6 +243,8 @@ Gains from stacking (Option B), or from replacement (Option A) except where note
    against real MCP SDKs before Option C is trusted.
 
 ## 6. Recommended plan
+
+The Formwork-side work to close the gaps in §4 is proposed in [FEP-5](fep-5.md).
 
 1. **Formwork-side fixes.**
    - Make the Linux compiler drop or downgrade `**/` rows to partial with a warning (§5.1).
