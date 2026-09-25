@@ -52,7 +52,7 @@ The gaps, per platform:
 | G5 | **Process isolation**: other PIDs, `/proc`, IPC, private `/tmp` | Namespaces | `signal` / `process-info` limited to self; no namespaces | None; shared `/tmp` | None; shared `/tmp` and `$DARWIN_USER_TEMP_DIR` |
 | G6 | **Privileged kernel interfaces** (IOKit, `mach-priv*`) | n/a (seccomp) | Not granted | seccomp baseline ([FW-ISO8](../formwork.md#fw-iso8)) | Allowed: `(allow default)` has no baseline |
 | G7 | **Host-service channels**: a service outside the sandbox that runs code, opens URLs, or releases secrets for the confined process | Closed (private `$XDG_RUNTIME_DIR`, `DBUS_*` stripped) | AppleEvents/`lsopen` presumed closed **(characterize)**; all `mach-lookup` allowed | Open: session bus, `systemd --user`, X11/Wayland sockets (see G4) | Open: `appleevent-send`, `lsopen`, all `mach-lookup` |
-| G8 | **Other processes' arguments and environment** | Hidden (PID ns) | `sysctl` `kern.procargs2` readable **(characterize)** | `/proc/<pid>/cmdline` readable; `environ` blocked by Landlock (verified) | `kern.procargs2` returns same-uid **environments** **(characterize)** |
+| G8 | **Other processes' arguments and environment** | Hidden (PID ns) | `sysctl` `kern.procargs2` readable **(characterize)** | Open for same-uid processes: a confined process read a sibling's `/proc/<pid>/environ` and `cmdline` (verified; Landlock does not govern `ptrace_may_access`) | `kern.procargs2` returns same-uid **environments** **(characterize)** |
 
 G7 is the largest gap. A confined process that can reach a host service acting on its behalf leaves
 the sandbox without breaking anything.
@@ -80,8 +80,17 @@ This FEP closes G1–G8 within the closed concept list:
 - G5 and G8 are an optional Confiner tier plus one default-on deny.
 - G6 and G7 extend the anti-shedding baseline to both backends.
 
-Phase 0 (§2) comes first: two defects block the default profile on Linux, and two make the macOS
-report over-claim.
+**Phasing.** Each phase lands independently, and the report is honest at every phase boundary.
+- **Phase 0** — defects (§2). Two block the default profile on Linux; two make the macOS report
+  over-claim.
+- **Phase 1** — baselines that need no new transport: channels and privileged interfaces (§3.4),
+  environment disclosure (§3.3, `FW-ISO16`), and their report lines.
+- **Phase 2** — egress transport: the Linux supervisor, the macOS endpoint, UDP and resolver closure
+  (§3.1).
+- **Phase 3** — inspection and brokering (§3.2), which depend on Phase 2.
+- **Phase 4** — the `isolate` tier (§3.3).
+- Throughout — `explain`, `learn` and refusal messages (§3.5) land with the phase that introduces
+  each denial kind.
 
 ### 1.1 Constraints this FEP holds to
 
@@ -119,6 +128,7 @@ report over-claim.
 | D6 | both | The Gateway forwards non-JSON frames, JSON-RPC batch arrays, and id-less `tools/call` / `resources/read` / `prompts/get` unfiltered | [FW-GW2](../formwork.md#fw-gw2), [FW-GW4](../formwork.md#fw-gw4) | Non-JSON frame: close the connection. Batch arrays: refuse them (MCP 2025-06-18 removed batching). Gated methods: check policy whether or not they carry an `id`. Test: `FW-ADV-016`. |
 | D7 | macOS | No report line for host-service channels or privileged interfaces | [FW-INV5](../formwork.md#fw-inv5), [FW-XR1](../formwork.md#fw-xr1) | Report both `Unenforceable` now. Phase 1 closes them (`FW-ISO13`, `FW-ISO14`). |
 | D8 | macOS | The port tier's mDNSResponder literal is a DNS exfiltration channel, and the report doesn't list it | [FW-INV5](../formwork.md#fw-inv5) | Report it under the port tier. Drop the literal under `AllowHosts` (`FW-EGR12`). |
+| D9 | Linux | `formwork.md` §9 describes Landlock scoping as blocking processes outside the domain, and this FEP's first draft repeated that `/proc/<pid>/environ` was blocked. A confined process read a same-uid sibling's `environ` and `cmdline` (verified). Scoping covers abstract sockets and signals only. | [FW-INV5](../formwork.md#fw-inv5), honesty is bidirectional (constitution Errors) | Add a report line `process-environment disclosure: Partial (same-uid readable)` on Linux, and correct the §9 prose (§7). Phase 1 adds the macOS deny and Phase 4 the Linux tier (`FW-ISO16`). |
 
 ---
 
@@ -160,7 +170,12 @@ pointer-argument TOCTOU of user notification does not apply.
 
 The same filter:
 - denies AF_INET/6 `SOCK_DGRAM` at `socket()`;
-- denies `sendto`/`sendmsg` carrying an address on a stream socket (TCP Fast Open).
+- denies `sendto`/`sendmsg` carrying an address on a stream socket (TCP Fast Open);
+- delivers `sendto`/`sendmsg` carrying an address on an AF_UNIX datagram socket to the supervisor as
+  well. Datagram unix sockets reach a path without `connect()` (`/dev/log` is the common case), so
+  mediating `connect()` alone would leave that route open. The supervisor applies the §3.1.1 grant
+  check to the address; a granted path is forwarded by the supervisor performing the send through a
+  socket it holds, and an ungranted one returns `EACCES`.
 
 For pathname AF_UNIX sockets (G4, G7), the supervisor:
 1. resolves `sun_path` against the target's `/proc/<pid>/root` and `cwd`, opening it `O_PATH` on
@@ -291,11 +306,23 @@ broker-credentials = ["anthropic"]        # the agent sees a placeholder, never 
 
 ### 3.3 Process isolation (G5, G8)
 
-**Default-on for both backends (`FW-ISO16`): other processes' environments are unreadable.** This is
-not optional, because it is a credential-disclosure path.
-- **Linux:** Landlock domain scoping already denies `/proc/<pid>/environ` (verified).
+**Default-on for both backends (`FW-ISO16`): other processes' environments are unreadable where the
+platform can express it, and reported where it cannot.** Environment disclosure is a
+credential-disclosure path, so this is not part of the opt-in tier.
 - **macOS:** the default profile denies `sysctl-read` of `kern.procargs2` **(characterize)**. On
   macOS this call returns the full environment of same-uid processes.
+- **Linux:** a confined process can read a same-uid sibling's `/proc/<pid>/environ` and `cmdline`
+  today (verified on this host under `ambient-minus-subtract`). Access to those files is decided by
+  `ptrace_may_access`, which Landlock does not govern, and a Landlock deny on `/proc/<pid>` cannot be
+  written for "every pid but the caller's": a rule is bound to one inode at spawn, while each
+  descendant's `/proc/self` resolves to a different directory. The honest verdicts are:
+  - `Partial` in the default profile, with the residual named ("same-uid process environments are
+    readable");
+  - `Enforced` under `isolate = ["processes"]`, where the fresh `procfs` in the PID namespace lists
+    only session processes;
+  - `Enforced` when stacked under an outer PID namespace (Omnigent's bwrap).
+
+  The report line and one operator-channel line state this on every Linux run without the tier.
 
 **Opt-in tier: `isolate`.** It is opt-in because it changes what `ps`, debuggers and IDE bridges
 see. It has three portable members.
@@ -415,7 +442,9 @@ Each one is explainable with the tools the operator already uses, and discoverab
   needs). `run` keeps exiting with the workload's status. A Formwork failure after spawn exits `125`
   and prints a result-channel line saying the failure was Formwork's. Examples: the Gateway dying,
   or the supervisor losing its listener. Omnigent-style launchers can then tell "the agent failed"
-  from "the sandbox failed".
+  from "the sandbox failed". `125` is the value `git` and `docker` use for the same purpose. A
+  workload that itself exits `125` is indistinguishable by code alone, so the attribution line is
+  the contract and the code is the convenience.
 - **Embedding.**
   - `--blueprint -` reads the blueprint from stdin, so generated blueprints need no temp file. The
     source is disclosed as `stdin` ([FW-FID7](../formwork.md#fw-fid7)).
@@ -430,6 +459,7 @@ Each one is explainable with the tools the operator already uses, and discoverab
 | Egress endpoint authentication | By construction | Credential + peer-PID check | SBPL cannot scope `localhost` to a session |
 | TLS inspection clients | All env-trust clients | Excludes Security.framework clients | No per-process trust on macOS |
 | Keychain lift granularity | Per bus name (Secret Service as a whole) | Whole keychain channel | Seatbelt gates `securityd` as one service |
+| Other processes' environment | `Partial` without `isolate` | `Enforced` (sysctl deny) | `ptrace_may_access` is outside Landlock's scope |
 | Any-depth `**/` rows | `Partial` | `Enforced` | Landlock cannot root them |
 | stat on denied paths | `Partial` | `Enforced` | kernel mechanism |
 | `isolate` `processes` / `ipc` | `Enforced` where user namespaces exist | `Partial` or `Enforced` per characterization | no namespaces on macOS |
@@ -459,10 +489,10 @@ These continue existing families: EGR, ISO, CRED, FID, DISC and XR.
 | `FW-CRED13` **Service-located credentials** | The Catalog shall express credential locations that are services (macOS mach names, Linux bus names and sockets). It shall ship the `os-keyring` type, floor-denied by default, and map the `claude` type's macOS location to the keychain. |
 | `FW-ISO10` **Isolation tier** | When a blueprint requests `isolate`, the Confiner shall apply each member (`processes`, `ipc`, `tmp`) using the §3.3 mechanism for the platform. It shall refuse before spawn any member the host cannot provide, and print one operator-channel line for each member it provides as `Partial`. |
 | `FW-ISO11` **UDP closure (Linux)** | Under the host-allowlist posture, the Confiner shall deny AF_INET and AF_INET6 `SOCK_DGRAM` socket creation. Under the port posture, the FidelityReport shall mark UDP unrestricted. |
-| `FW-ISO12` **Pathname socket mediation (Linux)** | Under supervised connect, the supervisor shall refuse `connect()` to a pathname AF_UNIX socket unless it is granted by `allow` or was bound by a process in the session. |
-| `FW-ISO13` **Channel baseline** | In every blueprint, the Confiner shall deny each §3.4 channel not lifted by `channels` or by a typed credential exclusion, using the mechanism listed for its platform. Where the platform mechanism is unavailable (Linux without supervised connect), the FidelityReport shall mark the channel `Partial`. |
+| `FW-ISO12` **Pathname socket mediation (Linux)** | Under supervised connect, the supervisor shall refuse `connect()`, and `sendto`/`sendmsg` with an address, to a pathname AF_UNIX socket unless it is granted by `allow` or was bound by a process in the session. |
+| `FW-ISO13` **Channel baseline** | In every blueprint, the Confiner shall deny each channel in the shipped baseline set that is not lifted by `channels` or by a typed credential exclusion, using the mechanism listed for its platform. The baseline set is the §3.4 table minus any channel the transparency gates (§1.1) moved to `strict`; the FidelityReport shall list each moved channel as `Partial`. Where the platform mechanism is unavailable (Linux without supervised connect), the FidelityReport shall mark the channel `Partial`. |
 | `FW-ISO14` **Privileged-interface baseline (macOS)** | The macOS profile shall deny `mach-priv-host-port`, `mach-priv-task-port`, and `iokit-open` outside the shipped IOKit allowlist. |
-| `FW-ISO16` **Process-environment disclosure** | In every blueprint, the Confiner shall deny a confined process reading the environment of any process outside the session. |
+| `FW-ISO16` **Process-environment disclosure** | In every blueprint, the Confiner shall deny a confined process reading the environment of any process outside the session where the platform provides a mechanism (macOS `kern.procargs2` deny; Linux PID namespace under `isolate`). Where it does not (Linux without `isolate`), the FidelityReport shall mark it `Partial` and name the residual. |
 | `FW-FID8` **Per-backend report lines** | The FidelityReport shall carry per-backend verdicts for: host scoping, inspection (with the client-trust caveat), UDP, pathname sockets, resolver closure, brokering, each `isolate` member, each channel, and privileged interfaces. |
 | `FW-FID9` **Self-explaining refusals** | For each refusal this FEP introduces, Formwork shall emit, within the run, one line naming what was refused, the deciding rule, and the `explain` invocation that reproduces the verdict. The refusals are: Gateway 403s, supervised-connect denials, and TLS `unknown_ca` rejections of the session CA. The line goes in the HTTP 403 body, or on the operator channel. |
 | `FW-DISC12` **Host and channel discovery** | `learn` shall reverse-compile Gateway egress violations and channel denials into proposal entries (`net.hosts`, `channels`) on both backends. It shall withhold, and itemize to the operator, metadata and private-IP destinations and credential-typed channels. |
@@ -590,9 +620,13 @@ the requirement tests below depend on it.
 - `FW-E2E-083` **Environment disclosure (both).** An unconfined sibling carries `FW_CANARY=<nonce>`
   in its environment.
   - Control: `ps -E` (macOS) or `/proc/<pid>/environ` (Linux) shows the nonce.
-  - Confined, under the **default** profile: neither shows it.
+  - macOS, confined under the **default** profile: not shown.
+  - Linux, confined under the default profile: shown, and the report says `Partial` with the residual
+    (the [FW-E2E-025](../formwork.md#fw-e2e-025) honesty pattern); under `isolate = ["processes"]`
+    on `ubuntu-22.04`: not shown, and the report says `Enforced`.
 - `FW-E2E-084` **Agent examples under the baseline (both).** Each shipped `examples/` blueprint runs
-  its agent's non-interactive smoke command with the baseline on, with zero unexpected denials. The
+  its agent's non-interactive smoke command with the baseline on, with zero denials outside the
+  lift set the example documents. The
   Claude Code example's login layer is exercised separately with `channels = ["open-url"]`.
 - `FW-E2E-085` **Discovery of hosts and channels (both).** `learn` runs a millisecond workload that
   does two things and exits: hits `blocked.test` through the proxy, and touches the clipboard.
@@ -642,7 +676,7 @@ Conditional on the characterization suite confirming the **(characterize)** mark
 | Pathname AF_UNIX | Unreachable (not mounted) | Denied | Mediated | Enforced (literals) |
 | Host-service channels | Closed | Partly (mach open) | Closed under supervised connect, else `Partial` | Closed; keychain lift is whole-channel |
 | Privileged interfaces | seccomp | Not granted | seccomp | Denied, IOKit allowlist |
-| Other processes' env | Hidden | Open **(characterize)** | Blocked (verified) | Blocked, default-on |
+| Other processes' env | Hidden | Open **(characterize)** | `Partial` by default (same-uid readable, reported); `Enforced` under `isolate` | Blocked, default-on |
 | Process visibility / IPC / tmp | Namespaces | Self-only signal/info | Opt-in, namespaces | Opt-in, filters |
 | Runs without user namespaces | No | n/a | Yes, except `isolate` `processes`/`ipc` | n/a |
 | Explain / learn for egress and channels | No | No | Yes | Yes |
@@ -703,6 +737,8 @@ Conditional on the characterization suite confirming the **(characterize)** mark
   outside its session to act on its behalf — execute, open a URL, perform egress, or disclose a
   secret — through a host service" (`FW-INV14`).
 - **`formwork.md` §9.**
+  - Correct the Linux cross-domain bullet: Landlock scoping covers abstract sockets and signals;
+    `/proc/<pid>/environ` of same-uid processes stays readable without a PID namespace.
   - Add the macOS SBPL operations and the Linux supervisor.
   - Add a fidelity row per `FW-FID8` line.
   - Copy §3.6.
@@ -791,7 +827,7 @@ changed the text above.
 
 | Criterion / norm | Finding in the earlier draft | Resolution |
 |---|---|---|
-| **Parity** ([FW-XR6](../formwork.md#fw-xr6)) | Channel lifts were spelled `allow:service:<mach-name>`, so the same blueprint meant nothing on Linux. `isolate`'s `procargs` member named a macOS sysctl | Portable `channels` enum and `os-keyring` type (§3.4); `isolate` members renamed `processes` / `ipc` / `tmp`; environment protection made default-on for both (`FW-ISO16`) |
+| **Parity** ([FW-XR6](../formwork.md#fw-xr6)) | Channel lifts were spelled `allow:service:<mach-name>`, so the same blueprint meant nothing on Linux. `isolate`'s `procargs` member named a macOS sysctl | Portable `channels` enum and `os-keyring` type (§3.4); `isolate` members renamed `processes` / `ipc` / `tmp`; environment protection default-on on macOS and honestly `Partial` on Linux without the tier (`FW-ISO16`) |
 | **Honest promises** / surface fail-fast ([FW-XR9](../formwork.md#fw-xr9)) | "Fail loudly at the requested verdict" was undefined: a blueprint cannot request a verdict. `AllowHosts` under `confine-self` had no stated failure point. A `gh` user on macOS learned about the CA problem from a TLS error mid-session | Unenforceable is refused before spawn, and `Partial` runs with one named residual line (§1.1, `FW-ISO10`, `FW-EGR14`). Client-trust caveats are surfaced before the run by `explain` and the operator channel (§3.2) |
 | **CLI simplicity** / Growth | `run --gateway <socket>` added surface for a posture embedders don't use | Withdrawn. `run` hosts the Gateway, and `confine-self` + `AllowHosts` is refused with the alternative named (`FW-EGR14`). New inputs to `explain` are positional arguments typed by shape, not new subcommands |
 | **Docs** / audience layering | The earlier draft said nothing about what users see | §6 keeps the README quickstart to at most five lines with no FW IDs, and puts channel and brokering recipes in `examples/` |
