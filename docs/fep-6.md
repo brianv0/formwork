@@ -21,9 +21,11 @@ up to `FW-EGR15`, `FW-CRED15`, `FW-FID11`, `FW-INV14`, `FW-E2E-091` and `FW-ADV-
 proxy is about 2,900 lines of its own Python (asyncio, the standard-library `ssl` module, and
 `cryptography` for certificates) under `omnigent/inner/egress/`. The proxy is present in the
 repository's first public commit (2026-06-13), and no commit message in its 4,165-commit history
-names another proxy. Formwork can build the equivalent in Rust (§3). Every protocol parser and state
-machine in the proposed engine is Rust; the cryptographic primitives come from `ring`, which is Rust
-with C and assembly cores (§3.3).
+names another proxy. Formwork can build the equivalent in Rust on `hyper`, `rustls` and `rcgen`,
+adding 34 crates to the release binary (§3). OpenAI's Codex (`codex-rs/network-proxy`) and Coder's
+httpjail are shipped Rust egress proxies on the same building blocks (§2.2). Every protocol parser
+and state machine in the proposed engine is Rust; the cryptographic primitives come from `ring`,
+which is Rust with C and assembly cores (§3.3).
 
 ---
 
@@ -114,17 +116,151 @@ alternative.
 
 ### 2.2 Other implementations
 
-<!-- research agent 2 -->
+Read from source where the source is open, at these snapshots: `openai/codex@18344a9`,
+`coder/httpjail@6d476da` (v0.6.2), `anthropic-experimental/sandbox-runtime@ddbeb74` (v0.0.77),
+`github/gh-aw-firewall` (HEAD on 2026-09-27), `superfly/tokenizer@12c9cb2` and
+`stripe/smokescreen@c8bfe28`. Docker Sandboxes, Vercel Sandbox, Deno Sandbox, E2B and Cloudflare
+Sandbox are described from their documentation.
+
+| System | Stack | TLS termination | Destination guard | Credentials |
+|---|---|---|---|---|
+| Codex `network-proxy` | Rust: `rama` `=0.3.0-alpha.4`, `rustls`, `rcgen` through `rama` (`codex-rs/network-proxy/Cargo.toml`) | only for hosts with request hooks, hosts bound to a brokered credential, or its GET/HEAD/OPTIONS "limited" mode; HTTP/2 on both sides | a name check before connecting and a check of the address the connector dials (`src/connect_policy.rs`, `TargetCheckedStreamConnector`) | a dummy with the credential's prefix and length in the environment, swapped in `Authorization` or a configured header for bound hosts; the path is checked for encoded separators before a URL-prefix binding applies (`src/authorization_path.rs`) |
+| httpjail | Rust: `hyper` 1, `rustls`, `rcgen`, `tls-parser`, V8 for rules | every connection; HTTP/1.1 only; CA key on disk (`src/tls.rs`) | none | none |
+| sandbox-runtime | TypeScript: `node:http` and a SOCKS5 server on one socket | opt-in `tlsTerminate`, HTTP/1.1 ALPN; `excludeDomains` tunnel | resolve once and dial the vetted address; loopback, link-local, metadata and the host's own interface addresses refused; NAT64 and 6to4 decoded; RFC 1918 allowed by default | a length-padded sentinel with per-credential hosts, substituted in headers and streamed bodies; AWS SigV4 re-signed |
+| `gh-aw-firewall` | Squid and iptables in Docker | peeks the ClientHello and splices only when the server name is allowed (`src/squid/`); optional bump with a one-day CA | Squid ACLs | model-API keys held by a separate reverse-proxy container |
+| Fly `tokenizer` | Go | none: the client sends plain HTTP to the proxy, which dials TLS; CONNECT is refused because a tunnel escapes the host check | private addresses refused at dial | a NaCl-sealed secret per request naming its allowed hosts |
+| smokescreen | Go | optional per-ACL, static headers only | resolve, classify, dial the classified address | static headers |
+| Docker Sandboxes | closed | yes, on the forward-proxy path | policy-aware resolver | sentinel in the sandbox; the proxy overwrites the header for bound hosts |
+| Vercel Sandbox | closed | only for domains with header-transform rules; elsewhere the server name is matched and domain fronting is documented as possible | not documented | header transforms |
+| Cloudflare Sandbox | closed | yes: TPROXY sends ports 80 and 443 to the Workers runtime; per-instance CA | not documented | Worker code sets headers |
+
+What this changes in the design:
+
+1. **Selective termination is the common design.** Codex, Vercel, sandbox-runtime's
+   `excludeDomains` and `gh-aw-firewall` terminate TLS only where a request-level rule or a
+   credential needs it, which is FEP-5's two grades. `gh-aw-firewall` compares the ClientHello's
+   server name with the allowlist before splicing, the check `FW-EGR16` requires.
+2. **The CA key stays in memory.** Codex generates an ECDSA P-256 CA per process and keeps a test
+   that the key is never written (`src/certs.rs`, `managed_ca_private_key_is_not_persisted`).
+   httpjail and Omnigent store theirs on disk.
+3. **No credential over plaintext.** Codex requires an explicit opt-in to broker over plain HTTP,
+   and sandbox-runtime brokers only when it terminates TLS. The engine never presents a credential on
+   a request it forwards without TLS (`FW-CRED19`).
+4. **The host's own addresses are a destination class.** sandbox-runtime refuses its host's
+   interface addresses. On a cloud machine with a public address, a wildcard rule whose name
+   resolves to that address reaches every service listening on all interfaces, and the address is
+   global, so a range table alone misses it (§4.5).
+5. **Numeric host spellings.** sandbox-runtime canonicalizes hosts through the WHATWG URL parser,
+   which reads `2130706433`, `0x7f.1` and `127.1` as IPv4 addresses, as `getaddrinfo` does. The
+   engine applies the same reading and accepts only dotted-decimal (§4.2).
+6. **Leaf certificate details break clients.** sandbox-runtime adds an authority key identifier
+   because Python 3.13's `VERIFY_X509_STRICT` rejects leaves without one; httpjail sets the fixed
+   serial `[1, 2, 3, 4]` on every leaf (`src/tls.rs`). §4.6 specifies both fields.
+7. **HTTP/2.** Codex terminates HTTP/2 on both sides; sandbox-runtime and httpjail offer HTTP/1.1
+   only. §4.8 and §10 record the choice for Formwork.
+8. **Linux transport.** Codex runs the agent in a network namespace with no route, passes the
+   in-namespace listening socket out over `SCM_RIGHTS`, and accepts on it from a bridge in the host
+   namespace (`codex-rs/linux-sandbox/src/proxy_routing.rs`). It needs user namespaces, which
+   FEP-5's supervisor does not; it is prior art for FEP-5's optional namespace path.
 
 ### 2.3 The Rust building blocks
 
-<!-- research agent 1 -->
+Versions are from crates.io on 2026-09-27. Crate counts are packages added to Formwork's resolved
+graph (66 packages today) when the option is added to `formwork-gateway`, measured with
+`cargo tree -e normal,build` on Linux x86_64.
+
+| Option | Latest | TLS | Leaf minting | Tunnel path | Added crates | Notes |
+|---|---|---|---|---|---|---|
+| `hudsucker` | 0.25.0, 2026-07-15 | `rustls` (compiles both `aws-lc-rs` and `ring`) | `rcgen`; every leaf served with the CA's own key pair (`src/certificate_authority/rcgen_authority.rs`) | peeks the ClientHello, then dials `TcpStream::connect(authority)` itself (`src/proxy/internal.rs`) | 104 lean, 120 default | one maintainer; WebSocket support always compiled |
+| `http-mitm-proxy` | 0.18.0, 2026-01-24 | `rustls` server side; upstream `native-tls` by default | `rcgen`, P-256 key per host | intercepts every CONNECT or none | 67 with `rustls` | one maintainer, 5 commits in six months |
+| `rama` | 0.4.0, 2026-08-19 | BoringSSL first, `rustls` secondary | `rcgen` or BoringSSL | `SniRouter`, `PeekTlsClientHelloService` | 158 slim, 226 with HTTP and `rustls` | MSRV 1.96; carries its own fork of `hyper` and `h2`; its `rustls` MITM example calls itself "not the recommended proxy architecture"; Codex pins `=0.3.0-alpha.4` |
+| `pingora` | 0.9.0, 2026-09-09 | OpenSSL, BoringSSL, s2n; `rustls` called experimental | none built in | none: a reverse-proxy design where CONNECT gets 405 by default | 163 with `rustls` (`libz-ng-sys` builds with CMake) | `run_forever` may fork the process; five RUSTSEC entries |
+| `third-wheel` | 0.6.0, 2021-03-18 | OpenSSL, `hyper` 0.14 | OpenSSL | — | — | unmaintained |
+| Compose (§3.3) | — | `rustls` on `ring` | `rcgen` with an in-memory `Issuer` | the engine's own code, so pinning applies | 34; 39 with HTTP/2 | the set Codex's and httpjail's proxies are built from, less the frameworks |
+
+Measured alternatives within the composed set: `aws-lc-rs` instead of `ring` adds 10 crates;
+`rustls-platform-verifier` instead of `rustls-native-certs` adds 6 on Linux and 15 across targets;
+`hickory-resolver` adds 66; `tls-parser` for ClientHello parsing adds 22 on its own.
+
+Security history bearing on the choice (RUSTSEC):
+
+- **`h2`**, the HTTP/2 implementation under `hyper`: four denial-of-service advisories since 2023,
+  each a flood the server side absorbs: resets (RUSTSEC-2023-0034), error resets
+  (RUSTSEC-2024-0003), CONTINUATION frames (RUSTSEC-2024-0332) and empty DATA frames
+  (RUSTSEC-2026-0258, August 2026).
+- **`hyper`** HTTP/1 parsing: four request-smuggling advisories in 2020–2021 (RUSTSEC-2020-0008,
+  RUSTSEC-2021-0020, RUSTSEC-2021-0078, RUSTSEC-2021-0079), none since; none ever for `httparse`.
+- **`rustls`**: RUSTSEC-2024-0399 was a panic in `Acceptor::accept`, the ClientHello-peek API §4.3
+  uses (fixed in 0.23.18); RUSTSEC-2026-0285 is fixed only in 0.23.45, the current release.
+- **`pingora`**: RUSTSEC-2026-0033 spliced a WebSocket upgrade before the upstream answered `101`.
+  The engine splices an upgraded connection only after the upstream's `101` (§4.8).
+
+For scale: Omnigent's proxy is about 2,900 lines of Python. Codex's `network-proxy` is 29,400 lines
+of Rust in 61 files including 305 tests, and covers SOCKS5, request hooks, configuration and
+credential providers that this FEP does not need. httpjail is 9,500 lines including its Linux
+namespace and nftables setup.
 
 ---
 
 ## 3. Build or buy
 
-<!-- decision after research -->
+### 3.1 A proxy program beside `formwork`
+
+Envoy, Squid, mitmproxy and smokescreen would each run as a second program per session, with
+`formwork` rendering its configuration, supervising its lifetime and translating its logs into
+violation records.
+
+- **Envoy** cannot mint certificates from a local CA. The workable path terminates CONNECT into an
+  internal listener whose TLS context uses the `on_demand_secret` certificate selector with the SNI
+  mapper, which pauses each handshake and asks an SDS server, one Formwork would have to write, for
+  a certificate; session resumption is not supported in that mode
+  (`api/envoy/extensions/transport_sockets/tls/cert_selectors/on_demand_secret/v3/config.proto`).
+  Its `credential_injector` filter sets a static secret or an OAuth2 client-credentials token in
+  `Authorization`; a placeholder swap needs a Lua, Wasm or dynamic-module filter.
+- **Squid** mints certificates with `ssl-bump generate-host-certificates=on` and
+  `security_file_certgen`, and its peek, splice and bump steps are mature (`gh-aw-firewall` ships a
+  configuration). Credential injection needs ICAP or eCAP, and every value rendered into its
+  configuration language has to be escaped.
+- **mitmproxy** mints certificates, speaks HTTP/2 and WebSocket, and makes a placeholder swap a
+  short addon. It is about 23 MB of wheels plus a CPython runtime.
+- **smokescreen** resolves, classifies and dials the classified address, and now has optional MITM
+  with static headers. It has no method or path rules; the stripped binary is 13.8 MB.
+
+Each fails the self-contained-binary rule (constitution Growth) and places the policy decision, the
+credential and the refusal record in a second program outside the Gateway concept. None is
+proposed.
+
+### 3.2 A Rust proxy framework
+
+Every framework in §2.3 opens the upstream socket for a tunnelled host itself, from the authority
+string, so the engine's resolve-classify-dial sequence (§4.5) cannot run on the tunnel path without
+a fork. `hudsucker` also serves every leaf with the CA's key, and chooses only between intercepting
+and tunnelling at the ClientHello, with no refusal. `http-mitm-proxy` intercepts every CONNECT or
+none. `rama` would raise the MSRV to 1.96, bring its own `hyper` and `h2` fork and 158–226 crates,
+and depend largely on one maintainer. `pingora` is a reverse proxy. The frameworks add 67 to 228
+crates against 34 for the composed set, and the parts they save (the CONNECT upgrade, the ClientHello
+peek, the leaf cache) are each a few hundred lines on `hyper` and `rustls`.
+
+### 3.3 Composing the engine
+
+The engine is built on `hyper` (HTTP/1 server and client, including the CONNECT upgrade),
+`tokio-rustls` and `rustls`, `rcgen` for the CA and leaves, `rustls-native-certs` for the host trust
+store, and `tokio::net::lookup_host` for resolution. The manifest is in §5. `httparse` arrives with
+`hyper`; nothing else parses HTTP.
+
+**What "pure Rust" means here.** Every parser and state machine the confined process's bytes reach
+(HTTP/1.1 in `hyper` and `httparse`, TLS in `rustls`, certificate handling in `rustls-webpki` and
+`rcgen`) is Rust. The cryptographic primitives come from `ring`, which is Rust with C and assembly
+cores derived from BoringSSL and needs a C compiler through `cc` at build time. `aws-lc-rs`, the
+`rustls` default, is C as well, and adds 10 crates. A provider written wholly in Rust exists
+(`rustls-rustcrypto`) and is not proposed for a component that terminates TLS for credentials.
+
+### 3.4 Decision
+
+Build the engine in `formwork-gateway` on the composed set. It is the only option in which
+destination pinning, the server-name check, the placeholder scan and the reflection guard all run
+on every path, and it adds the fewest crates. Codex's `network-proxy` and httpjail show the same
+building blocks in shipped Rust egress proxies.
 
 ---
 
@@ -172,7 +308,11 @@ violation record (§4.10).
 3. **Authority.** Parse into `HostName` or an IP literal plus a port ([FW-EGR3](fep-1.md#fw-egr3)):
    bytes limited to `[A-Za-z0-9.-]`, lowercased, one trailing dot removed, no empty label, labels of
    at most 63 bytes, names of at most 253; IPv6 literals in brackets without a zone identifier;
-   non-ASCII names refused (clients send A-labels).
+   non-ASCII names refused (clients send A-labels). A name whose last label is numeric or starts
+   with `0x` is read as an IPv4 address, as the WHATWG URL parser and `getaddrinfo` read it, and
+   accepted only in dotted-decimal form: `2130706433`, `0x7f.1` and `127.1` are refused as
+   `malformed`. One `HostName` value then serves the policy decision, the leaf certificate, the
+   credential binding and the upstream TLS server name.
 4. **Host decision.** Look the host up in `EgressPolicy`: `deny` rules first (terminal), then exact
    names, then wildcard suffixes. The result is not listed, denied, tunnel, or inspected.
 5. **Destination.** Resolve and classify (§4.5); the result is an ordered list of admitted
@@ -223,10 +363,10 @@ refused as `sni-mismatch`; the operator line names ECH as the likely cause.
 4. A refused request gets `403` with the body `denied by formwork policy` and the connection stays
    usable, as it would after any other `403`.
 
-The upstream side is a pool of keep-alive HTTP/1.1 connections keyed by host and port. Its connector
-resolves and classifies (§4.5), connects to admitted addresses in answer order, and verifies the
-upstream certificate for the host name against the host trust store (`FW-EGR24`). A pooled
-connection is reused only for the host it was opened for.
+The upstream side is a pool of keep-alive `hyper::client::conn::http1` connections keyed by host
+and port. Its connector resolves and classifies (§4.5), connects to admitted addresses in answer
+order, and verifies the upstream certificate for the host name against the host trust store
+(`FW-EGR24`). A pooled connection is reused only for the host it was opened for.
 
 ### 4.5 Destination policy
 
@@ -237,13 +377,15 @@ is classified; if any address is refused, the connection is refused (`address-cl
 mixed public and private answer is the rebinding pattern. The engine then connects only to addresses
 from that answer (`FW-EGR17`).
 
-Classes, checked on the address and, for IPv6 forms that embed an IPv4 address, on the embedded
-address as well:
+Classes are checked in table order and the first match decides, so `169.254.169.254` is metadata
+before it is link-local. Each address is checked, and for IPv6 forms that embed an IPv4 address, the
+embedded address as well:
 
 | Class | Ranges | Admitted by |
 |---|---|---|
 | Metadata | `169.254.169.254`, `fd00:ec2::254`, `100.100.100.200` (Alibaba), `168.63.129.16` (Azure WireServer) | an IP-literal rule naming the address ([FW-EGR4](fep-1.md#fw-egr4)) |
 | Gateway endpoints | the session's own listener addresses and ports | never (`FW-EGR18`) |
+| Host addresses | every address on the host's interfaces, enumerated with `getifaddrs` at session start | an IP-literal rule, or an exact-name rule (`FW-EGR19`) |
 | Local and private | `0.0.0.0/8`, `127.0.0.0/8`, `::1`, `::`, RFC 1918, `100.64.0.0/10`, `169.254.0.0/16`, `fe80::/10`, `fc00::/7` | an IP-literal rule, or an exact-name rule (`FW-EGR19`); never a wildcard rule |
 | Special-purpose | `192.0.0.0/24`, `192.0.2.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `240.0.0.0/4`, `255.255.255.255`, multicast, `100::/64`, `2001:db8::/32` | an IP-literal rule |
 | Global | everything else | any matching rule |
@@ -254,9 +396,11 @@ is XOR-obfuscated). `64:ff9b::a9fe:a9fe` reaches `169.254.169.254` on a NAT64 ne
 classified as metadata. The table is written out in the engine: the standard library's
 `Ipv4Addr::is_global` and `Ipv6Addr::is_global` are unstable.
 
-Two changes from FEP-1 are proposed (§9 b, §10). FEP-1 does not list loopback, so a wildcard rule
-whose name an attacker controls could reach services on the operator's loopback interface; loopback
-joins the local class. FEP-1 also lets only IP literals name private ranges, which makes every
+Three changes from FEP-1 are proposed (§9 b, §10). FEP-1 does not list loopback, so a wildcard
+rule whose name an attacker controls could reach services on the operator's loopback interface;
+loopback joins the local class. The host's own interface addresses become a class, because on a
+machine with a public address they are global and a range table alone admits them. FEP-1 also lets
+only IP literals name private ranges, which makes every
 intranet host unreachable by name and conflicts with its own `FW-E2E-029`, where `allowed.test`
 resolves to `127.0.0.1`. The table admits local and private addresses for exact-name rules and never
 for wildcards: the rebinding attacks in the record depend on a name the attacker controls, which a
@@ -269,11 +413,13 @@ start with `rcgen` and its private key is never serialized (FEP-5 `FW-EGR13`).
 
 | Field | CA | Leaf |
 |---|---|---|
-| Key | ECDSA P-256, generated per session | ECDSA P-256, one key per session shared by all leaves |
+| Key | ECDSA P-256, generated per session | ECDSA P-256, one key per session, distinct from the CA key, shared by all leaves |
 | Basic constraints | CA, path length 0 | not a CA |
 | Key usage | `keyCertSign`, `cRLSign` | `digitalSignature`; EKU `serverAuth` |
 | Subject alternative name | none | the host as a DNS name, or an IP address for an IP-literal rule |
 | Name constraints | permitted subtrees: each inspected exact name, each wildcard's suffix, each inspected IP literal (`FW-EGR25`) | none |
+| Key identifiers | subject key identifier | subject and authority key identifiers (Python 3.13's `VERIFY_X509_STRICT` requires the authority identifier) |
+| Serial | 16 random bytes, high bit clear, so the integer is positive | same, fresh per leaf |
 | Validity | from one hour before start to **ca-lifetime** after | from one hour before minting to **leaf-lifetime** after; re-minted when half has elapsed |
 
 The name constraints restrict what a leaked key or a minting defect could impersonate to the hosts
@@ -297,8 +443,10 @@ require `CAP_SYS_PTRACE` whatever Yama and Landlock decide; on macOS `ptrace(PT_
 for the new image.
 
 **Presentation limits.** The engine never presents a credential on OPTIONS (`FW-CRED18`), and TRACE
-is refused outright on inspected hosts (`FW-EGR23`). A request that already carries a
-non-placeholder credential header is forwarded unchanged.
+is refused outright on inspected hosts (`FW-EGR23`). It never presents a credential on a request it
+forwards without TLS, since the bytes would cross the network in the clear (`FW-CRED19`); §9 (i)
+makes the matching blueprint a compile error. A request that already carries a non-placeholder
+credential header is forwarded unchanged.
 
 **Placeholder scan.** For every inspected request the engine scans the request target and every
 header value for the session placeholder prefix (`fwcred-`). A placeholder bound to another host, an
@@ -339,7 +487,7 @@ the operator; the confined process receives the upstream response unchanged.
 | Plain HTTP (absolute-form, port 80 rule) | the inspected request pipeline without TLS; reported unencrypted per FEP-5 §4 | A |
 | HTTP/1.1 over TLS to an inspected host | terminate, match, broker, forward | B |
 | HTTP/2 to an inspected host | not offered in ALPN; clients fall back to HTTP/1.1. A ClientHello whose ALPN list excludes `http/1.1` is refused as `alpn` (`FW-EGR20`), and the operator line suggests tunnel grade for the host | spike-gated (§11) |
-| WebSocket over an inspected host | the upgrade GET is matched and brokered like any request; frames after `101` pass uninspected, and the report line says so | C |
+| WebSocket over an inspected host | the upgrade GET is matched and brokered like any request; the engine splices the two sides only after the upstream answers `101` (the `pingora` defect, §2.3); frames pass uninspected, and the report line says so | C |
 | An operator's upstream proxy | the engine connects through the proxy named in `formwork run`'s own environment; the proxy resolves names, so address classification is `Partial` and the report says so (`FW-EGR26`) | C |
 | HTTP/3 and QUIC | UDP is closed under host rules (FEP-5 `FW-ISO11`); clients fall back to TCP | — |
 | Non-HTTP TCP (SSH, database protocols) | refused under host rules; a port-scoped fd ([FW-GW6](../formwork.md#fw-gw6)) is the FEP-1 answer and has no grammar yet (§11) | — |
@@ -424,7 +572,9 @@ The engine is the same program on both platforms. The differences come from the 
 §3.6) and from the host trust store: on Linux `rustls-native-certs` reads the system bundle; on
 macOS it reads the keychain's trusted roots. On both it reads `SSL_CERT_FILE` and `SSL_CERT_DIR`
 from `formwork run`'s own environment when they are set, and uses only those locations; the
-resolved-input disclosure ([FW-FID7](../formwork.md#fw-fid7)) names the source.
+resolved-input disclosure ([FW-FID7](../formwork.md#fw-fid7)) names the source. The Launcher sets
+the session's CA variables only in the environment it builds for the child, never in its own, so
+the engine cannot load the session bundle as upstream trust (`FW-EGR24`).
 
 ---
 
@@ -441,9 +591,25 @@ Data-model surface that versions with the record schema.
 [FW-FID4](../formwork.md#fw-fid4)); `EgressError` in `formwork-gateway`, whose variants are API
 surface.
 
-**Dependencies.**
+**Dependencies.** All in `formwork-gateway`; none in any other crate.
 
-<!-- dependency table after research -->
+| Crate | Features | Why |
+|---|---|---|
+| `hyper` 1 | `http1`, `server`, `client` | HTTP/1.1 framing on both sides, and the CONNECT upgrade |
+| `hyper-util` 0.1 | `tokio` | `tokio` I/O adapters and the timer behind **head-timeout** |
+| `http-body-util` 0.1 | default | body adapters for streaming |
+| `rustls` 0.23 (≥ 0.23.45) | `ring`, `std`, `tls12`; no default features | TLS on both sides; `Acceptor` for the ClientHello peek |
+| `tokio-rustls` 0.26 | `ring`, `tls12`; no default features | `LazyConfigAcceptor` and async TLS streams |
+| `rcgen` 0.14 | `crypto`, `ring`; no default features | the session CA and leaves, in memory |
+| `rustls-native-certs` 0.8 | default | the host trust store, for upstream verification and for the session bundle |
+| `tokio` (existing) | adds `net` | listeners, sockets and `lookup_host` |
+
+Together they add 34 crates on Linux, among them `ring`, `rustls-webpki`, `http`, `httparse`,
+`time` and `zeroize`; on macOS `rustls-native-certs` also brings `security-framework` to read the
+keychain. HTTP/2 would add 5 more (`h2`, `slab`, `fnv`, `tokio-util`, `futures-sink`).
+
+**Toolchain.** `rcgen` 0.14.8 and later, and `time` 0.3.47 and later (the RUSTSEC-2026-0009 fix),
+need Rust 1.88, so the workspace `rust-version` rises from 1.85 to 1.88.
 
 ---
 
@@ -456,7 +622,7 @@ These continue the EGR, CRED, FID and INV families. One obligation per ID; ratio
 | `FW-EGR16` Tunnel server name | For a tunnel-grade host, the Gateway shall forward bytes upstream only after buffering a complete TLS ClientHello whose server name equals the canonical CONNECT host, and shall refuse a connection whose first byte is not a TLS handshake record. |
 | `FW-EGR17` Single resolution | Before connecting upstream, the Gateway shall resolve the host once, classify every returned address, including any IPv4 address embedded in an IPv6 address, refuse the connection if any address is in a class the matching rule does not admit, and connect only to addresses from that resolution. |
 | `FW-EGR18` Gateway self-exclusion | The Gateway shall refuse every upstream connection to its own listener endpoints. |
-| `FW-EGR19` Local and private admission | The Gateway shall admit a loopback, private, shared or link-local address other than a metadata address only for a host matched by an exact-name or IP-literal rule. |
+| `FW-EGR19` Local and private admission | The Gateway shall admit a loopback, private, shared, link-local or host-interface address other than a metadata address only for a host matched by an exact-name or IP-literal rule. |
 | `FW-EGR20` Inspected ALPN | For an inspected host, the Gateway shall offer only `http/1.1` in ALPN and shall refuse a ClientHello whose ALPN list is present and excludes `http/1.1`. |
 | `FW-EGR21` Streamed bodies | The Gateway shall forward request and response bodies as they arrive, holding at most **body-buffer** bytes of a body per direction in memory. |
 | `FW-EGR22` Authorized forwarding | For an inspected request, the Gateway shall send upstream a request line built from the method and canonical path that matched, with hop-by-hop headers and `Proxy-Authorization` removed. |
@@ -465,8 +631,9 @@ These continue the EGR, CRED, FID and INV families. One obligation per ID; ratio
 | `FW-EGR25` Constrained session CA | The session CA certificate shall carry name constraints whose permitted subtrees are exactly the session's inspected exact names, wildcard suffixes and IP literals. |
 | `FW-EGR26` Upstream proxy | When `formwork run`'s environment names an upstream proxy, the Gateway shall send admitted egress through it and report destination classification `Partial` with the reason. |
 | `FW-CRED16` Broker custody | While it holds a brokered credential, the Gateway process shall be non-dumpable (Linux) or deny debugger attachment (macOS). |
-| `FW-CRED17` Reflection guard | For a response to a request on which it presented a brokered credential, the Gateway shall request identity content coding, refuse a response with another content coding, and end the response without releasing any byte that begins a wire encoding of the presented credential. |
+| `FW-CRED17` Reflection guard | For a response to a request on which it presented a brokered credential, the Gateway shall request identity content coding, refuse a response with another content coding, and end the response without releasing any byte that begins an occurrence of a wire encoding of the presented credential. |
 | `FW-CRED18` No credential on OPTIONS | The Gateway shall not present a brokered credential on an OPTIONS request. |
+| `FW-CRED19` No credential in cleartext | The Gateway shall present a brokered credential only on a request it forwards to the upstream over TLS. |
 | `FW-FID12` Egress refusal reasons | Every egress violation record shall carry exactly one reason from the closed set in §4.10. |
 | `FW-FID13` Egress grant records | For each admitted tunnel and inspected request, the Gateway shall emit a grant record with host, grade, method, canonical path, status, byte counts and duration, and no header value, body byte or query string. |
 
@@ -532,16 +699,17 @@ Draft numbers continue above `FW-E2E-091` and `FW-ADV-020`.
   connection. Fail: any reaches a fixture.
 - `FW-ADV-023` **Address classes.** Under `https:*.test`, the resolver fixture answers
   `127.0.0.1`, `10.0.0.1`, `100.100.100.200`, `168.63.129.16`, `::ffff:169.254.169.254`,
-  `64:ff9b::a9fe:a9fe`, `2002:a9fe:a9fe::1`, `fe80::1`, a public address mixed with `10.0.0.1`, and
-  the Gateway's own listener address. Then, under the exact rule `https:allowed.test`, it answers
-  `127.0.0.1` and then `169.254.169.254`. Pass: every wildcard case and the exact-name metadata case
-  are refused with `address-class`, and the exact-name loopback case is admitted. Fail: any other
-  outcome.
+  `64:ff9b::a9fe:a9fe`, `2002:a9fe:a9fe::1`, `fe80::1`, a public address mixed with `10.0.0.1`, an
+  address of the runner's own interfaces, and the Gateway's own listener address. Then, under the
+  exact rule `https:allowed.test`, it answers `127.0.0.1` and then `169.254.169.254`. Pass: every
+  wildcard case and the exact-name metadata case are refused with `address-class`, and the
+  exact-name loopback case is admitted. Fail: any other outcome.
 - `FW-ADV-024` **Parser battery (`FW-INV15`).** Heads carrying both `Content-Length` and
   `Transfer-Encoding`, two differing `Content-Length` values, obsolete line folding, a bare LF, a NUL
   in a header value, an invalid method token, a head over **head-limit**, CONNECT authorities with
-  userinfo, a path, a zone identifier or a percent-encoded dot, and a truncated ClientHello. Pass:
-  the fixture upstream receives no byte from any of them. Fail: any byte arrives.
+  userinfo, a path, a zone identifier, a percent-encoded dot, or a numeric spelling (`2130706433`,
+  `0x7f.1`, `127.1`), and a truncated ClientHello. Pass: the fixture upstream receives no byte from
+  any of them. Fail: any byte arrives.
 
 The parsers in `FW-ADV-024` (authority, path canonicalization, ClientHello buffering) are also fuzz
 targets once the fuzz infrastructure that `docs/STATUS.md` defers exists.
@@ -554,7 +722,7 @@ Each phase lands with the FEP-5 phase that needs it, and the report is honest at
   classification, tunnel grade, plain HTTP, records. `FW-EGR16`–`FW-EGR19`, `FW-EGR21`,
   `FW-FID12`, `FW-FID13`, `FW-INV15`.
 - **Phase B**, with FEP-5 Phase 3: inspection, the session CA, the upstream pool, brokering, the
-  reflection guard and custody. `FW-EGR20`, `FW-EGR22`–`FW-EGR25`, `FW-CRED16`–`FW-CRED18`.
+  reflection guard and custody. `FW-EGR20`, `FW-EGR22`–`FW-EGR25`, `FW-CRED16`–`FW-CRED19`.
 - **Phase C**: WebSocket upgrade on inspected hosts; upstream proxy chaining (`FW-EGR26`).
 - **HTTP/2 on inspected hosts**: after the §11 spike.
 
@@ -618,12 +786,28 @@ recommended FEP-7. Applied on this branch.
 **(h) `formwork.md` §11, "Linux gateway egress isolation build-vs-buy".** FEP-5 (f) narrows it to
 the optional network-namespace path; this FEP records that the proxy itself is built (§3).
 
+**(i) FEP-5 `FW-CRED12`.** Add: the compiler also rejects a blueprint that brokers a credential to
+a bound host whose only inspected rule forwards without TLS (port 80), naming the rule to change
+(`FW-CRED19`).
+
 ---
 
 ## 10. Decisions (recorded per constitution Precedence & Conflicts)
 
-<!-- build decisions after research -->
-
+- **Build, in-process, in Rust.** Sidecars fail the self-contained-binary rule and move the
+  decision, the credential and the record out of the Gateway (§3.1); frameworks dial tunnelled hosts
+  themselves and cost 67–228 crates (§3.2). The composed engine costs 34 (§3.4).
+- **`ring`, not `aws-lc-rs`.** `ring` needs only `cc` and 10 fewer crates. `aws-lc-rs` is the only
+  `rustls` provider with the post-quantum hybrid key exchange, so the engine's own upstream
+  connections from inspected hosts do not offer it; tunnel-grade connections keep whatever the
+  client negotiates. Revisited in §11.
+- **`rustls-native-certs`, not `rustls-platform-verifier`.** The session bundle (§4.6) must list the
+  roots the engine trusts, and only `rustls-native-certs` exports them; using it for upstream
+  verification as well keeps one source for both. The platform verifier would add revocation
+  checking on macOS and 6–15 crates.
+- **A per-host pool of `hyper::client::conn::http1` connections, not `hyper-util`'s pooled
+  client.** The connector has to resolve, classify and dial (§4.5) on every new connection; keeping
+  it in the engine's own code keeps that sequence in one place.
 - **Tunnel grade checks the server name.** FEP-1's grade trusts the client's claim; comparing the
   ClientHello's server name with the CONNECT host costs one parse with rustls's own acceptor and
   refuses the cheapest fronting variant, a CONNECT to one name carrying a ClientHello for another.
@@ -640,12 +824,15 @@ the optional network-namespace path; this FEP records that the proxy itself is b
   and the violation record names the cause.
 - **Hold back only a matching prefix.** A fixed hold-back window of the credential's length would
   delay the tail of every streamed event until the next one arrived.
-- **One leaf key per session.** A key per host buys nothing when every key lives in the same process;
-  a shared key makes minting a signature only.
+- **One leaf key per session, separate from the CA key.** A key per host buys nothing when every
+  key lives in the same process, and a shared key makes minting a signature only. Serving leaves
+  with the CA's own key, as `hudsucker` does, would put the signing key in every handshake.
 - **Name constraints on the session CA.** They cost one extension and bound what a leaked key could
   impersonate to the hosts the file already inspects.
-- **HTTP/1.1 first.** Every model API and registry the examples use accepts it, and the HTTP/2
-  server adds the `h2` crate and the stream-reset denial-of-service class to the Gateway (§2.3).
+- **HTTP/1.1 first.** Every model API and registry the examples use accepts it, and
+  server-sent-event and chunked streaming work over it. An HTTP/2 server adds 5 crates and places
+  `h2`, with four flood advisories since 2023, on a socket the confined process controls (§2.3).
+  Codex terminates HTTP/2 on both sides; sandbox-runtime and httpjail do not.
 - **No SOCKS5.** Codex and sandbox-runtime offer it for non-HTTP TCP. Under host rules Formwork's
   answer to non-HTTP TCP is the port-scoped fd ([FW-GW6](../formwork.md#fw-gw6)), which needs a
   grammar first (§11); a SOCKS front door would be a second, weaker path to the same place.
@@ -681,5 +868,13 @@ the optional network-namespace path; this FEP records that the proxy itself is b
   (FEP-1, [FW-GW6](../formwork.md#fw-gw6)). A grammar proposal belongs with FEP-5's `rules`.
 - **Encrypted Client Hello.** Refused today as a server-name mismatch. If an agent toolchain enables
   ECH by default, tunnel grade needs a policy for the outer name.
+- **Post-quantum key exchange upstream.** With `ring`, the engine's upstream TLS from inspected
+  hosts offers classical key exchange only. Moving to `aws-lc-rs` (10 more crates, a C and C++
+  build) buys the hybrid group. Owner: Phase B review.
+- **Placeholder shape.** FEP-5's placeholder is `fwcred-<type>-<nonce>`; Codex and sandbox-runtime
+  give the dummy the credential's prefix and length, so a client that checks a key's format
+  locally accepts it. A shaped dummy loses the prefix the engine scans for, so detection would
+  match exact placeholder values instead. The client matrix (`FW-E2E-094`) shows whether any
+  shipped example's client checks format.
 - **Upstream proxy authentication.** `FW-EGR26` supports proxies without authentication or with
   Basic credentials in the proxy URL. NTLM and Kerberos proxies are not supported.
