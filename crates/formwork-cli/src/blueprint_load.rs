@@ -980,7 +980,7 @@ mod tests {
             .fs
             .write_subtract
             .contains(&PathPattern::parse("**/.git/hooks/**").unwrap()));
-        // FW-TRA7 also names shell rc files and the agent-config `.claude` dir as tamper vectors.
+        // FW-TRA7 also names shell rc files and the agent-config settings that carry hooks as tamper vectors.
         assert!(bp
             .fs
             .write_subtract
@@ -988,7 +988,7 @@ mod tests {
         assert!(bp
             .fs
             .write_subtract
-            .contains(&PathPattern::parse("**/.claude/**").unwrap()));
+            .contains(&PathPattern::parse("**/.claude/settings.json").unwrap()));
         // ...and the extending file's grant layers on top.
         assert!(bp
             .fs
