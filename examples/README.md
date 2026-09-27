@@ -33,7 +33,10 @@ formwork compile --blueprint examples/blueprints/agent-session.toml --report-onl
 On macOS (Seatbelt) fs read/write, default-deny egress, and the direct-TCP port tier are all
 enforced by the kernel. Egress is **port-scoped, not host-scoped**: `net = { ports = [443] }` allows
 any HTTPS host, so the agent reaches its model API — the filesystem sandbox, not an egress
-allowlist, is what stops secrets being read to exfiltrate in the first place. On a host that can't
+allowlist, is what stops secrets being read to exfiltrate in the first place. On Linux the port tier
+also denies UDP and raw sockets (FW-INV3: direct DNS fails closed), so a confined process cannot
+resolve hostnames there; on macOS the port tier re-allows the system resolver. Host-scoped egress
+through the gateway, which resolves names on the agent's behalf, is specified in `docs/fep-5.md`. On a host that can't
 enforce a capability, `formwork` reports the gap instead of pretending (it never fails open).
 
 ## Layout

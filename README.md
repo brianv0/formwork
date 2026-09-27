@@ -44,7 +44,9 @@ directory, then parents up to `$HOME`) and announces which file it used:
 # FORMWORK.toml — extend the built-in default profile (broad reads, credentials and other
 # projects denied, secret-shaped env vars scrubbed), then open what this project needs:
 extends = ["builtin:default"]
-net = { ports = [443] }              # HTTPS egress only; omit for no network at all
+net = { ports = [443] }              # HTTPS egress only; omit for no network at all.
+                                     # Linux: the port tier closes UDP too, so hostnames do not
+                                     # resolve inside the sandbox (see examples/README.md).
 rules = ["readwrite:$CWD/**"]        # the project directory is the writable working set
 ```
 
