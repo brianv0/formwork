@@ -584,3 +584,141 @@ fn brokering_to_a_tunneled_host_is_refused_at_load() {
     assert_ne!(out.code, 0);
     assert!(out.stderr.contains("api.anthropic.com"), "{}", out.stderr);
 }
+
+#[cfg(target_os = "linux")]
+fn isolation_host(dir: &Path) -> bool {
+    let out = formwork(dir, &["explain", "--json"], &[]);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    v["host"]["user-namespaces"].as_bool() == Some(true)
+}
+
+/// FW-E2E-079 (Linux): under `isolate = ["processes"]`, `/proc` lists only session processes, a
+/// host process can be neither signaled nor read, `$TMPDIR` is a tmpfs, the workload's exit code
+/// passes through the stage and init (FW-XR10), and the report says `Enforced` for the member and
+/// for environment disclosure (FW-ISO16). On a host without user namespaces (Ubuntu 24.04's
+/// AppArmor restriction) the run is refused before spawn, naming the alternatives (FW-XR9).
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_e2e_079_isolation_tier() {
+    let dir = Scratch::new("isolate");
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\"]\n\
+         isolate = [\"processes\", \"ipc\"]\n",
+    )
+    .unwrap();
+    let marker = dir.path().join("started");
+    if !isolation_host(dir.path()) {
+        let out = formwork(
+            dir.path(),
+            &["run", "--", "/bin/sh", "-c", "touch started"],
+            &[],
+        );
+        assert_ne!(out.code, 0);
+        for alternative in ["AppArmor", "sysctl", "bwrap", "drop the member"] {
+            assert!(
+                out.stderr.contains(alternative),
+                "{alternative}: {}",
+                out.stderr
+            );
+        }
+        assert!(!marker.exists(), "refused before spawn");
+        return;
+    }
+    let mut host = Command::new("sleep")
+        .arg("30")
+        .env("FW_HOST_CANARY", "host-environment")
+        .spawn()
+        .unwrap();
+    let hp = host.id();
+    let script = format!(
+        "ls /proc | grep -c '^[0-9]'\n\
+         stat -f -c %T \"$TMPDIR\"\n\
+         kill -0 {hp} 2>/dev/null && echo host-signalable\n\
+         cat /proc/{hp}/environ 2>/dev/null\n\
+         exit 7"
+    );
+    let out = formwork(dir.path(), &["run", "--", "/bin/sh", "-c", &script], &[]);
+    let _ = host.kill();
+    let _ = host.wait();
+    assert_eq!(out.code, 7, "the workload's status: {}", out.stderr);
+    let mut lines = out.stdout.lines();
+    let pids: usize = lines
+        .next()
+        .unwrap_or("")
+        .trim()
+        .parse()
+        .unwrap_or(usize::MAX);
+    assert!(
+        pids <= 5,
+        "/proc lists only the init, sh, ls and grep: {}",
+        out.stdout
+    );
+    assert_eq!(lines.next(), Some("tmpfs"), "{}", out.stdout);
+    assert!(!out.stdout.contains("host-signalable"), "{}", out.stdout);
+    assert!(!out.stdout.contains("host-environment"), "{}", out.stdout);
+
+    let report = formwork(dir.path(), &["compile", "--report-only"], &[]);
+    let v: serde_json::Value = serde_json::from_str(&report.stdout).unwrap();
+    let caps = &v["per-capability"];
+    for key in ["isolate-processes", "isolate-ipc", "process-environment"] {
+        assert_eq!(caps[key]["status"], "enforced", "{key}: {}", caps[key]);
+    }
+}
+
+/// The isolation tier under host rules: the supervisor still decides every connect from inside
+/// the namespaces, and a pathname socket bound in the session's tmpfs is admitted (FW-ISO12).
+#[cfg(target_os = "linux")]
+#[test]
+fn isolation_tier_keeps_supervised_egress() {
+    let dir = Scratch::new("isolate-egress");
+    if !supervision_host(dir.path()) || !isolation_host(dir.path()) || !on_path("curl") {
+        not_exercised("connect supervision, user namespaces or curl unavailable");
+        return;
+    }
+    let (port, hits) = http_fixture();
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        format!(
+            "extends = [\"builtin:default\"]\n\
+             rules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:{port}\"]\n\
+             isolate = [\"processes\"]\n"
+        ),
+    )
+    .unwrap();
+    let url = format!("http://127.0.0.1:{port}/");
+    let via = formwork(
+        dir.path(),
+        &["run", "--", "curl", "-sS", "-m", "5", &url],
+        &[],
+    );
+    assert_eq!(via.code, 0, "{}", via.stderr);
+    assert_eq!(via.stdout, "upstream-ok\n");
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    let bypass = formwork(
+        dir.path(),
+        &[
+            "run",
+            "--",
+            "curl",
+            "-sS",
+            "-m",
+            "5",
+            "--noproxy",
+            "*",
+            &url,
+        ],
+        &[],
+    );
+    assert_ne!(bypass.code, 0, "a direct connect must fail");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before);
+
+    if on_path("python3") {
+        let script = "import os, socket\n\
+                      p = os.path.join(os.environ['TMPDIR'], 's.sock')\n\
+                      srv = socket.socket(socket.AF_UNIX); srv.bind(p); srv.listen(1)\n\
+                      c = socket.socket(socket.AF_UNIX); c.connect(p); print('admitted')\n";
+        let out = formwork(dir.path(), &["run", "--", "python3", "-c", script], &[]);
+        assert_eq!(out.stdout, "admitted\n", "{}", out.stderr);
+    }
+}

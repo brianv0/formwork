@@ -705,6 +705,12 @@ fn baseline_rows(
                      environments; pending characterization C5"
                 .to_string(),
         },
+        Os::Linux if host.user_namespaces && input.isolate.contains(&IsolateMember::Processes) => {
+            // FW-ISO16: the fresh procfs lists only session processes.
+            Fidelity::Enforced {
+                backend: Backend::Namespaces,
+            }
+        }
         Os::Linux => Fidelity::Partial {
             backend: Backend::Landlock,
             reason: if facilities.pid_ns_nested {
@@ -730,12 +736,20 @@ fn baseline_rows(
         .writes
         .iter()
         .any(|p| p.matches_path(tmp) || p.matches_path(private_tmp_tmp));
+    let tmpfs = host.os == Os::Linux
+        && host.user_namespaces
+        && input.isolate.contains(&IsolateMember::Processes);
     let private_tmp = if shares_tmp {
         Fidelity::Partial {
             backend: Backend::Launcher,
-            reason: "directory form: TMPDIR/TMP/TEMP point at a per-session directory, but /tmp \
-                     is shared by a blueprint write grant"
-                .to_string(),
+            reason: if tmpfs {
+                "tmpfs form: TMPDIR/TMP/TEMP point at a tmpfs in the session's mount namespace, \
+                 but /tmp is shared by a blueprint write grant"
+            } else {
+                "directory form: TMPDIR/TMP/TEMP point at a per-session directory, but /tmp is \
+                 shared by a blueprint write grant"
+            }
+            .to_string(),
         }
     } else {
         Fidelity::Enforced {
@@ -751,9 +765,8 @@ fn baseline_rows(
             IsolateMember::Ipc => Capability::IsolateIpc,
         };
         let fidelity = match host.os {
-            Os::Linux if host.user_namespaces => Fidelity::Unenforceable {
-                reason: "the Linux namespace tier is not in this build; `run` refuses the member"
-                    .to_string(),
+            Os::Linux if host.user_namespaces => Fidelity::Enforced {
+                backend: Backend::Namespaces,
             },
             Os::Linux => Fidelity::Unenforceable {
                 reason: "unprivileged user namespaces are unavailable on this host; `run` \

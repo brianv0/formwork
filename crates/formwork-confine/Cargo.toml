@@ -21,6 +21,9 @@ libc = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }
 seccompiler = { workspace = true }
+# The isolation stage's spec crosses an exec as JSON (FW-ISO10).
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # serde_json parses host rules in the supervised-connect tests.
 [dev-dependencies]

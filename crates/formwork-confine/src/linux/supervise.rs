@@ -69,6 +69,21 @@ pub struct Plan {
     child_end: RawFd,
 }
 
+impl Plan {
+    /// The descriptor the child sends its listener over.
+    pub(crate) fn child_end(&self) -> RawFd {
+        self.child_end
+    }
+
+    /// The child side rebuilt in the isolation stage from the inherited handoff descriptor.
+    pub(crate) fn from_handoff(child_end: RawFd) -> Plan {
+        Plan {
+            filter: notify_filter(),
+            child_end,
+        }
+    }
+}
+
 /// The parent's half before the child exists.
 pub struct Pending {
     parent_end: UnixStream,

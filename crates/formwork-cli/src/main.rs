@@ -444,6 +444,12 @@ fn init_telemetry() {
 }
 
 fn main() -> Result<()> {
+    // The isolation stage (FW-ISO10) is this binary re-executed by `run` before any thread starts;
+    // in every other process this returns `None` at once.
+    #[cfg(target_os = "linux")]
+    if let Some(code) = formwork_confine::isolation_stage() {
+        std::process::exit(code);
+    }
     init_telemetry();
     let cli = parse_cli();
     let cmd = match &cli.command {
@@ -1076,7 +1082,7 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
     let resolved = args.resolve()?;
     let mut blueprint = args.load(&resolved.path, &home())?;
     let host = detect();
-    refuse_unavailable_isolation(&blueprint, &host)?;
+    refuse_unavailable_isolation(&blueprint, &host, purpose)?;
     let catalog =
         ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
     // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
@@ -1337,24 +1343,36 @@ fn formwork_failure(what: &str) -> ! {
 
 /// FW-XR9: an isolation member the host cannot provide is refused before the workload starts,
 /// naming every alternative, never run weaker than the blueprint asked (FW-INV6).
-fn refuse_unavailable_isolation(blueprint: &Blueprint, host: &HostProfile) -> Result<()> {
+fn refuse_unavailable_isolation(
+    blueprint: &Blueprint,
+    host: &HostProfile,
+    purpose: Purpose,
+) -> Result<()> {
     if blueprint.isolate.is_empty() || host.os != formwork_detect::Os::Linux {
         return Ok(());
     }
     let members: Vec<&str> = blueprint.isolate.iter().map(|m| m.name()).collect();
     if !host.user_namespaces {
         bail!(
-            "isolate = {members:?} needs unprivileged user namespaces, which this host does not \
-             allow. Alternatives: on Ubuntu 24.04 lift the AppArmor restriction with \
-             `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`; check \
-             `user.max_user_namespaces` is non-zero; run formwork under bwrap, which provides \
-             the namespaces itself; or drop the member from `isolate`"
+            "isolate = {members:?} needs unprivileged user namespaces that can mount a fresh \
+             /proc, which this host does not allow. Alternatives: on Ubuntu 24.04 lift the \
+             AppArmor restriction with `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`; \
+             check `user.max_user_namespaces` is non-zero; run formwork under bwrap, which \
+             provides the namespaces itself; or drop the member from `isolate`"
         );
     }
-    bail!(
-        "isolate = {members:?}: the Linux namespace tier is not in this build; run formwork under \
-         bwrap for the same isolation, or drop the member from `isolate`"
-    )
+    match purpose {
+        Purpose::Spawn => Ok(()),
+        Purpose::ConfineSelf => bail!(
+            "isolate = {members:?} creates namespaces around the workload, which needs the spawn \
+             posture (`formwork run -- …`); `run --confine-self` execs in place. Use the spawn \
+             posture, or drop the member from `isolate`"
+        ),
+        Purpose::GatewayBackend => bail!(
+            "isolate = {members:?} applies to `formwork run`; an MCP backend behind `formwork \
+             gateway` runs without the isolation tier. Drop the member from `isolate`"
+        ),
+    }
 }
 
 /// FEP-5 D3: a FORMWORK.toml inside a writable grant is write-protected, which splits the grant
@@ -1393,8 +1411,19 @@ fn spawn_confined_child(
     program: &str,
     args: &[String],
 ) -> Result<std::process::ExitStatus> {
-    let mut command = Command::new(program);
-    command.args(args);
+    #[cfg(target_os = "linux")]
+    let isolated = !session.blueprint.isolate.is_empty();
+    #[cfg(not(target_os = "linux"))]
+    let isolated = false;
+    // Under the isolation tier the spawned process is this binary as the isolation stage, which
+    // execs the workload inside the namespaces (FW-ISO10); it carries the workload's environment.
+    let mut command = if isolated {
+        Command::new("/proc/self/exe")
+    } else {
+        let mut c = Command::new(program);
+        c.args(args);
+        c
+    };
     apply_env(
         &mut command,
         &session.blueprint,
@@ -1402,8 +1431,21 @@ fn spawn_confined_child(
         &session_env(session),
     );
     #[cfg(target_os = "linux")]
-    let pending = formwork_confine::spawn_confined_supervised(&mut command, &session.policy)
-        .context("applying confinement")?;
+    let pending = if isolated {
+        let argv: Vec<String> = std::iter::once(program.to_string())
+            .chain(args.iter().cloned())
+            .collect();
+        formwork_confine::spawn_isolated(
+            &mut command,
+            &argv,
+            &session.policy,
+            Some(&session.tmp_dir.path),
+        )
+        .context("applying confinement with the isolation tier")?
+    } else {
+        formwork_confine::spawn_confined_supervised(&mut command, &session.policy)
+            .context("applying confinement")?
+    };
     #[cfg(not(target_os = "linux"))]
     formwork_confine::spawn_confined(&mut command, &session.policy)
         .context("applying confinement")?;
@@ -1624,13 +1666,16 @@ fn learn_run_linux(
         .arg(&trace_path)
         .arg("--")
         .arg(&current_exe)
-        // Host rules need the spawn posture's Gateway and supervisor outside the sandbox; the
-        // tracer follows the spawned child the same way it follows a confine-self exec.
-        .args(if loaded.net.host_table().is_some() {
-            &["run", "--blueprint"][..]
-        } else {
-            &["run", "--confine-self", "--blueprint"][..]
-        })
+        // Host rules need the spawn posture's Gateway and supervisor outside the sandbox, and the
+        // isolation tier its stage; the tracer follows the spawned child the same way it follows
+        // a confine-self exec.
+        .args(
+            if loaded.net.host_table().is_some() || !loaded.isolate.is_empty() {
+                &["run", "--blueprint"][..]
+            } else {
+                &["run", "--confine-self", "--blueprint"][..]
+            },
+        )
         .arg(&resolved.path)
         .args(args.forward_overrides())
         .arg("--")

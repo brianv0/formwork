@@ -11,6 +11,7 @@ use std::os::unix::process::CommandExt;
 use super::*;
 use formwork_compile::{ConfinerPolicy, LinuxPolicy};
 
+pub mod isolate;
 mod landlock;
 mod seccomp;
 pub mod supervise;
@@ -106,6 +107,24 @@ pub fn spawn_confined_supervised(
         command.pre_exec(move || apply(&mut plan));
     }
     Ok(pending)
+}
+
+/// The isolation tier (FW-ISO10): configure `command` -- `Command::new("/proc/self/exe")` with
+/// the workload's environment applied -- as the isolation stage for `argv`. The binary must call
+/// [`isolate::stage_if_requested`] first thing in `main`.
+pub fn spawn_isolated(
+    command: &mut Command,
+    argv: &[String],
+    policy: &CompiledPolicy,
+    private_tmp: Option<&std::path::Path>,
+) -> Result<Option<supervise::Pending>, ConfineError> {
+    let linux = linux_policy(policy)?;
+    if linux.isolate.is_empty() {
+        return Err(ConfineError::MechanismFailed(
+            "spawn_isolated needs a policy with an isolate member".into(),
+        ));
+    }
+    isolate::configure(command, argv, linux, private_tmp)
 }
 
 pub fn enforce_self(policy: &CompiledPolicy) -> Result<(), ConfineError> {

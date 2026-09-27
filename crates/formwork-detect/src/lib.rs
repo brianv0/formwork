@@ -147,26 +147,97 @@ mod linux {
 
     use super::{HostFacilities, HostProfile, Os};
 
-    /// Can this process create a user namespace? Probed by doing it in a short-lived forked
-    /// child, so the probe never changes this process's own namespaces. The child only calls
-    /// `unshare` and `_exit`, both async-signal-safe.
+    /// Can this process carry the isolation tier (FW-ISO10)? Probed by doing it in short-lived
+    /// forked children, so the probe never changes this process's own namespaces: create the user,
+    /// PID, mount, IPC and UTS namespaces, map the uid and gid, and mount a fresh `/proc` from the
+    /// new namespace's first process. An AppArmor-restricted Ubuntu 24.04 fails the first step; a
+    /// container whose `/proc` is partly masked fails the last. The children call only
+    /// async-signal-safe functions over strings built before the fork.
     fn user_namespaces() -> bool {
-        // SAFETY: fork in a possibly multi-threaded process; the child calls only
-        // async-signal-safe functions (unshare, _exit) before exiting.
+        use std::ffi::CString;
+        // SAFETY: getuid/getgid have no failure modes.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let c = |s: String| CString::new(s).expect("no NUL");
+        let setgroups = c("/proc/self/setgroups".into());
+        let uid_map = c("/proc/self/uid_map".into());
+        let gid_map = c("/proc/self/gid_map".into());
+        let deny = b"deny";
+        let uid_line = format!("{uid} {uid} 1\n");
+        let gid_line = format!("{gid} {gid} 1\n");
+        let root = c("/".into());
+        let proc_ = c("proc".into());
+        let proc_dir = c("/proc".into());
+
+        // SAFETY: async-signal-safe open/write/close only.
+        let write_file = |path: &CString, bytes: &[u8]| -> bool {
+            unsafe {
+                let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if fd < 0 {
+                    return false;
+                }
+                let n = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+                libc::close(fd);
+                n == bytes.len() as isize
+            }
+        };
+        // SAFETY: waitpid on our own child.
+        let wait = |pid: libc::pid_t| -> i32 {
+            let mut status = 0;
+            if unsafe { libc::waitpid(pid, &mut status, 0) } != pid || !libc::WIFEXITED(status) {
+                return -1;
+            }
+            libc::WEXITSTATUS(status)
+        };
+
+        // SAFETY: fork in a possibly multi-threaded process; the children call only
+        // async-signal-safe functions (unshare, open, write, close, fork, mount, waitpid, _exit).
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return false;
         }
         if pid == 0 {
-            let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
-            unsafe { libc::_exit(if rc == 0 { 0 } else { 1 }) };
+            unsafe {
+                let flags = libc::CLONE_NEWUSER
+                    | libc::CLONE_NEWPID
+                    | libc::CLONE_NEWNS
+                    | libc::CLONE_NEWIPC
+                    | libc::CLONE_NEWUTS;
+                if libc::unshare(flags) != 0 {
+                    libc::_exit(1);
+                }
+                if !write_file(&setgroups, deny)
+                    || !write_file(&uid_map, uid_line.as_bytes())
+                    || !write_file(&gid_map, gid_line.as_bytes())
+                {
+                    libc::_exit(2);
+                }
+                let init = libc::fork();
+                if init < 0 {
+                    libc::_exit(3);
+                }
+                if init == 0 {
+                    let none = std::ptr::null::<libc::c_char>();
+                    let private = libc::mount(
+                        none,
+                        root.as_ptr(),
+                        none,
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        std::ptr::null(),
+                    ) == 0;
+                    let procfs = private
+                        && libc::mount(
+                            proc_.as_ptr(),
+                            proc_dir.as_ptr(),
+                            proc_.as_ptr(),
+                            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                            std::ptr::null(),
+                        ) == 0;
+                    libc::_exit(if procfs { 0 } else { 4 });
+                }
+                libc::_exit(wait(init));
+            }
         }
-        let mut status = 0;
-        // SAFETY: waiting on the child we just forked.
-        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
-            return false;
-        }
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+        wait(pid) == 0
     }
 
     /// The three facilities the `connect()` supervisor needs (FW-EGR7), each probed for real:

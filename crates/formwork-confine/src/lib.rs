@@ -61,6 +61,28 @@ pub fn spawn_confined_supervised(
     backend::spawn_confined_supervised(command, policy)
 }
 
+/// The isolation tier (FW-ISO10): `command` is `Command::new("/proc/self/exe")` with the
+/// workload's environment applied; it becomes the single-threaded stage that creates the
+/// namespaces, then confines and execs `argv`. Start the returned supervisor half after spawning.
+#[cfg(target_os = "linux")]
+pub fn spawn_isolated(
+    command: &mut Command,
+    argv: &[String],
+    policy: &CompiledPolicy,
+    private_tmp: Option<&std::path::Path>,
+) -> Result<Option<PendingSupervisor>, ConfineError> {
+    tracing::info!(
+        posture = "spawn",
+        backend = backend_label(policy),
+        "configuring confinement with the isolation tier"
+    );
+    backend::spawn_isolated(command, argv, policy, private_tmp)
+}
+
+/// The isolation stage's entry point; see [`spawn_isolated`]. Call first thing in `main`.
+#[cfg(target_os = "linux")]
+pub use backend::isolate::stage_if_requested as isolation_stage;
+
 /// Irreversible; confine-self posture (FW-ISO6).
 pub fn enforce_self(policy: &CompiledPolicy) -> Result<(), ConfineError> {
     tracing::info!(
