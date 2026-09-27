@@ -467,8 +467,8 @@ fn fw_e2e_086_run_exits_with_the_workload_status() {
     assert_eq!(out.stdout, "");
 }
 
-/// FW-E2E-082 (Linux, run-outside): against a session bus started for the test, a confined
-/// `gdbus call` is refused under host rules (supervised connect) and succeeds once `run-outside` is
+/// FW-E2E-082 (Linux, run-outside; FW-INV14): against a session bus started for the test, a
+/// confined `gdbus call` is refused under host rules (supervised connect) and succeeds once `run-outside` is
 /// lifted, which also re-admits DBUS_SESSION_BUS_ADDRESS. The control call runs unconfined first.
 #[cfg(target_os = "linux")]
 #[test]
@@ -838,7 +838,7 @@ fn fw_e2e_090_brokered_open_url() {
 
 /// FW-ADV-020, the opener route (Linux): with `open-url` not lifted, a URL carrying a nonce toward
 /// a host no rule names never reaches the host opener, so no browser outside the session fetches
-/// it. (The session-bus route is `FW-E2E-082`'s refusal; the direct route is `FW-E2E-075`'s.)
+/// it -- no process outside the session opens a URL for it (FW-INV14). (The session-bus route is `FW-E2E-082`'s refusal; the direct route is `FW-E2E-075`'s.)
 #[cfg(target_os = "linux")]
 #[test]
 fn fw_adv_020_the_opener_does_not_exfiltrate_when_not_lifted() {

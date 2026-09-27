@@ -290,6 +290,15 @@ pub fn propose_host_rules(
                 if !path.starts_with('/') {
                     continue;
                 }
+                // A requested path is a literal; `*` in it would become a glob in the rule and
+                // widen the proposal past what the session asked for.
+                if path.contains('*') {
+                    out.withheld.push((
+                        target,
+                        format!("the path {path:?} carries `*`, which a rule would read as a glob"),
+                    ));
+                    continue;
+                }
                 HostRule::parse(method.atom(), &format!("{host}{port}{path}"))
             }
             // Admitted already: the refusal was not a missing rule (e.g. the name resolved to a
@@ -547,6 +556,7 @@ mod tests {
                 obs("169.254.169.254", 80, None),
                 obs("metadata.google.internal", 80, None),
                 obs("evil.test", 443, None),
+                obs("api.github.com", 443, Some(("GET", "/repos/**"))),
             ],
             Some(&table),
         );
@@ -571,6 +581,11 @@ mod tests {
             "{withheld:?}"
         );
         assert!(withheld.contains(&"evil.test:443"), "{withheld:?}");
+        assert!(
+            out.withheld.iter().any(|(_, why)| why.contains("glob")),
+            "a literal `*` in a requested path is never proposed as a glob: {:?}",
+            out.withheld
+        );
     }
 
     #[test]

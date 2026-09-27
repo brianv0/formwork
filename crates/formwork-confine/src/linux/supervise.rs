@@ -48,6 +48,8 @@ const UNIX_DIAG_VFS: u16 = 1;
 const AUDIT_ARCH: u32 = 0xc000_003e;
 #[cfg(target_arch = "aarch64")]
 const AUDIT_ARCH: u32 = 0xc000_00b7;
+/// Distinct refused socket paths kept for `learn` (FW-DISC12).
+const MAX_RECORDED_REFUSALS: usize = 1024;
 /// Largest datagram the supervisor sends on a target's behalf.
 const MAX_DATAGRAM: usize = 256 * 1024;
 
@@ -789,7 +791,10 @@ fn admit_unix(
         &format!("formwork explain {}", real.display()),
     );
     if let Ok(mut refused) = config.refused_sockets.lock() {
-        refused.push(real);
+        // Bounded: a session looping on a refused connect must not grow this without limit.
+        if refused.len() < MAX_RECORDED_REFUSALS && !refused.contains(&real) {
+            refused.push(real);
+        }
     }
     Err(libc::EACCES)
 }

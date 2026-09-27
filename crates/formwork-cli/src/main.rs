@@ -1413,9 +1413,8 @@ fn session_env(session: &Session) -> Vec<(String, String)> {
     }
     vars.extend(session.egress_env.iter().cloned());
     if let Some(opener) = &session.opener {
+        // `PATH` is prefixed with the shim directory in `apply_env`, over the posture's own value.
         let shim = opener.dir.display().to_string();
-        let inherited = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
-        vars.push(("PATH".to_string(), format!("{shim}:{inherited}")));
         vars.push(("BROWSER".to_string(), format!("{shim}/xdg-open")));
         vars.push((
             formwork_gateway::opener::OPENER_FD_ENV.to_string(),
@@ -1528,6 +1527,7 @@ fn spawn_confined_child(
         &session.blueprint,
         &session.catalog,
         &session_env(session),
+        session.opener.as_ref().map(|o| o.dir.as_path()),
     );
     #[cfg(target_os = "linux")]
     let pending = if isolated {
@@ -2033,6 +2033,7 @@ fn apply_env(
     blueprint: &Blueprint,
     catalog: &ResolvedCatalog,
     session_vars: &[(String, String)],
+    path_prefix: Option<&std::path::Path>,
 ) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let built = formwork_blueprint::construct_env(
@@ -2046,6 +2047,18 @@ fn apply_env(
     command.envs(built.kept.iter().cloned());
     // Set after the posture ran, so no scrub or allowlist can drop the session's own variables.
     command.envs(session_vars.iter().map(|(k, v)| (k, v)));
+    // FW-ISO17: the opener shim goes first in the PATH the posture built (or, when the posture
+    // dropped it, this process's own).
+    if let Some(prefix) = path_prefix {
+        let base = built
+            .kept
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_else(|| "/usr/bin:/bin".to_string());
+        command.env("PATH", format!("{}:{base}", prefix.display()));
+    }
     if !built.locator_stripped.is_empty() {
         tracing::info!(stripped = ?built.locator_stripped, "channel locator variables stripped (channels not lifted, FW-BP11)");
     }
@@ -2081,6 +2094,7 @@ fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Resul
         &session.blueprint,
         &session.catalog,
         &session_env(&session),
+        None,
     );
 
     tracing::info!(server = %server, backend = %program, "starting MCP gateway");
@@ -2102,6 +2116,6 @@ fn exec_replace(
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(program);
     command.args(args);
-    apply_env(&mut command, blueprint, catalog, session_vars);
+    apply_env(&mut command, blueprint, catalog, session_vars, None);
     command.exec()
 }

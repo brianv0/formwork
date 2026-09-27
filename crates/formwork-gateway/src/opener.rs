@@ -28,6 +28,9 @@ pub const SHIM_NAMES: &[&str] = &[
     "www-browser",
 ];
 
+/// URLs kept for `learn`; the operator channel records every one.
+const MAX_RECORDS: usize = 1024;
+
 /// URLs longer than this are refused; a login URL is a few hundred bytes.
 const MAX_URL: usize = 8 * 1024;
 
@@ -209,6 +212,10 @@ fn serve(
             }
         };
         if let Ok(mut r) = sink.lock() {
+            // Bounded: the operator line is the record; this list only feeds `learn`.
+            if r.len() >= MAX_RECORDS {
+                continue;
+            }
             r.push(OpenRecord {
                 url,
                 channel_denied: !lifted && refused.is_some(),
