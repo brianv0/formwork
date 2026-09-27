@@ -66,6 +66,69 @@ fn fw_e2e_026_dry_run_cross_platform_compile() {
     ));
 }
 
+/// FW-E2E-028: cross-platform equivalence (dry-run). The SAME blueprint compiled for a Linux and a
+/// macOS `HostProfile` must (a) evaluate the exact same capability set on both -- none silently
+/// dropped on either platform -- (b) share an enforceable intersection that includes the load-bearing
+/// net-default-deny, and (c) reflect every enforcement divergence in the FidelityReport: where a
+/// capability is Enforced on one platform but not the other, the non-enforced side is an explicit
+/// Partial/Unenforceable carrying a surfaced reason, never a missing key or a blank one. Pure --
+/// runs on any host.
+#[test]
+fn fw_e2e_028_cross_platform_equivalence_dry_run() {
+    use std::collections::BTreeSet;
+
+    let bp = rich_blueprint();
+    // ABI v6: the most capable Linux profile, so any Linux/macOS divergence is a genuine backend
+    // difference, not merely an old-kernel gap.
+    let linux = compile(&bp, &HostProfile::synthetic_linux(Some(6)));
+    let mac = compile(&bp, &HostProfile::synthetic_macos());
+
+    // (a) Both platforms evaluate the identical capability set -- the report is complete on each, so
+    // no capability can differ by simply being absent on one side.
+    let lkeys: BTreeSet<_> = linux.report.per_capability.keys().collect();
+    let mkeys: BTreeSet<_> = mac.report.per_capability.keys().collect();
+    assert_eq!(
+        lkeys, mkeys,
+        "both platforms must evaluate the same capability set (divergence lives in Fidelity, not in \
+         a missing key)"
+    );
+
+    // (b) The enforceable intersection is non-empty and includes net-default-deny (the invariant both
+    // backends must carry), and every capability enforced on both denies the same way (semantics
+    // match), so observable behavior matches across platforms for the intersection.
+    assert!(
+        linux.report.per_capability[&Capability::NetDefaultDeny].is_enforced()
+            && mac.report.per_capability[&Capability::NetDefaultDeny].is_enforced(),
+        "net-default-deny must be in the enforceable intersection on both platforms"
+    );
+
+    for cap in lkeys {
+        let lf = &linux.report.per_capability[cap];
+        let mf = &mac.report.per_capability[cap];
+        if lf.is_enforced() && mf.is_enforced() {
+            // Intersection: both enforce, so behavior matches. The denial semantics must agree too --
+            // a difference there would be an observable divergence with no report entry.
+            assert_eq!(
+                linux.report.semantics.get(cap),
+                mac.report.semantics.get(cap),
+                "{cap:?} is enforced on both but its denial semantics differ across platforms"
+            );
+            continue;
+        }
+        // (c) Any divergence must be reflected in the report: the non-enforced side is an explicit
+        // Partial/Unenforceable with a surfaced reason -- never silent (FW-INV5/FW-INV6).
+        for (f, os) in [(lf, "linux"), (mf, "macos")] {
+            match f {
+                Fidelity::Enforced { .. } => {}
+                Fidelity::Partial { reason, .. } | Fidelity::Unenforceable { reason } => assert!(
+                    !reason.is_empty(),
+                    "{cap:?} diverges across platforms but the {os} side carries no reason"
+                ),
+            }
+        }
+    }
+}
+
 /// FW-E2E-027: deterministic compile -- byte-identical output, insensitive to input ordering.
 #[test]
 fn fw_e2e_027_deterministic_compile() {

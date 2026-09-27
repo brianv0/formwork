@@ -23,6 +23,17 @@ pytest` runs the E2E harness (macOS-marked and enforcement-gated tests skip wher
 carry them). Clippy is clean under `-D warnings`, and the whole workspace cross-compiles for Linux
 (`cargo check --target x86_64-unknown-linux-gnu`).
 
+## Tracked test-method exceptions
+
+A test that substitutes a single targeted assertion for a spec-stated verification method is a
+recorded exception, not an in-code caveat (constitution: *Precedence & Conflicts* — each records the
+rule it suspends, the reason, and an expiry). The live register:
+
+| Requirement | Spec method | Standing in | Reason | Expiry / owner |
+|---|---|---|---|---|
+| [`FW-INV2`](../formwork.md#fw-inv2) | fuzzed over random spawn trees | one targeted assertion — a nested forked descendant down to the shed-probe leaf (`crates/formwork-confine/tests/linux_confine.rs`) | fuzz/property infra not yet built | deferred; fuzz-infra FEP TBD |
+| [`FW-INV4`](../formwork.md#fw-inv4) | fuzzed over guessed names and out-of-band identifiers | one targeted assertion — a hidden-real and an out-of-band identity per axis (`crates/formwork-gateway/tests/gateway.rs`) | fuzz/property infra not yet built | deferred; fuzz-infra FEP TBD |
+
 ## Deprecations
 
 Compat shims are exceptions to the command-surface rule and expire at a named event (constitution:
