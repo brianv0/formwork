@@ -381,6 +381,45 @@ A channel is lifted in one of two ways:
 | `os-keyring` | `allow-credentials` (a Catalog type) | `mach-lookup` of `securityd` / `SecurityServer` **(characterize)** | session bus `org.freedesktop.secrets`; `$XDG_RUNTIME_DIR/keyring/*` |
 | (none) | — | `mach-priv-host-port`, `mach-priv-task-port`; `iokit-open` outside the shipped allowlist | seccomp (unchanged) |
 
+**Groups: turning a desktop's worth of channels on or off in one word.** An operator on a laptop
+does not think in six channels. The `channels` field therefore takes the same shape as the MCP
+policy tables ([FW-GW9](../formwork.md#fw-gw9)): an `allow` scope and a terminal `deny` list, whose
+entries are channel names or **group** names.
+
+```toml
+channels = "deny"                                      # the default: every channel closed
+channels = ["clipboard"]                               # sugar for { allow = ["clipboard"] }
+channels = { allow = ["desktop"] }                     # the group: what an interactive login needs
+channels = { allow = ["desktop"], deny = ["screen"] }  # deny is terminal, from any layer
+```
+
+Groups are exact enumerations fixed in the schema, expanded at the parse edge like a sigil
+([FW-BP5](../formwork.md#fw-bp5)), never a pattern:
+- **`desktop`** = `clipboard`, `open-url`. The two channels an interactive session uses by hand:
+  paste into the agent, let it open a login page. Neither runs code outside the sandbox.
+- **`media`** = `screen`, `camera`, `microphone`. The TCC-tier privacy set, grouped so an operator
+  who wants screenshots for a UI-testing agent can say so once and see one report line for it.
+- **`run-outside`** belongs to no group. It is code execution outside the sandbox and is only ever
+  lifted by its own name.
+- `os-keyring` stays under `allow-credentials` because it is a credential. A blueprint that wants
+  "everything a desktop login needs" writes `channels = { allow = ["desktop"] }` plus
+  `allow-credentials = ["claude"]` (or `os-keyring`), and `explain desktop` prints both lines.
+
+Layering follows the fs model: `allow` unions across layers, `deny` is terminal from any layer
+([FW-CAP8](../formwork.md#fw-cap8) applied to channels). That is what makes the group useful for
+turning things *off*: a team profile may `allow = ["desktop"]`, and a CI blueprint that extends it
+writes `deny = ["desktop"]` and gets every member closed, with provenance showing which layer did it.
+`--set 'channels = { deny = ["desktop"] }'` does the same from the command line; no new flag.
+
+`builtin:desktop` ships as a second embedded profile: `builtin:default` plus
+`channels = { allow = ["desktop"] }`. It is the one-line answer for a developer machine
+(`extends = ["builtin:desktop"]`), and the README quickstart can name it in a comment without
+growing past five lines. Server and CI blueprints keep `builtin:default`, where the group is closed.
+
+`explain desktop` (and `explain media`) prints the group's members, each member's verdict and
+deciding layer, and — from `FW-FID10` — whether each is reachable on this host. A group name is
+therefore also the operator's way to ask "what does my desktop expose to this agent right now".
+
 - **TCC.** macOS attributes a child's privacy-sensitive access to the responsible app (the terminal
   or IDE). The camera, screen and input rows stop a confined agent from using TCC grants the user
   gave that app.
@@ -483,7 +522,7 @@ Each one is explainable with the tools the operator already uses, and discoverab
 
 ## 4. Proposed requirements (draft numbering — anchored on landing)
 
-These continue existing families: EGR, ISO, CRED, FID, DISC and XR.
+These continue existing families: EGR, ISO, CRED, BP, FID, DISC and XR.
 
 | Req | Requirement |
 |---|---|
@@ -503,6 +542,7 @@ These continue existing families: EGR, ISO, CRED, FID, DISC and XR.
 | `FW-ISO11` **UDP closure (Linux)** | Under the host-allowlist posture, the Confiner shall deny AF_INET and AF_INET6 `SOCK_DGRAM` socket creation. Under the port posture, the FidelityReport shall mark UDP unrestricted. |
 | `FW-ISO12` **Pathname socket mediation (Linux)** | Under supervised connect, the supervisor shall refuse `connect()`, and `sendto`/`sendmsg` with an address, to a pathname AF_UNIX socket unless it is granted by `allow` or was bound by a process in the session. |
 | `FW-ISO13` **Channel baseline** | In every blueprint, the Confiner shall deny each channel in the shipped baseline set that is not lifted by `channels` or by a typed credential exclusion, using the mechanism listed for its platform. The baseline set is the §3.4 table minus any channel the transparency gates (§1.1) moved to `strict`; the FidelityReport shall list each moved channel as `Partial`. Where the platform mechanism is unavailable (Linux without supervised connect), the FidelityReport shall mark the channel `Partial`. |
+| `FW-BP9` **Channel policy shape** | The Blueprint shall express channel lifts as an `allow` scope and a terminal `deny` list over the closed channel enum and the fixed groups `desktop` (`clipboard`, `open-url`) and `media` (`screen`, `camera`, `microphone`). Groups shall expand at the parse edge into their members; `allow` shall union across layers and `deny` shall be terminal from any layer; `explain <group>` shall print each member's verdict, deciding layer, and host reachability (`FW-FID10`). |
 | `FW-ISO14` **Privileged-interface baseline (macOS)** | The macOS profile shall deny `mach-priv-host-port`, `mach-priv-task-port`, and `iokit-open` outside the shipped IOKit allowlist. |
 | `FW-ISO16` **Process-environment disclosure** | In every blueprint, the Confiner shall deny a confined process reading the environment of any process outside the session where the platform provides a mechanism (macOS `kern.procargs2` deny; Linux PID namespace under `isolate`). Where it does not (Linux without `isolate`), the FidelityReport shall mark it `Partial` and name the residual. |
 | `FW-FID8` **Per-backend report lines** | The FidelityReport shall carry per-backend verdicts for: host scoping, inspection (with the client-trust caveat), UDP, pathname sockets, resolver closure, brokering, each `isolate` member, each channel, and privileged interfaces. |
@@ -665,6 +705,14 @@ the requirement tests below depend on it.
     names the bus socket, the user-manager socket and the display socket, and `run` prints the
     matching `Partial` line naming them. The same run under supervised connect prints `Enforced`.
   - macOS runner: `detect` reports the GUI-session verdict, and the channel lines match `FW-E2E-081`.
+- `FW-E2E-088` **Channel groups (both).**
+  - `extends = ["builtin:desktop"]`: the clipboard and URL-open probes from `FW-E2E-081`/`082`
+    succeed; `screen` and `run-outside` are denied.
+  - The same blueprint plus a downstream layer `channels = { deny = ["desktop"] }`: both probes are
+    denied, and `explain desktop` names the denying layer.
+  - A `--set 'channels = { deny = ["clipboard"] }'` on top of `builtin:desktop`: only `open-url`
+    stays open.
+  - `channels = { allow = ["desk"] }` fails at parse and the error lists the valid names and groups.
 - `FW-E2E-086` **Exit-code contract (both).**
   - A workload exiting 3 makes `run` exit 3.
   - Killing the Gateway mid-run makes `run` exit 125, with the attribution line on stdout.
@@ -725,11 +773,20 @@ Conditional on the characterization suite confirming the **(characterize)** mark
     a host-only rule.
   - **`broker-credentials`** — a list of Catalog types. It is the typed complement of
     `allow-credentials`, and a type listed in both is a parse error.
-  - **`channels`** — a closed enum (`run-outside`, `open-url`, `clipboard`, `screen`, `camera`,
-    `microphone`). A typo fails at parse and lists the valid names (`deny_unknown_fields`
-    discipline).
+  - **`channels`** — `"deny"` (default) or `{ allow, deny }` over a closed enum (`run-outside`,
+    `open-url`, `clipboard`, `screen`, `camera`, `microphone`) plus two fixed groups (`desktop`,
+    `media`); a bare list is sugar for `allow`. A typo fails at parse and lists the valid names
+    (`deny_unknown_fields` discipline). The `{ allow, deny }` shape is the one MCP policy already
+    uses, so there is no second way to spell allow-with-terminal-deny.
     - Rejected alternative: `allow:service:<mach-name>` in `rules`. It put platform names in
       blueprints and broke [FW-XR6](../formwork.md#fw-xr6).
+    - Rejected alternative: a separate top-level `desktop = true` switch. It would be a second
+      field expressing a subset of the first, and it could not be turned off by a downstream layer
+      without inventing a posture rule for a boolean. A group inside `channels` gives the same one
+      word and inherits the deny-terminal merge for free.
+    - Rejected alternative: groups as patterns (`desk*`). Groups are exact lists in the schema, so
+      adding a channel to a group is a reviewed schema change, not something a blueprint can widen
+      ([FW-CAP2](../formwork.md#fw-cap2)).
   - **`isolate`** — a subset of `["processes", "ipc", "tmp"]`.
     - Rejected alternative: making it automatic. Process isolation is visible to tools, and
       transparency is the default.
@@ -744,6 +801,11 @@ Conditional on the characterization suite confirming the **(characterize)** mark
   - One new flag, `--blueprint -`. An earlier draft's `run --gateway <socket>` for `confine-self` is
     withdrawn: the refusal plus the spawn-posture alternative (`FW-EGR14`) covers the need without
     adding surface.
+- **Profiles.** `builtin:desktop` is added beside `builtin:default`: the same profile with
+  `channels = { allow = ["desktop"] }`. Two embedded profiles, one difference, documented in one
+  sentence each. It is a profile rather than a default because a server or CI host should not have
+  the clipboard and URL-open channels open by default, and profiles are the existing way to say
+  "this kind of host" ([FW-BP2](../formwork.md#fw-bp2)).
 - **Default profile.** It gains the channel baseline, the privileged-interface baseline, and the
   environment-disclosure deny, all gated by `FW-E2E-084` and the toolchain tests
   ([FW-E2E-020](../formwork.md#fw-e2e-020)..023) on both OSes.
@@ -866,6 +928,7 @@ changed the text above.
 | **Docs** / audience layering | The earlier draft said nothing about what users see | §6 keeps the README quickstart to at most five lines with no FW IDs, and puts channel and brokering recipes in `examples/` |
 | **Examples** | The baseline would have silently broken the flagship Claude Code example on macOS (keychain credential, browser login) | `claude` Catalog type gains its keychain location; the example documents a login-only `open-url` layer; `FW-E2E-084` runs every example on both OSes |
 | **Explainability** ([FW-FID6](../formwork.md#fw-fid6)) | New denial kinds (host, request, channel, socket) had no `explain` path and no runtime message | `explain` accepts URLs, channels and sockets; `FW-FID9` puts a rule and an `explain` hint on every new refusal, including the TLS `unknown_ca` diagnosis |
+| **Good defaults** / CLI simplicity | Six channel names with no grouping: a laptop user had to list them one by one, and a CI blueprint extending a team profile had no way to close them again | `desktop` and `media` groups inside `channels`, deny terminal across layers, and a `builtin:desktop` profile (`FW-BP9`, §3.4) |
 | **Good defaults** | The operator had to know an agent's hosts and channels in advance to write `net.hosts` / `channels` | `learn` proposes both (`FW-DISC12`), with the floor rule extended to metadata IPs and keyring channels |
 | Resolved-input disclosure ([FW-FID7](../formwork.md#fw-fid7)) | Listener endpoint, CA path, session tmp, and the D3 layout were auto-chosen and undisclosed | All are named in `compile` / `explain` output (§3.5); placeholders are named by type, never by value |
 | Discovery trust scope ([FW-BP8](../formwork.md#fw-bp8)) | D3's first fix moved learned grants to a machine-local state directory, which changed the team workflow | Recommended `.formwork/` in the project, inside the unchanged BP8 walk (§2, §8.2) |
