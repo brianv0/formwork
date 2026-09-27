@@ -108,6 +108,18 @@ fn main() {
                     json!({"contents": [{"uri": uri, "text": format!("contents of {uri}")}]}),
                 );
             }
+            Some("resources/subscribe") | Some("resources/unsubscribe") => reply(&id, json!({})),
+            Some("completion/complete") => {
+                let values = v
+                    .pointer("/params/ref/name")
+                    .or_else(|| v.pointer("/params/ref/uri"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                reply(
+                    &id,
+                    json!({"completion": {"values": [format!("completed:{values}")], "total": 1}}),
+                );
+            }
             Some("prompts/list") => reply(
                 &id,
                 json!({"prompts": [{"name": "greeting"}, {"name": "secret_prompt"}]}),

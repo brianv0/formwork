@@ -193,6 +193,122 @@ async fn fw_e2e_015_resource_and_prompt_shading() {
     assert_eq!(ok["result"]["contents"][0]["uri"], "file:///pub");
 }
 
+/// FW-GW3 / FW-INV4: `resources/subscribe`, `resources/unsubscribe`, and `completion/complete` are
+/// shaded on the same axes as read/get, so an ungranted resource cannot be subscribed and an
+/// ungranted completion is refused -- oracle-free (FW-ADV-004), never falling through to the backend.
+#[tokio::test]
+async fn fw_gw3_subscribe_and_completion_are_shaded() {
+    let policy = McpPolicy {
+        resources: Visibility::allow_exact(["file:///pub"]),
+        prompts: Visibility::allow_exact(["greeting"]),
+        ..Default::default()
+    };
+    let mut agent = start(policy);
+
+    // Granted subscribe round-trips to the backend.
+    agent
+        .request(1, "resources/subscribe", json!({"uri": "file:///pub"}))
+        .await;
+    assert!(
+        agent.recv().await["result"].is_object(),
+        "granted subscribe must reach the backend"
+    );
+
+    // Ungranted subscribe of a real-but-hidden resource is refused, and identically to a nonexistent
+    // one, so subscribe is not an oracle.
+    agent
+        .request(2, "resources/subscribe", json!({"uri": "file:///secret"}))
+        .await;
+    let hidden = agent.recv().await;
+    agent
+        .request(3, "resources/subscribe", json!({"uri": "file:///nope"}))
+        .await;
+    let absent = agent.recv().await;
+    assert!(hidden["error"].is_object(), "ungranted subscribe refused");
+    assert_eq!(hidden["error"]["code"], absent["error"]["code"]);
+    let strip = |v: &Value| {
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .replace("file:///secret", "X")
+            .replace("file:///nope", "X")
+    };
+    assert_eq!(
+        strip(&hidden),
+        strip(&absent),
+        "subscribe refusal must be oracle-free"
+    );
+    assert!(!hidden["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_lowercase()
+        .contains("denied"));
+
+    // Granted completion (prompt ref) round-trips.
+    agent
+        .request(
+            4,
+            "completion/complete",
+            json!({"ref": {"type": "ref/prompt", "name": "greeting"}, "argument": {"name": "x", "value": ""}}),
+        )
+        .await;
+    assert!(
+        agent.recv().await["result"]["completion"].is_object(),
+        "granted completion must reach the backend"
+    );
+
+    // Ungranted completion referencing a hidden prompt is refused, oracle-free vs a nonexistent one.
+    agent
+        .request(
+            5,
+            "completion/complete",
+            json!({"ref": {"type": "ref/prompt", "name": "secret_prompt"}, "argument": {"name": "x", "value": ""}}),
+        )
+        .await;
+    let hidden_prompt = agent.recv().await;
+    agent
+        .request(
+            6,
+            "completion/complete",
+            json!({"ref": {"type": "ref/prompt", "name": "no_such_prompt"}, "argument": {"name": "x", "value": ""}}),
+        )
+        .await;
+    let absent_prompt = agent.recv().await;
+    assert!(
+        hidden_prompt["error"].is_object(),
+        "ungranted completion refused"
+    );
+    assert_eq!(
+        hidden_prompt["error"]["code"],
+        absent_prompt["error"]["code"]
+    );
+    let strip_p = |v: &Value| {
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .replace("secret_prompt", "X")
+            .replace("no_such_prompt", "X")
+    };
+    assert_eq!(
+        strip_p(&hidden_prompt),
+        strip_p(&absent_prompt),
+        "completion refusal must be oracle-free"
+    );
+
+    // A completion referencing an ungranted resource is refused too.
+    agent
+        .request(
+            7,
+            "completion/complete",
+            json!({"ref": {"type": "ref/resource", "uri": "file:///secret"}, "argument": {"name": "x", "value": ""}}),
+        )
+        .await;
+    assert!(
+        agent.recv().await["error"].is_object(),
+        "ungranted resource completion refused"
+    );
+}
+
 /// FW-E2E-015 (resource templates): templates are shaded by `uriTemplate`, not by `name` (design §4
 /// item identity), so a URI-shaped grant governs templates on the same axis as concrete resources.
 #[tokio::test]
