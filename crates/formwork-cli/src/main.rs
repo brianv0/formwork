@@ -331,6 +331,8 @@ impl BlueprintArgs {
             mcp: Default::default(),
             allow_credentials: self.allow_cred.clone(),
             discovery: Default::default(),
+            channels: None,
+            isolate: Vec::new(),
         })
     }
 }

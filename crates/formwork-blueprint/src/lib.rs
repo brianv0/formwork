@@ -2,6 +2,7 @@
 //! (`Blueprint::narrow`) can only shrink a grant, never widen it (FW-CAP2).
 
 mod catalog;
+mod channel;
 mod discovery;
 mod launcher;
 mod layer;
@@ -10,6 +11,9 @@ mod path;
 mod provenance;
 
 pub use catalog::{Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP};
+pub use channel::{
+    valid_channel_names, Channel, ChannelError, ChannelGroup, ChannelPolicy, IsolateMember,
+};
 pub use discovery::{
     reverse_compile, synthesize_blueprint, AccessRecord, Candidate, CandidateTag, DenialAccess,
     DenialRecord, ProposalOutcome, WithheldEntry,
@@ -44,6 +48,12 @@ pub struct Blueprint {
     pub allow_credentials: Vec<String>,
     #[serde(default)]
     pub discovery: DiscoveryBlueprint,
+    /// Host-service channels lifted from the baseline (FW-ISO13, FW-BP9). Default: none.
+    #[serde(default)]
+    pub channels: ChannelPolicy,
+    /// The opt-in isolation tier (FW-ISO10). Default: empty.
+    #[serde(default)]
+    pub isolate: Vec<IsolateMember>,
 }
 
 impl Blueprint {
@@ -558,6 +568,8 @@ impl Blueprint {
             mcp: BTreeMap::new(),
             allow_credentials: Vec::new(),
             discovery: DiscoveryBlueprint::default(),
+            channels: ChannelPolicy::default(),
+            isolate: Vec::new(),
         }
     }
 
@@ -571,6 +583,9 @@ impl Blueprint {
         let mut allow_credentials = self.allow_credentials.clone();
         allow_credentials.sort();
         allow_credentials.dedup();
+        let mut isolate = self.isolate.clone();
+        isolate.sort();
+        isolate.dedup();
         Blueprint {
             fs: FsBlueprint {
                 read_mode: self.fs.read_mode,
@@ -588,6 +603,8 @@ impl Blueprint {
             discovery: DiscoveryBlueprint {
                 auto_widen: canonicalize_set(&self.discovery.auto_widen),
             },
+            channels: self.channels.clone(),
+            isolate,
         }
     }
 }

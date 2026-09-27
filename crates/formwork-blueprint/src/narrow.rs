@@ -56,6 +56,27 @@ impl Blueprint {
                     &requested.discovery.auto_widen,
                 ),
             },
+            // A channel lift is authority: a child keeps only the lifts both hold, and a deny
+            // from either side stays terminal (FW-BP10).
+            channels: crate::ChannelPolicy::allow(
+                crate::Channel::ALL
+                    .into_iter()
+                    .filter(|c| self.channels.lifted(*c) && requested.channels.lifted(*c)),
+            )
+            .with_deny(
+                self.channels
+                    .denied()
+                    .iter()
+                    .chain(requested.channels.denied().iter())
+                    .copied(),
+            ),
+            // Isolation only ever grows under narrowing: a member either side requests is kept.
+            isolate: self
+                .isolate
+                .iter()
+                .chain(requested.isolate.iter())
+                .copied()
+                .collect(),
         }
         .canonicalize()
     }
