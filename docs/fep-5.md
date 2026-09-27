@@ -960,6 +960,17 @@ Conditional on the characterization suite confirming the **(characterize)** mark
       Omnigent uses, so its `"GET,POST host/path"` rules translate by moving the space to a colon.
     - Two rules for the same host union; a `deny:` for the host is terminal. An HTTP-method rule
       makes the host inspected (TLS terminated at the Gateway); `https:` alone does not.
+    - **The verb names the layer that enforces it**, and the report follows from that:
+
+      | Rule form | Layer | Enforced by | Verdict |
+      |---|---|---|---|
+      | `net = { ports = [443] }` | L4 | kernel (Landlock `ConnectTcp` / Seatbelt) | `Enforced`; any host on the port, UDP open on Linux (D4) |
+      | `https:host[:port]` | L4 target + TLS SNI | Gateway at CONNECT, unterminated | `Partial` ([FW-EGR5](fep-1.md#fw-egr5)): trusts client SNI/Host; request opaque |
+      | `<methods>:host[/glob]` | L7 | Gateway, TLS terminated | `Enforced` for env-trust clients; platform-verifier clients refused (§3.2) |
+
+      `https:` is the most a rule can say without terminating TLS: where the connection goes and
+      the name the client claims. Method or path is L7 and needs the certificate, which is why
+      inspection is spelled by the verb rather than inferred from a path.
   - **`allow-credentials` (extended).** Entries are a bare Catalog type (expose, unchanged),
     `broker:<type>`, or an inline binding table `{ name, env, hosts, scheme }` for a credential the
     Catalog does not know. One list governs the Catalog; the earlier `broker-credentials` list and
