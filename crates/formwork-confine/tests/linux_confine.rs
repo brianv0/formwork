@@ -483,14 +483,18 @@ fn fw_adv_005_confined_backend_cannot_manufacture_egress_fd() {
     );
 }
 
-/// FW-ADV-006 (Linux): cross-domain UNIX-socket reach-around. On an ABI>=6 kernel the confined
-/// process cannot connect to a pathname (or abstract) UNIX socket owned by an out-of-domain process;
-/// below v6 the capability is reported Unenforceable/Partial and the fail-closed net posture still
-/// holds. This host lacks ABI v6, so the capable-kernel arm skips cleanly and the reported-gap arm
-/// (a pure property of the compiled report) runs.
+/// FW-ADV-006 (Linux): cross-domain UNIX-socket reach-around. Landlock ABI v6 scoping covers
+/// *abstract* UNIX sockets and signals; it does not mediate *pathname* `connect()` (formwork.md
+/// section 9). On an ABI>=6 kernel the confined process therefore cannot reach an out-of-domain
+/// abstract socket, while an out-of-domain pathname socket stays reachable and the report says
+/// `Partial` for it -- a paired allow/deny probe against the real mechanism, with the report and the
+/// behavior checked against each other (FW-E2E-024). Below v6 the capability is reported
+/// Unenforceable/Partial and the fail-closed net posture still holds.
 #[test]
 fn fw_adv_006_cross_domain_unix_socket_reach_around() {
     use formwork_compile::{Capability, Fidelity};
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener};
 
     let host = detect();
     let policy = compile(&Blueprint::empty(), &host);
@@ -501,33 +505,47 @@ fn fw_adv_006_cross_domain_unix_socket_reach_around() {
         .expect("the cross-domain-socket capability is always reported");
 
     if host.landlock_abi.unwrap_or(0) >= 6 {
-        // Capable kernel: a listener owned by this (out-of-domain, unconfined) test process, which the
-        // confined child must not be able to reach once UNIX-socket scoping is in force.
-        let sock = std::env::temp_dir().join(format!("fw-adv006-{}.sock", std::process::id()));
+        // Both listeners are owned by this unconfined test process, so both are out of the
+        // confined child's domain. Only the abstract one is within Landlock's scope.
+        let name = format!("fw-adv006-{}", std::process::id());
+        let abstract_addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let abstract_listener = UnixListener::bind_addr(&abstract_addr).unwrap();
+        let sock = std::env::temp_dir().join(format!("{name}.sock"));
         let _ = fs::remove_file(&sock);
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let path_listener = UnixListener::bind(&sock).unwrap();
+
         let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-unix-connect-probe"));
-        // Grant BOTH the probe's tree (so it loads) and the socket's directory for read, so a *path*
-        // denial cannot be confused with the scope denial: reaching connect() and being blocked at
-        // the socket scope is the point.
+        // Grant the probe's tree (so it loads) and the socket's directory, so a path denial cannot be
+        // mistaken for a scope denial: reaching connect() is the point.
         let sock_dir = fs::canonicalize(sock.parent().unwrap()).unwrap();
         let policy = closed_policy(
             vec![pp(probe.parent().unwrap()), pp(&sock_dir)],
             vec![],
             vec![],
         );
-        let mut cmd = Command::new(&probe);
-        cmd.arg(&sock);
-        let code = run(&policy, cmd);
-        drop(listener);
+
+        let mut abstract_cmd = Command::new(&probe);
+        abstract_cmd.arg(format!("@{name}"));
+        let abstract_code = run(&policy, abstract_cmd);
+        let mut path_cmd = Command::new(&probe);
+        path_cmd.arg(&sock);
+        let path_code = run(&policy, path_cmd);
+        drop(abstract_listener);
+        drop(path_listener);
         let _ = fs::remove_file(&sock);
-        assert!(
-            matches!(cross, Fidelity::Partial { .. } | Fidelity::Enforced { .. }),
-            "an ABI>=6 host must report cross-domain scoping as Partial/Enforced, not a gap"
+
+        assert_eq!(
+            abstract_code, 0,
+            "an out-of-domain abstract UNIX socket must be unreachable under ABI>=6 scoping"
         );
-        assert_ne!(
-            code, 4,
-            "a confined process must not connect to an out-of-domain UNIX socket on a capable kernel"
+        assert_eq!(
+            path_code, 4,
+            "a pathname UNIX socket is not mediated by Landlock; if this connect is now blocked, the \
+             mechanism changed and the report's Partial residual must be revisited"
+        );
+        assert!(
+            matches!(cross, Fidelity::Partial { .. }),
+            "with pathname connect unmediated the report must say Partial, never Enforced; got {cross:?}"
         );
     } else {
         // Below v6: the gap is reported (never silently pretended), and net still fails closed.
