@@ -13,7 +13,6 @@ rules = [
     "https:sentry.io",
 ]
 allow-credentials = ["claude", "broker:anthropic"]
-env = { scrub = {} }
 
 [fs]
 writes = ["~/.claude/**"]

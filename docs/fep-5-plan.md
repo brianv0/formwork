@@ -75,11 +75,12 @@ here rather than silently deviated.
 
 - **`explain --hosts`, not `explain --net`.** `--net` is already the sugar flag that sets the net
   posture on every blueprint-taking subcommand; a second meaning on `explain` would collide in the
-  shared argument struct. `explain --hosts` prints the host table.
+  shared argument struct. `explain --hosts` prints the host table. *Resolved: `--hosts` kept, and
+  `fep-5.md` (§3.5, §4, `FW-FID11`) amended to match.*
 - **The README's brokered example uses `any:`, not `https:`.** The proposal's README sketch pairs
   `https:api.anthropic.com` with `broker:anthropic`, which `FW-CRED12` itself refuses: the Gateway
   cannot present a credential on a tunnel it cannot see into. The README and the examples use the
-  inspected grade.
+  inspected grade. *Resolved: `any:` kept, and the §3.2 sketch in `fep-5.md` amended to match.*
 - **Sockets are granted by a literal write grant.** §3.1 says "granted by `allow`". `allow` also
   turns on the exec allowlist, so granting a socket through it would restrict exec as a side
   effect. A literal write grant on the socket path admits it (`FW-ISO12`); the compiler keeps
@@ -98,12 +99,14 @@ here rather than silently deviated.
 - **The shim is always placed.** §3.4 places it "when `open-url` is lifted". It is placed in every
   spawned session and refuses when the channel is not lifted, because `learn` proposes the channel
   from that refusal (§3.4, "`learn` proposes the channel from the shim's refusal record"), and
-  `FW-ADV-020`'s opener route needs the refusal to be observable.
+  `FW-ADV-020`'s opener route needs the refusal to be observable. *Resolved: always placed, and
+  `FW-ISO17` amended to say so.*
 - **Learning on Linux observes hosts and channels only through the spawn shim.** The Linux learning
   shim runs `run --confine-self` unless the blueprint has host rules or `isolate`, because the spawn
   posture puts `formwork`'s own file syscalls into the trace. Without host rules there is no Gateway,
   supervisor or outside process to observe, so host and channel proposals need host rules on Linux.
-  The shim reports its observations to `learn` over an inherited pipe.
+  The shim reports its observations to `learn` over an inherited pipe. *Resolved: kept as is. The
+  only proposal lost is `open-url` on Linux without host rules or `isolate`; the README says so.*
 - **macOS: the peer-PID check on the egress endpoint is not built.** The endpoint is gated by the
   per-session credential only, and `net-host-scope` says `Partial` with that reason.
 - **macOS: the `os-keyring` and `securityd` denies are withheld** until the characterization suite
@@ -111,6 +114,12 @@ here rather than silently deviated.
 - **`FW-E2E-086`'s second half** (killing the Gateway mid-session) is not reachable from a
   black-box test: the Gateway is a thread in the `formwork` process. The exit path is implemented
   (`run` checks the listener after the workload exits and fails with 125 and one `formwork:` line).
+
+- **The port-scoped `agent-session.toml` is retired.** Each agent has a host-scoped blueprint on
+  the shared `agent-base.toml`, which now carries the env scrub itself. Where host rules are refused,
+  the examples document the port tier on the command line instead:
+  `--blueprint agent-base.toml --net ports:443 --allow-cred claude`. `FW-E2E-024` (macOS port tier)
+  and `FW-E2E-026` (dry-run compile) moved onto those blueprints.
 
 ## 4. Tests
 

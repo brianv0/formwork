@@ -973,15 +973,26 @@ fn fw_e2e_084_agent_examples_under_the_baseline() {
             std::fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
         }
     }
+    // The state directories the examples tell the operator to create once, outside the sandbox.
+    for state in [
+        ".claude",
+        ".codex",
+        ".local/share/opencode",
+        ".local/state/opencode",
+        ".cache/opencode",
+        ".config/opencode",
+    ] {
+        std::fs::create_dir_all(dir.path().join(state)).unwrap();
+    }
     let keys = [
         ("ANTHROPIC_API_KEY", "sk-fixture-084"),
         ("OPENAI_API_KEY", "sk-fixture-084"),
     ];
     let examples = [
-        ("agent-session.toml", "claude"),
         ("claude-code.toml", "claude"),
         ("claude-code-api-key.toml", "claude"),
         ("codex.toml", "codex"),
+        ("codex-api-key.toml", "codex"),
         ("opencode.toml", "opencode"),
     ];
     for (file, agent) in examples {

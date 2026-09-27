@@ -26,17 +26,25 @@ Formwork claims only what the current host can back. Check yours:
 
 ```sh
 formwork explain                                  # capabilities of this machine, human-readably
-formwork explain --blueprint examples/blueprints/agent-session.toml   # + this blueprint's per-capability fidelity
-formwork compile --blueprint examples/blueprints/agent-session.toml --report-only   # the same, as JSON for CI
+formwork explain --blueprint examples/blueprints/claude-code.toml   # + this blueprint's per-capability fidelity
+formwork compile --blueprint examples/blueprints/claude-code.toml --report-only   # the same, as JSON for CI
 ```
 
 Egress is **host-scoped** in the per-agent blueprints (`claude-code.toml`, `codex.toml`,
 `opencode.toml`): every connection goes through the session Gateway, and only the hosts the
 blueprint names are reachable. On Linux this needs connect supervision (seccomp user notification
 and `pidfd_getfd`, Linux 5.6+); `formwork explain --hosts` shows the table and what this host
-enforces. `agent-session.toml` is the port-scoped fallback: `net = { ports = [443] }` allows any
-HTTPS host, so there the filesystem sandbox is what stops secrets being read to exfiltrate. On a host that can't
-enforce a capability, `formwork` reports the gap instead of pretending (it never fails open).
+enforces. On a host that can't enforce a capability, `formwork` reports the gap instead of
+pretending (it never fails open).
+
+Where host rules are refused (Linux without connect supervision), fall back to the port tier on the
+shared base. It allows any HTTPS host, so there the filesystem sandbox is what stops secrets being
+read to exfiltrate:
+
+```sh
+formwork run --blueprint examples/blueprints/agent-base.toml --net ports:443 \
+  --allow-cred claude --rule "readwrite:~/.claude/**" -- claude --dangerously-skip-permissions
+```
 
 ## Layout
 
@@ -47,7 +55,6 @@ examples/
   blueprints/claude-code-api-key.toml  # the same with ANTHROPIC_API_KEY brokered, never held by the agent
   blueprints/codex.toml           # Axis A for codex: host-scoped egress
   blueprints/opencode.toml        # Axis A for opencode: host-scoped egress, one rule per provider
-  blueprints/agent-session.toml   # port-scoped fallback: any HTTPS host (hosts without host rules)
   blueprints/mcp-gateway.toml      # Axis B: gateway policy — [mcp.files] shading + backend confinement
   blueprints/rules-demo.toml       # flat verb rules (rules/mode) — same model, terser to write
   gateway-demo.sh             # runnable Axis B demo against the built-in fixture (no external deps)
@@ -82,7 +89,7 @@ credential floor compiles into that same deny layer, so it can never be punched 
 formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos --report-only
 
 # The same vocabulary on the CLI, layered over any base blueprint — a deny narrows from anywhere:
-formwork run --blueprint examples/blueprints/agent-session.toml \
+formwork run --blueprint examples/blueprints/claude-code.toml \
   --rule "deny:$CWD/secrets" -- <agent> <flags>
 ```
 
@@ -97,23 +104,23 @@ compiled-in default with `extends = ["builtin:default"]`, no repo checkout neede
 
 ```sh
 # Add extra denies for one run — safe from any layer, since deny is terminal:
-formwork run --blueprint examples/blueprints/agent-session.toml \
+formwork run --blueprint examples/blueprints/claude-code.toml \
   --rule "deny:$CWD/secrets" --rule "deny:$CWD/.env.production" -- claude --dangerously-skip-permissions
 
 # Let the agent EDIT existing files but not CREATE new ones (the create/write split):
-formwork run --blueprint examples/blueprints/agent-session.toml \
+formwork run --blueprint examples/blueprints/claude-code.toml \
   --rule "modify:$CWD/var/log/app.log" -- <agent>
 
 # Flip a blueprint to unveil (empty universe) and hand-pick what's readable/runnable:
-formwork run --blueprint examples/blueprints/agent-session.toml --mode unveil \
+formwork run --blueprint examples/blueprints/claude-code.toml --mode unveil \
   --rule "readonly:/usr/**" --rule "readexec:/bin/**" --rule "readwrite:$CWD/**" -- <agent>
 
 # Tighten an otherwise-unrestricted agent's exec down to an allowlist (last-wins over `exec = "unrestricted"`):
-formwork run --blueprint examples/blueprints/agent-session.toml \
+formwork run --blueprint examples/blueprints/claude-code.toml \
   --rule "exec:/usr/bin/git" --rule "exec:/usr/bin/python3" -- <agent>
 
 # Let one credential type through the floor AND grant its directory, in one invocation:
-formwork run --blueprint examples/blueprints/agent-session.toml \
+formwork run --blueprint examples/blueprints/claude-code.toml \
   --allow-cred aws --rule "readonly:$HOME/.aws/**" -- <agent>
 
 # Mix verb rules with a `--set` TOML fragment — both parse as the same model:
@@ -137,7 +144,7 @@ UV_NATIVE_TLS=1 formwork run --blueprint examples/blueprints/agent-base.toml --r
 # Ask why one path is granted or denied — the deciding rule and the layer it came from:
 formwork explain --blueprint examples/blueprints/rules-demo.toml '$CWD/.env'
 # Overrides apply here too, so you can check a deny before running under it (deny is terminal):
-formwork explain --blueprint examples/blueprints/agent-session.toml \
+formwork explain --blueprint examples/blueprints/claude-code.toml \
   --rule "deny:$CWD/secrets/**" "$CWD/secrets/key"
 ```
 

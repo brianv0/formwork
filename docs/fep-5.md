@@ -254,7 +254,7 @@ The README-layer shape of the feature:
 
 ```toml
 extends = ["builtin:default"]
-rules = ["readwrite:$CWD/**", "https:api.anthropic.com"]   # this host only, via the gateway
+rules = ["readwrite:$CWD/**", "any:api.anthropic.com"]     # this host only, inspected by the gateway
 allow-credentials = ["broker:anthropic"]                   # the agent sees a placeholder, never the key
 ```
 
@@ -328,8 +328,9 @@ channel is a credential store.
 On Linux the portal, `systemd --user` and the Secret Service share one socket, `$XDG_RUNTIME_DIR/bus`;
 a `connect()` supervisor sees one `sun_path` and cannot tell `OpenURI` from `StartTransientUnit`, so
 lifting the socket for URLs would lift code execution. The channel therefore uses the
-single-privileged-broker pattern: the Launcher places a Formwork-owned `xdg-open` / `open` shim
-first in `PATH` and in `BROWSER`; the shim sends the URL over the Seam; the Gateway accepts
+single-privileged-broker pattern: in every spawned session the Launcher places a Formwork-owned
+`xdg-open` / `open` shim first in `PATH` and in `BROWSER`; the shim sends the URL over the Seam; the
+Gateway refuses it unless `open-url` is lifted, and otherwise accepts
 `http` and `https` URLs only, refuses `file:`, `javascript:` and custom schemes, records the URL on
 the operator channel, and opens it with the host opener outside the sandbox. No host service is
 lifted on either platform, closed mode needs no grant, and `learn` proposes the channel from the
@@ -406,7 +407,7 @@ explainable with the tools the operator already uses and discoverable through `l
   extended, no new subcommand): a value with `scheme://` is a URL and gives the host-rule verdict,
   the method and path match, the grade and the deciding rule; a member of the channel enum or a group
   name gives the channel verdict, its lift, and host reachability; anything else is a path, and a
-  socket path gives the supervised-connect verdict. `explain --net` prints the resolved host table,
+  socket path gives the supervised-connect verdict. `explain --hosts` prints the resolved host table,
   one host per line with its grade, methods, paths, broker binding and deciding layer.
 - **`learn`** proposes hosts and channels (`FW-DISC12`). Gateway egress violations reverse-compile
   into host rules (`https:<host>`, or `<methods>:<host>/<path>` when the host is inspected); channel
@@ -542,8 +543,10 @@ valid names (`deny_unknown_fields` discipline).
 (mach names on macOS; bus names and sockets on Linux), the `os-keyring` type, and the `claude` type's
 macOS keychain location. Embedded data, so a catalog version bump.
 
-**CLI.** No new subcommand and no new flag. `explain` accepts URLs, channel and group names, and
-socket paths positionally, and `--net` prints the resolved host table. Two Launcher-provided files
+**CLI.** No new subcommand, and one new flag: `explain --hosts` prints the resolved host table.
+(`--net` was the first choice, but it is already the net-posture override every blueprint-taking
+subcommand shares.) `explain` accepts URLs, channel and group names, and socket paths
+positionally. Two Launcher-provided files
 appear at run time, the opener shim and the CA bundle, both under `FW-TRA9`.
 
 **Profiles.** `builtin:default` only. It loses its explicit `reads = ["/**"]` row (D10) and gains
@@ -593,7 +596,7 @@ ID; discussion and rationale live in §3.
 | <a id="fw-iso13"></a>**FW-ISO13** Channel baseline | In every blueprint, the Confiner shall deny each channel in the shipped baseline set that is not lifted by `channels` or by a typed credential exclusion, using the mechanism listed for its platform. |
 | <a id="fw-iso14"></a>**FW-ISO14** Privileged-interface baseline (macOS) | The macOS profile shall deny `mach-priv-host-port`, `mach-priv-task-port`, and `iokit-open` outside the shipped IOKit allowlist. |
 | <a id="fw-iso16"></a>**FW-ISO16** Process-environment disclosure | The Confiner shall deny a confined process reading the environment of any process outside the session where the platform provides a mechanism (macOS `kern.procargs2` deny; Linux PID namespace under `isolate`). |
-| <a id="fw-iso17"></a>**FW-ISO17** Opener shim | When `open-url` is lifted, the Launcher shall place a Formwork-owned opener first in `PATH` and in `BROWSER`. |
+| <a id="fw-iso17"></a>**FW-ISO17** Opener shim | In every spawned session, the Launcher shall place a Formwork-owned opener first in `PATH` and in `BROWSER`; it hands each URL to the Gateway, which opens it only when `open-url` is lifted and otherwise records a refusal. |
 | <a id="fw-iso18"></a>**FW-ISO18** Brokered URL open | The Gateway shall accept from the opener shim `http` and `https` URLs only, record each on the operator channel, and open it with the host opener outside the session. |
 | <a id="fw-bp9"></a>**FW-BP9** Channel policy shape | The Blueprint shall express channel lifts as an `allow` scope and a `deny` list over the closed channel enum and the fixed groups `desktop` (`clipboard`, `open-url`) and `media` (`screen`, `camera`, `microphone`), with groups expanded at the parse edge. |
 | <a id="fw-bp10"></a>**FW-BP10** Channel layering | Across layers, channel `allow` scopes shall union, `deny` entries shall be terminal, and the `"deny"` keyword shall mean an empty `allow` scope. |
@@ -605,7 +608,7 @@ ID; discussion and rationale live in §3.
 | <a id="fw-fid8"></a>**FW-FID8** Per-backend report lines | The FidelityReport shall carry, each under the stable JSON key §3.5 names, per-backend verdicts for host scoping, inspection, UDP, pathname sockets, resolver closure, brokering, each `isolate` member, private tmp, each channel, privileged interfaces and process-environment disclosure, and a `withheld` list naming every rule the backend could not install. |
 | <a id="fw-fid9"></a>**FW-FID9** Self-explaining refusals | For each Gateway refusal, supervised-connect denial, opener-shim refusal and TLS `unknown_ca` rejection of the session CA, Formwork shall emit on the operator channel, within the run, one line naming what was refused, the deciding rule, and the `explain` invocation that reproduces the verdict, while the confined process receives only a generic refusal ([FW-CRED7](../formwork.md#fw-cred7)). |
 | <a id="fw-fid10"></a>**FW-FID10** Host-session detection | `detect` shall probe for the host facilities that make each channel reachable (session bus, user manager, display server, keyring service; GUI session on macOS) and for PID-namespace nesting, and record them in the HostProfile. |
-| <a id="fw-fid11"></a>**FW-FID11** Explain for hosts and channels | `explain` shall accept a URL, a channel or group name, or a socket path as a positional argument and print the verdict, the deciding rule and layer, the grade for a host, and host reachability for a channel; `explain --net` shall print every effective host once with its grade, methods, paths, broker binding and deciding layer. |
+| <a id="fw-fid11"></a>**FW-FID11** Explain for hosts and channels | `explain` shall accept a URL, a channel or group name, or a socket path as a positional argument and print the verdict, the deciding rule and layer, the grade for a host, and host reachability for a channel; `explain --hosts` shall print every effective host once with its grade, methods, paths, broker binding and deciding layer. |
 | <a id="fw-disc12"></a>**FW-DISC12** Host and channel discovery | `learn` shall reverse-compile Gateway egress violations and channel denials into proposal entries (host rules, `channels`) on both backends, at the grade an existing rule for the host already has, and shall withhold and itemize metadata and private-IP destinations and credential-typed channels ([FW-DISC3](../formwork.md#fw-disc3)). |
 | <a id="fw-xr10"></a>**FW-XR10** Wrapper transparency | Wrapper subcommands shall exit with the workload's status and write nothing of their own to stdout. |
 | <a id="fw-xr11"></a>**FW-XR11** Failure attribution | A Formwork failure after the workload is spawned shall exit `125` and emit one `formwork:`-prefixed line on stderr attributing the failure to Formwork. |

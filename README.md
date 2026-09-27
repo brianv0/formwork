@@ -85,6 +85,10 @@ formwork learn --list             # see the proposed grants, numbered
 formwork learn --accept 1         # accept by number or pattern; applies from the next run
 ```
 
+Beyond paths, `learn` proposes the hosts a run was refused and the channels it tried to use, such
+as opening a login URL. On Linux it sees those only when the blueprint already has host rules or
+`isolate`; with no host rules at all it proposes paths alone.
+
 See [`examples/`](examples/README.md) for complete blueprints, the rule vocabulary, CLI recipes,
 and wiring for Claude Code, codex, and opencode.
 

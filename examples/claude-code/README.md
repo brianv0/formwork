@@ -27,8 +27,8 @@ Notes:
   meant for.
 - Egress is host-scoped: a host the blueprint does not name is refused, and `formwork learn`
   proposes the rule a run needed. On a Linux host without connect supervision, host rules are
-  refused before the run starts; `agent-session.toml` is the port-scoped fallback there
-  (`net = { ports = [443] }` = any HTTPS host).
+  refused before the run starts. Fall back to the port tier there (any HTTPS host):
+  `formwork run --blueprint ./examples/blueprints/agent-base.toml --net ports:443 --allow-cred claude --rule "readwrite:~/.claude/**" -- claude`.
 
 ## Axis B — stage an MCP config that routes servers through the gateway
 
@@ -84,7 +84,7 @@ Run Claude confined **and** route its MCP servers through the gateway — Axis A
 Axis B walls each tool server:
 
 ```sh
-formwork run --blueprint ./examples/blueprints/agent-session.toml -- \
+formwork run --blueprint ./examples/blueprints/claude-code.toml -- \
     claude --dangerously-skip-permissions \
            --strict-mcp-config --mcp-config ./examples/claude-code/mcp.json
 ```

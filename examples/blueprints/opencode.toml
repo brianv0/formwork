@@ -1,21 +1,28 @@
-# opencode under host-scoped egress (FEP-5). opencode talks to whichever model provider you
-# configure; the rules below name Anthropic and OpenAI plus opencode's own model catalog. Add a
-# `https:` rule per provider you use -- `formwork learn` proposes the ones a run needed.
+# opencode under host-scoped egress (FEP-5), with the Anthropic key brokered: the agent's
+# ANTHROPIC_API_KEY is a per-session placeholder, and the Gateway presents the real key to
+# api.anthropic.com only. opencode reads the session CA through the variables the Launcher sets
+# (verified with opencode 1.18). The run is refused before it starts if ANTHROPIC_API_KEY is unset.
+#
+# Another provider: swap its host into `rules` as an inspected rule and its type into
+# `allow-credentials` (OpenAI: "any:api.openai.com" and "broker:openai"). `formwork learn` proposes
+# the hosts a run needed.
+#
+# opencode keeps its sessions and caches under the XDG directories; create them once outside the
+# sandbox (`mkdir -p ~/.local/share/opencode ~/.local/state/opencode ~/.cache/opencode
+# ~/.config/opencode`). Deliberately refused: registry.npmjs.org (runtime package installs).
 #
 #   formwork explain --blueprint examples/blueprints/opencode.toml --hosts
 
 extends = ["agent-base.toml"]
 
 rules = [
-    "https:api.anthropic.com",
-    "https:api.openai.com",
+    "any:api.anthropic.com",
     "https:models.dev",
+    "https:models.opencode.ai",
     "https:opencode.ai",
 ]
-allow-credentials = ["anthropic", "openai"]
+allow-credentials = ["broker:anthropic"]
 channels = ["open-url"]
-env = { scrub = { allow = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] } }
 
 [fs]
-# opencode keeps its sessions, auth and caches under the XDG directories.
 writes = ["~/.local/share/opencode/**", "~/.local/state/opencode/**", "~/.cache/opencode/**", "~/.config/opencode/**"]

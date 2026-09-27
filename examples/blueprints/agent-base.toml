@@ -1,6 +1,7 @@
 # The filesystem and environment every agent example shares. It carries no network posture: each
-# agent's blueprint adds its own -- host rules (`claude-code.toml`, `codex.toml`, `opencode.toml`)
-# or the port tier (`agent-session.toml`). The two cannot mix (FW-BP13).
+# agent's blueprint adds host rules (`claude-code.toml`, `codex.toml`, `opencode.toml`). Where host
+# rules are refused (Linux without connect supervision), add the port tier on the command line
+# instead -- `--net ports:443` -- which reaches any HTTPS host. The two cannot mix (FW-BP13).
 #
 #   reads   the whole ambient environment MINUS the compiled-in credential floor (keys, cloud
 #           creds, keychains, browser profiles -- profiles/credential-catalog.toml).
@@ -8,6 +9,8 @@
 #   exec    unrestricted, so the agent runs tools freely; set an allowlist to restrict execve.
 
 exec = "unrestricted"
+# Drop secret-shaped env vars; each agent's blueprint re-admits the model key it needs, if any.
+env = { scrub = {} }
 
 [fs]
 read-mode = "ambient-minus-subtract"

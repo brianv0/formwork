@@ -24,7 +24,6 @@ rules = [
 # aws, ssh, other agents' state, ... -- stays denied and stripped.
 allow-credentials = ["claude"]
 channels = ["desktop"]
-env = { scrub = {} }
 
 [fs]
 writes = ["~/.claude/**"]
