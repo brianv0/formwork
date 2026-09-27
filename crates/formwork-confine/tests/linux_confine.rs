@@ -190,17 +190,24 @@ fn landlock_symlink_in_grant_does_not_escape() {
         return;
     }
     let fx = Fixture::new("symlink");
-    // A hole forces `root` to be split into its entries; a symlink to /etc rides among them.
-    std::os::unix::fs::symlink("/etc", fx.root.join("etclink")).unwrap();
+    // An ungranted target outside the fixture (`/etc` is a closed-mode essential since D11).
+    let outside = std::env::temp_dir().join(format!("fw-linux-symtarget-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir_all(&outside).unwrap();
+    let outside = fs::canonicalize(&outside).unwrap();
+    fs::write(outside.join("private.txt"), b"out of scope\n").unwrap();
+    // A hole forces `root` to be split into its entries; a symlink to the target rides among them.
+    std::os::unix::fs::symlink(&outside, fx.root.join("outlink")).unwrap();
     let policy = closed_policy(
         vec![pp(&fx.root)],
         vec![],
         vec![pp(&fx.root.join("secret"))],
     );
+    let escaped = run(&policy, cat(&fx.root.join("outlink/private.txt")));
+    let _ = fs::remove_dir_all(&outside);
     assert_ne!(
-        run(&policy, cat(&fx.root.join("etclink/hostname"))),
-        0,
-        "reading /etc through an in-grant symlink must be denied (no escape)"
+        escaped, 0,
+        "reading an ungranted directory through an in-grant symlink must be denied (no escape)"
     );
     assert_eq!(
         run(&policy, cat(&fx.granted_file())),
@@ -279,20 +286,12 @@ fn net_default_deny_blocks_udp() {
     );
 }
 
-/// FW-ISO5 (DNS, Linux): the mirror of the macOS resolver test -- the two kernels sever DNS at
-/// different layers, so the shared claim (a granted port tier can resolve a name) needs a
-/// per-backend probe. Which half runs depends on the kernel, so the report drives the assertion
-/// rather than a second copy of the ABI rule (FW-E2E-024, report soundness):
-///
-///   * tier Enforced (Landlock net, ABI 4+): net-deny's seccomp inet filter is not installed and
-///     Landlock net governs TCP only, so nothing blocks the resolver's UDP:53 -- DNS works with no
-///     macOS-style re-allow. Asserts not-EPERM, not success: a sandboxed runner may have no route.
-///   * tier Unenforceable (below ABI 4, e.g. CI's 5.15): the tier falls back to a full seccomp inet
-///     deny, so DNS is deliberately dead. That is FW-INV6 honesty, not the macOS bug -- formwork
-///     reports the gap instead of silently opening egress, and the fix must not weaken it.
+/// FW-ISO11 (Linux): under the direct TCP port tier, direct UDP/raw egress is denied -- there is
+/// no direct-DNS hole (FEP-5 D4). Landlock net governs TCP only, so the port tier pairs its per-port
+/// TCP allow with a seccomp deny of inet DGRAM/RAW `socket(2)`; below ABI 4 the tier falls back to
+/// the full inet deny. Either way the UDP socket fails with EPERM (exit 7).
 #[test]
-fn port_tier_resolver_matches_reported_fidelity() {
-    use formwork_compile::{Capability, Fidelity};
+fn port_tier_denies_direct_udp_egress() {
     let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-udp-probe"));
     let probe_dir = probe.parent().expect("probe has a parent directory");
     let mut blueprint = Blueprint::empty();
@@ -300,25 +299,46 @@ fn port_tier_resolver_matches_reported_fidelity() {
     blueprint.fs.reads = vec![pp(probe_dir)];
     blueprint.net = NetPosture::Ports(vec![443]);
     let policy = compile(&blueprint, &detect());
-    let tier = policy
-        .report
-        .per_capability
-        .get(&Capability::NetPortTier)
-        .expect("a requested port tier is always reported");
-    let enforced = matches!(tier, Fidelity::Enforced { .. });
-
     let code = run(&policy, Command::new(&probe));
-    if enforced {
-        assert_ne!(
-            code, 7,
-            "an enforced port tier must leave the resolver reachable, else it reaches only IPs"
-        );
-    } else {
-        assert_eq!(
-            code, 7,
-            "an unenforceable port tier must fail closed to the inet deny, not open egress; got {code}"
-        );
+    assert_eq!(
+        code, 7,
+        "a direct UDP socket under the port tier must be denied with EPERM; got {code}"
+    );
+}
+
+/// FW-ISO5 (Linux, Landlock net, ABI 4+): the port tier is TCP-selective -- a granted TCP port is
+/// not denied at connect() (the STREAM socket survives the DGRAM/RAW deny), a non-granted port is.
+#[test]
+fn port_tier_tcp_selective_under_landlock() {
+    use formwork_compile::{Capability, Fidelity};
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-connect-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    let mut blueprint = Blueprint::empty();
+    blueprint.fs.read_mode = ReadMode::Closed;
+    blueprint.fs.reads = vec![pp(probe_dir)];
+    blueprint.net = NetPosture::Ports(vec![443]);
+    let policy = compile(&blueprint, &detect());
+    if !matches!(
+        policy.report.per_capability.get(&Capability::NetPortTier),
+        Some(Fidelity::Enforced { .. })
+    ) {
+        eprintln!("skipping: no Landlock net port tier on this host");
+        return;
     }
+    let mut granted = Command::new(&probe);
+    granted.arg("443");
+    assert_ne!(
+        run(&policy, granted),
+        7,
+        "a granted TCP port must not be denied"
+    );
+    let mut denied = Command::new(&probe);
+    denied.arg("9090");
+    assert_eq!(
+        run(&policy, denied),
+        7,
+        "a non-granted TCP port must be denied"
+    );
 }
 
 /// FW-TRA2 (Linux): the sandbox is transparent -- a shell that forks and execs a child runs clean

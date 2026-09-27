@@ -16,6 +16,12 @@ use formwork_blueprint::{
 /// The blueprint file every subcommand looks for when `--blueprint` is not given.
 pub const DEFAULT_BLUEPRINT_NAME: &str = "FORMWORK.toml";
 
+/// The second discovery location (FEP-5 D3): a blueprint inside `.formwork/`, so the file and its
+/// derived proposal/discovered layers sit in one directory. Write-protecting them then protects
+/// one directory instead of splitting the project root, where Landlock would lose the right to
+/// create files directly in the root.
+pub const DOTDIR_BLUEPRINT: &str = ".formwork/blueprint.toml";
+
 /// Profiles compiled into the binary, addressable as `extends = ["builtin:<name>"]` -- so a
 /// blueprint can layer on the shipped default without a repo checkout (the release-binary user
 /// has no `profiles/` directory to point at).
@@ -50,24 +56,31 @@ pub struct ResolvedBlueprint {
 /// a `FORMWORK.toml` discovered from the launch directory upward. `Ok(None)` means neither -- the
 /// caller decides whether that is an error (enforcing commands) or a degraded mode (`explain`
 /// with no blueprint still summarizes the host).
-pub fn resolve_blueprint(flag: Option<&Path>, cwd: &Path, home: &str) -> Option<ResolvedBlueprint> {
+pub fn resolve_blueprint(
+    flag: Option<&Path>,
+    cwd: &Path,
+    home: &str,
+) -> Result<Option<ResolvedBlueprint>> {
     if let Some(path) = flag {
         tracing::info!(blueprint = %path.display(), source = "flag", "blueprint resolved");
-        return Some(ResolvedBlueprint {
+        return Ok(Some(ResolvedBlueprint {
             path: path.to_path_buf(),
             source: BlueprintSource::Flag,
-        });
+        }));
     }
-    let found = find_default_blueprint(cwd, home)?;
+    let Some(found) = find_default_blueprint(cwd, home)? else {
+        return Ok(None);
+    };
     tracing::info!(
         blueprint = %found.display(),
         source = "auto-discovered",
-        "blueprint resolved (no --blueprint given; found {DEFAULT_BLUEPRINT_NAME})"
+        "blueprint resolved (no --blueprint given; found {})",
+        found.display()
     );
-    Some(ResolvedBlueprint {
+    Ok(Some(ResolvedBlueprint {
         path: found,
         source: BlueprintSource::Discovered,
-    })
+    }))
 }
 
 /// Walk from `cwd` upward looking for a `FORMWORK.toml`, stopping at `$HOME` (inclusive) so a
@@ -82,7 +95,7 @@ pub fn resolve_blueprint(flag: Option<&Path>, cwd: &Path, home: &str) -> Option<
 /// remains the explicit door for a file discovery will not trust. The `$HOME` boundary compares
 /// symlink-resolved paths, so a symlinked home (macOS `/var` vs `/private/var`) cannot let the
 /// walk escape above the real home directory.
-pub fn find_default_blueprint(cwd: &Path, home: &str) -> Option<PathBuf> {
+pub fn find_default_blueprint(cwd: &Path, home: &str) -> Result<Option<PathBuf>> {
     find_default_blueprint_trusting(cwd, home, &user_controls)
 }
 
@@ -93,7 +106,7 @@ fn find_default_blueprint_trusting(
     cwd: &Path,
     home: &str,
     trusted: &dyn Fn(&Path) -> bool,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>> {
     // Boundary comparisons happen in symlink-resolved coordinates; the returned candidate keeps
     // the caller's (as-given) coordinates, which the loader canonicalizes itself.
     let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
@@ -105,26 +118,48 @@ fn find_default_blueprint_trusting(
         if !trusted(dir) {
             break;
         }
-        let candidate = dir.join(DEFAULT_BLUEPRINT_NAME);
-        if candidate.is_file() {
+        let root_file = dir.join(DEFAULT_BLUEPRINT_NAME);
+        let dotdir_file = dir.join(DOTDIR_BLUEPRINT);
+        // `.formwork/` is one more directory level: it must be the user's too (FW-BP8).
+        let dotdir_ok = || dotdir_file.parent().map(trusted).unwrap_or(false);
+        let candidate = match (root_file.is_file(), dotdir_file.is_file()) {
+            (true, true) => bail!(
+                "both {} and {} exist; one project has one blueprint -- remove one, or pass \
+                 --blueprint to choose",
+                root_file.display(),
+                dotdir_file.display()
+            ),
+            (true, false) => Some(root_file),
+            (false, true) if dotdir_ok() => Some(dotdir_file),
+            (false, true) => {
+                tracing::warn!(
+                    candidate = %dotdir_file.display(),
+                    "ignoring a .formwork/ directory not owned by the invoking user (FW-BP8); \
+                     pass --blueprint to use its blueprint explicitly"
+                );
+                return Ok(None);
+            }
+            (false, false) => None,
+        };
+        if let Some(candidate) = candidate {
             if trusted(&candidate) {
-                return Some(candidate);
+                return Ok(Some(candidate));
             }
             // Fail-closed, not fail-open-through-a-foreign-file: the nearer suspicious file also
             // shadows anything above it -- silently skipping to a farther match would leave the
             // planted file looking effective.
             tracing::warn!(
                 candidate = %candidate.display(),
-                "ignoring a {DEFAULT_BLUEPRINT_NAME} not owned by the invoking user (FW-BP8); \
-                 pass --blueprint to use it explicitly"
+                "ignoring a blueprint not owned by the invoking user (FW-BP8); pass --blueprint \
+                 to use it explicitly"
             );
-            return None;
+            return Ok(None);
         }
         if resolve(dir) == home {
             break;
         }
     }
-    None
+    Ok(None)
 }
 
 /// Implicit policy may come only from territory the invoking user controls (FW-BP8): the path is
@@ -159,8 +194,42 @@ pub fn load_stack(
     sigils: &Sigils,
 ) -> Result<Blueprint> {
     let layers = load_layers(path, sets, sugar, sigils)?;
-    let plain: Vec<BlueprintLayer> = layers.into_iter().map(|(_, l)| l).collect();
-    validate(formwork_blueprint::merge(&plain))
+    let (blueprint, _) = merge_with_provenance(&layers);
+    refuse_universe_row(&layers, &blueprint)?;
+    validate(blueprint)
+}
+
+/// FEP-5 D10: the ambient universe is a property of the read mode, never a row. Under `closed`
+/// (`mode = "unveil"`) a `/**` read row silently reopens everything the mode closed, so it is
+/// refused, naming the layer it came from.
+fn refuse_universe_row(layers: &[(RuleSource, BlueprintLayer)], merged: &Blueprint) -> Result<()> {
+    if merged.fs.read_mode != formwork_blueprint::ReadMode::Closed {
+        return Ok(());
+    }
+    let universe = PathPattern::parse("/**").expect("constant pattern");
+    for (source, layer) in layers {
+        let rows = layer
+            .fs
+            .reads
+            .iter()
+            .chain(layer.fs.writes.iter())
+            .chain(layer.fs.writes_no_create.iter());
+        if rows.clone().any(|p| *p == universe) {
+            let origin = match source {
+                RuleSource::BuiltIn => "the built-in baseline".to_string(),
+                RuleSource::Profile(p) => format!("profile {p}"),
+                RuleSource::File(p) => format!("blueprint {p}"),
+                RuleSource::Cli => "a CLI override".to_string(),
+                RuleSource::Discovered(p) => format!("discovered layer {p}"),
+            };
+            bail!(
+                "a `/**` grant from {origin} reopens the whole filesystem under the closed read \
+                 mode (`mode = \"unveil\"`); the ambient universe is a read mode, not a rule -- \
+                 use `mode = \"subtractive\"`, or grant the directories the session needs"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Same stack as [`load_stack`], but each layer keeps the [`RuleSource`] it came from so `explain`
@@ -174,6 +243,7 @@ pub fn load_stack_with_provenance(
 ) -> Result<(Blueprint, Provenance)> {
     let layers = load_layers(path, sets, sugar, sigils)?;
     let (blueprint, provenance) = merge_with_provenance(&layers);
+    refuse_universe_row(&layers, &blueprint)?;
     Ok((validate(blueprint)?, provenance))
 }
 
@@ -1012,19 +1082,19 @@ mod tests {
         let home_str = home.to_str().unwrap();
 
         // Nothing anywhere: no discovery.
-        assert_eq!(find_default_blueprint(&project, home_str), None);
+        assert_eq!(find_default_blueprint(&project, home_str).unwrap(), None);
 
         // A file in a parent (still under $HOME) is found from a nested cwd.
         std::fs::write(home.join("work").join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
         assert_eq!(
-            find_default_blueprint(&project, home_str),
+            find_default_blueprint(&project, home_str).unwrap(),
             Some(home.join("work").join(DEFAULT_BLUEPRINT_NAME))
         );
 
         // The cwd's own file wins over a parent's.
         std::fs::write(project.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
         assert_eq!(
-            find_default_blueprint(&project, home_str),
+            find_default_blueprint(&project, home_str).unwrap(),
             Some(project.join(DEFAULT_BLUEPRINT_NAME))
         );
 
@@ -1033,16 +1103,65 @@ mod tests {
         std::fs::write(dir.path().join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
         std::fs::remove_file(project.join(DEFAULT_BLUEPRINT_NAME)).unwrap();
         std::fs::remove_file(home.join("work").join(DEFAULT_BLUEPRINT_NAME)).unwrap();
-        assert_eq!(find_default_blueprint(&project, home_str), None);
+        assert_eq!(find_default_blueprint(&project, home_str).unwrap(), None);
 
         // A cwd outside $HOME still walks its own ancestors (a project need not live under
         // home), just never as far as the filesystem root.
         let outside = dir.path().join("elsewhere");
         std::fs::create_dir_all(&outside).unwrap();
         assert_eq!(
-            find_default_blueprint(&outside, home_str),
+            find_default_blueprint(&outside, home_str).unwrap(),
             Some(dir.path().join(DEFAULT_BLUEPRINT_NAME))
         );
+    }
+
+    /// FEP-5 D3: `.formwork/blueprint.toml` is discovered like FORMWORK.toml, and a directory
+    /// holding both is a loud error rather than a silent pick.
+    #[test]
+    fn dotdir_blueprint_is_discovered_and_ambiguity_fails_loud() {
+        let dir = Scratch::new("discover-dotdir");
+        let home = dir.path().join("home");
+        let project = home.join("proj");
+        std::fs::create_dir_all(project.join(".formwork")).unwrap();
+        let home_str = home.to_str().unwrap();
+        let dotdir = project.join(DOTDIR_BLUEPRINT);
+        std::fs::write(&dotdir, "").unwrap();
+        assert_eq!(
+            find_default_blueprint(&project, home_str).unwrap(),
+            Some(dotdir.clone())
+        );
+        std::fs::write(project.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
+        let err = find_default_blueprint(&project, home_str).unwrap_err();
+        assert!(format!("{err}").contains("both"), "{err}");
+    }
+
+    /// FEP-5 D10: `/**` under the closed read mode is refused, naming the layer; the same row is
+    /// harmless under the ambient mode.
+    #[test]
+    fn universe_row_under_closed_mode_is_refused_naming_the_layer() {
+        let dir = Scratch::new("universe-row");
+        std::fs::write(
+            dir.path().join("base.toml"),
+            "[fs]\nread-mode = \"ambient-minus-subtract\"\nreads = [\"/**\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("bp.toml"),
+            "extends = [\"base.toml\"]\nmode = \"unveil\"\n",
+        )
+        .unwrap();
+        let err = load(&dir.path().join("bp.toml"), "/home/x").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("base.toml") && msg.contains("/**"), "{msg}");
+        assert!(load(&dir.path().join("base.toml"), "/home/x").is_ok());
+        // The builtin default no longer carries the row, so extending it in unveil mode is fine.
+        std::fs::write(
+            dir.path().join("strict.toml"),
+            "extends = [\"builtin:default\"]\nmode = \"unveil\"\n",
+        )
+        .unwrap();
+        let bp = load(&dir.path().join("strict.toml"), "/home/x").unwrap();
+        assert!(bp.fs.reads.is_empty(), "{:?}", bp.fs.reads);
     }
 
     /// FW-BP8: the walk ends at the first ancestor the invoking user does not control, BEFORE
@@ -1064,14 +1183,14 @@ mod tests {
 
         // The planted file sits in the untrusted ancestor: never consulted.
         assert_eq!(
-            find_default_blueprint_trusting(&project, home_str, &trusted),
+            find_default_blueprint_trusting(&project, home_str, &trusted).unwrap(),
             None
         );
 
         // The user's own launch directory still works below the same untrusted ancestor.
         std::fs::write(project.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
         assert_eq!(
-            find_default_blueprint_trusting(&project, home_str, &trusted),
+            find_default_blueprint_trusting(&project, home_str, &trusted).unwrap(),
             Some(project.join(DEFAULT_BLUEPRINT_NAME))
         );
     }
@@ -1093,7 +1212,7 @@ mod tests {
         let trusted = move |p: &Path| p != foreign;
 
         assert_eq!(
-            find_default_blueprint_trusting(&project, home_str, &trusted),
+            find_default_blueprint_trusting(&project, home_str, &trusted).unwrap(),
             None,
             "a refused candidate must not fall through to the file it shadows"
         );
@@ -1115,7 +1234,7 @@ mod tests {
         std::fs::write(dir.path().join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
 
         assert_eq!(
-            find_default_blueprint(&project, link_home.to_str().unwrap()),
+            find_default_blueprint(&project, link_home.to_str().unwrap()).unwrap(),
             None,
             "the walk escaped above a symlinked $HOME"
         );

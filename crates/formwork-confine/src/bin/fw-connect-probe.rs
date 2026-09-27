@@ -19,7 +19,13 @@ use std::time::Duration;
 fn main() {
     // Static IP -- no DNS, which would need lookups/reads beyond the probe's point. Under net=deny
     // the kernel rejects connect() immediately, so the address is never actually routed to.
-    let addr: SocketAddr = "93.184.216.34:80".parse().expect("static addr literal");
+    // The port is argv[1] (default 80), so the port-tier test can aim at a granted and a
+    // non-granted port with one binary.
+    let port: u16 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80);
+    let addr = SocketAddr::from(([93, 184, 216, 34], port));
     let code = match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
         Ok(_) => 0,
         Err(e) if e.kind() == ErrorKind::PermissionDenied => 7,

@@ -22,7 +22,9 @@ pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
 pub use narrow::intersect_grants;
 pub use path::{canonicalize_set, PathError, PathPattern};
-pub use provenance::{merge_with_provenance, Explanation, Provenance, RuleSource, Verdict};
+pub use provenance::{
+    merge_with_provenance, ChannelExplanation, Explanation, Provenance, RuleSource, Verdict,
+};
 
 use std::collections::BTreeMap;
 

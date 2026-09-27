@@ -45,54 +45,69 @@ const BASELINE_DENY: &[&str] = &[
     "setns",
 ];
 
-/// `net_via_seccomp` is true when the host lacks Landlock net ABI and net default-deny must instead
-/// be carried by denying inet `socket(2)` creation.
-pub fn seccomp_plan(net_via_seccomp: bool) -> SeccompPlan {
+/// How the seccomp filter carries the inet-egress deny for a net plan. Landlock net governs only
+/// TCP, so seccomp carries at least the UDP/raw half of net default-deny on every Linux path
+/// (FW-ISO11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InetSeccompDeny {
+    /// Deny inet `socket(2)` at the family level: TCP + UDP + raw blocked at creation.
+    FullInet,
+    /// Deny inet/inet6 DGRAM and RAW `socket(2)` while allowing STREAM.
+    DgramRawOnly,
+}
+
+/// Build the seccomp baseline plus whatever inet-egress deny `inet_deny` calls for.
+pub fn seccomp_plan(inet_deny: InetSeccompDeny) -> SeccompPlan {
     let deny_syscalls: Vec<String> = BASELINE_DENY.iter().map(|s| s.to_string()).collect();
     debug_assert!(
         deny_syscalls.windows(2).all(|w| w[0] < w[1]),
         "BASELINE_DENY must stay sorted"
     );
 
-    // Block inet/inet6/packet + non-route netlink; AF_UNIX and socketpair stay allowed so the
-    // injected fd seam is untouched (FW-XR7).
-    let deny_socket_families = if net_via_seccomp {
-        vec![
-            SocketFamily::Inet,
-            SocketFamily::Inet6,
-            SocketFamily::Packet,
-            SocketFamily::NetlinkNonRoute,
-        ]
-    } else {
-        Vec::new()
+    // AF_UNIX and socketpair are never listed, so the injected-fd seam is untouched (FW-XR7).
+    let (deny_socket_families, deny_inet_dgram_raw) = match inet_deny {
+        InetSeccompDeny::FullInet => (
+            vec![
+                SocketFamily::Inet,
+                SocketFamily::Inet6,
+                SocketFamily::Packet,
+                SocketFamily::NetlinkNonRoute,
+            ],
+            false,
+        ),
+        InetSeccompDeny::DgramRawOnly => (
+            vec![SocketFamily::Packet, SocketFamily::NetlinkNonRoute],
+            true,
+        ),
     };
 
     SeccompPlan {
         deny_syscalls,
         deny_socket_families,
+        deny_inet_dgram_raw,
         restrict_userns: true,
         set_no_new_privs: true,
     }
 }
 
-/// Returns `(plan, net_via_seccomp, port_tier)`.
-pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, bool, PortTier) {
+/// Returns `(plan, inet_deny, port_tier)`.
+pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, InetSeccompDeny, PortTier) {
     let abi = host.landlock_abi.unwrap_or(0);
     match net {
-        NetPosture::Deny => {
-            // Deny ALL inet egress via seccomp (blocks TCP, UDP, and raw at the socket-family level),
-            // matching macOS `(deny network*)`. Landlock net governs *only* TCP, so carrying deny with
-            // it would leave UDP/raw open -- an exfil channel. AF_UNIX (the injected-fd seam) stays
-            // allowed. Landlock net is reserved for the port tier, where per-port TCP allow is needed.
-            (LinuxNetPlan::SeccompDenyInet, true, PortTier::NotRequested)
-        }
+        // Deny ALL inet egress via seccomp (TCP, UDP and raw at the socket-family level), matching
+        // macOS `(deny network*)`. AF_UNIX (the injected-fd seam) stays allowed.
+        NetPosture::Deny => (
+            LinuxNetPlan::SeccompDenyInet,
+            InetSeccompDeny::FullInet,
+            PortTier::NotRequested,
+        ),
         NetPosture::Ports(ports) => {
             if abi >= LANDLOCK_NET_ABI {
                 (
-                    LinuxNetPlan::LandlockTcp {
+                    LinuxNetPlan::LandlockTcpSeccompDgramRawDeny {
                         ports: ports.clone(),
                     },
-                    false,
+                    InetSeccompDeny::DgramRawOnly,
                     PortTier::Enforced,
                 )
             } else {
@@ -100,7 +115,7 @@ pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, bool, Po
                 // report the tier unenforceable -- no silent open (FW-INV6).
                 (
                     LinuxNetPlan::SeccompDenyInet,
-                    true,
+                    InetSeccompDeny::FullInet,
                     PortTier::UnenforceableBelowAbi4,
                 )
             }
@@ -121,7 +136,7 @@ mod tests {
 
     #[test]
     fn baseline_is_sorted_and_denies_escalation_surfaces() {
-        let plan = seccomp_plan(false);
+        let plan = seccomp_plan(InetSeccompDeny::FullInet);
         assert!(plan.deny_syscalls.windows(2).all(|w| w[0] < w[1]));
         assert!(plan.deny_syscalls.iter().any(|s| s == "bpf"));
         assert!(plan.deny_syscalls.iter().any(|s| s == "setns"));
@@ -137,7 +152,23 @@ mod tests {
         }
         assert!(plan.restrict_userns);
         assert!(plan.set_no_new_privs);
-        assert!(plan.deny_socket_families.is_empty());
+        assert!(plan.deny_socket_families.contains(&SocketFamily::Inet));
+        assert!(!plan.deny_inet_dgram_raw);
+    }
+
+    #[test]
+    fn port_tier_seccomp_denies_dgram_raw_but_not_stream() {
+        let plan = seccomp_plan(InetSeccompDeny::DgramRawOnly);
+        assert!(
+            plan.deny_inet_dgram_raw,
+            "UDP/raw must be denied (FW-ISO11)"
+        );
+        assert!(
+            !plan.deny_socket_families.contains(&SocketFamily::Inet)
+                && !plan.deny_socket_families.contains(&SocketFamily::Inet6),
+            "the inet families must not be denied wholesale, or TCP dies too"
+        );
+        assert!(plan.deny_socket_families.contains(&SocketFamily::Packet));
     }
 
     #[test]
@@ -145,12 +176,12 @@ mod tests {
         // Deny is carried by seccomp at every ABI so UDP/raw are covered, not just TCP.
         for abi in [1, 4, 6] {
             let host = HostProfile::synthetic_linux(Some(abi));
-            let (plan, via_seccomp, tier) = net_plan(&host, &NetPosture::Deny);
+            let (plan, inet_deny, tier) = net_plan(&host, &NetPosture::Deny);
             assert!(
                 matches!(plan, LinuxNetPlan::SeccompDenyInet),
                 "abi {abi}: net-deny must be the complete seccomp inet deny"
             );
-            assert!(via_seccomp);
+            assert_eq!(inet_deny, InetSeccompDeny::FullInet);
             assert_eq!(tier, PortTier::NotRequested);
         }
     }
@@ -158,14 +189,15 @@ mod tests {
     #[test]
     fn port_tier_unenforceable_below_abi4_falls_back_to_deny() {
         let old = HostProfile::synthetic_linux(Some(1));
-        let (plan, via_seccomp, tier) = net_plan(&old, &NetPosture::Ports(vec![8080]));
+        let (plan, inet_deny, tier) = net_plan(&old, &NetPosture::Ports(vec![8080]));
         assert!(matches!(plan, LinuxNetPlan::SeccompDenyInet));
-        assert!(via_seccomp);
+        assert_eq!(inet_deny, InetSeccompDeny::FullInet);
         assert_eq!(tier, PortTier::UnenforceableBelowAbi4);
 
         let new = HostProfile::synthetic_linux(Some(4));
-        let (plan, _, tier) = net_plan(&new, &NetPosture::Ports(vec![8080]));
-        assert!(matches!(plan, LinuxNetPlan::LandlockTcp { ports } if ports == vec![8080]));
+        let (plan, inet_deny, tier) = net_plan(&new, &NetPosture::Ports(vec![8080]));
+        assert_eq!(plan.landlock_tcp_ports(), Some(&[8080][..]));
+        assert_eq!(inet_deny, InetSeccompDeny::DgramRawOnly);
         assert_eq!(tier, PortTier::Enforced);
     }
 }

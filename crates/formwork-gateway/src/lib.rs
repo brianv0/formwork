@@ -76,15 +76,38 @@ enum Frame {
         id: Value,
         raw: Vec<u8>,
     },
+    /// A gated method sent without an `id` (a notification): policy applies all the same, but a
+    /// refusal has no one to answer, so it is dropped (D6, FW-ADV-016).
+    GatedNotification {
+        axis: Axis,
+        target: String,
+        raw: Vec<u8>,
+    },
+    /// A JSON-RPC batch array. MCP 2025-06-18 removed batching, and a batch would carry gated
+    /// calls past per-frame policy, so it is refused whole (D6).
+    Batch,
+    /// Not JSON at all. From the agent it closes the connection (D6); from a backend it forwards,
+    /// since backend output is not a door into anything.
+    NotJson(Vec<u8>),
     Passthrough(Vec<u8>),
+}
+
+#[derive(Clone, Copy)]
+enum Axis {
+    Tool,
+    Resource,
+    Prompt,
 }
 
 impl Frame {
     fn parse(raw: Vec<u8>) -> Frame {
         let value: Value = match serde_json::from_slice(&raw) {
             Ok(v) => v,
-            Err(_) => return Frame::Passthrough(raw),
+            Err(_) => return Frame::NotJson(raw),
         };
+        if value.is_array() {
+            return Frame::Batch;
+        }
         let method = value
             .get("method")
             .and_then(Value::as_str)
@@ -135,6 +158,21 @@ impl Frame {
             },
             (Some("sampling/createMessage"), Some(id)) => Frame::Sampling { id, raw },
             (Some("elicitation/create"), Some(id)) => Frame::Elicitation { id, raw },
+            (Some("tools/call"), None) => Frame::GatedNotification {
+                axis: Axis::Tool,
+                target: pointer_str("/params/name"),
+                raw,
+            },
+            (Some("resources/read"), None) => Frame::GatedNotification {
+                axis: Axis::Resource,
+                target: pointer_str("/params/uri"),
+                raw,
+            },
+            (Some("prompts/get"), None) => Frame::GatedNotification {
+                axis: Axis::Prompt,
+                target: pointer_str("/params/name"),
+                raw,
+            },
             (None, Some(id)) => Frame::Response { id, raw },
             _ => Frame::Passthrough(raw),
         }
@@ -149,7 +187,10 @@ impl Frame {
             | Frame::Sampling { raw, .. }
             | Frame::Elicitation { raw, .. }
             | Frame::Response { raw, .. }
+            | Frame::GatedNotification { raw, .. }
+            | Frame::NotJson(raw)
             | Frame::Passthrough(raw) => raw,
+            Frame::Batch => Vec::new(),
         }
     }
 }
@@ -271,6 +312,34 @@ where
             Frame::ListRequest { id, kind, raw } => {
                 pending.lock().await.insert(id_key(&id), kind);
                 write_frame(&backend_w, &raw).await?;
+            }
+            Frame::GatedNotification { axis, target, raw } => {
+                let permitted = match axis {
+                    Axis::Tool => policy.tools.permits(&target),
+                    Axis::Resource => policy.resources.permits(&target),
+                    Axis::Prompt => policy.prompts.permits(&target),
+                };
+                if permitted {
+                    write_frame(&backend_w, &raw).await?;
+                } else {
+                    tracing::info!(target = %target, "gateway dropped an id-less call to an ungranted item");
+                }
+            }
+            Frame::Batch => {
+                tracing::info!("gateway refused a JSON-RPC batch array");
+                write_frame(
+                    &agent_w,
+                    json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "Invalid Request"}})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .await?;
+            }
+            Frame::NotJson(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "agent sent a frame that is not JSON; closing the connection (fail-closed)",
+                ));
             }
             other => write_frame(&backend_w, &other.into_raw()).await?,
         }
@@ -554,14 +623,22 @@ mod tests {
         let resp = Frame::parse(br#"{"id":3,"result":{}}"#.to_vec());
         assert!(matches!(resp, Frame::Response { .. }));
 
-        // A notification (no id) and non-JSON both forward verbatim.
+        // An ungated notification forwards verbatim; a gated one is policy-checked (D6).
         assert!(matches!(
             Frame::parse(br#"{"method":"notifications/x"}"#.to_vec()),
             Frame::Passthrough(_)
         ));
         assert!(matches!(
+            Frame::parse(br#"{"method":"tools/call","params":{"name":"x"}}"#.to_vec()),
+            Frame::GatedNotification { .. }
+        ));
+        assert!(matches!(
             Frame::parse(b"not json".to_vec()),
-            Frame::Passthrough(_)
+            Frame::NotJson(_)
+        ));
+        assert!(matches!(
+            Frame::parse(br#"[{"id":1,"method":"tools/call"}]"#.to_vec()),
+            Frame::Batch
         ));
     }
 }

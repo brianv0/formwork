@@ -512,3 +512,52 @@ async fn fw_e2e_019_backend_confinement_recursion() {
         "backend direct egress must be denied"
     );
 }
+
+/// FW-ADV-016 (FEP-5 D6): the three frame-level bypasses of per-call shading. A batch array is
+/// refused whole, an id-less `tools/call` for a shaded tool never reaches the backend, and a
+/// non-JSON frame closes the connection. The backend fixture answers `tools/call` for any name, so
+/// a frame that slipped through would produce a reply the agent could observe.
+#[tokio::test]
+async fn fw_adv_016_gateway_frame_bypass() {
+    let mut agent = start(tools_only(&["read_file"]));
+
+    agent
+        .send(json!([{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "http_fetch", "arguments": {}}}]))
+        .await;
+    let batch = agent.recv().await;
+    assert_eq!(
+        batch["error"]["code"], -32600,
+        "a batch is refused: {batch}"
+    );
+    assert!(batch.get("result").is_none());
+
+    // An id-less call to a shaded tool is dropped; the next request's reply is the first frame
+    // back, so nothing the dropped call produced is interleaved.
+    agent
+        .notify("tools/call", json!({"name": "http_fetch", "arguments": {}}))
+        .await;
+    agent
+        .request(
+            2,
+            "tools/call",
+            json!({"name": "read_file", "arguments": {}}),
+        )
+        .await;
+    let next = agent.recv().await;
+    assert_eq!(
+        next["id"], 2,
+        "the shaded notification produced no reply: {next}"
+    );
+    assert_eq!(next["result"]["content"][0]["text"], "ok:read_file");
+
+    // A non-JSON frame closes the connection: the agent's read side reaches EOF.
+    agent.writer.write_all(b"this is not json\n").await.unwrap();
+    agent.writer.flush().await.unwrap();
+    let eof = timeout(Duration::from_secs(5), agent.reader.next_line())
+        .await
+        .expect("the gateway must close, not hang");
+    assert!(
+        matches!(eof, Ok(None)),
+        "a non-JSON frame must close the connection, got {eof:?}"
+    );
+}

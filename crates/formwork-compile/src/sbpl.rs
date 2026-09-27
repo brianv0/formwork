@@ -7,7 +7,10 @@
 //! backstop inside `~/.aws/**` without widening anything), then operator subtract holes last --
 //! an operator deny is never lifted by anything.
 
-use formwork_blueprint::{intersect_grants, ExecPosture, NetPosture, PathPattern, ReadMode};
+use formwork_blueprint::{
+    intersect_grants, Channel, ChannelPolicy, ExecPosture, IsolateMember, NetPosture, PathPattern,
+    ReadMode,
+};
 
 use crate::CompileInput;
 
@@ -37,8 +40,86 @@ pub fn render(input: &CompileInput) -> String {
         &input.floor_exempt,
     );
     render_exec(&mut b, &input.exec);
+    render_baseline(&mut b, &input.channels);
+    render_isolate(&mut b, &input.isolate);
 
     b
+}
+
+/// The SBPL that closes one channel (FW-ISO13). Operation-level denies where one operation is the
+/// channel (`appleevent-send`, `lsopen`), mach service denies by name otherwise. The names are the
+/// ones the characterization suite settles (FEP-5 §6.3 C3); the report says so.
+fn channel_rules(channel: Channel) -> &'static [&'static str] {
+    match channel {
+        Channel::RunOutside => &[
+            "(deny appleevent-send)",
+            "(deny mach-lookup (global-name \"com.apple.coreservices.appleevents\"))",
+        ],
+        // `open-url` is brokered through the Gateway (FW-ISO18); LaunchServices stays denied even
+        // when the channel is lifted, so this rule is emitted unconditionally below.
+        Channel::OpenUrl => &["(deny lsopen)"],
+        Channel::Clipboard => &["(deny mach-lookup (global-name-regex #\"^com\\.apple\\.pasteboard\\.\"))"],
+        Channel::Screen => &[
+            "(deny mach-lookup (global-name-regex #\"^com\\.apple\\.(screencapture|replayd)\"))",
+        ],
+        Channel::Camera => &["(deny mach-lookup (global-name-regex #\"^com\\.apple\\.cmio\\.\"))"],
+        Channel::Microphone => &[
+            "(deny mach-lookup (global-name-regex #\"^com\\.apple\\.audio\\.AudioComponentRegistrar\"))",
+        ],
+    }
+}
+
+/// The mechanism behind a channel's deny, for the report's reason text.
+pub fn channel_mechanism(channel: Channel) -> &'static str {
+    match channel {
+        Channel::RunOutside => "appleevent-send and the AppleEvents service",
+        Channel::OpenUrl => "lsopen",
+        Channel::Clipboard => "com.apple.pasteboard.* lookups",
+        Channel::Screen => "screen-capture service lookups",
+        Channel::Camera => "com.apple.cmio.* lookups",
+        Channel::Microphone => "audio component registrar lookups",
+    }
+}
+
+/// The anti-shedding baseline on macOS (FW-ISO8 as amended): host-service channels not lifted
+/// (FW-ISO13), privileged kernel ports (FW-ISO14), and other processes' environments (FW-ISO16).
+fn render_baseline(b: &mut String, channels: &ChannelPolicy) {
+    b.push_str("\n;; host-service channel baseline (FW-ISO13)\n");
+    for channel in Channel::ALL {
+        // LaunchServices is never lifted: `open-url` is brokered by the Gateway (FW-ISO18).
+        if channels.lifted(channel) && channel != Channel::OpenUrl {
+            continue;
+        }
+        for rule in channel_rules(channel) {
+            b.push_str(rule);
+            b.push('\n');
+        }
+    }
+    b.push_str(";; privileged interfaces (FW-ISO14)\n");
+    b.push_str("(deny mach-priv-host-port)\n");
+    b.push_str("(deny mach-priv-task-port)\n");
+    b.push_str(";; other processes' arguments and environment (FW-ISO16)\n");
+    b.push_str("(deny sysctl-read (sysctl-name \"kern.procargs2\"))\n");
+}
+
+/// The opt-in isolation tier on macOS (FW-ISO10). `children` and `pgrp` re-allow the session's
+/// own process management (shell job control, `make -j`).
+fn render_isolate(b: &mut String, isolate: &[IsolateMember]) {
+    if isolate.is_empty() {
+        return;
+    }
+    b.push_str("\n;; isolation tier (FW-ISO10)\n");
+    if isolate.contains(&IsolateMember::Processes) {
+        b.push_str("(deny process-info* (target others))\n");
+        b.push_str("(allow process-info* (target children))\n");
+        b.push_str("(allow process-info* (target pgrp))\n");
+        b.push_str("(deny signal (target others))\n");
+        b.push_str("(allow signal (target children))\n");
+        b.push_str("(allow signal (target pgrp))\n");
+    }
+    if isolate.contains(&IsolateMember::Ipc) {
+        b.push_str("(deny ipc-sysv*)\n");
+    }
 }
 
 /// Seatbelt classifies an AF_UNIX connect as `network-outbound`, so FW-ISO3's `(deny network*)`
@@ -50,6 +131,10 @@ pub const MACOS_RESOLVER_SOCKET: &str = "/private/var/run/mDNSResponder";
 fn render_net(b: &mut String, net: &NetPosture) {
     b.push_str("\n;; net: fail-closed egress (FW-ISO3)\n");
     b.push_str("(deny network*)\n");
+    // FW-EGR15: a confined login flow accepts the callback an unconfined browser makes to it.
+    b.push_str(";; loopback listen under every posture (FW-EGR15)\n");
+    b.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+    b.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
     if let NetPosture::Ports(ports) = net {
         if !ports.is_empty() {
             b.push_str(";; optional direct TCP port tier (FW-ISO5)\n");
@@ -72,6 +157,9 @@ fn render_net(b: &mut String, net: &NetPosture) {
 /// "/"))` stops `execve`'d programs loading their own code. Runtime dirs, not user data -- secrets
 /// live under `$HOME`, which stays denied -- and any `subtract` hole still wins (emitted last).
 const MACOS_READ_ESSENTIALS: &[&str] = &[
+    // D11: configuration every runtime reads (resolv.conf, hosts, ssl); the absolute floor rows
+    // under it (/etc/shadow, /etc/sudoers) are still denied, emitted after the grants.
+    "/private/etc",
     "/System",
     "/Library",
     "/bin",
@@ -357,6 +445,8 @@ mod tests {
             write_subtract: vec![],
             net: NetPosture::Deny,
             exec: ExecPosture::Unrestricted,
+            channels: ChannelPolicy::default(),
+            isolate: Vec::new(),
         }
     }
 
@@ -456,6 +546,40 @@ mod tests {
         let s = render(&input());
         assert!(s.contains("(deny network*)"));
         assert!(!s.contains("network-outbound"));
+        // FW-EGR15: loopback listen stays open under every posture.
+        assert!(s.contains("(allow network-inbound (local ip \"localhost:*\"))"));
+    }
+
+    #[test]
+    fn baseline_denies_channels_until_lifted_and_never_lifts_launchservices() {
+        let s = render(&input());
+        assert!(s.contains("(deny appleevent-send)"));
+        assert!(s.contains("(deny lsopen)"));
+        assert!(s.contains("com\\.apple\\.pasteboard"));
+        assert!(s.contains("(deny mach-priv-task-port)"));
+        assert!(s.contains("(deny sysctl-read (sysctl-name \"kern.procargs2\"))"));
+        let mut i = input();
+        i.channels = ChannelPolicy::allow([Channel::Clipboard, Channel::OpenUrl]);
+        let lifted = render(&i);
+        assert!(
+            !lifted.contains("pasteboard"),
+            "a lifted channel drops its deny"
+        );
+        assert!(
+            lifted.contains("(deny lsopen)"),
+            "open-url is brokered, LaunchServices stays denied (FW-ISO18)"
+        );
+    }
+
+    #[test]
+    fn isolate_processes_denies_others_and_keeps_the_session() {
+        let mut i = input();
+        i.isolate = vec![IsolateMember::Processes, IsolateMember::Ipc];
+        let s = render(&i);
+        assert!(s.contains("(deny signal (target others))"));
+        assert!(s.contains("(allow signal (target children))"));
+        assert!(s.contains("(deny ipc-sysv*)"));
+        assert!(!render(&input()).contains("target others"));
     }
 
     #[test]

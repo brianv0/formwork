@@ -29,6 +29,57 @@ pub struct HostProfile {
     /// For the report only; nothing depends on it.
     #[serde(default)]
     pub os_version: String,
+    /// Whether an unprivileged process can create a user namespace here -- what the Linux
+    /// isolation tier needs (FW-ISO10). `false` on macOS and wherever policy forbids it (an
+    /// AppArmor-restricted Ubuntu 24.04, `user.max_user_namespaces = 0`).
+    #[serde(default)]
+    pub user_namespaces: bool,
+    /// The host facilities that make host-service channels reachable, and PID-namespace nesting
+    /// (FW-FID10). Recorded here so `compile` stays pure (FW-CAP5).
+    #[serde(default, skip_serializing_if = "HostFacilities::is_empty")]
+    pub facilities: HostFacilities,
+}
+
+/// What `detect` found running on this host that a confined process could ask to act for it
+/// (FW-FID10). Each entry is the socket or service found, `None` when absent. Container and CI
+/// hosts usually run no user session, which is why every channel line in the report says whether
+/// the facility is present on this host.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HostFacilities {
+    /// The D-Bus session bus socket (Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_bus: Option<String>,
+    /// The `systemd --user` private socket (Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_manager: Option<String>,
+    /// Display-server sockets: X11 under `/tmp/.X11-unix`, Wayland under `$XDG_RUNTIME_DIR`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub display: Vec<String>,
+    /// A keyring service socket under `$XDG_RUNTIME_DIR` (Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyring: Option<String>,
+    /// An audio server socket (PulseAudio/PipeWire) -- the Linux `microphone` path besides
+    /// `/dev/snd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
+    /// A video capture device node (`/dev/video*`), the Linux `camera` path (Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_device: Option<String>,
+    /// macOS: whether a GUI login session owns this process (LaunchServices, the pasteboard and
+    /// WindowServer are reachable only then).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gui_session: bool,
+    /// Linux: this process already runs inside a nested PID namespace (a multi-field `NSpid`),
+    /// so other host processes are not visible to it regardless of the blueprint.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pid_ns_nested: bool,
+}
+
+impl HostFacilities {
+    pub fn is_empty(&self) -> bool {
+        self == &HostFacilities::default()
+    }
 }
 
 impl HostProfile {
@@ -39,6 +90,8 @@ impl HostProfile {
             seccomp: true,
             seatbelt: false,
             os_version: "synthetic-linux".to_string(),
+            user_namespaces: true,
+            facilities: HostFacilities::default(),
         }
     }
 
@@ -49,6 +102,8 @@ impl HostProfile {
             seccomp: false,
             seatbelt: true,
             os_version: "synthetic-macos".to_string(),
+            user_namespaces: false,
+            facilities: HostFacilities::default(),
         }
     }
 }
@@ -72,13 +127,148 @@ pub fn detect() -> HostProfile {
             seccomp: false,
             seatbelt: false,
             os_version: "unsupported".to_string(),
+            user_namespaces: false,
+            facilities: HostFacilities::default(),
         }
     }
 }
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{HostProfile, Os};
+    use std::path::{Path, PathBuf};
+
+    use super::{HostFacilities, HostProfile, Os};
+
+    /// Can this process create a user namespace? Probed by doing it in a short-lived forked
+    /// child, so the probe never changes this process's own namespaces. The child only calls
+    /// `unshare` and `_exit`, both async-signal-safe.
+    fn user_namespaces() -> bool {
+        // SAFETY: fork in a possibly multi-threaded process; the child calls only
+        // async-signal-safe functions (unshare, _exit) before exiting.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return false;
+        }
+        if pid == 0 {
+            let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+            unsafe { libc::_exit(if rc == 0 { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        // SAFETY: waiting on the child we just forked.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
+            return false;
+        }
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
+
+    fn is_socket(path: &Path) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(path)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+    }
+
+    /// `$XDG_RUNTIME_DIR`, falling back to `/run/user/<uid>` (a login session sets both; a CI
+    /// job sets neither, and the fallback then does not exist).
+    fn runtime_dir() -> Option<PathBuf> {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            // SAFETY: getuid is always successful and has no memory effects.
+            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));
+        dir.is_dir().then_some(dir)
+    }
+
+    fn session_bus(runtime: Option<&Path>) -> Option<String> {
+        // `unix:path=/run/user/1000/bus[,guid=…]` is the common shape; an abstract address has
+        // no path and is scoped by Landlock ABI 6, so it is not a pathname-socket facility.
+        if let Some(addr) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
+            let addr = addr.to_string_lossy().into_owned();
+            for part in addr.split(';') {
+                if let Some(rest) = part.strip_prefix("unix:") {
+                    for kv in rest.split(',') {
+                        if let Some(path) = kv.strip_prefix("path=") {
+                            if is_socket(Path::new(path)) {
+                                return Some(path.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let bus = runtime?.join("bus");
+        is_socket(&bus).then(|| bus.display().to_string())
+    }
+
+    fn facilities() -> HostFacilities {
+        let runtime = runtime_dir();
+        let rt = runtime.as_deref();
+        let in_runtime = |rel: &str| -> Option<String> {
+            let p = rt?.join(rel);
+            is_socket(&p).then(|| p.display().to_string())
+        };
+        let mut display = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/tmp/.X11-unix") {
+            let mut found: Vec<String> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| is_socket(p))
+                .map(|p| p.display().to_string())
+                .collect();
+            found.sort();
+            display.extend(found);
+        }
+        if let Some(rt) = rt {
+            if let Ok(entries) = std::fs::read_dir(rt) {
+                let mut found: Vec<String> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("wayland-") && !n.ends_with(".lock"))
+                            .unwrap_or(false)
+                            && is_socket(p)
+                    })
+                    .map(|p| p.display().to_string())
+                    .collect();
+                found.sort();
+                display.extend(found);
+            }
+        }
+        HostFacilities {
+            session_bus: session_bus(rt),
+            user_manager: in_runtime("systemd/private"),
+            display,
+            keyring: in_runtime("keyring/control").or_else(|| in_runtime("keyring/ssh")),
+            audio: in_runtime("pulse/native").or_else(|| in_runtime("pipewire-0")),
+            video_device: first_device("video"),
+            gui_session: false,
+            pid_ns_nested: pid_ns_nested(),
+        }
+    }
+
+    fn first_device(prefix: &str) -> Option<String> {
+        let mut found: Vec<String> = std::fs::read_dir("/dev")
+            .ok()?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| e.path().display().to_string())
+            .collect();
+        found.sort();
+        found.into_iter().next()
+    }
+
+    /// A multi-field `NSpid` line means this process sits in a nested PID namespace.
+    fn pid_ns_nested() -> bool {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("NSpid:"))
+                    .map(|l| l.split_whitespace().count() > 2)
+            })
+            .unwrap_or(false)
+    }
 
     // ABI-version query: landlock_create_ruleset(NULL, 0, VERSION).
     const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
@@ -131,13 +321,26 @@ mod linux {
             seccomp: seccomp_available(),
             seatbelt: false,
             os_version: kernel_version(),
+            user_namespaces: user_namespaces(),
+            facilities: facilities(),
         }
     }
 }
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{HostProfile, Os};
+    use super::{HostFacilities, HostProfile, Os};
+
+    /// A GUI login session owns this process when the per-user bootstrap namespace is the Aqua
+    /// session's. `launchctl managername` prints `Aqua` there and `Background`/`System` for a
+    /// ssh or CI session, where LaunchServices and the pasteboard are not reachable.
+    fn gui_session() -> bool {
+        std::process::Command::new("/bin/launchctl")
+            .arg("managername")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "Aqua")
+            .unwrap_or(false)
+    }
 
     fn product_version() -> String {
         // Read `kern.osrelease` via the standard two-call sysctlbyname sizing pattern.
@@ -180,6 +383,11 @@ mod macos {
             seccomp: false,
             seatbelt: true,
             os_version: product_version(),
+            user_namespaces: false,
+            facilities: HostFacilities {
+                gui_session: gui_session(),
+                ..HostFacilities::default()
+            },
         }
     }
 }

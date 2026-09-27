@@ -1,8 +1,7 @@
 //! The seccomp baseline (FW-ISO8): a *deny-list* BPF filter. Default action is `Allow` so an ordinary
 //! toolchain is never tripped by a forgotten syscall (FW-TRA2); a small fixed set of
-//! escalation/confinement-shedding syscalls, and -- whenever net-deny is seccomp-carried -- inet
-//! `socket(2)` creation,
-//! return `EPERM`. Built in the parent; `apply()` runs in the forked child after `NO_NEW_PRIVS`.
+//! escalation/confinement-shedding syscalls, and inet `socket(2)` creation (the whole family under
+//! an outright deny; DGRAM/RAW only under the port tier, FW-ISO11) return `EPERM`. Built in the parent; `apply()` runs in the forked child after `NO_NEW_PRIVS`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -32,14 +31,21 @@ pub fn build(plan: &SeccompPlan) -> Result<BpfProgram, ConfineError> {
         rules.entry(nr).or_default(); // empty rule vec == unconditional match -> EPERM
     }
 
-    // Seccomp-carried net default-deny (any outright deny; Landlock net is TCP-only): block
-    // inet/inet6/packet/non-route-netlink socket(2). AF_UNIX and socketpair are absent -> allowed, so
-    // the injected-fd seam is untouched (FW-XR7). All are conditions on socket()'s domain (arg0, OR).
-    if !plan.deny_socket_families.is_empty() {
-        let mut socket_rules = Vec::new();
-        for fam in &plan.deny_socket_families {
-            socket_rules.extend(socket_family_rules(*fam)?);
+    // Seccomp-carried net default-deny (Landlock net is TCP-only, so seccomp carries at least the
+    // UDP/raw half, FW-ISO11). AF_UNIX and socketpair are never listed, so the injected-fd seam is
+    // untouched (FW-XR7). Rules on `socket()` are ORed; each rule's conditions are ANDed.
+    let mut socket_rules = Vec::new();
+    for fam in &plan.deny_socket_families {
+        socket_rules.extend(socket_family_rules(*fam)?);
+    }
+    if plan.deny_inet_dgram_raw {
+        for domain in [libc::AF_INET as u64, libc::AF_INET6 as u64] {
+            for sock_type in [libc::SOCK_DGRAM as u64, libc::SOCK_RAW as u64] {
+                socket_rules.push(inet_socket_type_rule(domain, sock_type)?);
+            }
         }
+    }
+    if !socket_rules.is_empty() {
         rules
             .entry(libc::SYS_socket)
             .or_default()
@@ -105,6 +111,24 @@ fn eq_rule(arg: u8, value: u64) -> Result<SeccompRule, ConfineError> {
     let cond = SeccompCondition::new(arg, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value)
         .map_err(|e| fail(format!("seccomp condition: {e}")))?;
     SeccompRule::new(vec![cond]).map_err(|e| fail(format!("seccomp rule: {e}")))
+}
+
+/// `socket(domain, type, _)` with `domain == domain` AND `(type & SOCK_TYPE_MASK) == sock_type`.
+/// Masked because `SOCK_NONBLOCK`/`SOCK_CLOEXEC` ride the high bits of `type`; an exact match would
+/// let `socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK)` slip past.
+fn inet_socket_type_rule(domain: u64, sock_type: u64) -> Result<SeccompRule, ConfineError> {
+    // SOCK_TYPE_MASK from <linux/net.h>: the low four bits hold the type.
+    const SOCK_TYPE_MASK: u64 = 0xf;
+    let domain_cond = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)
+        .map_err(|e| fail(format!("seccomp condition: {e}")))?;
+    let type_cond = SeccompCondition::new(
+        1,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+        sock_type,
+    )
+    .map_err(|e| fail(format!("seccomp condition: {e}")))?;
+    SeccompRule::new(vec![domain_cond, type_cond]).map_err(|e| fail(format!("seccomp rule: {e}")))
 }
 
 fn socket_family_rules(fam: SocketFamily) -> Result<Vec<SeccompRule>, ConfineError> {

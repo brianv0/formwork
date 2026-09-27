@@ -18,7 +18,7 @@ use landlock::{
 };
 
 use formwork_blueprint::{PathPattern, ReadMode};
-use formwork_compile::{ExecPlan, LinuxNetPlan, LinuxPolicy};
+use formwork_compile::{ExecPlan, LinuxPolicy};
 
 use super::ConfineError;
 
@@ -30,18 +30,11 @@ fn fail(msg: impl Into<String>) -> ConfineError {
 /// child dies before `main` (the Linux analogue of the macOS `dyld` failure). Curated literals; a
 /// broad `/dev` is deliberately avoided (it would expose block devices -- an out-of-band fs read).
 ///
-/// `/proc/self` is deliberately absent: it is a per-process symlink, so a rule built here (in the
-/// parent) binds the *launcher's* `/proc/<pid>`, not the child's. The child's own `/proc/self` is
-/// added post-fork in `apply` (runtimes read `/proc/self/{maps,exe,status}` and would otherwise die).
-const READ_ESSENTIALS: &[&str] = &[
-    "/usr",
-    "/lib",
-    "/lib64",
-    "/bin",
-    "/sbin",
-    "/etc/ld.so.cache",
-    "/etc/ld.so.preload",
-];
+/// `/etc` and `/proc` are whole (D11): a grandchild's `/proc/self` is a different directory from
+/// the child's, and runtimes (`node`, `cargo`, `go`) read `/etc` and `/proc/self/*` at start. The
+/// absolute floor rows under `/etc` are still holes in the expansion. `/proc` makes same-uid
+/// processes' environments readable, which the report states (`process-environment`, D9).
+const READ_ESSENTIALS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc"];
 const RW_DEVICES: &[&str] = &[
     "/dev/null",
     "/dev/zero",
@@ -64,10 +57,13 @@ fn abi_of(v: u32) -> ABI {
 }
 
 /// A concrete (absolute) subtract hole. Any-depth `**/` patterns are handled separately (they cannot
-/// be a rooted Landlock rule); the caller rejects them so nothing is silently missed.
+/// be a rooted Landlock rule); the caller rejects them so nothing is silently missed. A `prefix`
+/// hole withholds every directory entry whose path starts with `base` as a string -- the numbered
+/// device nodes of a denied channel (`/dev/video0`, `/dev/video1`, FW-ISO13).
 struct Hole {
     base: PathBuf,
     subtree: bool,
+    prefix: bool,
 }
 
 fn holes_of(patterns: &[PathPattern]) -> Result<Vec<Hole>, ConfineError> {
@@ -83,6 +79,7 @@ fn holes_of(patterns: &[PathPattern]) -> Result<Vec<Hole>, ConfineError> {
                 Ok(Hole {
                     base: p.base().to_path_buf(),
                     subtree: p.is_subtree(),
+                    prefix: false,
                 })
             }
         })
@@ -92,6 +89,13 @@ fn holes_of(patterns: &[PathPattern]) -> Result<Vec<Hole>, ConfineError> {
 impl Hole {
     /// The hole denies `path` outright (it is the hole, or lies within a subtree hole).
     fn covers(&self, path: &Path) -> bool {
+        if self.prefix {
+            return path
+                .to_str()
+                .zip(self.base.to_str())
+                .map(|(p, b)| p.starts_with(b))
+                .unwrap_or(false);
+        }
         if self.subtree {
             path.starts_with(&self.base)
         } else {
@@ -100,6 +104,15 @@ impl Hole {
     }
     /// The hole sits strictly below `dir` -- so `dir` must be split, not granted whole.
     fn strictly_under(&self, dir: &Path) -> bool {
+        if self.prefix {
+            // The entries sit in the prefix's parent directory, so every ancestor of that
+            // directory (and the directory itself) must be split.
+            return self
+                .base
+                .parent()
+                .map(|p| p.starts_with(dir))
+                .unwrap_or(false);
+        }
         self.base != dir && self.base.starts_with(dir)
     }
 }
@@ -143,11 +156,9 @@ fn expand(root: &Path, holes: &[Hole]) -> Vec<PathBuf> {
     out
 }
 
-/// A built ruleset plus the one thing that can only be finished in the child: whether to add the
-/// child's own `/proc/self` (Closed mode) once its pid exists.
+/// A built ruleset, ready for `restrict_self` in the child.
 pub struct Built {
     ruleset: RulesetCreated,
-    grant_proc_self: bool,
 }
 
 /// Build the ruleset in the parent. Returns `None` when the policy needs no Landlock (no ABI target),
@@ -181,7 +192,7 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
         .set_compatibility(CompatLevel::HardRequirement) // no silent downgrade (FW-INV6)
         .handle_access(handled_fs)
         .map_err(|e| fail(format!("landlock handle_access(fs): {e}")))?;
-    let net_governed = matches!(policy.net, LinuxNetPlan::LandlockTcp { .. }) && abi_ver >= 4;
+    let net_governed = policy.net.landlock_tcp_ports().is_some() && abi_ver >= 4;
     if net_governed {
         ruleset = ruleset
             .handle_access(AccessNet::from_all(abi))
@@ -202,9 +213,18 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
         .map_err(|e| fail(format!("landlock create: {e}")))?;
 
     // --- filesystem grants ---
-    let read_holes = holes_of(&policy.subtract)?;
+    let device_holes = || {
+        policy.withhold_device_prefixes.iter().map(|p| Hole {
+            base: PathBuf::from(p),
+            subtree: false,
+            prefix: true,
+        })
+    };
+    let mut read_holes = holes_of(&policy.subtract)?;
+    read_holes.extend(device_holes());
     let mut write_holes = holes_of(&policy.subtract)?;
     write_holes.extend(holes_of(&policy.write_subtract)?); // write-subtract denies writes only
+    write_holes.extend(device_holes());
 
     let mut read_roots: Vec<PathBuf> = policy.reads.iter().map(root_of).collect();
     if policy.read_mode == ReadMode::Closed {
@@ -256,7 +276,7 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     }
 
     // --- net grants ---
-    if let LinuxNetPlan::LandlockTcp { ports } = &policy.net {
+    if let Some(ports) = policy.net.landlock_tcp_ports() {
         if net_governed {
             for &port in ports {
                 let rule = NetPort::new(port, AccessNet::ConnectTcp);
@@ -267,11 +287,7 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
         }
     }
 
-    Ok(Some(Built {
-        ruleset: created,
-        // Add the child's own /proc/self post-fork (below). Ambient mode already covers /proc via `/`.
-        grant_proc_self: policy.read_mode == ReadMode::Closed,
-    }))
+    Ok(Some(Built { ruleset: created }))
 }
 
 /// Apply the built ruleset to the calling thread (the forked child, or in place for confine-self).
@@ -279,15 +295,7 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
 /// raw OS errors. Asserts the kernel *fully* enforced -- a downgraded apply is a failure, not a
 /// warning (FW-INV5/INV6).
 pub fn apply(built: Built) -> io::Result<()> {
-    let Built {
-        ruleset,
-        grant_proc_self,
-    } = built;
-    let ruleset = if grant_proc_self {
-        add_proc_self(ruleset)?
-    } else {
-        ruleset
-    };
+    let Built { ruleset } = built;
     let status = ruleset
         .restrict_self()
         .map_err(|_| io::Error::last_os_error())?;
@@ -297,19 +305,6 @@ pub fn apply(built: Built) -> io::Result<()> {
         // aborts the spawn, so there is no weakly-confined child.
         _ => Err(io::Error::from_raw_os_error(libc::EPERM)),
     }
-}
-
-/// Grant the child read of its OWN `/proc/self`, resolved here (post-fork) so it binds the child's
-/// pid. Landlock rules are inode-keyed and `/proc/<pid>` is per-process, so this cannot be done at
-/// build time in the parent. A missing `/proc` (rare, minimal container) is not an error.
-fn add_proc_self(ruleset: RulesetCreated) -> io::Result<RulesetCreated> {
-    let fd = match PathFd::new("/proc/self") {
-        Ok(fd) => fd,
-        Err(_) => return Ok(ruleset),
-    };
-    ruleset
-        .add_rule(PathBeneath::new(fd, AccessFs::ReadFile | AccessFs::ReadDir))
-        .map_err(|_| io::Error::last_os_error())
 }
 
 fn expand_all(roots: &[PathBuf], holes: &[Hole]) -> Vec<PathBuf> {

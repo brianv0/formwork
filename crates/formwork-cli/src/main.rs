@@ -219,11 +219,11 @@ impl BlueprintArgs {
     /// caller (`explain` with no path) that degrades to a host-only summary instead of erroring.
     fn try_resolve(&self) -> Result<Option<ResolvedBlueprint>> {
         let cwd = cwd()?;
-        Ok(blueprint_load::resolve_blueprint(
+        blueprint_load::resolve_blueprint(
             self.blueprint.as_deref(),
             std::path::Path::new(&cwd),
             &home(),
-        ))
+        )
     }
 
     /// Whether any override flag was given -- overrides without a base blueprint are an error,
@@ -592,10 +592,27 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
     let sigils = blueprint_load::Sigils::new(&home, &cwd);
     let catalog =
         ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
+    let host = detect();
+    // Channel verdicts come from the compiled report so the enforcement line is this host's.
+    let report = compile(&blueprint, &host, &catalog).report;
+    let landlock_withholds = host.os == formwork_detect::Os::Linux && host.landlock_abi.is_some();
     // Shape rides beside the verdict, not into the JSON: only the human door prints the lift hint,
     // the machine shape stays stable (FW-CRED7).
     let mut rows = Vec::new();
-    for path in &paths {
+    let mut channel_rows = Vec::new();
+    for arg in &paths {
+        // Typed by shape (FW-FID11): a channel or group name is a channel, anything else a path.
+        if let Some(channel) = formwork_blueprint::Channel::from_name(arg) {
+            channel_rows.push(provenance.explain_channel(channel));
+            continue;
+        }
+        if let Some(group) = formwork_blueprint::ChannelGroup::from_name(arg) {
+            for channel in group.members() {
+                channel_rows.push(provenance.explain_channel(*channel));
+            }
+            continue;
+        }
+        let path = arg;
         // A bare relative path resolves against cwd here: blueprint rules stay absolute/sigil to be
         // location-independent, but `explain` is a live diagnostic, not a stored grant.
         let expanded = sigils.expand(path);
@@ -620,12 +637,36 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
                     .find(|p| p.matches_path(target.base()))
                     .map(|p| p.to_string())
             });
-        let explanation = provenance.explain(&blueprint, target.base(), floor.clone());
+        let mut explanation = provenance.explain(&blueprint, target.base(), floor.clone());
+        // D2: on Linux a floor or tamper row that exists only in any-depth form is withheld, so
+        // the model verdict above is not what this kernel enforces.
+        if landlock_withholds {
+            let absolute_floor_hit = catalog
+                .denied_paths(&blueprint.allow_credentials)
+                .iter()
+                .any(|p| !p.is_any_depth() && p.matches_path(target.base()));
+            if floor.is_some() && !absolute_floor_hit {
+                explanation.host_note = Some(
+                    "withheld on this host -- Landlock cannot root the any-depth floor row, so \
+                     this path is not denied by the kernel here (see `withheld` in the report)"
+                        .to_string(),
+                );
+            } else if provenance.write_subtract_only_any_depth(target.base()) {
+                explanation.host_note = Some(
+                    "write denial withheld on this host -- Landlock cannot root the any-depth \
+                     write-subtract row, so writes here are not denied by the kernel"
+                        .to_string(),
+                );
+            }
+        }
         rows.push((explanation, floor, shape));
     }
     if json {
         let explanations: Vec<_> = rows.iter().map(|(e, _, _)| e).collect();
         let mut value = serde_json::json!({ "explanations": explanations });
+        if !channel_rows.is_empty() {
+            value["channels"] = serde_json::to_value(&channel_rows)?;
+        }
         attach_blueprint_info(&mut value, &resolved);
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
@@ -639,6 +680,9 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
             if let Some(floor_type) = floor {
                 print!("{}", render::floor_remedy(floor_type, shape.as_deref()));
             }
+        }
+        for channel in &channel_rows {
+            print!("{}", render::channel_explanation(channel, &report));
         }
     }
     Ok(())
@@ -725,11 +769,47 @@ struct Session {
     /// The resolved blueprint file this session was built from (flag or discovered FORMWORK.toml);
     /// `learn` derives the proposal/discovered-layer paths from it.
     blueprint_path: PathBuf,
+    /// The per-session temporary directory (FW-TRA10), removed when the spawned child exits.
+    tmp_dir: SessionTmp,
+}
+
+/// The Launcher-owned per-session temporary directory (FW-TRA9/FW-TRA10). Created 0700 beneath the
+/// host temp root (`$TMPDIR` on macOS is the per-user `DARWIN_USER_TEMP_DIR`), granted read-write
+/// in every read mode, and exported as `TMPDIR`/`TMP`/`TEMP` to the confined child.
+struct SessionTmp {
+    path: PathBuf,
+}
+
+impl SessionTmp {
+    fn create() -> Result<SessionTmp> {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path = root.join(format!(
+            "formwork-session-{}-{nanos:08x}",
+            std::process::id()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .with_context(|| format!("creating the session temp directory {}", path.display()))?;
+        let path = std::fs::canonicalize(&path).context("resolving the session temp directory")?;
+        Ok(SessionTmp { path })
+    }
+
+    fn remove(&self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
     let resolved = args.resolve()?;
     let mut blueprint = args.load(&resolved.path, &home())?;
+    let host = detect();
+    refuse_unavailable_isolation(&blueprint, &host)?;
     let catalog =
         ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
     // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
@@ -746,6 +826,18 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
     // own NEXT run (FW-XR8 / FW-INV8). Keys off the RESOLVED path, so a discovered FORMWORK.toml
     // is protected exactly like an explicit one.
     blueprint_load::protect_policy_inputs(&mut blueprint, &resolved.path)?;
+    announce_split_root(&blueprint, &resolved.path, &host);
+    // FW-TRA9/FW-TRA10: the Launcher-owned temporary directory is a write grant in every read mode.
+    let tmp_dir = SessionTmp::create()?;
+    let tmp_rendered = tmp_dir
+        .path
+        .to_str()
+        .ok_or_else(|| anyhow!("session temp directory is not valid UTF-8 (FW-INV6)"))?;
+    blueprint.fs.writes.push(
+        PathPattern::parse(&format!("{tmp_rendered}/**"))
+            .context("granting the session temp directory")?,
+    );
+    tracing::info!(tmp = %tmp_dir.path.display(), "session temp directory (TMPDIR/TMP/TEMP)");
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
     // faithfully rendered (FW-INV6). The catalog's paths get the same treatment -- a floor hole
@@ -754,7 +846,6 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
         .context("canonicalizing grant paths")?;
     let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
         .context("canonicalizing credential catalog paths")?;
-    let host = detect();
     let policy = compile(&blueprint, &host, &catalog);
     itemize_credential_floor(&policy.report, &catalog);
     Ok(Session {
@@ -762,7 +853,61 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
         catalog,
         policy,
         blueprint_path: resolved.path,
+        tmp_dir,
     })
+}
+
+/// FW-XR9: an isolation member the host cannot provide is refused before the workload starts,
+/// naming every alternative, never run weaker than the blueprint asked (FW-INV6).
+fn refuse_unavailable_isolation(blueprint: &Blueprint, host: &HostProfile) -> Result<()> {
+    if blueprint.isolate.is_empty() || host.os != formwork_detect::Os::Linux {
+        return Ok(());
+    }
+    let members: Vec<&str> = blueprint.isolate.iter().map(|m| m.name()).collect();
+    if !host.user_namespaces {
+        bail!(
+            "isolate = {members:?} needs unprivileged user namespaces, which this host does not \
+             allow. Alternatives: on Ubuntu 24.04 lift the AppArmor restriction with \
+             `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`; check \
+             `user.max_user_namespaces` is non-zero; run formwork under bwrap, which provides \
+             the namespaces itself; or drop the member from `isolate`"
+        );
+    }
+    bail!(
+        "isolate = {members:?}: the Linux namespace tier is not in this build; run formwork under \
+         bwrap for the same isolation, or drop the member from `isolate`"
+    )
+}
+
+/// FEP-5 D3: a FORMWORK.toml inside a writable grant is write-protected, which splits the grant
+/// around it; on Linux the split directory cannot be granted whole, so new files cannot be created
+/// directly in it. Say so, and name the layout that avoids it.
+fn announce_split_root(
+    blueprint: &Blueprint,
+    blueprint_path: &std::path::Path,
+    host: &HostProfile,
+) {
+    if host.os != formwork_detect::Os::Linux {
+        return;
+    }
+    let Some(dir) = blueprint_path.parent() else {
+        return;
+    };
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if dir.ends_with(".formwork") {
+        return;
+    }
+    let probe = dir.join(".formwork-split-probe");
+    if blueprint.fs.writes.iter().any(|w| w.matches_path(&probe)) {
+        tracing::info!(
+            dir = %dir.display(),
+            "the blueprint is write-protected inside a writable grant, which splits {} on Linux: \
+             files that exist stay writable, but new files cannot be created directly in it. \
+             Move the blueprint to {} to keep the root whole",
+            dir.display(),
+            blueprint_load::DOTDIR_BLUEPRINT
+        );
+    }
 }
 
 fn spawn_confined_child(
@@ -772,11 +917,18 @@ fn spawn_confined_child(
 ) -> Result<std::process::ExitStatus> {
     let mut command = Command::new(program);
     command.args(args);
-    apply_env(&mut command, &session.blueprint, &session.catalog);
+    apply_env(
+        &mut command,
+        &session.blueprint,
+        &session.catalog,
+        Some(&session.tmp_dir.path),
+    );
     formwork_confine::spawn_confined(&mut command, &session.policy)
         .context("applying confinement")?;
     tracing::info!(program = %program, "spawning confined command");
-    let status = command.status().context("spawning confined command")?;
+    let status = command.status();
+    session.tmp_dir.remove();
+    let status = status.context("spawning confined command")?;
     log_exit("confined command exited", &status);
     Ok(status)
 }
@@ -792,7 +944,14 @@ fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<
         Posture::Self_ => {
             formwork_confine::enforce_self(&session.policy).context("confining self")?;
             tracing::info!(program = %program, "exec after confine-self");
-            let err = exec_replace(program, args, &session.blueprint, &session.catalog);
+            // The session temp directory outlives an exec in place: no launcher remains to remove it.
+            let err = exec_replace(
+                program,
+                args,
+                &session.blueprint,
+                &session.catalog,
+                &session.tmp_dir.path,
+            );
             bail!("exec failed after confine-self: {err}");
         }
     }
@@ -1011,16 +1170,31 @@ fn itemize_credential_floor(report: &formwork_compile::FidelityReport, catalog: 
 /// strip partitions first (FW-CRED2/4), then the posture (FW-ENV1/2). Impure -- it reads the real
 /// process environment -- so it lives in the CLI shell; the decision itself is the pure
 /// `construct_env`. Itemization is names and types only, never values (FW-CRED7).
-fn apply_env(command: &mut Command, blueprint: &Blueprint, catalog: &ResolvedCatalog) {
+fn apply_env(
+    command: &mut Command,
+    blueprint: &Blueprint,
+    catalog: &ResolvedCatalog,
+    tmp: Option<&std::path::Path>,
+) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let built = formwork_blueprint::construct_env(
         &blueprint.env,
         catalog,
         &blueprint.allow_credentials,
+        &blueprint.channels,
         vars,
     );
     command.env_clear();
     command.envs(built.kept.iter().cloned());
+    // FW-TRA10: set after the posture ran, so no scrub or allowlist can drop it.
+    if let Some(tmp) = tmp {
+        for var in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(var, tmp);
+        }
+    }
+    if !built.locator_stripped.is_empty() {
+        tracing::info!(stripped = ?built.locator_stripped, "channel locator variables stripped (channels not lifted, FW-BP11)");
+    }
     if !built.posture_dropped.is_empty() {
         tracing::info!(count = built.posture_dropped.len(), dropped = ?built.posture_dropped, "scrubbed environment variables");
     }
@@ -1048,12 +1222,19 @@ fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Resul
         .context("building confined backend command")?;
     // The gateway is a launcher too: the backend it spawns is part of the session, so the same
     // env construction applies (FW-CRED2 env arm; FW-INV7 covers the whole tree).
-    apply_env(&mut backend, &session.blueprint, &session.catalog);
+    apply_env(
+        &mut backend,
+        &session.blueprint,
+        &session.catalog,
+        Some(&session.tmp_dir.path),
+    );
 
     tracing::info!(server = %server, backend = %program, "starting MCP gateway");
     // The async runtime lives entirely in `formwork-gateway` (constitution Layers): the CLI stays
     // synchronous and hands the confined backend over as a plain command.
-    formwork_gateway::serve_stdio(backend, policy).context("proxying MCP traffic")
+    let served = formwork_gateway::serve_stdio(backend, policy).context("proxying MCP traffic");
+    session.tmp_dir.remove();
+    served
 }
 
 #[cfg(unix)]
@@ -1062,10 +1243,11 @@ fn exec_replace(
     args: &[String],
     blueprint: &Blueprint,
     catalog: &ResolvedCatalog,
+    tmp: &std::path::Path,
 ) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(program);
     command.args(args);
-    apply_env(&mut command, blueprint, catalog);
+    apply_env(&mut command, blueprint, catalog, Some(tmp));
     command.exec()
 }
