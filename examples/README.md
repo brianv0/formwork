@@ -30,17 +30,24 @@ formwork explain --blueprint examples/blueprints/agent-session.toml   # + this b
 formwork compile --blueprint examples/blueprints/agent-session.toml --report-only   # the same, as JSON for CI
 ```
 
-On macOS (Seatbelt) fs read/write, default-deny egress, and the direct-TCP port tier are all
-enforced by the kernel. Egress is **port-scoped, not host-scoped**: `net = { ports = [443] }` allows
-any HTTPS host, so the agent reaches its model API — the filesystem sandbox, not an egress
-allowlist, is what stops secrets being read to exfiltrate in the first place. On a host that can't
+Egress is **host-scoped** in the per-agent blueprints (`claude-code.toml`, `codex.toml`,
+`opencode.toml`): every connection goes through the session Gateway, and only the hosts the
+blueprint names are reachable. On Linux this needs connect supervision (seccomp user notification
+and `pidfd_getfd`, Linux 5.6+); `formwork explain --hosts` shows the table and what this host
+enforces. `agent-session.toml` is the port-scoped fallback: `net = { ports = [443] }` allows any
+HTTPS host, so there the filesystem sandbox is what stops secrets being read to exfiltrate. On a host that can't
 enforce a capability, `formwork` reports the gap instead of pretending (it never fails open).
 
 ## Layout
 
 ```
 examples/
-  blueprints/agent-session.toml   # Axis A: confine an agent — scoped writes, secrets subtracted, HTTPS-only egress
+  blueprints/agent-base.toml      # the filesystem and environment every agent example shares
+  blueprints/claude-code.toml     # Axis A for Claude Code: host-scoped egress, login through open-url
+  blueprints/claude-code-api-key.toml  # the same with ANTHROPIC_API_KEY brokered, never held by the agent
+  blueprints/codex.toml           # Axis A for codex: host-scoped egress
+  blueprints/opencode.toml        # Axis A for opencode: host-scoped egress, one rule per provider
+  blueprints/agent-session.toml   # port-scoped fallback: any HTTPS host (hosts without host rules)
   blueprints/mcp-gateway.toml      # Axis B: gateway policy — [mcp.files] shading + backend confinement
   blueprints/rules-demo.toml       # flat verb rules (rules/mode) — same model, terser to write
   gateway-demo.sh             # runnable Axis B demo against the built-in fixture (no external deps)
@@ -118,6 +125,14 @@ formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos 
 
 # Compile a Linux policy on a Mac (or vice-versa) to review it before enforcing — pure, no kernel:
 formwork compile --blueprint examples/blueprints/rules-demo.toml --target linux-v6 --report-only
+
+# Host-scoped egress: show the host table and the layer each rule came from:
+formwork explain --blueprint examples/blueprints/claude-code.toml --hosts
+
+# Under an inspected rule, clients must trust the session CA. Most read SSL_CERT_FILE and friends,
+# which the Launcher sets; uv needs UV_NATIVE_TLS=1 to read them:
+UV_NATIVE_TLS=1 formwork run --blueprint examples/blueprints/agent-base.toml --rule "get:pypi.org" \
+  --rule "get:files.pythonhosted.org" -- uv sync
 
 # Ask why one path is granted or denied — the deciding rule and the layer it came from:
 formwork explain --blueprint examples/blueprints/rules-demo.toml '$CWD/.env'

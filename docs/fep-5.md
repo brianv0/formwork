@@ -1,18 +1,21 @@
-# FEP-5 (proposal): host-scoped egress, credential brokering, host-service channels, and process isolation on both backends
+# FEP-5 (landed): host-scoped egress, credential brokering, host-service channels, and process isolation on both backends
 
-**Formwork Enhancement Proposal 5 — proposal, not landed.** Companion to `formwork.md` (design +
-end-to-end spec), `constitution.md` (doctrine), and `docs/fep-1.md` (host-scoped egress, which this
-FEP gives a transport). Motivated by `docs/omnigent-integration-eval.md`.
+**Formwork Enhancement Proposal 5 — landed, macOS characterization owed.** Companion to
+`formwork.md` (design + end-to-end spec), `constitution.md` (doctrine), and `docs/fep-1.md`
+(host-scoped egress, which this FEP gives a transport). Motivated by
+`docs/omnigent-integration-eval.md`.
 
-**Status: nothing in this document mutates the landed spec or the constitution yet.** Per the
-constitution (Requirements & identifiers; Precedence & Conflicts), a draft lives in its FEP until
-adoption, and the landed docs stay stable. The amendments in §7 are written as apply-on-landing
-blocks for review. New identifiers are draft numbering, written as inline code so the requirements
-canary skips them, and start above the highest landed or drafted number: `FW-E2E-074` and
-`FW-ADV-015` landed; `FW-INV12` and `FW-DISC7`–`FW-DISC10` drafted or reserved by FEP-4; `FW-EGR6`
-and `FW-FID5` drafted by FEP-1. Three open PRs touch this FEP's ground and are accounted for in §2
-and §8: #28 (spec-conformance fixes), #29 (UDP/raw closure under the port tier), #30 (adversarial
-and invariant coverage).
+**Status.** Phases 0–4 are implemented on both backends, with the opener shim and host and channel
+discovery; `docs/fep-5-plan.md` records how, every departure from the text below, and what is
+still owed. The requirements stay defined here, anchored, and code cites them bare; the §7
+amendments are applied to `formwork.md`, `docs/fep-1.md`, `docs/unstated-requirements.md` and
+`constitution.md`. What remains is the macOS characterization suite (§6.3) and the macOS-only
+tests that depend on it; until it runs, the report keeps every macOS verdict it would settle at
+`Partial`. The draft-numbering note below is kept as the record of how the numbers were chosen:
+`FW-E2E-074` and `FW-ADV-015` were the highest landed; `FW-INV12` and `FW-DISC7`–`FW-DISC10` were
+drafted or reserved by FEP-4; `FW-EGR6` and `FW-FID5` were drafted by FEP-1. Three PRs touched this
+FEP's ground and are accounted for in §2 and §8: #28 (spec-conformance fixes), #29 (UDP/raw
+closure under the port tier), #30 (adversarial and invariant coverage).
 
 **Platform stance.** Each gap is closed on both backends, or the report states the difference
 (§3.6). Blueprint vocabulary is portable: no field value is a platform name, and the same blueprint
@@ -806,10 +809,10 @@ Each phase lands independently, and the report is honest at every boundary.
 
 ---
 
-## 7. Proposed amendments to the landed docs (apply on landing)
+## 7. Amendments to the landed docs
 
-None of these are applied yet. On adoption they fold into the landed documents and the draft IDs
-gain anchors.
+Applied on landing: each block below is now in the named document, and the IDs are anchored in this
+one.
 
 **(a) `formwork.md` [FW-XR7](../formwork.md#fw-xr7).** Current: "The agent reaches the gateway via
 an inherited fd. Formwork never depends on an in-sandbox `connect()` nor on the filesystem sandbox

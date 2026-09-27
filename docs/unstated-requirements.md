@@ -150,6 +150,10 @@ aarch64-apple-darwin`) but runtime-verified only on a real Mac — is exactly th
 062..064) must have an executing macOS job and an executing Linux job before a release tag; a
 platform-marked test that has never run on its platform is reported, not assumed.
 
+**Applied by FEP-5 §6.2:** CI sets `FW_REQUIRE_EXERCISED=1`, so a platform test that cannot
+exercise its mechanism on a runner fails instead of skipping, and the matrix runs two releases of
+each OS.
+
 ## 11. Learning-loop ergonomics: the artifact conventions are implementation detail
 
 "Accept seems like it could just be part of learn" generalized to: the user drives the whole
@@ -171,8 +175,9 @@ half-true:
 > Wrapper subcommands are exit-code transparent for the workload; Formwork's own failures are
 > distinguishable from the workload's.
 
-**Mint?** Worth an ID only when an embedder needs it; until then, note it as a known gap —
-pretending the contract exists already would violate item 2.
+**Minted by FEP-5** as [FW-XR10](fep-5.md#fw-xr10) (wrapper transparency: the workload's status, 128 + signal
+for a signal death) and [FW-XR11](fep-5.md#fw-xr11) (a Formwork failure after the spawn exits 125 with one
+`formwork:` line on stderr).
 
 ---
 

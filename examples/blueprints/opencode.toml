@@ -1,0 +1,21 @@
+# opencode under host-scoped egress (FEP-5). opencode talks to whichever model provider you
+# configure; the rules below name Anthropic and OpenAI plus opencode's own model catalog. Add a
+# `https:` rule per provider you use -- `formwork learn` proposes the ones a run needed.
+#
+#   formwork explain --blueprint examples/blueprints/opencode.toml --hosts
+
+extends = ["agent-base.toml"]
+
+rules = [
+    "https:api.anthropic.com",
+    "https:api.openai.com",
+    "https:models.dev",
+    "https:opencode.ai",
+]
+allow-credentials = ["anthropic", "openai"]
+channels = ["open-url"]
+env = { scrub = { allow = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] } }
+
+[fs]
+# opencode keeps its sessions, auth and caches under the XDG directories.
+writes = ["~/.local/share/opencode/**", "~/.local/state/opencode/**", "~/.cache/opencode/**", "~/.config/opencode/**"]

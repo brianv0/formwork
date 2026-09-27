@@ -54,12 +54,57 @@ fn landlock_host(dir: &Path) -> bool {
 const QUICKSTART: &str = "extends = [\"builtin:default\"]\nnet = { ports = [443] }\n\
                           rules = [\"readwrite:$CWD/**\"]\n";
 
-/// FEP-5 D1: the README quickstart starts. `builtin:default`'s any-depth write-subtract rows used
-/// to reach the Landlock builder and abort the spawn on Linux; they are withheld and reported now.
+/// The README's `toml` blocks, verbatim, in order; the first is the quickstart.
+fn readme_blueprints() -> Vec<String> {
+    let readme =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"))
+            .expect("README.md");
+    readme
+        .split("```toml\n")
+        .skip(1)
+        .map(|rest| rest[..rest.find("```").expect("the toml block closes")].to_string())
+        .collect()
+}
+
+fn readme_quickstart() -> String {
+    readme_blueprints()
+        .into_iter()
+        .next()
+        .expect("the README has a toml block")
+}
+
+/// Every blueprint the README shows loads and compiles, the brokered one included (FW-CRED12:
+/// brokering needs an inspected rule).
+#[test]
+fn every_readme_blueprint_loads() {
+    for (i, blueprint) in readme_blueprints().into_iter().enumerate() {
+        let dir = Scratch::new(&format!("readme-{i}"));
+        std::fs::write(dir.path().join("FORMWORK.toml"), &blueprint).unwrap();
+        let out = formwork(dir.path(), &["compile", "--report-only"], &[]);
+        assert_eq!(out.code, 0, "{blueprint}\n{}", out.stderr);
+    }
+}
+
+/// FEP-5 D1: the README quickstart starts, verbatim. `builtin:default`'s any-depth write-subtract
+/// rows used to reach the Landlock builder and abort the spawn on Linux; they are withheld and
+/// reported now. The quickstart stays at most five lines (FEP-5 §4).
 #[test]
 fn readme_quickstart_starts_and_reports_what_it_withholds() {
     let dir = Scratch::new("quickstart");
-    std::fs::write(dir.path().join("FORMWORK.toml"), QUICKSTART).unwrap();
+    let quickstart = readme_quickstart();
+    assert!(quickstart.lines().count() <= 5, "{quickstart}");
+    assert_eq!(
+        quickstart
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .map(|l| l.split('#').next().unwrap().trim_end())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+        QUICKSTART,
+        "the fixture the other tests use is the README's quickstart"
+    );
+    std::fs::write(dir.path().join("FORMWORK.toml"), &quickstart).unwrap();
     let run = formwork(dir.path(), &["run", "--", "/bin/sh", "-c", "exit 0"], &[]);
     assert_eq!(run.code, 0, "the quickstart must start:\n{}", run.stderr);
 
@@ -672,8 +717,14 @@ fn fw_e2e_079_isolation_tier() {
 #[test]
 fn isolation_tier_keeps_supervised_egress() {
     let dir = Scratch::new("isolate-egress");
-    if !supervision_host(dir.path()) || !isolation_host(dir.path()) || !on_path("curl") {
-        not_exercised("connect supervision, user namespaces or curl unavailable");
+    if !isolation_host(dir.path()) {
+        // Ubuntu 24.04's AppArmor restriction: the tier is refused there, which FW-E2E-079
+        // exercises; nothing to compose it with.
+        eprintln!("skipping: user namespaces unavailable; FW-E2E-079 covers the refusal");
+        return;
+    }
+    if !supervision_host(dir.path()) || !on_path("curl") {
+        not_exercised("connect supervision or curl unavailable");
         return;
     }
     let (port, hits) = http_fixture();
@@ -897,5 +948,172 @@ fn a_discovered_layer_without_provenance_for_hosts_or_channels_is_refused() {
         let out = formwork(dir.path(), &["explain", "--json"], &[]);
         assert_ne!(out.code, 0, "{forged}");
         assert!(out.stderr.contains("FW-DISC6"), "{forged}: {}", out.stderr);
+    }
+}
+
+/// FW-E2E-084 (Linux): each shipped agent blueprint starts under the baseline, and where the
+/// agent is installed, its non-interactive smoke command (`--version`) runs under `learn` with no
+/// denial to propose. The blueprints are copied out of the repo so the proposal files land in
+/// scratch.
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_e2e_084_agent_examples_under_the_baseline() {
+    let dir = Scratch::new("examples");
+    if !supervision_host(dir.path()) {
+        not_exercised("connect supervision unavailable (the agent examples use host rules)");
+        return;
+    }
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = repo.join("examples/blueprints");
+    let copy = dir.path().join("blueprints");
+    std::fs::create_dir_all(&copy).unwrap();
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().and_then(|e| e.to_str()) == Some("toml") {
+            std::fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
+        }
+    }
+    let keys = [
+        ("ANTHROPIC_API_KEY", "sk-fixture-084"),
+        ("OPENAI_API_KEY", "sk-fixture-084"),
+    ];
+    let examples = [
+        ("agent-session.toml", "claude"),
+        ("claude-code.toml", "claude"),
+        ("claude-code-api-key.toml", "claude"),
+        ("codex.toml", "codex"),
+        ("opencode.toml", "opencode"),
+    ];
+    for (file, agent) in examples {
+        let blueprint = copy.join(file);
+        let blueprint = blueprint.to_str().unwrap();
+        let started = formwork(
+            dir.path(),
+            &[
+                "run",
+                "--blueprint",
+                blueprint,
+                "--",
+                "/bin/sh",
+                "-c",
+                "echo started",
+            ],
+            &keys,
+        );
+        assert_eq!(started.code, 0, "{file}: {}", started.stderr);
+        assert_eq!(started.stdout, "started\n", "{file}");
+        if !on_path(agent) || !on_path("strace") {
+            eprintln!("{file}: {agent} or strace not installed; the smoke command is skipped");
+            continue;
+        }
+        let smoke = formwork(
+            dir.path(),
+            &["learn", "--blueprint", blueprint, "--", agent, "--version"],
+            &keys,
+        );
+        assert_eq!(smoke.code, 0, "{file}: {}", smoke.stderr);
+        assert!(
+            smoke.stdout.contains("(0 candidates"),
+            "{file}: `{agent} --version` was denied something: {}\n{}",
+            smoke.stdout,
+            smoke.stderr
+        );
+    }
+}
+
+/// FW-E2E-087 (Linux): host-session detection. With an empty runtime directory and no bus address
+/// the session-bus channel reports its facility absent; with a fixture `dbus-daemon` in the runtime
+/// directory `detect` names its socket, the report says `Partial` without host rules and
+/// `Enforced` under supervised connect. With `Xvfb` on the runner, the display socket is named too.
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_e2e_087_host_session_detection() {
+    let dir = Scratch::new("detect");
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\"]\n",
+    )
+    .unwrap();
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let rt = runtime.to_str().unwrap().to_string();
+    let explain = |extra: &[&str]| -> serde_json::Value {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_formwork"));
+        cmd.args(["explain", "--json"])
+            .args(extra)
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .env("XDG_RUNTIME_DIR", &rt)
+            .env_remove("DBUS_SESSION_BUS_ADDRESS");
+        let out = cmd.output().unwrap();
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("explain: {}", String::from_utf8_lossy(&out.stderr)))
+    };
+    let bare = explain(&[]);
+    assert_eq!(
+        bare["report"]["channels"]["run-outside"]["host"]["present"], false,
+        "{}",
+        bare["report"]["channels"]["run-outside"]
+    );
+    assert_eq!(
+        bare["report"]["channels"]["microphone"]["host"]["present"],
+        false
+    );
+
+    if !on_path("dbus-daemon") {
+        not_exercised("dbus-daemon unavailable");
+        return;
+    }
+    let bus = runtime.join("bus");
+    let mut daemon = Command::new("dbus-daemon")
+        .args(["--session", "--nofork", "--address"])
+        .arg(format!("unix:path={}", bus.display()))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !bus.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let with_bus = explain(&[]);
+    let supervised = supervision_host(dir.path());
+    let under_rules = explain(&["--set", "rules = [\"https:127.0.0.1:9\"]"]);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let channel = &with_bus["report"]["channels"]["run-outside"]["host"];
+    assert_eq!(channel["present"], true, "{channel}");
+    assert_eq!(channel["via"], bus.display().to_string(), "{channel}");
+    assert_eq!(
+        with_bus["report"]["per-capability"]["channel-run-outside"]["status"],
+        "partial"
+    );
+    if supervised {
+        let line = &under_rules["report"]["per-capability"]["channel-run-outside"];
+        assert_eq!(line["status"], "enforced", "{line}");
+        assert_eq!(line["backend"], "supervisor", "{line}");
+    }
+
+    if on_path("Xvfb") {
+        let display = 90 + (std::process::id() % 9) as usize;
+        let socket = PathBuf::from(format!("/tmp/.X11-unix/X{display}"));
+        let mut xvfb = Command::new("Xvfb")
+            .arg(format!(":{display}"))
+            .args(["-nolisten", "tcp"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !socket.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let with_display = explain(&[]);
+        let _ = xvfb.kill();
+        let _ = xvfb.wait();
+        let clipboard = &with_display["report"]["channels"]["clipboard"]["host"];
+        assert_eq!(clipboard["present"], true, "{clipboard}");
+    } else {
+        not_exercised("Xvfb unavailable");
     }
 }

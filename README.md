@@ -37,8 +37,9 @@ Or build from source: `cargo install --path crates/formwork-cli`.
 
 ## Quickstart
 
-Drop a `FORMWORK.toml` in your project — every subcommand finds it automatically (current
-directory, then parents up to `$HOME`) and announces which file it used:
+Drop a `FORMWORK.toml` in your project (or `.formwork/blueprint.toml`, which keeps Formwork's own
+files in one directory) — every subcommand finds it automatically (current directory, then parents
+up to `$HOME`) and announces which file it used:
 
 ```toml
 # FORMWORK.toml — extend the built-in default profile (broad reads, credentials and other
@@ -61,7 +62,19 @@ formwork explain ~/.ssh/id_ed25519 '$CWD/src/main.rs'
 
 The sandbox holds for the whole process tree — a `git` or `python` the agent spawns hits the same
 walls. Denials surface as ordinary `EACCES`/`EPERM`, credentials stay unreadable even under broad
-read grants, and a deny always beats an allow, from any layer.
+read grants, and a deny always beats an allow, from any layer. Host services that could act for
+the agent outside the sandbox — the clipboard, opening URLs, the session bus, AppleEvents — are
+closed unless the blueprint lifts them with `channels`.
+
+To reach named hosts only, write host rules instead of the port tier. Every connection then goes
+through a Gateway that Formwork runs outside the sandbox, and an API key can be *brokered*: the
+agent holds a placeholder, and the Gateway presents the real key to that host alone.
+
+```toml
+extends = ["builtin:default"]
+rules = ["readwrite:$CWD/**", "any:api.anthropic.com"]   # this host only, through the Gateway
+allow-credentials = ["broker:anthropic"]                 # the agent sees a placeholder, never the key
+```
 
 `formwork learn` runs a workload enforced while recording what the kernel denied, then
 proposes grants for review — nothing is widened until you accept it:
@@ -81,6 +94,9 @@ and wiring for Claude Code, codex, and opencode.
 |---|---|---|
 | Filesystem read/write walls (`run`, `gateway`) | ✅ Seatbelt | ✅ Landlock + seccomp (kernel 5.13+) |
 | Default-deny network, port tier | ✅ | ✅ (best on kernel 6.7+) |
+| Host-scoped egress through the Gateway, TLS inspection, credential brokering | ✅ | ✅ (kernel 5.6+, Yama `ptrace_scope` 0 or 1) |
+| Host-service channels closed by default (`channels`) | ✅ | ✅ (sockets closed under host rules; hidden otherwise) |
+| Process isolation (`isolate = ["processes", "ipc"]`) | partial (sandbox filters) | ✅ where unprivileged user namespaces are allowed |
 | Exec allow-lists | ✅ | ✅ |
 | MCP gateway shading | ✅ | ✅ |
 | `learn` (denial observation) | ✅ unified-log feed | ✅ ptrace feed (needs `strace` installed; fails fast with the reason otherwise) |

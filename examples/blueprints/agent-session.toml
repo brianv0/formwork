@@ -1,23 +1,22 @@
 # Sandbox for an interactive coding agent (Claude Code / codex / opencode) launched under
-# `formwork run`. The kernel — not the agent's own permission prompts — is the wall, which is what
-# makes it safe to hand the agent its "skip every prompt" flag (see each host's README).
+# `formwork run`, with PORT-scoped egress. The kernel -- not the agent's own permission prompts --
+# is the wall, which is what makes it safe to hand the agent its "skip every prompt" flag.
 #
-# Based on profiles/default.toml, adapted for one interactive agent: it deliberately WIDENS the
-# default in the axes this agent needs -- :443 egress for the model API, this agent's own ~/.claude
-# kept writable, and two model-API-key env vars re-admitted -- while every other secret stays denied.
-# `~` expands against $HOME when the CLI loads the blueprint. Narrowing a grant is always safe; these
-# widenings are deliberate, so review them before use.
+# Prefer the host-scoped blueprint for your agent (`claude-code.toml`, `codex.toml`,
+# `opencode.toml`): there every connection goes through the session Gateway and only the named
+# hosts are reachable. This one is for hosts that cannot carry host rules (Linux without connect
+# supervision), and it stays the portable baseline the docs' recipes build on.
 #
-#   reads   the whole ambient environment MINUS the compiled-in credential floor (keys, cloud
-#           creds, keychains, browser profiles -- profiles/credential-catalog.toml).
-#   writes  one project tree + scratch. Point this at your repo.
-#   net     HTTPS egress only, so the agent still reaches its model API. This is port-scoped, not
-#           host-scoped: formwork does not (yet) allowlist egress by host, so treat :443 as "any
-#           HTTPS host". The fs sandbox is what stops secrets being read to exfiltrate at all.
-#   exec    unrestricted, so the agent runs tools freely; set an allowlist to restrict execve.
+# On top of `agent-base.toml` it deliberately WIDENS in the axes one agent needs -- :443 egress for
+# the model API, this agent's own ~/.claude kept writable, and two model-API-key env vars
+# re-admitted -- while every other secret stays denied. Review these widenings before use.
+#
+#   net     HTTPS egress only. This is port-scoped, not host-scoped: treat :443 as "any HTTPS
+#           host". The fs sandbox is what stops secrets being read to exfiltrate at all.
+
+extends = ["agent-base.toml"]
 
 net = { ports = [443] }
-exec = "unrestricted"
 # Scrub secret-shaped env vars but keep the model auth the agent needs. Egress is open
 # to any HTTPS host, so this stops e.g. AWS_SECRET_ACCESS_KEY being exfiltrated via the environment.
 env = { scrub = { allow = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] } }
@@ -28,21 +27,5 @@ env = { scrub = { allow = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] } }
 allow-credentials = ["anthropic", "claude"]
 
 [fs]
-read-mode = "ambient-minus-subtract"
-reads = ["/**"]
-# project + scratch + this agent's own state dir, so Claude can persist history/settings/auth.
-writes = ["~/project/**", "~/.claude/**", "/tmp/**", "/private/tmp/**", "/var/tmp/**"]
-# Credential locations are NOT listed here: the compiled-in catalog floor denies them all under
-# every blueprint, minus exactly the `allow-credentials` above. Add project-specific
-# denies here if you need them; credential locations belong in the catalog.
-subtract = []
-
-# Tamper vectors: write-denied but readable, so the agent can't plant a git hook / .mcp.json / IDE
-# task that later runs unsandboxed, yet git and tooling still read them.
-write-subtract = [
-    "**/.git/hooks/**",
-    "**/.git/config",
-    "**/.mcp.json",
-    "**/.vscode/**",
-    "**/.idea/**",
-]
+# This agent's own state dir, so Claude can persist history/settings/auth.
+writes = ["~/.claude/**"]

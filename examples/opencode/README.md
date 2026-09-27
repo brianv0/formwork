@@ -7,18 +7,19 @@ tool). Setting `permission: "allow"` (or launching with `--auto`) removes the co
 under `formwork run` and the kernel wall — not the in-app prompt — is what scopes the process:
 
 ```sh
-formwork run --blueprint ./examples/blueprints/agent-session.toml -- opencode
+formwork run --blueprint ./examples/blueprints/opencode.toml -- opencode
 ```
 
 with `permission: "allow"` set in [`opencode.json`](./opencode.json). `./sandbox-agent.sh` runs
 this (and prints the enforced-capability report first). For a headless one-shot:
 
 ```sh
-formwork run --blueprint ./examples/blueprints/agent-session.toml -- opencode run --auto "summarize the build"
+formwork run --blueprint ./examples/blueprints/opencode.toml -- opencode run --auto "summarize the build"
 ```
 
 The blueprint grants writes to `~/project` + scratch, subtracts credentials/keychains/browser profiles,
-and allows only HTTPS egress so the model API still works. Narrow `writes` to your repo.
+and reaches only the model providers it names, through the session Gateway. Add a `https:` rule
+per provider you use, or let `formwork learn` propose them. Narrow `writes` to your repo.
 
 ## Axis B — route MCP servers through the gateway
 

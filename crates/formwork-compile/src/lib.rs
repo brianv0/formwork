@@ -818,8 +818,9 @@ fn linux_channel_fidelity(
     let unmediated = |what: &str| Fidelity::Partial {
         backend: Backend::Launcher,
         reason: format!(
-            "{what} is reachable by pathname connect() without host rules; its locator variables \
-             are stripped (FW-BP11), which hides it from well-behaved clients but does not close it"
+            "pathname connect() reaches {what} without host rules; the locator variables are \
+             stripped (FW-BP11), which hides the socket from well-behaved clients but does not \
+             close it"
         ),
     };
     match channel {

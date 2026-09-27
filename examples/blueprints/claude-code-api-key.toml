@@ -1,0 +1,19 @@
+# Claude Code with an API key, brokered (FEP-5 §3.2). The agent's ANTHROPIC_API_KEY is a per-session
+# placeholder; the Gateway terminates TLS for api.anthropic.com (the `any:` rule inspects it),
+# swaps in the real key on that host only, and refuses the placeholder anywhere else. Node reads the
+# session CA through NODE_EXTRA_CA_CERTS, which the Launcher sets.
+#
+# The run is refused before it starts if ANTHROPIC_API_KEY is not set in the launching shell.
+
+extends = ["agent-base.toml"]
+
+rules = [
+    "any:api.anthropic.com",
+    "https:statsig.anthropic.com",
+    "https:sentry.io",
+]
+allow-credentials = ["claude", "broker:anthropic"]
+env = { scrub = {} }
+
+[fs]
+writes = ["~/.claude/**"]

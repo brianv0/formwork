@@ -53,7 +53,11 @@ jobs:
         # workload's denial must survive unified-log persistence latency) via Seatbelt +
         # `log show`; Linux FW-E2E-071 (the same millisecond shape) via Landlock + the strace
         # ptrace feed.
-        os: [ubuntu-22.04, macos-14]
+        #
+        # FEP-5 §6.2: ubuntu-24.04 restricts unprivileged user namespaces through AppArmor, so the
+        # `isolate` refusal path runs on a real runner beside 22.04's working tier; macos-15 beside
+        # macos-14 because Seatbelt service names and sysctl behavior change across releases.
+        os: [ubuntu-22.04, ubuntu-24.04, macos-14, macos-15]
     steps:
       - uses: actions/checkout@v4
 
@@ -64,15 +68,26 @@ jobs:
       # The Linux learn feed (FW-E2E-071) traces the workload with strace; installing it here is
       # what lets the ubuntu job EXECUTE the ptrace-feed tests instead of skipping them -- a
       # platform-marked test that never runs on its platform is a claim, not a verification.
-      - name: Install strace (Linux denial feed)
+      # strace: the Linux learn feed. dbus, glib's gdbus and Xvfb: the session-bus and display
+      # fixtures the channel tests connect to (FW-E2E-082, FW-E2E-087). curl: the egress probes.
+      # Distribution packages, not actions.
+      - name: Install Linux test fixtures
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y strace
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y strace dbus libglib2.0-bin xvfb curl
 
       - name: Build
         run: cargo build --workspace --locked
 
+      # FW_REQUIRE_EXERCISED: a platform test that cannot exercise its mechanism on a CI runner
+      # fails instead of skipping (FEP-5 §6.1) -- a skipped platform test is a claim, not a
+      # verification. It also covers the README quickstart (D1) and the agent examples starting
+      # under the baseline (FW-E2E-084).
       - name: Test
         run: cargo test --workspace --locked
+        env:
+          FW_REQUIRE_EXERCISED: "1"
 
       # The Python black-box harness drives the built `formwork` binary at the outermost real
       # boundary; platform-inappropriate tests skip via markers (macOS Seatbelt vs Linux Landlock),
@@ -106,6 +121,29 @@ jobs:
       # @modelcontextprotocol/server-everything and drives it through the gateway with a regex policy.
       - name: Regex shading against a real MCP server
         run: cargo test -p formwork-gateway --test real_server --locked -- --ignored --nocapture
+
+  # FW-E2E-084 with a real agent: install Claude Code from npm (network, like mcp-integration) and
+  # run its non-interactive smoke command under `learn` with each shipped Claude blueprint; the run
+  # must propose nothing, i.e. the example's lift set covers what the agent needed.
+  agent-examples:
+    name: agent examples (Claude Code)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-prefix: agents
+
+      - name: Install strace and Claude Code
+        run: |
+          sudo apt-get update && sudo apt-get install -y strace
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Agent examples under the baseline
+        run: cargo test -p formwork-cli --test fep5_run --locked fw_e2e_084 -- --nocapture
+        env:
+          FW_REQUIRE_EXERCISED: "1"
 
   # Enforce the declared MSRV (Cargo.toml `rust-version`). Without this the pin is documentation
   # only: every other job uses stable, so post-1.85 code could merge green while violating it.

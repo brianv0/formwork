@@ -1,0 +1,19 @@
+# codex under host-scoped egress (FEP-5): only the OpenAI API and its sign-in hosts are reachable,
+# through the session Gateway. `codex` keeps its own ~/.codex state; `openai` admits
+# OPENAI_API_KEY for API-key sign-in (drop it if you sign in with ChatGPT).
+#
+#   formwork explain --blueprint examples/blueprints/codex.toml --hosts
+
+extends = ["agent-base.toml"]
+
+rules = [
+    "https:api.openai.com",
+    "https:chatgpt.com",
+    "https:auth.openai.com",
+]
+allow-credentials = ["codex", "openai"]
+channels = ["open-url"]
+env = { scrub = { allow = ["OPENAI_API_KEY"] } }
+
+[fs]
+writes = ["~/.codex/**"]

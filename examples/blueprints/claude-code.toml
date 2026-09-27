@@ -1,0 +1,30 @@
+# Claude Code under host-scoped egress (FEP-5). Every connection goes through the session Gateway;
+# only the hosts below are reachable, and a direct socket to anything else is refused by the
+# kernel-side supervisor (Linux) or the sandbox profile (macOS). Check what this host enforces:
+#
+#   formwork explain --blueprint examples/blueprints/claude-code.toml --hosts
+#
+# Login: `claude` opens a browser for the OAuth flow. `desktop` lifts `open-url` (the URL is handed
+# to your browser outside the session, http(s) only) and the clipboard. The callback listener on
+# localhost is allowed under every posture.
+#
+# With an API key instead of the login, use `claude-code-api-key.toml`: the key is brokered, so the
+# agent never holds it.
+
+extends = ["agent-base.toml"]
+
+rules = [
+    "https:api.anthropic.com",
+    "https:console.anthropic.com",
+    "https:claude.ai",
+    "https:statsig.anthropic.com",
+    "https:sentry.io",
+]
+# `claude` lets THIS agent read and write its own ~/.claude state; every other catalog type --
+# aws, ssh, other agents' state, ... -- stays denied and stripped.
+allow-credentials = ["claude"]
+channels = ["desktop"]
+env = { scrub = {} }
+
+[fs]
+writes = ["~/.claude/**"]

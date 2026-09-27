@@ -9,14 +9,14 @@ that leaves nothing scoping the process. Run codex under `formwork run` and Form
 takes over that job:
 
 ```sh
-formwork run --blueprint ./examples/blueprints/agent-session.toml -- \
+formwork run --blueprint ./examples/blueprints/codex.toml -- \
     codex --dangerously-bypass-approvals-and-sandbox
 ```
 
 `./sandbox-agent.sh` runs exactly this. For a one-shot, headless run use `codex exec`:
 
 ```sh
-formwork run --blueprint ./examples/blueprints/agent-session.toml -- \
+formwork run --blueprint ./examples/blueprints/codex.toml -- \
     codex exec --dangerously-bypass-approvals-and-sandbox "summarize the build"
 ```
 
