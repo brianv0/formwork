@@ -885,7 +885,7 @@ the requirement tests below depend on it.
   - if characterization found the peer check unreliable, the report is `Partial` and names this
     residual.
 - `FW-ADV-020` **Exfiltration through a host service (both).** Under
-  ``rules = ["https:allowed.test"]``, the agent tries to send a nonce to the `blocked.test`
+  `rules = ["https:allowed.test"]`, the agent tries to send a nonce to the `blocked.test`
   fixture through each channel:
   - `open` of the fixture app with a URL argument;
   - an AppleEvent;
