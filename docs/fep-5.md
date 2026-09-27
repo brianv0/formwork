@@ -958,8 +958,20 @@ Conditional on the characterization suite confirming the **(characterize)** mark
     - **path**: optional after the host, a glob over the canonicalized path without query: `*`
       matches one segment, `**` any depth, `?` one character; absent means `/**`. The same grammar
       Omnigent uses, so its `"GET,POST host/path"` rules translate by moving the space to a colon.
-    - Two rules for the same host union; a `deny:` for the host is terminal. An HTTP-method rule
-      makes the host inspected (TLS terminated at the Gateway); `https:` alone does not.
+    - **One host, one grade; no inference.** The unveil discipline applied to hosts: every host
+      resolves to exactly one of *tunnel* (`https:`) or *inspected* (method verbs), and nothing
+      changes a host's grade behind the operator's back.
+      - Two rules at the same grade for one host union (two method rules, or two `https:`).
+      - A plain rule and a method rule that both match a host — directly or through a wildcard —
+        are a compile error naming both lines. Otherwise the plain rule would admit everything and
+        the path rule would be decoration.
+      - `deny:host` is terminal. `deny:host/path` needs the inspected grade; on a tunnel host it is
+        a compile error, never a silent no-op.
+      - `broker:<type>` requires an inspected rule for each bound host; the error names the line to
+        add (`any:api.github.com/**`). An earlier draft promoted the host silently.
+      - `net = { ports = [...] }` with any host rule is a compile error (FEP-1).
+      - `formwork explain --net` prints the resolved table, one host per line with its grade,
+        methods, paths, broker binding and deciding layer — the view of "what exists".
     - **The verb names the layer that enforces it**, and the report follows from that:
 
       | Rule form | Layer | Enforced by | Verdict |
