@@ -56,6 +56,10 @@ pub struct LinuxPolicy {
     /// numbered (`/dev/video0`); matched against directory entries during expansion only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub withhold_device_prefixes: Vec<String>,
+    /// Pathname UNIX sockets the supervisor admits besides those bound inside the session
+    /// (FW-ISO12): literal write grants and the sockets of lifted channels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unix_socket_grants: Vec<PathPattern>,
     /// The isolation tier (FW-ISO10), applied before Landlock and seccomp.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub isolate: Vec<formwork_blueprint::IsolateMember>,
@@ -73,6 +77,11 @@ pub enum LinuxNetPlan {
     /// governs which TCP ports connect, and direct UDP/raw egress fails closed. Nothing inside the
     /// sandbox resolves names under this plan; host rules restore resolution through the Gateway.
     LandlockTcpSeccompDgramRawDeny { ports: Vec<u16> },
+    /// The host-allowlist posture (FW-EGR7): inet STREAM sockets may be created, but every
+    /// `connect()` (and every addressed `sendto`) is delivered to the supervisor in the spawning
+    /// process, which performs the allowed ones itself -- only the session's Gateway listener and
+    /// admitted pathname sockets. UDP and raw stay seccomp-denied (FW-ISO11).
+    SupervisedConnect,
 }
 
 impl LinuxNetPlan {
@@ -108,6 +117,10 @@ pub struct SeccompPlan {
     /// `SOCK_NONBLOCK`/`SOCK_CLOEXEC` cannot evade it) while allowing STREAM (FW-ISO11).
     #[serde(default)]
     pub deny_inet_dgram_raw: bool,
+    /// Deliver `connect()` and addressed `sendto()` to the supervisor via seccomp user
+    /// notification (FW-EGR7). The confiner refuses to spawn without a supervisor when set.
+    #[serde(default)]
+    pub supervise_connect: bool,
     /// Deny new user namespaces (`CLONE_NEWUSER`, `setns`), which would hand back capabilities the
     /// baseline is removing. A flag because it is an argument-conditioned rule, not a whole deny.
     pub restrict_userns: bool,
@@ -137,4 +150,8 @@ pub struct MacosPolicy {
 pub struct GatewayPolicy {
     pub servers: std::collections::BTreeMap<String, McpPolicy>,
     pub direct_tcp_ports: Vec<u16>,
+    /// The host table the Gateway's egress listener enforces (FW-EGR1); `None` when the net
+    /// posture is not host-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<formwork_blueprint::HostTable>,
 }

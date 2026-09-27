@@ -44,6 +44,7 @@ fn formwork(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn landlock_host(dir: &Path) -> bool {
     let out = formwork(dir, &["explain", "--json"], &[]);
     let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
@@ -284,4 +285,205 @@ fn explain_names_the_channel_verdict_and_deciding_layer() {
         "an unknown channel fails at parse listing the valid names: {}",
         bad.stderr
     );
+}
+
+#[cfg(target_os = "linux")]
+/// Skip with a reason locally; in CI (`FW_REQUIRE_EXERCISED=1`) a test that could not exercise its
+/// mechanism fails instead (FEP-5 §6.1).
+fn not_exercised(reason: &str) {
+    if std::env::var("FW_REQUIRE_EXERCISED").as_deref() == Ok("1") {
+        panic!("not exercised on a CI runner: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
+#[cfg(target_os = "linux")]
+fn on_path(tool: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn supervision_host(dir: &Path) -> bool {
+    let out = formwork(dir, &["explain", "--json"], &[]);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    v["host"]["connect-supervision"].as_bool() == Some(true)
+}
+
+#[cfg(target_os = "linux")]
+/// A loopback HTTP upstream that answers every request with `upstream-ok` and counts connections.
+fn http_fixture() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = count.clone();
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nupstream-ok\n",
+            );
+        }
+    });
+    (port, count)
+}
+
+/// FW-E2E-075 (Linux, through `run`): with a host rule, a request through the Gateway reaches the
+/// upstream; the same request with the proxy bypassed is refused by the supervisor; a host no rule
+/// names is refused by the Gateway with a generic 403, and the operator channel names the refusal.
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_e2e_075_run_routes_egress_through_the_gateway() {
+    let dir = Scratch::new("egress");
+    if !supervision_host(dir.path()) || !on_path("curl") {
+        not_exercised("connect supervision or curl unavailable");
+        return;
+    }
+    let (port, hits) = http_fixture();
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        format!(
+            "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:{port}\"]\n"
+        ),
+    )
+    .unwrap();
+    let url = format!("http://127.0.0.1:{port}/");
+    let via = formwork(
+        dir.path(),
+        &["run", "--", "curl", "-sS", "-m", "5", &url],
+        &[],
+    );
+    assert_eq!(via.code, 0, "{}", via.stderr);
+    assert_eq!(
+        via.stdout, "upstream-ok\n",
+        "stdout is the workload's alone (FW-XR10)"
+    );
+
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    let bypass = formwork(
+        dir.path(),
+        &[
+            "run",
+            "--",
+            "curl",
+            "-sS",
+            "-m",
+            "5",
+            "--noproxy",
+            "*",
+            &url,
+        ],
+        &[],
+    );
+    assert_ne!(bypass.code, 0, "a direct connect must fail");
+    assert!(
+        bypass.stderr.contains("refused connect"),
+        "the supervisor names the refusal: {}",
+        bypass.stderr
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        before,
+        "the bypass never reached the upstream"
+    );
+
+    let other = formwork(
+        dir.path(),
+        &["run", "--", "curl", "-sS", "-m", "5", "http://127.0.0.2:9/"],
+        &[],
+    );
+    assert!(
+        other.stdout.contains("denied by formwork policy"),
+        "{}",
+        other.stdout
+    );
+    assert!(
+        other
+            .stderr
+            .contains("formwork explain http://127.0.0.2:9/"),
+        "the refusal names its reproduction (FW-FID9): {}",
+        other.stderr
+    );
+}
+
+/// FW-E2E-086 (first half, FW-XR10): `run` exits with the workload's status and writes nothing of
+/// its own to stdout.
+#[test]
+fn fw_e2e_086_run_exits_with_the_workload_status() {
+    let dir = Scratch::new("exit");
+    std::fs::write(dir.path().join("FORMWORK.toml"), QUICKSTART).unwrap();
+    let out = formwork(dir.path(), &["run", "--", "/bin/sh", "-c", "exit 3"], &[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(out.stdout, "");
+}
+
+/// FW-E2E-082 (Linux, run-outside): against a session bus started for the test, a confined
+/// `gdbus call` is refused under host rules (supervised connect) and succeeds once `run-outside` is
+/// lifted, which also re-admits DBUS_SESSION_BUS_ADDRESS. The control call runs unconfined first.
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_e2e_082_session_bus_is_closed_until_run_outside_is_lifted() {
+    let dir = Scratch::new("dbus");
+    if !supervision_host(dir.path()) || !on_path("dbus-daemon") || !on_path("gdbus") {
+        not_exercised("connect supervision, dbus-daemon or gdbus unavailable");
+        return;
+    }
+    let bus = dir.path().join("bus");
+    let address = format!("unix:path={}", bus.display());
+    let mut daemon = Command::new("dbus-daemon")
+        .args(["--session", "--nofork", "--address", &address])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !bus.exists() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let call = [
+        "gdbus",
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.DBus",
+        "--object-path",
+        "/org/freedesktop/DBus",
+        "--method",
+        "org.freedesktop.DBus.ListNames",
+    ];
+    let control = Command::new(call[0])
+        .args(&call[1..])
+        .env("DBUS_SESSION_BUS_ADDRESS", &address)
+        .output()
+        .unwrap();
+    assert!(control.status.success(), "control: the bus is live");
+
+    let base =
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:9\"]\n";
+    std::fs::write(dir.path().join("FORMWORK.toml"), base).unwrap();
+    let env = [("DBUS_SESSION_BUS_ADDRESS", address.as_str())];
+    let mut args = vec!["run", "--"];
+    args.extend(call);
+    let denied = formwork(dir.path(), &args, &env);
+    let mut lifted_args = vec!["run", "--set", "channels = [\"run-outside\"]", "--"];
+    lifted_args.extend(call);
+    let lifted = formwork(dir.path(), &lifted_args, &env);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    assert_ne!(
+        denied.code, 0,
+        "the bus must be unreachable: {}",
+        denied.stdout
+    );
+    assert_eq!(
+        lifted.code, 0,
+        "run-outside lifts the bus: {}",
+        lifted.stderr
+    );
+    assert!(lifted.stdout.contains("org.freedesktop.DBus"));
 }

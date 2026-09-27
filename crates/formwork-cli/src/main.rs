@@ -154,7 +154,13 @@ enum Cmd {
         /// Machine-readable JSON instead of the human rendering.
         #[arg(long)]
         json: bool,
-        /// Paths to explain. Sigils `~`/`$CWD` expand as in a grant; a bare relative path
+        /// Print the resolved host table: one host rule per line with its grade, methods, paths,
+        /// and the layer that wrote it (FW-FID11). (`--net` is the net-posture override every
+        /// blueprint-taking subcommand already accepts.)
+        #[arg(long)]
+        hosts: bool,
+        /// Paths to explain; a `scheme://` URL explains egress to it, and a channel or group name
+        /// (`clipboard`, `desktop`) explains that channel. Sigils `~`/`$CWD` expand as in a grant; a bare relative path
         /// resolves against the current directory, so `explain ./credentials` just works.
         paths: Vec<String>,
     },
@@ -333,6 +339,7 @@ impl BlueprintArgs {
             discovery: Default::default(),
             channels: None,
             isolate: Vec::new(),
+            hosts: Vec::new(),
         })
     }
 }
@@ -541,8 +548,9 @@ fn main() -> Result<()> {
         Cmd::Explain {
             blueprint,
             json,
+            hosts,
             paths,
-        } => explain(blueprint, paths, json)?,
+        } => explain(blueprint, paths, json, hosts)?,
     }
     Ok(())
 }
@@ -581,7 +589,10 @@ fn attach_blueprint_info(value: &mut serde_json::Value, resolved: &ResolvedBluep
 /// policy-input write-protection) are not applied -- explain reflects the blueprint, not a run.
 /// With no path, summarizes the session instead: host capabilities plus the merged blueprint's
 /// fidelity report (host-only when no blueprint exists) -- the human door `detect`'s JSON never was.
-fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
+fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> Result<()> {
+    if hosts {
+        return explain_net(&args, json);
+    }
     if paths.is_empty() {
         return explain_summary(&args, json);
     }
@@ -600,7 +611,12 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
     // the machine shape stays stable (FW-CRED7).
     let mut rows = Vec::new();
     let mut channel_rows = Vec::new();
+    let mut url_rows = Vec::new();
     for arg in &paths {
+        if arg.contains("://") {
+            url_rows.push(explain_url(&blueprint, &provenance, arg)?);
+            continue;
+        }
         // Typed by shape (FW-FID11): a channel or group name is a channel, anything else a path.
         if let Some(channel) = formwork_blueprint::Channel::from_name(arg) {
             channel_rows.push(provenance.explain_channel(channel));
@@ -667,6 +683,9 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
         if !channel_rows.is_empty() {
             value["channels"] = serde_json::to_value(&channel_rows)?;
         }
+        if !url_rows.is_empty() {
+            value["egress"] = serde_json::to_value(&url_rows)?;
+        }
         attach_blueprint_info(&mut value, &resolved);
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
@@ -684,7 +703,189 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
         for channel in &channel_rows {
             print!("{}", render::channel_explanation(channel, &report));
         }
+        for url in &url_rows {
+            print!("{}", render::egress_explanation(url));
+        }
     }
+    Ok(())
+}
+
+/// One URL's egress verdict (FW-FID11): the host's grade, which methods the path admits, the
+/// deciding rule and the layer that wrote it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct EgressExplanation {
+    pub url: String,
+    pub host: String,
+    pub port: u16,
+    /// `tunnel`, `inspected`, or `denied`.
+    pub grade: &'static str,
+    /// Per HTTP method on an inspected host: admitted or not, and the deciding rule.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<MethodVerdict>,
+    pub rule: Option<String>,
+    pub source: Option<formwork_blueprint::RuleSource>,
+    pub reason: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct MethodVerdict {
+    pub method: String,
+    pub admitted: bool,
+    pub rule: Option<String>,
+}
+
+fn explain_url(
+    blueprint: &Blueprint,
+    provenance: &formwork_blueprint::Provenance,
+    url: &str,
+) -> Result<EgressExplanation> {
+    use formwork_blueprint::{EgressDecision, HttpMethod};
+    let (scheme, rest) = url.split_once("://").expect("caller checked");
+    let default_port = match scheme {
+        "https" => 443,
+        "http" => 80,
+        other => bail!("explain takes http:// or https:// URLs, not {other}://"),
+    };
+    let (authority, raw_path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (raw_host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !h.ends_with(']') || authority.starts_with('[') => (
+            h.to_string(),
+            p.parse::<u16>().with_context(|| format!("port in {url}"))?,
+        ),
+        _ => (authority.to_string(), default_port),
+    };
+    let host =
+        formwork_blueprint::canonicalize_host(&raw_host).map_err(|e| anyhow!("{url}: {e}"))?;
+    let path = formwork_blueprint::canonicalize_request_path(raw_path)
+        .map_err(|e| anyhow!("{url}: {e}"))?;
+    let empty = formwork_blueprint::HostTable::default();
+    let table = blueprint.net.host_table().unwrap_or(&empty);
+    let source_of = |rule: &Option<formwork_blueprint::HostRule>| {
+        rule.as_ref()
+            .and_then(|r| provenance.host_rule_source(r).cloned())
+    };
+    let mut out = EgressExplanation {
+        url: url.to_string(),
+        host: host.to_string(),
+        port,
+        grade: "denied",
+        methods: Vec::new(),
+        rule: None,
+        source: None,
+        reason: None,
+    };
+    if blueprint.net.host_table().is_none() {
+        out.reason = Some(match &blueprint.net {
+            formwork_blueprint::NetPosture::Ports(p) => format!(
+                "the net posture is a direct port tier ({p:?}): any host on those ports, no \
+                 Gateway, no host scoping"
+            ),
+            _ => "the net posture is deny: no egress at all".to_string(),
+        });
+        return Ok(out);
+    }
+    match table.decide_connect(&host, port) {
+        EgressDecision::Tunnel { rule } => {
+            out.grade = "tunnel";
+            out.source = source_of(&Some(rule.clone()));
+            out.rule = Some(rule.to_string());
+            out.reason = Some(
+                "admitted at CONNECT by host and port; the request itself is opaque (FW-EGR5)"
+                    .to_string(),
+            );
+        }
+        EgressDecision::Inspect => {
+            out.grade = "inspected";
+            for m in HttpMethod::ALL {
+                let d = table.decide_request(&host, port, Some(m), &path);
+                let (admitted, rule) = match d {
+                    EgressDecision::Allow { rule } => (true, Some(rule)),
+                    EgressDecision::Deny { rule, .. } => (false, rule),
+                    _ => (false, None),
+                };
+                out.methods.push(MethodVerdict {
+                    method: m.atom().to_ascii_uppercase(),
+                    admitted,
+                    rule: rule.map(|r| r.to_string()),
+                });
+            }
+        }
+        EgressDecision::Deny { reason, rule } => {
+            out.source = source_of(&rule);
+            out.rule = rule.map(|r| r.to_string());
+            out.reason = Some(reason);
+        }
+        EgressDecision::Allow { .. } => {}
+    }
+    Ok(out)
+}
+
+/// `explain --hosts` (FW-FID11): every host rule once, with its grade and the layer that wrote it.
+fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
+    let resolved = args.resolve()?;
+    let (blueprint, provenance) = args.load_with_provenance(&resolved.path, &home())?;
+    let rules: Vec<serde_json::Value> = blueprint
+        .net
+        .host_table()
+        .map(|t| t.rules.clone())
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let (grade, methods, path) = match &r.access {
+                formwork_blueprint::HostAccess::Tunnel => {
+                    ("tunnel", "(opaque)".to_string(), "(opaque)".to_string())
+                }
+                formwork_blueprint::HostAccess::Inspected { methods, path } => (
+                    "inspected",
+                    if methods.is_empty() {
+                        "any".to_string()
+                    } else {
+                        methods
+                            .iter()
+                            .map(|m| m.atom())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    },
+                    path.as_str().to_string(),
+                ),
+                formwork_blueprint::HostAccess::Deny { path } => (
+                    "deny",
+                    "-".to_string(),
+                    path.as_ref()
+                        .map(|p| p.as_str().to_string())
+                        .unwrap_or_else(|| "(all)".into()),
+                ),
+            };
+            serde_json::json!({
+                "rule": r.to_string(),
+                "host": r.host.to_string(),
+                "port": r.port,
+                "grade": grade,
+                "methods": methods,
+                "paths": path,
+                "broker": serde_json::Value::Null,
+                "source": provenance.host_rule_source(r),
+                "layer": provenance.host_rule_source(r).map(render::source),
+            })
+        })
+        .collect();
+    if json {
+        let mut value = serde_json::json!({ "net": blueprint.net, "hosts": rules });
+        attach_blueprint_info(&mut value, &resolved);
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    println!(
+        "blueprint: {} ({})",
+        resolved.path.display(),
+        resolved.source.as_str()
+    );
+    print!("{}", render::net_table(&blueprint.net, &rules));
     Ok(())
 }
 
@@ -771,6 +972,35 @@ struct Session {
     blueprint_path: PathBuf,
     /// The per-session temporary directory (FW-TRA10), removed when the spawned child exits.
     tmp_dir: SessionTmp,
+    /// The Gateway egress listener, when the blueprint carries host rules (FW-EGR14).
+    egress: Option<Egress>,
+}
+
+/// A host-scoped session's egress door: the in-process Gateway listener and, on Linux, the port
+/// registry the connect supervisor fills (FW-EGR9).
+struct Egress {
+    proxy: formwork_gateway::EgressProxy,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    registry: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>>,
+}
+
+/// What a session is prepared for: which postures can carry host-scoped egress differs (FEP-5
+/// §3.1 -- only the spawn posture leaves a process outside the sandbox to host the Gateway).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Spawn,
+    ConfineSelf,
+    GatewayBackend,
+}
+
+/// A per-session secret from the kernel's CSPRNG, hex-encoded.
+fn session_nonce() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 24];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("reading /dev/urandom for the session credential")?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The Launcher-owned per-session temporary directory (FW-TRA9/FW-TRA10). Created 0700 beneath the
@@ -805,7 +1035,7 @@ impl SessionTmp {
     }
 }
 
-fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
+fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
     let resolved = args.resolve()?;
     let mut blueprint = args.load(&resolved.path, &home())?;
     let host = detect();
@@ -846,7 +1076,11 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
         .context("canonicalizing grant paths")?;
     let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
         .context("canonicalizing credential catalog paths")?;
-    let policy = compile(&blueprint, &host, &catalog);
+    let egress = start_egress(&blueprint, &host, purpose)?;
+    let endpoints = formwork_compile::SessionEndpoints {
+        gateway_port: egress.as_ref().map(|e| e.proxy.addr().port()),
+    };
+    let policy = formwork_compile::compile_for_session(&blueprint, &host, &catalog, &endpoints);
     itemize_credential_floor(&policy.report, &catalog);
     Ok(Session {
         blueprint,
@@ -854,7 +1088,104 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
         policy,
         blueprint_path: resolved.path,
         tmp_dir,
+        egress,
     })
+}
+
+/// FW-EGR14: a blueprint with host rules gets its Gateway egress listener here, in the `formwork`
+/// process that stays outside the sandbox. Refused before the workload starts wherever it cannot
+/// be carried (FW-XR9): under confine-self, behind the MCP gateway, and on a Linux host without
+/// connect supervision.
+fn start_egress(
+    blueprint: &Blueprint,
+    host: &HostProfile,
+    purpose: Purpose,
+) -> Result<Option<Egress>> {
+    let Some(table) = blueprint.net.host_table() else {
+        return Ok(None);
+    };
+    match purpose {
+        Purpose::Spawn => {}
+        Purpose::ConfineSelf => bail!(
+            "host rules route egress through the Gateway, which runs in the `formwork` process \
+             outside the sandbox; `run --confine-self` leaves no such process. Use the spawn \
+             posture (`formwork run -- …`)"
+        ),
+        Purpose::GatewayBackend => bail!(
+            "host rules apply to `formwork run`; an MCP backend behind `formwork gateway` takes \
+             `net = \"deny\"` or a port tier"
+        ),
+    }
+    if host.os == formwork_detect::Os::Linux && !(host.seccomp && host.connect_supervision) {
+        bail!(
+            "host rules need connect supervision, which this host lacks: seccomp user \
+             notification, pidfd_getfd (Linux 5.6+), and Yama ptrace_scope 0 or 1. Alternatives: \
+             `net = {{ ports = [443] }}` (any host on the port), or `net = \"deny\"`"
+        );
+    }
+    let registry = (host.os == formwork_detect::Os::Linux)
+        .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())));
+    let proxy = formwork_gateway::EgressProxy::start(formwork_gateway::EgressConfig {
+        table: table.clone(),
+        resolver: formwork_gateway::Resolver::System,
+        admission: formwork_gateway::Admission {
+            credential: session_nonce()?,
+            registry: registry.clone(),
+        },
+    })
+    .context("starting the Gateway egress listener")?;
+    for rule in &table.rules {
+        tracing::info!(rule = %rule, "egress host rule");
+    }
+    Ok(Some(Egress { proxy, registry }))
+}
+
+/// Variables the Launcher sets after the posture ran (FW-TRA10, FEP-5 §3.1): the session temp
+/// directory and, under host rules, the proxy that reaches the Gateway.
+fn session_env(session: &Session) -> Vec<(String, String)> {
+    let tmp = session.tmp_dir.path.display().to_string();
+    let mut vars: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
+        .iter()
+        .map(|v| (v.to_string(), tmp.clone()))
+        .collect();
+    if let Some(egress) = &session.egress {
+        let url = egress.proxy.proxy_url();
+        for var in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            if std::env::var_os(var).is_some() {
+                tracing::info!(
+                    var,
+                    "overriding an inherited proxy variable with the session Gateway"
+                );
+            }
+            vars.push((var.to_string(), url.clone()));
+        }
+        for var in ["NO_PROXY", "no_proxy"] {
+            vars.push((var.to_string(), String::new()));
+        }
+    }
+    vars
+}
+
+/// FW-XR10: the workload's status; a signal death is 128 + the signal, as a shell reports it.
+fn exit_code(status: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
+/// FW-XR11: a Formwork failure after the workload started exits 125 with one attributed line on
+/// stderr; stdout stays the workload's.
+fn formwork_failure(what: &str) -> ! {
+    eprintln!("formwork: {what}");
+    std::process::exit(125);
 }
 
 /// FW-XR9: an isolation member the host cannot provide is refused before the workload starts,
@@ -921,25 +1252,76 @@ fn spawn_confined_child(
         &mut command,
         &session.blueprint,
         &session.catalog,
-        Some(&session.tmp_dir.path),
+        &session_env(session),
     );
+    #[cfg(target_os = "linux")]
+    let pending = formwork_confine::spawn_confined_supervised(&mut command, &session.policy)
+        .context("applying confinement")?;
+    #[cfg(not(target_os = "linux"))]
     formwork_confine::spawn_confined(&mut command, &session.policy)
         .context("applying confinement")?;
     tracing::info!(program = %program, "spawning confined command");
-    let status = command.status();
+    let child = command.spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            session.tmp_dir.remove();
+            return Err(e).context("spawning confined command");
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let _supervisor = match pending {
+        None => None,
+        Some(pending) => {
+            let Some(egress) = &session.egress else {
+                let _ = child.kill();
+                formwork_failure(
+                    "the policy needs the connect supervisor but no Gateway is running",
+                );
+            };
+            let unix_grants = match &session.policy.confiner {
+                formwork_compile::ConfinerPolicy::Linux(l) => l.unix_socket_grants.clone(),
+                _ => Vec::new(),
+            };
+            let config = formwork_confine::SupervisorConfig {
+                gateway: egress.proxy.addr(),
+                registry: egress.registry.clone().unwrap_or_default(),
+                unix_grants,
+            };
+            match pending.start(config) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    session.tmp_dir.remove();
+                    formwork_failure(&format!("the connect supervisor failed to start: {e}"));
+                }
+            }
+        }
+    };
+    let status = child.wait();
     session.tmp_dir.remove();
-    let status = status.context("spawning confined command")?;
+    let status = status.context("waiting for the confined command")?;
     log_exit("confined command exited", &status);
+    if let Some(egress) = &session.egress {
+        if !egress.proxy.is_alive() {
+            formwork_failure("the Gateway egress listener stopped during the session");
+        }
+    }
     Ok(status)
 }
 
 fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<()> {
-    let session = prepare_session(&blueprint)?;
+    let purpose = match posture {
+        Posture::Spawn => Purpose::Spawn,
+        Posture::Self_ => Purpose::ConfineSelf,
+    };
+    let session = prepare_session(&blueprint, purpose)?;
     let (program, args) = argv.split_first().expect("argv is required");
     match posture {
         Posture::Spawn => {
             let status = spawn_confined_child(&session, program, args)?;
-            std::process::exit(status.code().unwrap_or(1));
+            std::process::exit(exit_code(&status));
         }
         Posture::Self_ => {
             formwork_confine::enforce_self(&session.policy).context("confining self")?;
@@ -950,7 +1332,7 @@ fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<
                 args,
                 &session.blueprint,
                 &session.catalog,
-                &session.tmp_dir.path,
+                &session_env(&session),
             );
             bail!("exec failed after confine-self: {err}");
         }
@@ -1022,18 +1404,18 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
         Ok(feed) => feed,
         Err(_) => {
             // --observe-anyway: enforced run, loudly observation-free, no proposal (FW-E2E-062).
-            let session = prepare_session(&blueprint)?;
+            let session = prepare_session(&blueprint, Purpose::Spawn)?;
             let (program, args) = argv.split_first().expect("argv is non-empty");
             let status = spawn_confined_child(&session, program, args)?;
             tracing::warn!(
                 "--observe-anyway: ran enforced, but this host has no denial feed -- no proposal was written (FW-INV5: reported, not pretended)"
             );
-            std::process::exit(status.code().unwrap_or(1));
+            std::process::exit(exit_code(&status));
         }
     };
     match feed {
         DenialFeed::MacosUnifiedLog => {
-            let session = prepare_session(&blueprint)?;
+            let session = prepare_session(&blueprint, Purpose::Spawn)?;
             tracing::info!(
                 "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
             );
@@ -1049,7 +1431,7 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
                 records,
                 &status,
             )?;
-            std::process::exit(status.code().unwrap_or(1));
+            std::process::exit(exit_code(&status));
         }
         DenialFeed::LinuxPtrace(strace) => learn_run_linux(strace, &blueprint, &argv, &run_id),
     }
@@ -1095,7 +1477,13 @@ fn learn_run_linux(
         .arg(&trace_path)
         .arg("--")
         .arg(&current_exe)
-        .args(["run", "--confine-self", "--blueprint"])
+        // Host rules need the spawn posture's Gateway and supervisor outside the sandbox; the
+        // tracer follows the spawned child the same way it follows a confine-self exec.
+        .args(if loaded.net.host_table().is_some() {
+            &["run", "--blueprint"][..]
+        } else {
+            &["run", "--confine-self", "--blueprint"][..]
+        })
         .arg(&resolved.path)
         .args(args.forward_overrides())
         .arg("--")
@@ -1117,7 +1505,7 @@ fn learn_run_linux(
         records,
         &status,
     )?;
-    std::process::exit(status.code().unwrap_or(1));
+    std::process::exit(exit_code(&status));
 }
 
 /// The operator channel's compile-time itemization (FW-CRED7). The full roll-call is identical
@@ -1174,7 +1562,7 @@ fn apply_env(
     command: &mut Command,
     blueprint: &Blueprint,
     catalog: &ResolvedCatalog,
-    tmp: Option<&std::path::Path>,
+    session_vars: &[(String, String)],
 ) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let built = formwork_blueprint::construct_env(
@@ -1186,12 +1574,8 @@ fn apply_env(
     );
     command.env_clear();
     command.envs(built.kept.iter().cloned());
-    // FW-TRA10: set after the posture ran, so no scrub or allowlist can drop it.
-    if let Some(tmp) = tmp {
-        for var in ["TMPDIR", "TMP", "TEMP"] {
-            command.env(var, tmp);
-        }
-    }
+    // Set after the posture ran, so no scrub or allowlist can drop the session's own variables.
+    command.envs(session_vars.iter().map(|(k, v)| (k, v)));
     if !built.locator_stripped.is_empty() {
         tracing::info!(stripped = ?built.locator_stripped, "channel locator variables stripped (channels not lifted, FW-BP11)");
     }
@@ -1208,7 +1592,7 @@ fn apply_env(
 /// `[mcp.<server>]` entry shades the protocol, its fs/net grant confines the backend the same way
 /// `run` confines any command (FW-GW5), so the backend spawns behind the same wall.
 fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Result<()> {
-    let session = prepare_session(&blueprint)?;
+    let session = prepare_session(&blueprint, Purpose::GatewayBackend)?;
 
     // An unlisted server is a config error, not a silent deny: a typo would otherwise masquerade as
     // a backend that legitimately exposes nothing, hiding the mistake.
@@ -1226,7 +1610,7 @@ fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Resul
         &mut backend,
         &session.blueprint,
         &session.catalog,
-        Some(&session.tmp_dir.path),
+        &session_env(&session),
     );
 
     tracing::info!(server = %server, backend = %program, "starting MCP gateway");
@@ -1243,11 +1627,11 @@ fn exec_replace(
     args: &[String],
     blueprint: &Blueprint,
     catalog: &ResolvedCatalog,
-    tmp: &std::path::Path,
+    session_vars: &[(String, String)],
 ) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(program);
     command.args(args);
-    apply_env(&mut command, blueprint, catalog, Some(tmp));
+    apply_env(&mut command, blueprint, catalog, session_vars);
     command.exec()
 }

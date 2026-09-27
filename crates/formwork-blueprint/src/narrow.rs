@@ -129,6 +129,27 @@ fn narrow_net(parent: &NetPosture, req: &NetPosture) -> NetPosture {
                 NetPosture::Ports(ports)
             }
         }
+        // A child keeps only host rules its parent also holds, and every deny either side wrote
+        // (FW-CAP2). Mixing a port tier with a host table narrows to deny: the two reach the network
+        // by different doors, and neither is a subset of the other.
+        (NetPosture::AllowHosts(a), NetPosture::AllowHosts(b)) => {
+            let rules: Vec<crate::HostRule> = b
+                .rules
+                .iter()
+                .filter(|r| {
+                    matches!(r.access, crate::HostAccess::Deny { .. }) || a.rules.contains(r)
+                })
+                .chain(
+                    a.rules
+                        .iter()
+                        .filter(|r| matches!(r.access, crate::HostAccess::Deny { .. })),
+                )
+                .cloned()
+                .collect();
+            NetPosture::AllowHosts(crate::HostTable::new(rules))
+        }
+        (NetPosture::AllowHosts(_), NetPosture::Ports(_))
+        | (NetPosture::Ports(_), NetPosture::AllowHosts(_)) => NetPosture::Deny,
     }
 }
 

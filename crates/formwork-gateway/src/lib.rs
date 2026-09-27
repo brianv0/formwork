@@ -18,6 +18,11 @@ use tokio::sync::Mutex;
 use formwork_blueprint::{Gate, McpPolicy};
 use formwork_compile::CompiledPolicy;
 
+pub mod egress;
+mod inspect;
+
+pub use egress::{Admission, EgressConfig, EgressProxy, Resolver, Violation};
+
 // Bounds a single frame so a peer that never sends a newline can't make the gateway buffer without
 // limit; overflow closes the connection. A stability bound (design §3), not a DoS-resistance claim --
 // the seam bounds its control channel the same way (`MAX_CONTROL_LINE`).

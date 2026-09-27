@@ -42,6 +42,8 @@ pub struct Provenance {
     /// already expanded.
     channel_allow: Vec<(Channel, RuleSource)>,
     channel_deny: Vec<(Channel, RuleSource)>,
+    /// Host rules with the layer that wrote each (FW-FID11 `explain --net`).
+    hosts: Vec<(crate::HostRule, RuleSource)>,
 }
 
 /// Like [`merge`], but also records, per fs/exec pattern, the layer it came from. The returned
@@ -66,6 +68,8 @@ pub fn merge_with_provenance(layers: &[(RuleSource, BlueprintLayer)]) -> (Bluepr
             Some(ExecPosture::Unrestricted) => p.exec.clear(),
             None => {}
         }
+        p.hosts
+            .extend(layer.hosts.iter().map(|h| (h.clone(), src.clone())));
         if let Some(channels) = &layer.channels {
             p.channel_allow
                 .extend(channels.allowed().iter().map(|c| (*c, src.clone())));
@@ -195,6 +199,11 @@ impl Provenance {
             exec,
             host_note: None,
         }
+    }
+
+    /// The layer that wrote a host rule (FW-FID11).
+    pub fn host_rule_source(&self, rule: &crate::HostRule) -> Option<&RuleSource> {
+        self.hosts.iter().find(|(r, _)| r == rule).map(|(_, s)| s)
     }
 
     /// Whether a denying write-subtract row for `path` exists only in any-depth form -- the rows

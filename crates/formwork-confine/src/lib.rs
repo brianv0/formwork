@@ -41,6 +41,26 @@ pub fn spawn_confined(command: &mut Command, policy: &CompiledPolicy) -> Result<
     backend::spawn_confined(command, policy)
 }
 
+/// The connect supervisor's configuration and handles (FW-EGR7); Linux only.
+#[cfg(target_os = "linux")]
+pub use backend::supervise::{Pending as PendingSupervisor, Supervisor, SupervisorConfig};
+
+/// As [`spawn_confined`], and when the policy routes egress through the connect supervisor
+/// (FW-EGR7), also prepares it: start the returned half after spawning, with the Gateway endpoint.
+/// `None` means the policy needs no supervisor (every macOS policy, and Linux without host rules).
+#[cfg(target_os = "linux")]
+pub fn spawn_confined_supervised(
+    command: &mut Command,
+    policy: &CompiledPolicy,
+) -> Result<Option<PendingSupervisor>, ConfineError> {
+    tracing::info!(
+        posture = "spawn",
+        backend = backend_label(policy),
+        "configuring confinement"
+    );
+    backend::spawn_confined_supervised(command, policy)
+}
+
 /// Irreversible; confine-self posture (FW-ISO6).
 pub fn enforce_self(policy: &CompiledPolicy) -> Result<(), ConfineError> {
     tracing::info!(

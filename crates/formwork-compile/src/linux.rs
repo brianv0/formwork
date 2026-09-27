@@ -57,7 +57,7 @@ pub enum InetSeccompDeny {
 }
 
 /// Build the seccomp baseline plus whatever inet-egress deny `inet_deny` calls for.
-pub fn seccomp_plan(inet_deny: InetSeccompDeny) -> SeccompPlan {
+pub fn seccomp_plan(inet_deny: InetSeccompDeny, supervise_connect: bool) -> SeccompPlan {
     let deny_syscalls: Vec<String> = BASELINE_DENY.iter().map(|s| s.to_string()).collect();
     debug_assert!(
         deny_syscalls.windows(2).all(|w| w[0] < w[1]),
@@ -85,6 +85,7 @@ pub fn seccomp_plan(inet_deny: InetSeccompDeny) -> SeccompPlan {
         deny_syscalls,
         deny_socket_families,
         deny_inet_dgram_raw,
+        supervise_connect,
         restrict_userns: true,
         set_no_new_privs: true,
     }
@@ -120,6 +121,18 @@ pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, InetSecc
                 )
             }
         }
+        // FW-EGR7: the supervisor mediates every connect; without it the posture fails closed to
+        // the full inet deny and the report says so (FW-INV6).
+        NetPosture::AllowHosts(_) if host.seccomp && host.connect_supervision => (
+            LinuxNetPlan::SupervisedConnect,
+            InetSeccompDeny::DgramRawOnly,
+            PortTier::NotRequested,
+        ),
+        NetPosture::AllowHosts(_) => (
+            LinuxNetPlan::SeccompDenyInet,
+            InetSeccompDeny::FullInet,
+            PortTier::NotRequested,
+        ),
     }
 }
 
@@ -136,7 +149,7 @@ mod tests {
 
     #[test]
     fn baseline_is_sorted_and_denies_escalation_surfaces() {
-        let plan = seccomp_plan(InetSeccompDeny::FullInet);
+        let plan = seccomp_plan(InetSeccompDeny::FullInet, false);
         assert!(plan.deny_syscalls.windows(2).all(|w| w[0] < w[1]));
         assert!(plan.deny_syscalls.iter().any(|s| s == "bpf"));
         assert!(plan.deny_syscalls.iter().any(|s| s == "setns"));
@@ -158,7 +171,7 @@ mod tests {
 
     #[test]
     fn port_tier_seccomp_denies_dgram_raw_but_not_stream() {
-        let plan = seccomp_plan(InetSeccompDeny::DgramRawOnly);
+        let plan = seccomp_plan(InetSeccompDeny::DgramRawOnly, false);
         assert!(
             plan.deny_inet_dgram_raw,
             "UDP/raw must be denied (FW-ISO11)"

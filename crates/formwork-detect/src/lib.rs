@@ -34,6 +34,11 @@ pub struct HostProfile {
     /// AppArmor-restricted Ubuntu 24.04, `user.max_user_namespaces = 0`).
     #[serde(default)]
     pub user_namespaces: bool,
+    /// Whether the spawning process can service a confined process's `connect()` (FW-EGR7):
+    /// seccomp user notification, `pidfd_getfd`, and a Yama `ptrace_scope` that lets an ancestor
+    /// reach its descendants' descriptors. Linux only.
+    #[serde(default)]
+    pub connect_supervision: bool,
     /// The host facilities that make host-service channels reachable, and PID-namespace nesting
     /// (FW-FID10). Recorded here so `compile` stays pure (FW-CAP5).
     #[serde(default, skip_serializing_if = "HostFacilities::is_empty")]
@@ -91,6 +96,7 @@ impl HostProfile {
             seatbelt: false,
             os_version: "synthetic-linux".to_string(),
             user_namespaces: true,
+            connect_supervision: true,
             facilities: HostFacilities::default(),
         }
     }
@@ -103,6 +109,7 @@ impl HostProfile {
             seatbelt: true,
             os_version: "synthetic-macos".to_string(),
             user_namespaces: false,
+            connect_supervision: false,
             facilities: HostFacilities::default(),
         }
     }
@@ -128,6 +135,7 @@ pub fn detect() -> HostProfile {
             seatbelt: false,
             os_version: "unsupported".to_string(),
             user_namespaces: false,
+            connect_supervision: false,
             facilities: HostFacilities::default(),
         }
     }
@@ -159,6 +167,47 @@ mod linux {
             return false;
         }
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
+
+    /// The three facilities the `connect()` supervisor needs (FW-EGR7), each probed for real:
+    /// the notification-size query succeeds only where user notification exists (5.0+);
+    /// `pidfd_getfd` on this process's own descriptor succeeds only where it exists (5.6+) and is
+    /// not blocked; and Yama scope 2 or 3 forbids an ancestor's access to its descendants.
+    fn connect_supervision() -> bool {
+        let mut sizes = [0u16; 3];
+        // SAFETY: SECCOMP_GET_NOTIF_SIZES writes three u16 into the buffer; no other effect.
+        let notif = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_GET_NOTIF_SIZES,
+                0,
+                sizes.as_mut_ptr(),
+            )
+        } == 0;
+        if !notif {
+            return false;
+        }
+        // SAFETY: pidfd_open on our own pid, then pidfd_getfd of our stderr; both descriptors
+        // are closed before returning.
+        let getfd = unsafe {
+            let pidfd = libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0);
+            if pidfd < 0 {
+                false
+            } else {
+                let dup = libc::syscall(libc::SYS_pidfd_getfd, pidfd as i32, 2, 0);
+                if dup >= 0 {
+                    libc::close(dup as i32);
+                }
+                libc::close(pidfd as i32);
+                dup >= 0
+            }
+        };
+        let yama_ok = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|scope| scope <= 1)
+            .unwrap_or(true);
+        getfd && yama_ok
     }
 
     fn is_socket(path: &Path) -> bool {
@@ -322,6 +371,7 @@ mod linux {
             seatbelt: false,
             os_version: kernel_version(),
             user_namespaces: user_namespaces(),
+            connect_supervision: connect_supervision(),
             facilities: facilities(),
         }
     }
@@ -384,6 +434,7 @@ mod macos {
             seatbelt: true,
             os_version: product_version(),
             user_namespaces: false,
+            connect_supervision: false,
             facilities: HostFacilities {
                 gui_session: gui_session(),
                 ..HostFacilities::default()

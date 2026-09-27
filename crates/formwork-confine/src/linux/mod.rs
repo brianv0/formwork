@@ -13,6 +13,7 @@ use formwork_compile::{ConfinerPolicy, LinuxPolicy};
 
 mod landlock;
 mod seccomp;
+pub mod supervise;
 
 fn linux_policy(policy: &CompiledPolicy) -> Result<&LinuxPolicy, ConfineError> {
     match &policy.confiner {
@@ -30,6 +31,8 @@ struct Plan {
     landlock: Option<landlock::Built>,
     seccomp: seccompiler::BpfProgram,
     no_new_privs: bool,
+    /// The supervised-connect filter and listener handoff (FW-EGR7), when the policy needs it.
+    supervise: Option<supervise::Plan>,
 }
 
 fn build(policy: &LinuxPolicy) -> Result<Plan, ConfineError> {
@@ -37,6 +40,7 @@ fn build(policy: &LinuxPolicy) -> Result<Plan, ConfineError> {
         landlock: landlock::build(policy)?,
         seccomp: seccomp::build(&policy.seccomp)?,
         no_new_privs: policy.no_new_privs || policy.seccomp.set_no_new_privs,
+        supervise: None,
     })
 }
 
@@ -53,11 +57,25 @@ fn apply(plan: &mut Plan) -> io::Result<()> {
     if let Some(built) = plan.landlock.take() {
         landlock::apply(built)?;
     }
-    seccomp::apply(&plan.seccomp)
+    seccomp::apply(&plan.seccomp)?;
+    if let Some(sup) = &plan.supervise {
+        supervise::install(sup)?;
+    }
+    Ok(())
 }
 
 pub fn spawn_confined(command: &mut Command, policy: &CompiledPolicy) -> Result<(), ConfineError> {
-    let mut plan = build(linux_policy(policy)?)?;
+    let linux = linux_policy(policy)?;
+    if linux.seccomp.supervise_connect {
+        // FW-INV6: host-scoped egress without its supervisor would be a child whose every connect
+        // hangs on a listener nobody reads; refuse rather than spawn it.
+        return Err(ConfineError::MechanismFailed(
+            "this policy routes egress through the connect supervisor; spawn it with \
+             spawn_confined_supervised"
+                .into(),
+        ));
+    }
+    let mut plan = build(linux)?;
     // SAFETY: the closure runs in the forked child before `execve`, issuing only syscalls over
     // artifacts built before the fork (allocation-free). On failure `spawn`/`status` fails -- there is
     // no unconfined child (FW-INV6).
@@ -67,8 +85,40 @@ pub fn spawn_confined(command: &mut Command, policy: &CompiledPolicy) -> Result<
     Ok(())
 }
 
+/// As [`spawn_confined`], plus the connect supervisor when the policy needs one (FW-EGR7). The
+/// returned half is started, after the spawn, with [`supervise::Pending::start`].
+pub fn spawn_confined_supervised(
+    command: &mut Command,
+    policy: &CompiledPolicy,
+) -> Result<Option<supervise::Pending>, ConfineError> {
+    let linux = linux_policy(policy)?;
+    let mut plan = build(linux)?;
+    let pending = if linux.seccomp.supervise_connect {
+        let (sup, pending) = supervise::prepare()?;
+        plan.supervise = Some(sup);
+        Some(pending)
+    } else {
+        None
+    };
+    // SAFETY: as in `spawn_confined`; the supervisor half issues only seccomp(2), sendmsg(2) and
+    // close(2) over descriptors and a filter built before the fork.
+    unsafe {
+        command.pre_exec(move || apply(&mut plan));
+    }
+    Ok(pending)
+}
+
 pub fn enforce_self(policy: &CompiledPolicy) -> Result<(), ConfineError> {
-    let mut plan = build(linux_policy(policy)?)?;
+    let linux = linux_policy(policy)?;
+    if linux.seccomp.supervise_connect {
+        // FEP-5 §3.1: no process outside the sandbox remains to supervise a confine-self session.
+        return Err(ConfineError::MechanismFailed(
+            "host-scoped egress needs a supervisor outside the sandbox; confine-self has none -- \
+             use the spawn posture"
+                .into(),
+        ));
+    }
+    let mut plan = build(linux)?;
     // In-process (not forked): a formatted error is fine here.
     apply(&mut plan).map_err(|e| ConfineError::MechanismFailed(format!("confine-self failed: {e}")))
 }

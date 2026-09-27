@@ -53,6 +53,10 @@ pub struct CompileInput {
     /// Host-service channels the blueprint lifts from the baseline (FW-ISO13).
     pub channels: ChannelPolicy,
     pub isolate: Vec<IsolateMember>,
+    /// The session Gateway's loopback port, known only when compiling for a spawn (FW-EGR8).
+    pub gateway_port: Option<u16>,
+    /// Pathname sockets granted by a literal write grant (FW-ISO12, FEP-5 §3.1.1).
+    pub unix_socket_grants: Vec<PathPattern>,
 }
 
 impl CompileInput {
@@ -75,7 +79,7 @@ impl CompileInput {
         CompileInput {
             read_mode: blueprint.fs.read_mode,
             effective_reads: canonicalize_set(&reads),
-            writes: canonicalize_set(&blueprint.fs.writes),
+            writes: formwork_blueprint::canonicalize_write_set(&blueprint.fs.writes),
             writes_no_create: canonicalize_set(&blueprint.fs.writes_no_create),
             subtract: canonicalize_set(&blueprint.fs.subtract),
             write_subtract: canonicalize_set(&blueprint.fs.write_subtract),
@@ -85,8 +89,29 @@ impl CompileInput {
             exec: blueprint.exec.clone(),
             channels: blueprint.channels.clone(),
             isolate: blueprint.isolate.clone(),
+            gateway_port: None,
+            // A literal (non-subtree) write grant names one file; that is how a session grants a
+            // socket (`readwrite:$SSH_AUTH_SOCK`). Subtree grants never admit sockets, or a
+            // writable `/tmp/**` would admit the X11 socket beneath it.
+            unix_socket_grants: canonicalize_set(
+                &blueprint
+                    .fs
+                    .writes
+                    .iter()
+                    .filter(|p| !p.is_subtree() && !p.is_any_depth())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
+}
+
+/// Per-spawn facts that are not blueprint content: the Gateway listener port the session's egress
+/// goes to (FW-EGR8/FW-EGR14). A dry-run compiles with none, and the macOS profile then allows no
+/// outbound endpoint at all (fail-closed).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionEndpoints {
+    pub gateway_port: Option<u16>,
 }
 
 /// Pure and deterministic in `(blueprint, host, catalog)`. The catalog is a mandatory input by
@@ -97,8 +122,20 @@ pub fn compile(
     host: &HostProfile,
     catalog: &ResolvedCatalog,
 ) -> CompiledPolicy {
+    compile_for_session(blueprint, host, catalog, &SessionEndpoints::default())
+}
+
+/// [`compile`] with the per-spawn endpoints a session adds. Still pure and deterministic in its
+/// inputs (FW-FID4).
+pub fn compile_for_session(
+    blueprint: &Blueprint,
+    host: &HostProfile,
+    catalog: &ResolvedCatalog,
+    session: &SessionEndpoints,
+) -> CompiledPolicy {
     let blueprint = blueprint.canonicalize();
-    let input = CompileInput::from_blueprint(&blueprint, catalog);
+    let mut input = CompileInput::from_blueprint(&blueprint, catalog);
+    input.gateway_port = session.gateway_port;
 
     let mut per_capability: BTreeMap<Capability, Fidelity> = BTreeMap::new();
     let mut semantics: BTreeMap<Capability, DenialSemantics> = BTreeMap::new();
@@ -114,7 +151,21 @@ pub fn compile(
             &mut withheld,
         ),
     };
-    let channels = baseline_rows(&input, host, &mut per_capability, &mut semantics);
+    let supervised = supervised(&input, host);
+    egress_rows(
+        &input,
+        host,
+        supervised,
+        &mut per_capability,
+        &mut semantics,
+    );
+    let channels = baseline_rows(
+        &input,
+        host,
+        supervised,
+        &mut per_capability,
+        &mut semantics,
+    );
 
     // Filesystem invisibility is never provided; document it as an explicit, reported fact.
     per_capability.insert(
@@ -178,6 +229,7 @@ pub fn compile(
     let gateway = GatewayPolicy {
         servers: blueprint.mcp.clone(),
         direct_tcp_ports,
+        egress: blueprint.net.host_table().cloned(),
     };
 
     CompiledPolicy {
@@ -311,7 +363,11 @@ fn compile_macos(
                 },
             );
         }
-        NetPosture::Deny => put(Capability::NetResolver, seatbelt("resolver closure")),
+        // FW-EGR12: under host rules the resolver literal is dropped and every lookup happens in
+        // the Gateway, which pins it (FW-ADV-008).
+        NetPosture::Deny | NetPosture::AllowHosts(_) => {
+            put(Capability::NetResolver, seatbelt("resolver closure"))
+        }
     }
     if let ExecPosture::Allowlist(_) = &input.exec {
         put(Capability::Exec, seatbelt("the exec allow-list"));
@@ -517,7 +573,8 @@ fn compile_linux(
         return (confiner, Vec::new());
     }
 
-    let seccomp = linux::seccomp_plan(inet_deny);
+    let supervise = matches!(net_plan, LinuxNetPlan::SupervisedConnect);
+    let seccomp = linux::seccomp_plan(inet_deny, supervise);
     debug_assert!(
         !matches!(inet_deny, InetSeccompDeny::DgramRawOnly) || seccomp.deny_inet_dgram_raw
     );
@@ -553,6 +610,7 @@ fn compile_linux(
         seccomp,
         no_new_privs: true,
         withhold_device_prefixes,
+        unix_socket_grants: canonicalize_set(&unix_socket_grants(input, host)),
         isolate: input.isolate.clone(),
     };
     (ConfinerPolicy::Linux(Box::new(policy)), direct_ports)
@@ -564,6 +622,7 @@ fn compile_linux(
 fn baseline_rows(
     input: &CompileInput,
     host: &HostProfile,
+    supervised: bool,
     caps: &mut BTreeMap<Capability, Fidelity>,
     sem: &mut BTreeMap<Capability, DenialSemantics>,
 ) -> BTreeMap<String, ChannelReport> {
@@ -603,7 +662,7 @@ fn baseline_rows(
                     }
                 }
             }
-            Os::Linux => linux_channel_fidelity(channel, fs_enforced, host),
+            Os::Linux => linux_channel_fidelity(channel, fs_enforced, supervised, host),
         };
         let cap = Capability::Channel(channel);
         caps.insert(cap, fidelity);
@@ -710,7 +769,28 @@ fn baseline_rows(
 
 /// Linux channel verdicts. The socket-shaped channels close only under supervised connect
 /// (FW-ISO12), which host rules turn on; the device-shaped ones close with the filesystem grant.
-fn linux_channel_fidelity(channel: Channel, fs_enforced: bool, host: &HostProfile) -> Fidelity {
+fn linux_channel_fidelity(
+    channel: Channel,
+    fs_enforced: bool,
+    supervised: bool,
+    host: &HostProfile,
+) -> Fidelity {
+    // Under supervised connect every pathname and abstract connect() is decided outside the
+    // sandbox (FW-ISO12), so the socket-shaped channels are closed.
+    if supervised {
+        return match channel {
+            Channel::Camera | Channel::Microphone if !fs_enforced => Fidelity::Unenforceable {
+                reason: "Landlock unavailable on this host; device nodes cannot be withheld"
+                    .to_string(),
+            },
+            Channel::Camera => Fidelity::Enforced {
+                backend: Backend::Landlock,
+            },
+            _ => Fidelity::Enforced {
+                backend: Backend::Supervisor,
+            },
+        };
+    }
     let unmediated = |what: &str| Fidelity::Partial {
         backend: Backend::Launcher,
         reason: format!(
@@ -741,6 +821,142 @@ fn linux_channel_fidelity(channel: Channel, fs_enforced: bool, host: &HostProfil
             reason: "Landlock unavailable on this host; device nodes cannot be withheld"
                 .to_string(),
         },
+    }
+}
+
+/// Whether the Linux `connect()` supervisor carries this session (FW-EGR7).
+fn supervised(input: &CompileInput, host: &HostProfile) -> bool {
+    host.os == Os::Linux
+        && matches!(input.net, NetPosture::AllowHosts(_))
+        && host.seccomp
+        && host.connect_supervision
+}
+
+/// The sockets the Linux supervisor admits besides in-session ones (FW-ISO12): literal write
+/// grants, and the sockets behind lifted channels as `detect` found them (FW-FID10). `open-url`
+/// never lifts a host service (FW-ISO18).
+fn unix_socket_grants(input: &CompileInput, host: &HostProfile) -> Vec<PathPattern> {
+    let f = &host.facilities;
+    let mut paths: Vec<String> = Vec::new();
+    for channel in input.channels.lifted_channels() {
+        match channel {
+            Channel::RunOutside => {
+                paths.extend(f.session_bus.iter().cloned());
+                paths.extend(f.user_manager.iter().cloned());
+            }
+            Channel::Clipboard | Channel::Screen => paths.extend(f.display.iter().cloned()),
+            Channel::Microphone => paths.extend(f.audio.iter().cloned()),
+            Channel::OpenUrl | Channel::Camera => {}
+        }
+    }
+    let mut grants = input.unix_socket_grants.clone();
+    grants.extend(paths.iter().filter_map(|p| PathPattern::parse(p).ok()));
+    grants
+}
+
+/// The host-scoped egress rows (FW-EGR1, FW-FID8): host scope, inspection, and -- under the
+/// supervisor -- the net rows the supervisor now carries.
+fn egress_rows(
+    input: &CompileInput,
+    host: &HostProfile,
+    supervised: bool,
+    caps: &mut BTreeMap<Capability, Fidelity>,
+    sem: &mut BTreeMap<Capability, DenialSemantics>,
+) {
+    let NetPosture::AllowHosts(table) = &input.net else {
+        return;
+    };
+    let mut put = |cap: Capability, f: Fidelity| {
+        caps.insert(cap, f);
+        sem.insert(cap, DenialSemantics::Deny);
+    };
+    let has_tunnel = table
+        .rules
+        .iter()
+        .any(|r| matches!(r.access, formwork_blueprint::HostAccess::Tunnel));
+    let has_inspected = table.rules.iter().any(|r| r.is_inspected());
+    let tunnel_gap = "tunnel-grade hosts (`https:`) are admitted by the CONNECT target and trust                       the client's SNI and Host; domain fronting is not caught (FW-EGR5)";
+    let unavailable = "connect supervision is unavailable on this host: it needs seccomp user                        notification, pidfd_getfd (Linux 5.6+), and Yama ptrace_scope 0 or 1;                        egress fails closed and `run` refuses the host rules";
+    match host.os {
+        Os::Linux if !supervised => {
+            put(
+                Capability::NetHostScope,
+                Fidelity::Unenforceable {
+                    reason: unavailable.to_string(),
+                },
+            );
+            return;
+        }
+        Os::Linux => {
+            put(
+                Capability::NetHostScope,
+                if has_tunnel {
+                    Fidelity::Partial {
+                        backend: Backend::Gateway,
+                        reason: tunnel_gap.to_string(),
+                    }
+                } else {
+                    Fidelity::Enforced {
+                        backend: Backend::Gateway,
+                    }
+                },
+            );
+            let supervisor = || Fidelity::Enforced {
+                backend: Backend::Supervisor,
+            };
+            put(Capability::NetDefaultDeny, supervisor());
+            put(Capability::NetResolver, supervisor());
+            let sendmsg_gap = "addressed sendmsg()/sendmmsg() on an AF_UNIX datagram socket is                                not mediated (its destination sits in memory seccomp cannot read);                                connect() and addressed sendto() are";
+            put(
+                Capability::NetUnixSocket,
+                Fidelity::Partial {
+                    backend: Backend::Supervisor,
+                    reason: sendmsg_gap.to_string(),
+                },
+            );
+            put(
+                Capability::CrossDomainSocket,
+                Fidelity::Partial {
+                    backend: Backend::Supervisor,
+                    reason: if host.landlock_abi.unwrap_or(0) >= 6 {
+                        format!("pathname and abstract connect() are supervised; {sendmsg_gap}")
+                    } else {
+                        format!(
+                            "pathname and abstract connect() are supervised; signals outside the                              domain need Landlock ABI 6; {sendmsg_gap}"
+                        )
+                    },
+                },
+            );
+        }
+        Os::MacOs => {
+            let mut reason = "the egress listener admits the per-session proxy credential; the                               peer-process check is pending characterization (C2), so a same-uid                               process that reads the agent's environment could reach it"
+                .to_string();
+            if has_tunnel {
+                reason = format!("{reason}; {tunnel_gap}");
+            }
+            put(
+                Capability::NetHostScope,
+                if host.seatbelt {
+                    Fidelity::Partial {
+                        backend: Backend::Gateway,
+                        reason,
+                    }
+                } else {
+                    Fidelity::Unenforceable {
+                        reason: "Seatbelt unavailable on this host".to_string(),
+                    }
+                },
+            );
+        }
+    }
+    if has_inspected {
+        put(
+            Capability::NetInspection,
+            Fidelity::Unenforceable {
+                reason: "TLS inspection is not in this build; the Gateway refuses inspected hosts"
+                    .to_string(),
+            },
+        );
     }
 }
 
@@ -904,6 +1120,7 @@ mod tests {
             seatbelt: false,
             os_version: "ancient".to_string(),
             user_namespaces: false,
+            connect_supervision: false,
             facilities: Default::default(),
         };
         let policy = compile(&sample_blueprint(), &host);

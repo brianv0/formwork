@@ -21,11 +21,14 @@ fn main() {
     // the kernel rejects connect() immediately, so the address is never actually routed to.
     // The port is argv[1] (default 80), so the port-tier test can aim at a granted and a
     // non-granted port with one binary.
-    let port: u16 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(80);
-    let addr = SocketAddr::from(([93, 184, 216, 34], port));
+    // argv[1] is a port on the static address, or a full `ip:port` (the supervised-connect tests
+    // aim at their loopback Gateway stand-in).
+    let arg = std::env::args().nth(1);
+    let addr = match arg.as_deref() {
+        Some(a) if a.contains(':') => a.parse().expect("ip:port"),
+        Some(p) => SocketAddr::from(([93, 184, 216, 34], p.parse().unwrap_or(80))),
+        None => SocketAddr::from(([93, 184, 216, 34], 80)),
+    };
     let code = match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
         Ok(_) => 0,
         Err(e) if e.kind() == ErrorKind::PermissionDenied => 7,

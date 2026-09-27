@@ -42,7 +42,7 @@ pub fn host_summary(profile: &HostProfile, strace_on_path: bool) -> String {
     }
 }
 
-fn source(s: &RuleSource) -> String {
+pub fn source(s: &RuleSource) -> String {
     match s {
         RuleSource::BuiltIn => "built-in".to_string(),
         RuleSource::Profile(name) => format!("profile {name}"),
@@ -72,6 +72,60 @@ pub fn explanation(e: &Explanation) -> String {
     );
     if let Some(note) = &e.host_note {
         out.push_str(&format!("  on this host: {note}\n"));
+    }
+    out
+}
+
+/// One URL's egress verdict (FW-FID11).
+pub fn egress_explanation(e: &crate::EgressExplanation) -> String {
+    let mut out = format!("{}\n  host: {}:{} -- {}\n", e.url, e.host, e.port, e.grade);
+    if let Some(rule) = &e.rule {
+        let origin = e
+            .source
+            .as_ref()
+            .map(source)
+            .unwrap_or_else(|| "built-in".into());
+        out.push_str(&format!("  rule: {rule} ({origin})\n"));
+    }
+    for m in &e.methods {
+        out.push_str(&format!(
+            "  {:7} {}{}\n",
+            m.method,
+            if m.admitted { "admitted" } else { "refused" },
+            m.rule
+                .as_ref()
+                .map(|r| format!(" by {r}"))
+                .unwrap_or_default()
+        ));
+    }
+    if let Some(reason) = &e.reason {
+        out.push_str(&format!("  {reason}\n"));
+    }
+    out
+}
+
+/// The resolved host table (`explain --net`), one rule per line.
+pub fn net_table(net: &formwork_blueprint::NetPosture, rules: &[serde_json::Value]) -> String {
+    use formwork_blueprint::NetPosture;
+    let mut out = String::new();
+    match net {
+        NetPosture::Deny => out.push_str("net: deny -- no egress\n"),
+        NetPosture::Ports(p) => out.push_str(&format!(
+            "net: direct port tier {p:?} -- any host on those ports, no Gateway\n"
+        )),
+        NetPosture::AllowHosts(_) => {
+            out.push_str("net: host rules -- all egress through the session Gateway\n")
+        }
+    }
+    for r in rules {
+        let origin = r["layer"].as_str().unwrap_or("?");
+        out.push_str(&format!(
+            "  {:40} {:9} methods {:14} paths {:20} ({origin})\n",
+            r["rule"].as_str().unwrap_or(""),
+            r["grade"].as_str().unwrap_or(""),
+            r["methods"].as_str().unwrap_or(""),
+            r["paths"].as_str().unwrap_or(""),
+        ));
     }
     out
 }

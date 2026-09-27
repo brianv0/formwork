@@ -4,6 +4,7 @@
 mod catalog;
 mod channel;
 mod discovery;
+mod egress;
 mod launcher;
 mod layer;
 mod narrow;
@@ -18,10 +19,15 @@ pub use discovery::{
     reverse_compile, synthesize_blueprint, AccessRecord, Candidate, CandidateTag, DenialAccess,
     DenialRecord, ProposalOutcome, WithheldEntry,
 };
+pub use egress::{
+    canonical_ip, canonicalize_host, canonicalize_request_path, is_restricted_ip, target_is_host,
+    validate_host_rules, CanonicalHost, EgressDecision, HostAccess, HostError, HostPattern,
+    HostRule, HostTable, HttpMethod, PathGlob, DEFAULT_HTTPS_PORT, HTTP_ATOMS, METADATA_HOSTNAMES,
+};
 pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
 pub use narrow::intersect_grants;
-pub use path::{canonicalize_set, PathError, PathPattern};
+pub use path::{canonicalize_set, canonicalize_write_set, PathError, PathPattern};
 pub use provenance::{
     merge_with_provenance, ChannelExplanation, Explanation, Provenance, RuleSource, Verdict,
 };
@@ -140,13 +146,27 @@ impl Mode {
 }
 
 /// `Deny` is the fail-closed default (FW-XR3); `Ports` allows direct TCP connect to a port set
-/// only where the platform can enforce it.
+/// only where the platform can enforce it; `AllowHosts` sends all egress through the Gateway, which
+/// admits only the host table's hosts (FW-EGR1). The three are mutually exclusive by construction.
+/// `AllowHosts` is authored only as host rules in `rules` (FW-BP13), never as a `net` value, so
+/// the variant is not deserialized from a blueprint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetPosture {
     #[default]
     Deny,
     Ports(Vec<u16>),
+    #[serde(skip_deserializing)]
+    AllowHosts(HostTable),
+}
+
+impl NetPosture {
+    pub fn host_table(&self) -> Option<&HostTable> {
+        match self {
+            NetPosture::AllowHosts(t) => Some(t),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -592,7 +612,7 @@ impl Blueprint {
             fs: FsBlueprint {
                 read_mode: self.fs.read_mode,
                 reads: canonicalize_set(&self.fs.reads),
-                writes: canonicalize_set(&self.fs.writes),
+                writes: canonicalize_write_set(&self.fs.writes),
                 writes_no_create: canonicalize_set(&self.fs.writes_no_create),
                 subtract: canonicalize_set(&self.fs.subtract),
                 write_subtract: canonicalize_set(&self.fs.write_subtract),
@@ -671,6 +691,7 @@ impl NetPosture {
                 }
             }
             NetPosture::Deny => NetPosture::Deny,
+            NetPosture::AllowHosts(t) => NetPosture::AllowHosts(HostTable::new(t.rules.clone())),
         }
     }
 }

@@ -196,6 +196,7 @@ pub fn load_stack(
     let layers = load_layers(path, sets, sugar, sigils)?;
     let (blueprint, _) = merge_with_provenance(&layers);
     refuse_universe_row(&layers, &blueprint)?;
+    validate_net(&layers, &blueprint)?;
     validate(blueprint)
 }
 
@@ -215,13 +216,7 @@ fn refuse_universe_row(layers: &[(RuleSource, BlueprintLayer)], merged: &Bluepri
             .chain(layer.fs.writes.iter())
             .chain(layer.fs.writes_no_create.iter());
         if rows.clone().any(|p| *p == universe) {
-            let origin = match source {
-                RuleSource::BuiltIn => "the built-in baseline".to_string(),
-                RuleSource::Profile(p) => format!("profile {p}"),
-                RuleSource::File(p) => format!("blueprint {p}"),
-                RuleSource::Cli => "a CLI override".to_string(),
-                RuleSource::Discovered(p) => format!("discovered layer {p}"),
-            };
+            let origin = describe_source(source);
             bail!(
                 "a `/**` grant from {origin} reopens the whole filesystem under the closed read \
                  mode (`mode = \"unveil\"`); the ambient universe is a read mode, not a rule -- \
@@ -244,6 +239,7 @@ pub fn load_stack_with_provenance(
     let layers = load_layers(path, sets, sugar, sigils)?;
     let (blueprint, provenance) = merge_with_provenance(&layers);
     refuse_universe_row(&layers, &blueprint)?;
+    validate_net(&layers, &blueprint)?;
     Ok((validate(blueprint)?, provenance))
 }
 
@@ -442,36 +438,128 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
         None => Vec::new(),
     };
     for raw in std::mem::take(&mut layer.rules) {
-        let (verb, path) = raw
+        let (verb, target) = raw
             .split_once(':')
-            .ok_or_else(|| anyhow!("rule {raw:?} is not \"<verb>:<path>\""))?;
-        let pat = PathPattern::parse(&sigils.expand(path.trim()))
-            .with_context(|| format!("rule {raw:?}"))?;
-        match verb.trim() {
-            "read" | "readonly" => layer.fs.reads.push(pat),
-            "readwrite" => layer.fs.writes.push(pat),
-            // The create/write split (FW-CAP9): `modify` grants write minus create, a distinct
-            // word from full `readwrite`/`writes` so the weaker grade never reads as full write.
-            "modify" => layer.fs.writes_no_create.push(pat),
-            "allow" => {
-                layer.fs.writes.push(pat.clone());
-                exec_paths.push(pat);
-            }
-            "readexec" => {
-                layer.fs.reads.push(pat.clone());
-                exec_paths.push(pat);
-            }
-            "exec" => exec_paths.push(pat),
-            "deny" => layer.fs.subtract.push(pat),
-            other => bail!(
-                "unknown rule verb {other:?} in {raw:?} (known: read, readonly, readwrite, modify, allow, readexec, exec, deny)"
-            ),
+            .ok_or_else(|| anyhow!("rule {raw:?} is not \"<verb>:<target>\""))?;
+        let target = target.trim();
+        let atoms: Vec<&str> = verb.split(',').map(str::trim).collect();
+        // The verb decides the axis (FW-BP15); `deny` belongs to both, and the target's shape --
+        // a path or a host -- decides it there (FW-BP13).
+        let http = atoms
+            .iter()
+            .all(|a| formwork_blueprint::HTTP_ATOMS.contains(a));
+        let host_deny = atoms == ["deny"] && formwork_blueprint::target_is_host(target);
+        if http || host_deny {
+            let rule = formwork_blueprint::HostRule::parse(verb, target)
+                .map_err(|e| anyhow!("rule {raw:?}: {e}"))?;
+            layer.hosts.push(rule);
+            continue;
+        }
+        let pat =
+            PathPattern::parse(&sigils.expand(target)).with_context(|| format!("rule {raw:?}"))?;
+        let fs = fs_atoms(&atoms).map_err(|e| anyhow!("rule {raw:?}: {e}"))?;
+        if fs.deny {
+            layer.fs.subtract.push(pat);
+            continue;
+        }
+        // `write` implies read and includes create; `modify` is write without create (FW-CAP9),
+        // subsumed when both are named.
+        if fs.write {
+            layer.fs.writes.push(pat.clone());
+        } else if fs.modify {
+            layer.fs.writes_no_create.push(pat.clone());
+        } else if fs.read {
+            layer.fs.reads.push(pat.clone());
+        }
+        if fs.exec {
+            exec_paths.push(pat);
         }
     }
     if !exec_paths.is_empty() {
         layer.exec = Some(ExecPosture::Allowlist(exec_paths));
     }
     Ok(())
+}
+
+/// The filesystem verb atoms of one rule (FW-BP15), with the landed compound verbs as aliases.
+#[derive(Default)]
+struct FsAtoms {
+    read: bool,
+    write: bool,
+    modify: bool,
+    exec: bool,
+    deny: bool,
+}
+
+fn fs_atoms(atoms: &[&str]) -> std::result::Result<FsAtoms, String> {
+    let mut out = FsAtoms::default();
+    for atom in atoms {
+        match *atom {
+            "read" | "readonly" => out.read = true,
+            "write" | "readwrite" => out.write = true,
+            "modify" => out.modify = true,
+            "exec" => out.exec = true,
+            "readexec" => {
+                out.read = true;
+                out.exec = true;
+            }
+            "allow" => {
+                out.write = true;
+                out.exec = true;
+            }
+            "deny" => out.deny = true,
+            other => {
+                return Err(format!(
+                    "unknown rule verb {other:?} (filesystem atoms: read, write, modify, exec, \
+                     deny, and the compounds readonly, readwrite, readexec, allow; HTTP atoms: {})",
+                    formwork_blueprint::HTTP_ATOMS.join(", ")
+                ))
+            }
+        }
+    }
+    if out.deny && atoms.len() > 1 {
+        return Err("`deny` cannot be combined with other atoms".to_string());
+    }
+    Ok(out)
+}
+
+/// FW-BP13/FW-EGR1: a port tier and host rules reach the network by different doors, so both in
+/// one blueprint is refused; FW-BP14: one host, one grade. Every conflict is named.
+fn validate_net(layers: &[(RuleSource, BlueprintLayer)], merged: &Blueprint) -> Result<()> {
+    let Some(table) = merged.net.host_table() else {
+        return Ok(());
+    };
+    if let Some((source, _)) = layers
+        .iter()
+        .rev()
+        .find(|(_, l)| matches!(l.net, Some(formwork_blueprint::NetPosture::Ports(_))))
+    {
+        let first = table
+            .rules
+            .first()
+            .map(|r| r.to_string())
+            .unwrap_or_default();
+        bail!(
+            "host rules (e.g. `{first}`) and a direct port tier (`net = {{ ports = [...] }}` in \
+             {}) cannot both apply: host rules route all egress through the Gateway, and the port \
+             tier would bypass it. Remove the port tier",
+            describe_source(source)
+        );
+    }
+    if let Err(errors) = formwork_blueprint::validate_host_rules(&table.rules) {
+        bail!("host rules conflict:\n  {}", errors.join("\n  "));
+    }
+    Ok(())
+}
+
+fn describe_source(source: &RuleSource) -> String {
+    match source {
+        RuleSource::BuiltIn => "the built-in baseline".to_string(),
+        RuleSource::Profile(p) => format!("profile {p}"),
+        RuleSource::File(p) => format!("blueprint {p}"),
+        RuleSource::Cli => "a CLI override".to_string(),
+        RuleSource::Discovered(p) => format!("discovered layer {p}"),
+    }
 }
 
 /// The CLI-edge path sigils, expanded before patterns reach the pure, absolute-only compiler:
@@ -775,6 +863,74 @@ mod tests {
             layer.exec,
             Some(ExecPosture::Allowlist(vec![pp("/bin/ls"), pp("/bin/cat")]))
         );
+    }
+
+    #[test]
+    fn verb_atoms_compose_and_host_rules_desugar_by_target_shape() {
+        let sigils = Sigils::new("/home/x", "/work");
+        let mut layer = BlueprintLayer {
+            rules: vec![
+                "read,write:/a/**".into(),
+                "read,exec:/b/**".into(),
+                "write,modify:/c".into(),
+                "https:api.anthropic.com".into(),
+                "get,post:api.github.com/repos/acme/**".into(),
+                "deny:telemetry.example.com".into(),
+                "deny:~/.ssh".into(),
+            ],
+            ..Default::default()
+        };
+        desugar_rules(&mut layer, &sigils).unwrap();
+        assert_eq!(layer.fs.writes, vec![pp("/a/**"), pp("/c")]);
+        assert_eq!(layer.fs.reads, vec![pp("/b/**")]);
+        assert_eq!(layer.fs.subtract, vec![pp("/home/x/.ssh")]);
+        assert_eq!(layer.exec, Some(ExecPosture::Allowlist(vec![pp("/b/**")])));
+        let hosts: Vec<String> = layer.hosts.iter().map(|h| h.to_string()).collect();
+        assert_eq!(
+            hosts,
+            vec![
+                "https:api.anthropic.com",
+                "get,post:api.github.com/repos/acme/**",
+                "deny:telemetry.example.com"
+            ]
+        );
+        let mut bad = BlueprintLayer {
+            rules: vec!["read,deny:/x".into()],
+            ..Default::default()
+        };
+        assert!(desugar_rules(&mut bad, &sigils).is_err());
+    }
+
+    #[test]
+    fn host_rules_refuse_a_port_tier_and_a_second_grade() {
+        let dir = Scratch::new("host-rules");
+        std::fs::write(
+            dir.path().join("bp.toml"),
+            "net = { ports = [443] }\nrules = [\"https:api.anthropic.com\"]\n",
+        )
+        .unwrap();
+        let msg = format!(
+            "{:#}",
+            load(&dir.path().join("bp.toml"), "/home/x").unwrap_err()
+        );
+        assert!(msg.contains("port tier"), "{msg}");
+        std::fs::write(
+            dir.path().join("two.toml"),
+            "rules = [\"https:*.github.com\", \"post:api.github.com/x\"]\n",
+        )
+        .unwrap();
+        let msg = format!(
+            "{:#}",
+            load(&dir.path().join("two.toml"), "/home/x").unwrap_err()
+        );
+        assert!(msg.contains("two grades"), "{msg}");
+        std::fs::write(
+            dir.path().join("ok.toml"),
+            "rules = [\"https:api.anthropic.com\", \"get:api.github.com\"]\n",
+        )
+        .unwrap();
+        let bp = load(&dir.path().join("ok.toml"), "/home/x").unwrap();
+        assert_eq!(bp.net.host_table().unwrap().rules.len(), 2);
     }
 
     #[test]
