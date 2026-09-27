@@ -45,7 +45,7 @@ pub struct BlueprintLayer {
     pub mcp: BTreeMap<String, McpPolicy>,
     /// Credential types deliberately let through (FW-CRED5); unions across layers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow_credentials: Vec<String>,
+    pub allow_credentials: Vec<crate::CredentialEntry>,
     #[serde(default, skip_serializing_if = "DiscoveryLayer::is_empty")]
     pub discovery: DiscoveryLayer,
     /// Channel lifts (FW-BP9); `allow` unions and `deny` is terminal across layers (FW-BP10).
@@ -331,7 +331,7 @@ mod tests {
         );
         let b = layer_toml(r#"allow-credentials = ["aws", "gcp"]"#);
         let merged = merge(&[a, b]);
-        assert_eq!(merged.allow_credentials, vec!["aws", "gcp"]);
+        assert_eq!(merged.exposed_credentials(), vec!["aws", "gcp"]);
         assert_eq!(merged.discovery.auto_widen, vec![pp("/work/project/**")]);
     }
 

@@ -480,6 +480,8 @@ mod tests {
             isolate: Vec::new(),
             gateway_port: None,
             unix_socket_grants: Vec::new(),
+            brokered: false,
+            keyring_lifted: false,
         }
     }
 

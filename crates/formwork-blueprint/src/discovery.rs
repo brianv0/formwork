@@ -7,7 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{canonicalize_set, Blueprint, FsBlueprint, PathPattern, ReadMode, ResolvedCatalog};
+use crate::{
+    canonicalize_set, Blueprint, CredentialEntry, FsBlueprint, PathPattern, ReadMode,
+    ResolvedCatalog,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -171,7 +174,10 @@ pub fn synthesize_blueprint(
             writes: canonicalize_set(&writes),
             ..FsBlueprint::default()
         },
-        allow_credentials: allow.to_vec(),
+        allow_credentials: allow
+            .iter()
+            .map(|a| CredentialEntry::Expose(a.clone()))
+            .collect(),
         ..Blueprint::empty()
     }
 }
@@ -270,7 +276,7 @@ mod tests {
             &catalog(),
             &["aws".to_string()],
         );
-        assert_eq!(bp.allow_credentials, vec!["aws".to_string()]);
+        assert_eq!(bp.exposed_credentials(), vec!["aws".to_string()]);
         let reads: Vec<String> = bp.fs.reads.iter().map(|p| p.canonical()).collect();
         assert_eq!(reads, vec!["/home/x/.aws/config"]);
     }

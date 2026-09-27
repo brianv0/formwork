@@ -28,6 +28,7 @@ use formwork_blueprint::{
     HostTable, HttpMethod, METADATA_HOSTNAMES,
 };
 
+use crate::inspect::{Broker, Inspection};
 use crate::GatewayError;
 
 /// Bound on a request head, so a client that never ends its headers cannot make the Gateway buffer
@@ -67,6 +68,10 @@ pub struct EgressConfig {
     pub table: HostTable,
     pub resolver: Resolver,
     pub admission: Admission,
+    /// The session CA and upstream trust, when any host is inspected (FW-EGR10/EGR13).
+    pub inspection: Option<Inspection>,
+    /// Brokered credentials (FW-CRED11).
+    pub brokers: Vec<Broker>,
 }
 
 /// One refusal (FW-FID5): what was refused, why, the deciding rule, and the reproduction.
@@ -178,13 +183,13 @@ impl Drop for EgressProxy {
     }
 }
 
-struct Shared {
-    config: EgressConfig,
+pub(crate) struct Shared {
+    pub(crate) config: EgressConfig,
     violations: Arc<Mutex<Vec<Violation>>>,
 }
 
 impl Shared {
-    fn refuse(
+    pub(crate) fn refuse(
         &self,
         kind: &'static str,
         target: &str,
@@ -255,15 +260,17 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
-/// A parsed request head.
-struct Head {
-    method: String,
-    target: String,
-    headers: Vec<(String, String)>,
+/// A parsed message head. For a response, `method` holds the version, `target` the status code,
+/// and `reason` the reason phrase.
+pub(crate) struct Head {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) reason: String,
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 impl Head {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -303,7 +310,7 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 
 /// Strict head parsing: CRLF line endings, no obsolete line folding, no NUL, one `name: value` per
 /// line. Anything else is refused rather than guessed at (FW-EGR11's spirit at the head).
-fn parse_head(raw: &[u8]) -> Option<Head> {
+pub(crate) fn parse_head(raw: &[u8]) -> Option<Head> {
     let text = std::str::from_utf8(raw).ok()?;
     if text.contains('\0') {
         return None;
@@ -338,6 +345,44 @@ fn parse_head(raw: &[u8]) -> Option<Head> {
     Some(Head {
         method,
         target,
+        reason: String::new(),
+        headers,
+    })
+}
+
+/// A response head: `HTTP/1.x <3-digit status> [reason]`, then headers under the same strict rules.
+pub(crate) fn parse_response_head(raw: &[u8]) -> Option<Head> {
+    let text = std::str::from_utf8(raw).ok()?;
+    if text.contains('\0') {
+        return None;
+    }
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next()?;
+    let mut parts = status_line.splitn(3, ' ');
+    let version = parts.next()?;
+    let status = parts.next()?;
+    let reason = parts.next().unwrap_or("").to_string();
+    if !(version == "HTTP/1.1" || version == "HTTP/1.0")
+        || status.len() != 3
+        || !status.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return None;
+        }
+        let (name, value) = line.split_once(':')?;
+        headers.push((name.to_string(), value.trim().to_string()));
+    }
+    Some(Head {
+        method: version.to_string(),
+        target: status.to_string(),
+        reason,
         headers,
     })
 }
@@ -360,8 +405,50 @@ fn basic_credential(credential: &str) -> String {
     format!("Basic {}", base64(format!("fw:{credential}").as_bytes()))
 }
 
-/// Standard base64 with padding (RFC 4648 §4), for the one header value the listener compares.
-fn base64(input: &[u8]) -> String {
+/// Decode standard base64 (RFC 4648 §4); `None` on any malformed input.
+pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let bytes = input.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 {
+            return None;
+        }
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n <<= 6;
+            if i < 4 - pad {
+                n |= val(c)?;
+            } else if c != b'=' {
+                return None;
+            }
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Standard base64 with padding (RFC 4648 §4).
+pub(crate) fn base64(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
@@ -445,7 +532,11 @@ fn split_authority(authority: &str, default_port: u16) -> Option<(String, u16)> 
 
 /// Resolve and pin (FW-EGR4, FW-ADV-008): the first address that is not restricted -- unless the
 /// host is an IP literal a rule names, which is the explicit naming EGR4 requires.
-async fn resolve(shared: &Shared, host: &CanonicalHost, port: u16) -> Result<SocketAddr, String> {
+pub(crate) async fn resolve(
+    shared: &Shared,
+    host: &CanonicalHost,
+    port: u16,
+) -> Result<SocketAddr, String> {
     let table = &shared.config.table;
     match host {
         CanonicalHost::Ip(ip) => {
@@ -540,14 +631,8 @@ async fn serve_connect(
     match shared.config.table.decide_connect(&host, port) {
         EgressDecision::Tunnel { .. } => {}
         EgressDecision::Inspect => {
-            return crate::inspect::serve_inspected(
-                stream,
-                host,
-                port,
-                leftover,
-                shared_inspect(&shared),
-            )
-            .await;
+            return crate::inspect::serve_inspected(stream, host, port, leftover, shared.clone())
+                .await;
         }
         EgressDecision::Deny { reason, rule } => {
             shared.refuse(
@@ -590,27 +675,6 @@ async fn serve_connect(
 /// without a wildcard that would swallow a future variant.
 fn unreachable_allow() -> ! {
     unreachable!("decide_connect returns Tunnel, Inspect or Deny")
-}
-
-fn shared_inspect(shared: &Arc<Shared>) -> crate::inspect::InspectContext {
-    crate::inspect::InspectContext {
-        table: shared.config.table.clone(),
-        refuse: {
-            let shared = shared.clone();
-            Arc::new(
-                move |target: &str, reason: &str, rule: Option<String>, explain: String| {
-                    shared.refuse("request", target, reason, rule, explain)
-                },
-            )
-        },
-        resolve: {
-            let shared = shared.clone();
-            Arc::new(move |host: CanonicalHost, port: u16| {
-                let shared = shared.clone();
-                Box::pin(async move { resolve(&shared, &host, port).await })
-            })
-        },
-    }
 }
 
 /// A plain-HTTP request in absolute form (`GET http://host/path HTTP/1.1`): decided by host, and by
@@ -675,6 +739,23 @@ async fn serve_plain(
         return respond(&mut stream, "403 Forbidden", "").await;
     }
     let hint = explain_hint("http", &host.to_string(), port, &path);
+    // A brokered credential is never presented over plain HTTP, and its placeholder never leaves
+    // unencrypted (FW-CRED11).
+    if let Some(b) = shared
+        .config
+        .brokers
+        .iter()
+        .find(|b| head.headers.iter().any(|(_, v)| v.contains(&b.placeholder)))
+    {
+        shared.refuse(
+            "request",
+            &format!("{} {host}:{port}{path}", head.method),
+            &format!("the {} placeholder was sent over plain HTTP", b.name),
+            None,
+            hint,
+        );
+        return respond(&mut stream, "403 Forbidden", "").await;
+    }
     let method = HttpMethod::from_token(&head.method);
     let decision = match shared.config.table.decide_connect(&host, port) {
         EgressDecision::Inspect => shared
@@ -747,6 +828,18 @@ mod tests {
         assert!(parse_head(b"GET / HTTP/1.1\r\n folded\r\n\r\n").is_none());
         assert!(parse_head(b"GET / HTTP/2\r\n\r\n").is_none());
         assert!(parse_head(b"GET  / HTTP/1.1\r\n\r\n").is_none());
+        let r = parse_response_head(b"HTTP/1.1 404 Not Found\r\nA: b\r\n\r\n").unwrap();
+        assert_eq!((r.target.as_str(), r.reason.as_str()), ("404", "Not Found"));
+        assert!(parse_response_head(b"HTTP/1.1 20 X\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        for s in [&b""[..], b"f", b"fo", b"foo", b"x-access-token:ghp_1"] {
+            assert_eq!(base64_decode(&base64(s)).unwrap(), s);
+        }
+        assert!(base64_decode("abc").is_none());
+        assert!(base64_decode("ab!=").is_none());
     }
 
     #[test]

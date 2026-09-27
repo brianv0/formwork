@@ -38,6 +38,23 @@ pub struct CatalogEntry {
     /// referenced file (FW-CRED3). Must be a subset of `envs`.
     #[serde(default)]
     pub env_file_refs: Vec<String>,
+    /// Service locations (FW-CRED13): `mach:<name>` on macOS, `bus:<name>` or
+    /// `runtime:<socket under $XDG_RUNTIME_DIR>` on Linux. Denied like paths, by the channel
+    /// mechanism of each backend.
+    #[serde(default)]
+    pub services: Vec<String>,
+    /// How the Gateway presents this type when it is brokered (FW-CRED11): one scheme per set of
+    /// hosts, since one credential can need different schemes on different hosts.
+    #[serde(default)]
+    pub broker: Vec<BrokerBlock>,
+}
+
+/// One `{ hosts, scheme }` pair of a Catalog `broker` block (FEP-5 §3.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct BrokerBlock {
+    pub hosts: Vec<String>,
+    pub scheme: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -89,6 +106,8 @@ impl Catalog {
                         .collect::<Result<_, _>>()?,
                     envs: entry.envs.clone(),
                     env_file_refs: entry.env_file_refs.clone(),
+                    services: entry.services.clone(),
+                    broker: entry.broker.clone(),
                 },
             );
         }
@@ -122,6 +141,10 @@ pub struct ResolvedEntry {
     pub paths: Vec<PathPattern>,
     pub envs: Vec<String>,
     pub env_file_refs: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub broker: Vec<BrokerBlock>,
 }
 
 impl ResolvedCatalog {
@@ -214,7 +237,7 @@ mod tests {
     #[test]
     fn builtin_catalog_parses_and_resolves() {
         let catalog = Catalog::builtin();
-        assert_eq!(catalog.version, 1);
+        assert_eq!(catalog.version, 2);
         // The FEP-named curated types are present.
         for t in [
             "aws",
@@ -262,9 +285,20 @@ mod tests {
     fn every_type_contributes_at_least_one_location() {
         for (name, entry) in &Catalog::builtin().types {
             assert!(
-                !entry.paths.is_empty() || !entry.envs.is_empty(),
-                "{name} has neither paths nor envs"
+                !entry.paths.is_empty() || !entry.envs.is_empty() || !entry.services.is_empty(),
+                "{name} has no location"
             );
+            for block in &entry.broker {
+                crate::BrokerScheme::parse(&block.scheme).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert!(
+                    !block.hosts.is_empty(),
+                    "{name}: a broker block binds no host"
+                );
+                assert!(
+                    !entry.envs.is_empty(),
+                    "{name}: a brokered type needs an env source"
+                );
+            }
         }
     }
 

@@ -3,6 +3,7 @@
 
 mod catalog;
 mod channel;
+mod credential;
 mod discovery;
 mod egress;
 mod launcher;
@@ -11,9 +12,13 @@ mod narrow;
 mod path;
 mod provenance;
 
-pub use catalog::{Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP};
+pub use catalog::{BrokerBlock, Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP};
 pub use channel::{
     valid_channel_names, Channel, ChannelError, ChannelGroup, ChannelPolicy, IsolateMember,
+};
+pub use credential::{
+    doubly_named, exposed_types, resolve_brokers, BrokerPlan, BrokerScheme, CredentialEntry,
+    InlineBinding,
 };
 pub use discovery::{
     reverse_compile, synthesize_blueprint, AccessRecord, Candidate, CandidateTag, DenialAccess,
@@ -50,10 +55,11 @@ pub struct Blueprint {
     pub env: EnvPosture,
     #[serde(default)]
     pub mcp: BTreeMap<String, McpPolicy>,
-    /// Credential types deliberately let through the catalog floor (FW-CRED5). The catalog itself
-    /// is compiled in; this is the only mechanism that lifts a typed entry -- path allows cannot.
+    /// Credential types deliberately let through the catalog floor (FW-CRED5), or brokered by the
+    /// Gateway (FW-BP12). The catalog itself is compiled in; this is the only mechanism that lifts a
+    /// typed entry -- path allows cannot. Floor computations read [`Blueprint::exposed_credentials`].
     #[serde(default)]
-    pub allow_credentials: Vec<String>,
+    pub allow_credentials: Vec<CredentialEntry>,
     #[serde(default)]
     pub discovery: DiscoveryBlueprint,
     /// Host-service channels lifted from the baseline (FW-ISO13, FW-BP9). Default: none.
@@ -65,6 +71,11 @@ pub struct Blueprint {
 }
 
 impl Blueprint {
+    /// The types whose floor is lifted (FW-CRED5): bare entries not also brokered.
+    pub fn exposed_credentials(&self) -> Vec<String> {
+        exposed_types(&self.allow_credentials)
+    }
+
     /// The floor-only Blueprint for a permissive recording: everything allowed, so the workload runs
     /// observably unconfined, except the credential floor. The floor is terminal, so the open `/**`
     /// write cannot reach a credential (FW-INV11) -- a recording can never touch one.

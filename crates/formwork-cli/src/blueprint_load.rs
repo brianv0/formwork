@@ -197,7 +197,7 @@ pub fn load_stack(
     let (blueprint, _) = merge_with_provenance(&layers);
     refuse_universe_row(&layers, &blueprint)?;
     validate_net(&layers, &blueprint)?;
-    validate(blueprint)
+    validate(blueprint, sigils.home)
 }
 
 /// FEP-5 D10: the ambient universe is a property of the read mode, never a row. Under `closed`
@@ -240,14 +240,19 @@ pub fn load_stack_with_provenance(
     let (blueprint, provenance) = merge_with_provenance(&layers);
     refuse_universe_row(&layers, &blueprint)?;
     validate_net(&layers, &blueprint)?;
-    Ok((validate(blueprint)?, provenance))
+    Ok((validate(blueprint, sigils.home)?, provenance))
 }
 
 /// A typo'd credential type would silently stay blocked -- fail-closed but intent-hiding, the same
 /// trap as a typo'd gateway server name. Validate at the edge (parse, don't validate).
-fn validate(blueprint: Blueprint) -> Result<Blueprint> {
+fn validate(blueprint: Blueprint, home: &str) -> Result<Blueprint> {
     let catalog = formwork_blueprint::Catalog::builtin();
-    for t in &blueprint.allow_credentials {
+    for entry in &blueprint.allow_credentials {
+        // Inline bindings name credentials the Catalog does not know; `resolve_brokers` checks them.
+        let t = match entry {
+            formwork_blueprint::CredentialEntry::Inline(_) => continue,
+            other => other.name(),
+        };
         if !catalog.is_known_type(t) {
             let known: Vec<&str> = catalog
                 .type_names()
@@ -255,6 +260,23 @@ fn validate(blueprint: Blueprint) -> Result<Blueprint> {
                 .collect();
             bail!("unknown credential type {t:?} in allow-credentials (known: {known:?})");
         }
+    }
+    // FW-CRED12: every brokered credential resolves to hosts an inspected rule covers.
+    let resolved = catalog
+        .resolve(home)
+        .context("resolving the credential catalog")?;
+    if let Err(errors) = formwork_blueprint::resolve_brokers(
+        &blueprint.allow_credentials,
+        &resolved,
+        blueprint.net.host_table(),
+    ) {
+        bail!("allow-credentials:\n  {}", errors.join("\n  "));
+    }
+    for t in formwork_blueprint::doubly_named(&blueprint.allow_credentials) {
+        tracing::info!(
+            credential = %t,
+            "named both bare and `broker:`; brokered wins, so the credential stays out of the session (FW-BP12)"
+        );
     }
     Ok(blueprint)
 }

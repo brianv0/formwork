@@ -35,6 +35,15 @@ libc = "0.2"
 # Constitution Layers: only formwork-gateway links it in the product; the CLI uses it dev-only.
 tokio = { version = "1", features = ["rt", "io-util", "process", "time"] }
 
+# TLS inspection at the Gateway (FEP-5 §3.2, FW-EGR10/EGR13). Only formwork-gateway links these.
+# rustls over OpenSSL keeps the trust base memory-safe; the `ring` provider avoids aws-lc's C++/cmake
+# build. rcgen mints the per-session CA and leaves in memory; rustls-native-certs is the host trust
+# store the Gateway verifies upstreams against.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls-native-certs = "0.8"
+
 # Linux confiner backends (Phase 2). Linux-only; referenced under a target cfg so the macOS build
 # never pulls them. Every crate here widens the trust base (Growth), so these two are the whole of it:
 # `landlock` carries the filesystem/net boundary, `seccompiler` the syscall baseline.

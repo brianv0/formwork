@@ -18,10 +18,13 @@ use tokio::sync::Mutex;
 use formwork_blueprint::{Gate, McpPolicy};
 use formwork_compile::CompiledPolicy;
 
+pub mod ca;
 pub mod egress;
 mod inspect;
 
+pub use ca::{pem_bundle, SessionCa};
 pub use egress::{Admission, EgressConfig, EgressProxy, Resolver, Violation};
+pub use inspect::{Broker, Inspection, UpstreamRoots};
 
 // Bounds a single frame so a peer that never sends a newline can't make the gateway buffer without
 // limit; overflow closes the connection. A stability bound (design §3), not a DoS-resistance claim --

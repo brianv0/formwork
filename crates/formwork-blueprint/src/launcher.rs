@@ -85,7 +85,16 @@ pub fn construct_env(
     // FW-BP11 / D5: a denied channel's locator variables are stripped (hiding the socket from
     // well-behaved clients); a lifted channel re-admits them, or its client cannot find the socket
     // and the lift is a silent no-op. An explicit Allowlist posture stays exact either way.
-    let (admitted, locators) = channels.locator_vars();
+    let (mut admitted, mut locators) = channels.locator_vars();
+    // The OS keyring is reached over the session bus on Linux (Secret Service), so exposing it
+    // admits the bus address -- the Catalog entry's services carry the socket grant.
+    if allow.iter().any(|t| t == "os-keyring") {
+        const BUS: &str = "DBUS_SESSION_BUS_ADDRESS";
+        locators.retain(|v| *v != BUS);
+        if !admitted.contains(&BUS) {
+            admitted.push(BUS);
+        }
+    }
     let (locator_pairs, remainder): (Vec<_>, Vec<_>) = remainder
         .into_iter()
         .partition(|(name, _)| locators.contains(&name.as_str()));

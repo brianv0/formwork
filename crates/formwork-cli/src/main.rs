@@ -335,7 +335,11 @@ impl BlueprintArgs {
             exec: None,
             env: None,
             mcp: Default::default(),
-            allow_credentials: self.allow_cred.clone(),
+            allow_credentials: self
+                .allow_cred
+                .iter()
+                .map(|c| formwork_blueprint::CredentialEntry::parse(c))
+                .collect(),
             discovery: Default::default(),
             channels: None,
             isolate: Vec::new(),
@@ -642,7 +646,7 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
         };
         let target =
             PathPattern::parse(&expanded).with_context(|| format!("explaining {path:?}"))?;
-        let floor = catalog.floor_type_of(&blueprint.allow_credentials, &target);
+        let floor = catalog.floor_type_of(&blueprint.exposed_credentials(), &target);
         let shape = floor
             .as_deref()
             .filter(|t| *t == formwork_blueprint::BACKSTOP)
@@ -658,7 +662,7 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
         // the model verdict above is not what this kernel enforces.
         if landlock_withholds {
             let absolute_floor_hit = catalog
-                .denied_paths(&blueprint.allow_credentials)
+                .denied_paths(&blueprint.exposed_credentials())
                 .iter()
                 .any(|p| !p.is_any_depth() && p.matches_path(target.base()));
             if floor.is_some() && !absolute_floor_hit {
@@ -974,6 +978,9 @@ struct Session {
     tmp_dir: SessionTmp,
     /// The Gateway egress listener, when the blueprint carries host rules (FW-EGR14).
     egress: Option<Egress>,
+    /// Variables the Launcher sets for inspection and brokering: the trust-bundle variables
+    /// (FW-EGR13) and each brokered credential's placeholder (FW-CRED14).
+    egress_env: Vec<(String, String)>,
 }
 
 /// A host-scoped session's egress door: the in-process Gateway listener and, on Linux, the port
@@ -1008,6 +1015,10 @@ fn session_nonce() -> Result<String> {
 /// in every read mode, and exported as `TMPDIR`/`TMP`/`TEMP` to the confined child.
 struct SessionTmp {
     path: PathBuf,
+    /// The read-only trust directory holding the inspection CA bundle (FW-EGR13), when the
+    /// blueprint inspects any host. A sibling of `path`, never inside it: the session may write
+    /// its temp directory, and a writable bundle would let it trust a CA of its own.
+    trust: Option<PathBuf>,
 }
 
 impl SessionTmp {
@@ -1027,11 +1038,37 @@ impl SessionTmp {
             .create(&path)
             .with_context(|| format!("creating the session temp directory {}", path.display()))?;
         let path = std::fs::canonicalize(&path).context("resolving the session temp directory")?;
-        Ok(SessionTmp { path })
+        Ok(SessionTmp { path, trust: None })
+    }
+
+    /// Write the inspection trust bundle into a fresh 0700 sibling directory (FW-EGR13).
+    fn write_trust_bundle(&mut self, bundle: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let mut name = self.path.as_os_str().to_owned();
+        name.push("-trust");
+        let dir = PathBuf::from(name);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("creating the session trust directory {}", dir.display()))?;
+        self.trust = Some(dir.clone());
+        let file = dir.join("ca-bundle.pem");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(&file)
+            .with_context(|| format!("writing {}", file.display()))?;
+        std::io::Write::write_all(&mut f, bundle.as_bytes())
+            .with_context(|| format!("writing {}", file.display()))?;
+        Ok(file)
     }
 
     fn remove(&self) {
         let _ = std::fs::remove_dir_all(&self.path);
+        if let Some(trust) = &self.trust {
+            let _ = std::fs::remove_dir_all(trust);
+        }
     }
 }
 
@@ -1049,7 +1086,7 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
         .subtract
         .extend(blueprint_load::env_file_ref_denies(
             &catalog,
-            &blueprint.allow_credentials,
+            &blueprint.exposed_credentials(),
         )?);
     // The policy inputs are write-denied inside the session: a confined agent must not be able
     // to edit the blueprint, forge the discovered layer, or doctor the proposal that shapes its
@@ -1068,6 +1105,8 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
             .context("granting the session temp directory")?,
     );
     tracing::info!(tmp = %tmp_dir.path.display(), "session temp directory (TMPDIR/TMP/TEMP)");
+    let mut tmp_dir = tmp_dir;
+    let tls = prepare_inspection(&mut blueprint, &catalog, &mut tmp_dir, purpose)?;
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
     // faithfully rendered (FW-INV6). The catalog's paths get the same treatment -- a floor hole
@@ -1076,7 +1115,11 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
         .context("canonicalizing grant paths")?;
     let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
         .context("canonicalizing credential catalog paths")?;
-    let egress = start_egress(&blueprint, &host, purpose)?;
+    let (egress_env, inspection, brokers) = match tls {
+        Some(t) => (t.env, Some(t.inspection), t.brokers),
+        None => (Vec::new(), None, Vec::new()),
+    };
+    let egress = start_egress(&blueprint, &host, purpose, inspection, brokers)?;
     let endpoints = formwork_compile::SessionEndpoints {
         gateway_port: egress.as_ref().map(|e| e.proxy.addr().port()),
     };
@@ -1089,7 +1132,106 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
         blueprint_path: resolved.path,
         tmp_dir,
         egress,
+        egress_env,
     })
+}
+
+/// What inspection and brokering add to a session.
+struct PreparedInspection {
+    inspection: formwork_gateway::Inspection,
+    brokers: Vec<formwork_gateway::Broker>,
+    env: Vec<(String, String)>,
+}
+
+/// Clients that honor one of these read the trust bundle; the list is the common set across
+/// OpenSSL, Node, Python requests, curl, git, and pip (FW-EGR13).
+const TRUST_VARS: &[&str] = &[
+    "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "PIP_CERT",
+];
+
+/// FW-EGR13 / FW-CRED11-14: when any host rule is inspected, mint the session CA, write the trust
+/// bundle (the CA plus the host's roots, so uninspected tunnels still verify) into a read-only
+/// directory the session may read, and resolve each brokered credential's secret on this side of
+/// the sandbox. A brokered credential with no value is refused before spawn (FW-XR9): the
+/// workload would otherwise start and fail on its first request.
+fn prepare_inspection(
+    blueprint: &mut Blueprint,
+    catalog: &ResolvedCatalog,
+    tmp: &mut SessionTmp,
+    purpose: Purpose,
+) -> Result<Option<PreparedInspection>> {
+    let Some(table) = blueprint.net.host_table() else {
+        return Ok(None);
+    };
+    if purpose != Purpose::Spawn || !table.rules.iter().any(|r| r.is_inspected()) {
+        return Ok(None);
+    }
+    let plans =
+        formwork_blueprint::resolve_brokers(&blueprint.allow_credentials, catalog, Some(table))
+            .map_err(|errors| anyhow!("allow-credentials:\n  {}", errors.join("\n  ")))?;
+    let ca = formwork_gateway::SessionCa::generate().context("generating the session CA")?;
+    let file = tmp.write_trust_bundle(&ca.trust_bundle())?;
+    let trust_dir = tmp.trust.clone().expect("set by write_trust_bundle");
+    let rendered = trust_dir
+        .to_str()
+        .ok_or_else(|| anyhow!("session trust directory is not valid UTF-8 (FW-INV6)"))?;
+    blueprint.fs.reads.push(
+        PathPattern::parse(&format!("{rendered}/**")).context("granting the trust directory")?,
+    );
+    // It sits under the host temp root, which a profile commonly grants writable; a bundle the
+    // session could append to would let it trust a CA of its own.
+    for pattern in [rendered.to_string(), format!("{rendered}/**")] {
+        blueprint
+            .fs
+            .write_subtract
+            .push(PathPattern::parse(&pattern).context("write-protecting the trust directory")?);
+    }
+    let file = file.display().to_string();
+    let mut env: Vec<(String, String)> = TRUST_VARS
+        .iter()
+        .map(|v| (v.to_string(), file.clone()))
+        .collect();
+    tracing::info!(bundle = %file, "inspection trust bundle");
+
+    let mut brokers = Vec::new();
+    for plan in plans {
+        let Some((var, secret)) = plan.env_sources.iter().find_map(|v| {
+            std::env::var(v)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| (v, s))
+        }) else {
+            bail!(
+                "{} is brokered, but none of its variables is set here ({}); set one, or drop \
+                  `broker:{}` from allow-credentials",
+                plan.name,
+                plan.env_sources.join(", "),
+                plan.name
+            );
+        };
+        let placeholder = format!("fwcred-{}-{}", plan.name, session_nonce()?);
+        tracing::info!(credential = %plan.name, var = %var, "brokered; the session holds a placeholder");
+        env.push((var.clone(), placeholder.clone()));
+        brokers.push(formwork_gateway::Broker {
+            name: plan.name,
+            placeholder,
+            secret,
+            bindings: plan.bindings,
+        });
+    }
+    Ok(Some(PreparedInspection {
+        inspection: formwork_gateway::Inspection {
+            ca: std::sync::Arc::new(ca),
+            upstream_roots: formwork_gateway::UpstreamRoots::System,
+        },
+        brokers,
+        env,
+    }))
 }
 
 /// FW-EGR14: a blueprint with host rules gets its Gateway egress listener here, in the `formwork`
@@ -1100,6 +1242,8 @@ fn start_egress(
     blueprint: &Blueprint,
     host: &HostProfile,
     purpose: Purpose,
+    inspection: Option<formwork_gateway::Inspection>,
+    brokers: Vec<formwork_gateway::Broker>,
 ) -> Result<Option<Egress>> {
     let Some(table) = blueprint.net.host_table() else {
         return Ok(None);
@@ -1132,6 +1276,8 @@ fn start_egress(
             credential: session_nonce()?,
             registry: registry.clone(),
         },
+        inspection,
+        brokers,
     })
     .context("starting the Gateway egress listener")?;
     for rule in &table.rules {
@@ -1170,6 +1316,7 @@ fn session_env(session: &Session) -> Vec<(String, String)> {
             vars.push((var.to_string(), String::new()));
         }
     }
+    vars.extend(session.egress_env.iter().cloned());
     vars
 }
 
@@ -1568,7 +1715,7 @@ fn apply_env(
     let built = formwork_blueprint::construct_env(
         &blueprint.env,
         catalog,
-        &blueprint.allow_credentials,
+        &blueprint.exposed_credentials(),
         &blueprint.channels,
         vars,
     );

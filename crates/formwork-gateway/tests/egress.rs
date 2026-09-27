@@ -74,6 +74,8 @@ fn start(
             credential: CREDENTIAL.to_string(),
             registry,
         },
+        inspection: None,
+        brokers: Vec::new(),
     })
     .unwrap()
 }

@@ -286,7 +286,7 @@ pub fn conclude_learning_run(
     let outcome = reverse_compile(
         &records,
         catalog,
-        &blueprint.allow_credentials,
+        &blueprint.exposed_credentials(),
         &blueprint.discovery.auto_widen,
     );
 

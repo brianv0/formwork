@@ -57,6 +57,10 @@ pub struct CompileInput {
     pub gateway_port: Option<u16>,
     /// Pathname sockets granted by a literal write grant (FW-ISO12, FEP-5 §3.1.1).
     pub unix_socket_grants: Vec<PathPattern>,
+    /// Whether any credential is brokered (FW-CRED11).
+    pub brokered: bool,
+    /// Whether the `os-keyring` type is lifted (FW-CRED13).
+    pub keyring_lifted: bool,
 }
 
 impl CompileInput {
@@ -65,15 +69,11 @@ impl CompileInput {
         reads.extend(blueprint.fs.writes.iter().cloned());
         // Write grants imply read; the no-create grant is a write grant too.
         reads.extend(blueprint.fs.writes_no_create.iter().cloned());
+        let exposed = blueprint.exposed_credentials();
         let floor_exempt: Vec<PathPattern> = catalog
             .types
             .iter()
-            .filter(|(name, _)| {
-                blueprint
-                    .allow_credentials
-                    .iter()
-                    .any(|a| a == name.as_str())
-            })
+            .filter(|(name, _)| exposed.iter().any(|a| a == name.as_str()))
             .flat_map(|(_, entry)| entry.paths.iter().cloned())
             .collect();
         CompileInput {
@@ -83,13 +83,18 @@ impl CompileInput {
             writes_no_create: canonicalize_set(&blueprint.fs.writes_no_create),
             subtract: canonicalize_set(&blueprint.fs.subtract),
             write_subtract: canonicalize_set(&blueprint.fs.write_subtract),
-            floor: canonicalize_set(&catalog.denied_paths(&blueprint.allow_credentials)),
+            floor: canonicalize_set(&catalog.denied_paths(&exposed)),
             floor_exempt: canonicalize_set(&floor_exempt),
             net: blueprint.net.clone(),
             exec: blueprint.exec.clone(),
             channels: blueprint.channels.clone(),
             isolate: blueprint.isolate.clone(),
             gateway_port: None,
+            brokered: blueprint
+                .allow_credentials
+                .iter()
+                .any(|e| !matches!(e, formwork_blueprint::CredentialEntry::Expose(_))),
+            keyring_lifted: exposed.iter().any(|t| t == "os-keyring"),
             // A literal (non-subtree) write grant names one file; that is how a session grants a
             // socket (`readwrite:$SSH_AUTH_SOCK`). Subtree grants never admit sockets, or a
             // writable `/tmp/**` would admit the X11 socket beneath it.
@@ -274,8 +279,9 @@ fn credential_report(
     let env_fidelity = Fidelity::Enforced {
         backend: Backend::Launcher,
     };
+    let exposed = blueprint.exposed_credentials();
     let mut per_type = BTreeMap::new();
-    for (name, entry) in catalog.enforced_types(&blueprint.allow_credentials) {
+    for (name, entry) in catalog.enforced_types(&exposed) {
         per_type.insert(
             name.to_string(),
             CredentialFidelity {
@@ -284,14 +290,19 @@ fn credential_report(
             },
         );
     }
-    let backstop_lifted = blueprint
+    let backstop_lifted = exposed.iter().any(|a| a == formwork_blueprint::BACKSTOP);
+    let mut brokered: Vec<String> = blueprint
         .allow_credentials
         .iter()
-        .any(|a| a == formwork_blueprint::BACKSTOP);
+        .filter(|e| !matches!(e, formwork_blueprint::CredentialEntry::Expose(_)))
+        .map(|e| e.name().to_string())
+        .collect();
+    brokered.sort();
+    brokered.dedup();
     CredentialReport {
         catalog_version: catalog.version,
-        allowed: blueprint.allow_credentials.clone(),
-        brokered: Vec::new(),
+        allowed: exposed,
+        brokered,
         per_type,
         backstop: (!backstop_lifted).then(|| path_fidelity_for(&catalog.backstop)),
         launcher_contingency: "env-var shading is applied by the launcher at spawn; it holds only \
@@ -849,6 +860,12 @@ fn unix_socket_grants(input: &CompileInput, host: &HostProfile) -> Vec<PathPatte
             Channel::OpenUrl | Channel::Camera => {}
         }
     }
+    // FW-CRED13: lifting `os-keyring` admits the keyring sockets and -- because the Secret Service
+    // lives on it -- the session bus (the coupling the report states).
+    if input.keyring_lifted {
+        paths.extend(f.keyring.iter().cloned());
+        paths.extend(f.session_bus.iter().cloned());
+    }
     let mut grants = input.unix_socket_grants.clone();
     grants.extend(paths.iter().filter_map(|p| PathPattern::parse(p).ok()));
     grants
@@ -875,8 +892,10 @@ fn egress_rows(
         .iter()
         .any(|r| matches!(r.access, formwork_blueprint::HostAccess::Tunnel));
     let has_inspected = table.rules.iter().any(|r| r.is_inspected());
-    let tunnel_gap = "tunnel-grade hosts (`https:`) are admitted by the CONNECT target and trust                       the client's SNI and Host; domain fronting is not caught (FW-EGR5)";
-    let unavailable = "connect supervision is unavailable on this host: it needs seccomp user                        notification, pidfd_getfd (Linux 5.6+), and Yama ptrace_scope 0 or 1;                        egress fails closed and `run` refuses the host rules";
+    let tunnel_gap = "tunnel-grade hosts (`https:`) are admitted by the CONNECT target and trust the client's SNI and Host; domain fronting is not caught (FW-EGR5)";
+    let unavailable = "connect supervision is unavailable on this host: it needs seccomp user \
+                        notification, pidfd_getfd (Linux 5.6+), and Yama ptrace_scope 0 or 1; \
+                        egress fails closed and `run` refuses the host rules";
     match host.os {
         Os::Linux if !supervised => {
             put(
@@ -906,7 +925,7 @@ fn egress_rows(
             };
             put(Capability::NetDefaultDeny, supervisor());
             put(Capability::NetResolver, supervisor());
-            let sendmsg_gap = "addressed sendmsg()/sendmmsg() on an AF_UNIX datagram socket is                                not mediated (its destination sits in memory seccomp cannot read);                                connect() and addressed sendto() are";
+            let sendmsg_gap = "addressed sendmsg()/sendmmsg() on an AF_UNIX datagram socket is not mediated (its destination sits in memory seccomp cannot read); connect() and addressed sendto() are";
             put(
                 Capability::NetUnixSocket,
                 Fidelity::Partial {
@@ -922,14 +941,17 @@ fn egress_rows(
                         format!("pathname and abstract connect() are supervised; {sendmsg_gap}")
                     } else {
                         format!(
-                            "pathname and abstract connect() are supervised; signals outside the                              domain need Landlock ABI 6; {sendmsg_gap}"
+                            "pathname and abstract connect() are supervised; signals outside the \
+                              domain need Landlock ABI 6; {sendmsg_gap}"
                         )
                     },
                 },
             );
         }
         Os::MacOs => {
-            let mut reason = "the egress listener admits the per-session proxy credential; the                               peer-process check is pending characterization (C2), so a same-uid                               process that reads the agent's environment could reach it"
+            let mut reason = "the egress listener admits the per-session proxy credential; the \
+                               peer-process check is pending characterization (C2), so a same-uid \
+                               process that reads the agent's environment could reach it"
                 .to_string();
             if has_tunnel {
                 reason = format!("{reason}; {tunnel_gap}");
@@ -950,11 +972,22 @@ fn egress_rows(
         }
     }
     if has_inspected {
+        // Every request to an inspected host is decided per method and path; a client that does
+        // not trust the session CA fails its handshake and is refused -- fail-closed, not a bypass.
+        // The macOS limit (Security.framework clients ignore SSL_CERT_FILE) is a compatibility
+        // note the operator channel carries (FW-FID9), not a gap in what is enforced.
         put(
             Capability::NetInspection,
-            Fidelity::Unenforceable {
-                reason: "TLS inspection is not in this build; the Gateway refuses inspected hosts"
-                    .to_string(),
+            Fidelity::Enforced {
+                backend: Backend::Gateway,
+            },
+        );
+    }
+    if input.brokered {
+        put(
+            Capability::CredentialBroker,
+            Fidelity::Enforced {
+                backend: Backend::Gateway,
             },
         );
     }
@@ -1241,7 +1274,7 @@ mod tests {
     fn excluded_type_leaves_report_per_type_and_lists_allowed() {
         let catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
         let bp = Blueprint {
-            allow_credentials: vec!["aws".to_string()],
+            allow_credentials: vec!["aws".into()],
             ..Blueprint::empty()
         };
         let policy = super::compile(&bp, &HostProfile::synthetic_macos(), &catalog);

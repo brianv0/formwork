@@ -487,3 +487,100 @@ fn fw_e2e_082_session_bus_is_closed_until_run_outside_is_lifted() {
     );
     assert!(lifted.stdout.contains("org.freedesktop.DBus"));
 }
+
+#[cfg(target_os = "linux")]
+const BROKERED: &str = "extends = [\"builtin:default\"]\n\
+                        rules = [\"readwrite:$CWD/**\", \"get,post:api.anthropic.com\"]\n\
+                        allow-credentials = [\"broker:anthropic\"]\n";
+
+/// FW-E2E-078 (Linux, the `run` half; the Gateway half is `formwork-gateway`'s inspect test): a
+/// brokered credential reaches the session only as its placeholder, the secret bytes appear
+/// nowhere in the confined environment, and the inspection trust bundle is readable but not
+/// writable (FW-EGR13, FW-CRED14, FW-INV13).
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_e2e_078_session_holds_the_placeholder_and_a_read_only_trust_bundle() {
+    let dir = Scratch::new("broker");
+    if !supervision_host(dir.path()) {
+        not_exercised("connect supervision unavailable");
+        return;
+    }
+    std::fs::write(dir.path().join("FORMWORK.toml"), BROKERED).unwrap();
+    std::fs::create_dir_all(dir.path().join(".anthropic")).unwrap();
+    std::fs::write(dir.path().join(".anthropic/key"), "catalog-file-bytes").unwrap();
+    let secret = "sk-fixture-5c1e7a9b";
+    let script = r#"printf 'key=%s\n' "$ANTHROPIC_API_KEY"
+cat "$HOME/.anthropic/key" 2>/dev/null
+head -1 "$SSL_CERT_FILE"
+[ "$NODE_EXTRA_CA_CERTS" = "$SSL_CERT_FILE" ] && echo same-bundle
+( echo x >> "$SSL_CERT_FILE" ) 2>/dev/null && echo bundle-writable
+env"#;
+    let out = formwork(
+        dir.path(),
+        &["run", "--", "/bin/sh", "-c", script],
+        &[("ANTHROPIC_API_KEY", secret)],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        out.stdout.contains("key=fwcred-anthropic-"),
+        "the placeholder, not the secret: {}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("-----BEGIN CERTIFICATE-----"));
+    assert!(out.stdout.contains("same-bundle"));
+    assert!(!out.stdout.contains("bundle-writable"), "{}", out.stdout);
+    assert!(
+        !out.stdout.contains(secret),
+        "secret disclosed: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("catalog-file-bytes"),
+        "a brokered type keeps its floor: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stderr.contains(secret),
+        "secret logged: {}",
+        out.stderr
+    );
+}
+
+/// FW-XR9 for brokering: a brokered credential with no value on the launching host is refused
+/// before the workload starts, naming the variable to set.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_brokered_credential_without_a_value_is_refused_before_spawn() {
+    let dir = Scratch::new("broker-unset");
+    if !supervision_host(dir.path()) {
+        not_exercised("connect supervision unavailable");
+        return;
+    }
+    std::fs::write(dir.path().join("FORMWORK.toml"), BROKERED).unwrap();
+    let marker = dir.path().join("started");
+    let out = Command::new(env!("CARGO_BIN_EXE_formwork"))
+        .args(["run", "--", "/bin/sh", "-c", "touch started"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("ANTHROPIC_API_KEY"), "{stderr}");
+    assert!(!marker.exists(), "the workload started");
+}
+
+/// FW-CRED12: a credential brokered to a host no inspected rule covers is refused at load, with
+/// the rule to write.
+#[test]
+fn brokering_to_a_tunneled_host_is_refused_at_load() {
+    let dir = Scratch::new("broker-tunnel");
+    let bp = "extends = [\"builtin:default\"]\n\
+              rules = [\"readwrite:$CWD/**\", \"https:api.anthropic.com\"]\n\
+              allow-credentials = [\"broker:anthropic\"]\n";
+    std::fs::write(dir.path().join("FORMWORK.toml"), bp).unwrap();
+    let out = formwork(dir.path(), &["explain", "--json"], &[]);
+    assert_ne!(out.code, 0);
+    assert!(out.stderr.contains("api.anthropic.com"), "{}", out.stderr);
+}
