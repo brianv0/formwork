@@ -16,7 +16,8 @@
 #           HTTPS host". The fs sandbox is what stops secrets being read to exfiltrate at all.
 #   exec    unrestricted, so the agent runs tools freely; set an allowlist to restrict execve.
 
-net = { ports = [443] }
+net = { ports = [443] }              # Linux: no name resolution under the port tier (FW-INV3);
+                                     # macOS re-allows the system resolver. See examples/README.md.
 exec = "unrestricted"
 # Scrub secret-shaped env vars but keep the model auth the agent needs. Egress is open
 # to any HTTPS host, so this stops e.g. AWS_SECRET_ACCESS_KEY being exfiltrated via the environment.
