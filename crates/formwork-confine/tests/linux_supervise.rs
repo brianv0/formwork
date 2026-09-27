@@ -123,6 +123,7 @@ fn run(
             gateway,
             registry,
             unix_grants,
+            refused_sockets: Default::default(),
         })
         .expect("supervisor starts");
     child.wait().unwrap().code().unwrap_or(-1)

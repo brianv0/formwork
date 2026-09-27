@@ -450,6 +450,7 @@ fn main() -> Result<()> {
     if let Some(code) = formwork_confine::isolation_stage() {
         std::process::exit(code);
     }
+    take_learning_report_fd();
     init_telemetry();
     let cli = parse_cli();
     let cmd = match &cli.command {
@@ -987,6 +988,13 @@ struct Session {
     /// Variables the Launcher sets for inspection and brokering: the trust-bundle variables
     /// (FW-EGR13) and each brokered credential's placeholder (FW-CRED14).
     egress_env: Vec<(String, String)>,
+    /// The opener shim and its socket (FW-ISO17), in the spawn posture.
+    opener: Option<OpenerSetup>,
+    /// The host this session was compiled for; `learn` maps refused sockets to channels by it.
+    host: HostProfile,
+    /// Pathname sockets the connect supervisor refused (FW-DISC12).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    refused_sockets: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
 }
 
 /// A host-scoped session's egress door: the in-process Gateway listener and, on Linux, the port
@@ -1021,10 +1029,10 @@ fn session_nonce() -> Result<String> {
 /// in every read mode, and exported as `TMPDIR`/`TMP`/`TEMP` to the confined child.
 struct SessionTmp {
     path: PathBuf,
-    /// The read-only trust directory holding the inspection CA bundle (FW-EGR13), when the
-    /// blueprint inspects any host. A sibling of `path`, never inside it: the session may write
-    /// its temp directory, and a writable bundle would let it trust a CA of its own.
-    trust: Option<PathBuf>,
+    /// Launcher-owned read-only directories beside `path` (FW-TRA9): the inspection trust bundle
+    /// and the opener shim. Siblings, never inside `path`: the session may write its temp
+    /// directory, and a writable bundle or shim would let it trust a CA or run code of its own.
+    siblings: Vec<PathBuf>,
 }
 
 impl SessionTmp {
@@ -1044,38 +1052,102 @@ impl SessionTmp {
             .create(&path)
             .with_context(|| format!("creating the session temp directory {}", path.display()))?;
         let path = std::fs::canonicalize(&path).context("resolving the session temp directory")?;
-        Ok(SessionTmp { path, trust: None })
+        Ok(SessionTmp {
+            path,
+            siblings: Vec::new(),
+        })
     }
 
-    /// Write the inspection trust bundle into a fresh 0700 sibling directory (FW-EGR13).
-    fn write_trust_bundle(&mut self, bundle: &str) -> Result<PathBuf> {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    /// A fresh 0700 sibling directory `<path>-<suffix>`, removed with the session.
+    fn sibling(&mut self, suffix: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt;
         let mut name = self.path.as_os_str().to_owned();
-        name.push("-trust");
+        name.push(format!("-{suffix}"));
         let dir = PathBuf::from(name);
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
-            .with_context(|| format!("creating the session trust directory {}", dir.display()))?;
-        self.trust = Some(dir.clone());
-        let file = dir.join("ca-bundle.pem");
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o400)
-            .open(&file)
-            .with_context(|| format!("writing {}", file.display()))?;
-        std::io::Write::write_all(&mut f, bundle.as_bytes())
-            .with_context(|| format!("writing {}", file.display()))?;
-        Ok(file)
+            .with_context(|| format!("creating the session directory {}", dir.display()))?;
+        self.siblings.push(dir.clone());
+        Ok(dir)
     }
 
     fn remove(&self) {
         let _ = std::fs::remove_dir_all(&self.path);
-        if let Some(trust) = &self.trust {
-            let _ = std::fs::remove_dir_all(trust);
+        for dir in &self.siblings {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
+}
+
+/// Write a Launcher-owned file, created fresh with `mode`.
+fn write_launcher_file(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    std::io::Write::write_all(&mut f, bytes).with_context(|| format!("writing {}", path.display()))
+}
+
+/// FW-TRA9: grant a Launcher-owned directory readable (and, for the shim, executable under an
+/// exec allowlist) in every read mode, and write-protect it: it sits under the host temp root,
+/// which a profile commonly grants writable.
+fn grant_launcher_dir(
+    blueprint: &mut Blueprint,
+    dir: &std::path::Path,
+    executable: bool,
+) -> Result<()> {
+    let rendered = dir
+        .to_str()
+        .ok_or_else(|| anyhow!("session directory is not valid UTF-8 (FW-INV6)"))?;
+    let subtree =
+        PathPattern::parse(&format!("{rendered}/**")).context("granting a session directory")?;
+    blueprint.fs.reads.push(subtree.clone());
+    blueprint
+        .fs
+        .write_subtract
+        .push(PathPattern::parse(rendered).context("write-protecting a session directory")?);
+    blueprint.fs.write_subtract.push(subtree.clone());
+    if executable {
+        if let formwork_blueprint::ExecPosture::Allowlist(allowed) = &mut blueprint.exec {
+            allowed.push(subtree);
+        }
+    }
+    Ok(())
+}
+
+/// The opener shim (FW-ISO17): a read-only directory first in `PATH`, and the socket its scripts
+/// write URLs to. The host end is served after the spawn (FW-ISO18).
+struct OpenerSetup {
+    dir: PathBuf,
+    host_end: std::sync::Mutex<Option<std::os::unix::net::UnixStream>>,
+    session_end: std::sync::Mutex<Option<std::os::fd::OwnedFd>>,
+    session_fd: std::os::fd::RawFd,
+    service: std::sync::Mutex<Option<formwork_gateway::OpenerService>>,
+}
+
+fn prepare_opener(blueprint: &mut Blueprint, tmp: &mut SessionTmp) -> Result<OpenerSetup> {
+    use std::os::fd::AsRawFd;
+    let dir = tmp.sibling("opener")?;
+    let script = formwork_gateway::opener::shim_script();
+    for name in formwork_gateway::opener::SHIM_NAMES {
+        write_launcher_file(&dir.join(name), script.as_bytes(), 0o500)?;
+    }
+    grant_launcher_dir(blueprint, &dir, true)?;
+    tracing::info!(shim = %dir.display(), "opener shim first in PATH and BROWSER (FW-ISO17)");
+    let (host_end, session_end) =
+        std::os::unix::net::UnixStream::pair().context("creating the opener socket")?;
+    let session_end = std::os::fd::OwnedFd::from(session_end);
+    Ok(OpenerSetup {
+        dir,
+        host_end: std::sync::Mutex::new(Some(host_end)),
+        session_fd: session_end.as_raw_fd(),
+        session_end: std::sync::Mutex::new(Some(session_end)),
+        service: std::sync::Mutex::new(None),
+    })
 }
 
 fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
@@ -1113,6 +1185,10 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
     tracing::info!(tmp = %tmp_dir.path.display(), "session temp directory (TMPDIR/TMP/TEMP)");
     let mut tmp_dir = tmp_dir;
     let tls = prepare_inspection(&mut blueprint, &catalog, &mut tmp_dir, purpose)?;
+    let opener = match purpose {
+        Purpose::Spawn => Some(prepare_opener(&mut blueprint, &mut tmp_dir)?),
+        Purpose::ConfineSelf | Purpose::GatewayBackend => None,
+    };
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
     // faithfully rendered (FW-INV6). The catalog's paths get the same treatment -- a floor hole
@@ -1139,7 +1215,32 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
         tmp_dir,
         egress,
         egress_env,
+        opener,
+        host,
+        refused_sockets: Default::default(),
     })
+}
+
+/// FW-ISO18: serve the opener socket from this process, outside the sandbox.
+fn start_opener(session: &Session, opener: &OpenerSetup) {
+    let Some(host_end) = opener.host_end.lock().ok().and_then(|mut h| h.take()) else {
+        return;
+    };
+    let lifted = session
+        .blueprint
+        .channels
+        .lifted(formwork_blueprint::Channel::OpenUrl);
+    let host_opener = std::env::var_os("FORMWORK_HOST_OPENER")
+        .map(PathBuf::from)
+        .unwrap_or_else(formwork_gateway::opener::host_opener);
+    match formwork_gateway::OpenerService::start(host_end, lifted, host_opener) {
+        Ok(service) => {
+            if let Ok(mut slot) = opener.service.lock() {
+                *slot = Some(service);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "the open-url service failed to start"),
+    }
 }
 
 /// What inspection and brokering add to a session.
@@ -1181,22 +1282,10 @@ fn prepare_inspection(
         formwork_blueprint::resolve_brokers(&blueprint.allow_credentials, catalog, Some(table))
             .map_err(|errors| anyhow!("allow-credentials:\n  {}", errors.join("\n  ")))?;
     let ca = formwork_gateway::SessionCa::generate().context("generating the session CA")?;
-    let file = tmp.write_trust_bundle(&ca.trust_bundle())?;
-    let trust_dir = tmp.trust.clone().expect("set by write_trust_bundle");
-    let rendered = trust_dir
-        .to_str()
-        .ok_or_else(|| anyhow!("session trust directory is not valid UTF-8 (FW-INV6)"))?;
-    blueprint.fs.reads.push(
-        PathPattern::parse(&format!("{rendered}/**")).context("granting the trust directory")?,
-    );
-    // It sits under the host temp root, which a profile commonly grants writable; a bundle the
-    // session could append to would let it trust a CA of its own.
-    for pattern in [rendered.to_string(), format!("{rendered}/**")] {
-        blueprint
-            .fs
-            .write_subtract
-            .push(PathPattern::parse(&pattern).context("write-protecting the trust directory")?);
-    }
+    let trust_dir = tmp.sibling("trust")?;
+    let file = trust_dir.join("ca-bundle.pem");
+    write_launcher_file(&file, ca.trust_bundle().as_bytes(), 0o400)?;
+    grant_launcher_dir(blueprint, &trust_dir, false)?;
     let file = file.display().to_string();
     let mut env: Vec<(String, String)> = TRUST_VARS
         .iter()
@@ -1323,6 +1412,16 @@ fn session_env(session: &Session) -> Vec<(String, String)> {
         }
     }
     vars.extend(session.egress_env.iter().cloned());
+    if let Some(opener) = &session.opener {
+        let shim = opener.dir.display().to_string();
+        let inherited = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+        vars.push(("PATH".to_string(), format!("{shim}:{inherited}")));
+        vars.push(("BROWSER".to_string(), format!("{shim}/xdg-open")));
+        vars.push((
+            formwork_gateway::opener::OPENER_FD_ENV.to_string(),
+            opener.session_fd.to_string(),
+        ));
+    }
     vars
 }
 
@@ -1449,8 +1548,29 @@ fn spawn_confined_child(
     #[cfg(not(target_os = "linux"))]
     formwork_confine::spawn_confined(&mut command, &session.policy)
         .context("applying confinement")?;
+    if let Some(opener) = &session.opener {
+        let fd = opener.session_fd;
+        // SAFETY: the closure runs post-fork and issues only fcntl(2) on a descriptor the session
+        // holds open until after the spawn.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     tracing::info!(program = %program, "spawning confined command");
     let child = command.spawn();
+    if let Some(opener) = &session.opener {
+        // The session holds the only copies now; EOF arrives when its last process exits.
+        drop(opener.session_end.lock().ok().and_then(|mut e| e.take()));
+        if child.is_ok() {
+            start_opener(session, opener);
+        }
+    }
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
@@ -1476,6 +1596,7 @@ fn spawn_confined_child(
                 gateway: egress.proxy.addr(),
                 registry: egress.registry.clone().unwrap_or_default(),
                 unix_grants,
+                refused_sockets: session.refused_sockets.clone(),
             };
             match pending.start(config) {
                 Ok(s) => Some(s),
@@ -1500,6 +1621,101 @@ fn spawn_confined_child(
     Ok(status)
 }
 
+/// The descriptor a Linux `learn` handed this `run` for its observations (FW-DISC12), taken
+/// from the environment before anything else reads it, so no workload inherits it.
+static LEARNING_REPORT_FD: std::sync::OnceLock<std::os::fd::RawFd> = std::sync::OnceLock::new();
+
+fn take_learning_report_fd() {
+    let Some(raw) = std::env::var_os(learn::REPORT_FD_ENV) else {
+        return;
+    };
+    // Single-threaded here: telemetry and every runtime start after this.
+    std::env::remove_var(learn::REPORT_FD_ENV);
+    let Some(fd) = raw
+        .to_str()
+        .and_then(|s| s.parse::<std::os::fd::RawFd>().ok())
+    else {
+        return;
+    };
+    // SAFETY: F_SETFD on a descriptor the learning parent handed us; the workload must not
+    // inherit it.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0 {
+        let _ = LEARNING_REPORT_FD.set(fd);
+    }
+}
+
+/// What this session was refused beyond paths (FW-DISC12): the Gateway's policy refusals, the
+/// opener's `open-url` refusals, and pathname sockets the supervisor refused, mapped onto the
+/// channels whose facilities `detect` found. The keyring's sockets are a credential type, not a
+/// channel, so they are withheld rather than proposed.
+fn session_observations(session: &Session) -> learn::SessionObservations {
+    use formwork_blueprint::Channel;
+    let mut obs = learn::SessionObservations::default();
+    if let Some(egress) = &session.egress {
+        obs.egress = egress
+            .proxy
+            .violations()
+            .into_iter()
+            .filter_map(|v| v.need)
+            .collect();
+    }
+    if let Some(opener) = &session.opener {
+        if let Ok(slot) = opener.service.lock() {
+            if let Some(service) = slot.as_ref() {
+                let records = service.records_within(std::time::Duration::from_millis(500));
+                if records.iter().any(|r| r.channel_denied) {
+                    obs.channels.push(Channel::OpenUrl.name().to_string());
+                }
+            }
+        }
+    }
+    let f = &session.host.facilities;
+    let refused = session
+        .refused_sockets
+        .lock()
+        .map(|r| r.clone())
+        .unwrap_or_default();
+    for path in refused {
+        let p = path.display().to_string();
+        let is = |candidate: &Option<String>| candidate.as_deref() == Some(p.as_str());
+        let channel = if is(&f.keyring) {
+            obs.withheld.push((
+                p.clone(),
+                "the keyring is a credential type; lift it with allow-credentials = \
+                 [\"os-keyring\"]"
+                    .to_string(),
+            ));
+            None
+        } else if is(&f.session_bus) || is(&f.user_manager) {
+            Some(Channel::RunOutside)
+        } else if f.display.contains(&p) {
+            Some(Channel::Clipboard)
+        } else if is(&f.audio) {
+            Some(Channel::Microphone)
+        } else {
+            None
+        };
+        if let Some(c) = channel {
+            obs.channels.push(c.name().to_string());
+        }
+    }
+    obs
+}
+
+/// Hand this session's observations to the Linux `learn` that spawned it, if one did.
+fn report_to_learning_run(session: &Session) {
+    let Some(&fd) = LEARNING_REPORT_FD.get() else {
+        return;
+    };
+    use std::os::fd::FromRawFd;
+    // SAFETY: the descriptor was handed to this process for exactly this write; it is owned here.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let body = serde_json::to_vec(&session_observations(session)).unwrap_or_default();
+    if let Err(e) = std::io::Write::write_all(&mut file, &body) {
+        tracing::warn!(error = %e, "could not report observations to the learning run");
+    }
+}
+
 fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<()> {
     let purpose = match posture {
         Posture::Spawn => Purpose::Spawn,
@@ -1510,6 +1726,7 @@ fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<
     match posture {
         Posture::Spawn => {
             let status = spawn_confined_child(&session, program, args)?;
+            report_to_learning_run(&session);
             std::process::exit(exit_code(&status));
         }
         Posture::Self_ => {
@@ -1611,6 +1828,7 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
             let started = std::time::Instant::now();
             let (program, args) = argv.split_first().expect("argv is non-empty");
             let status = spawn_confined_child(&session, program, args)?;
+            let observations = session_observations(&session);
             let records = learn::collect_denials_quiescent(started)?;
             learn::conclude_learning_run(
                 &session.blueprint,
@@ -1618,6 +1836,7 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
                 &session.catalog,
                 &run_id,
                 records,
+                &observations,
                 &status,
             )?;
             std::process::exit(exit_code(&status));
@@ -1680,9 +1899,42 @@ fn learn_run_linux(
         .args(args.forward_overrides())
         .arg("--")
         .args(argv);
+    // FW-DISC12: the shim's Gateway, opener and supervisor report over a pipe it inherits.
+    let (report_read, report_write) =
+        cloexec_pipe().context("creating the learning report pipe")?;
+    let report_fd = {
+        use std::os::fd::AsRawFd;
+        report_write.as_raw_fd()
+    };
+    command.env(learn::REPORT_FD_ENV, report_fd.to_string());
+    // SAFETY: the closure runs post-fork and issues only fcntl(2) on a descriptor held open until
+    // the spawn returns.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(move || {
+            if libc::fcntl(report_fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let reader = std::thread::spawn(move || {
+        let mut body = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut &report_read, &mut body);
+        body
+    });
     tracing::info!(tracer = %strace.display(), "spawning the workload under the ptrace denial feed");
-    let status = command.status().context("spawning strace")?;
+    let status = command.status();
+    drop(command);
+    drop(report_write);
+    let status = status.context("spawning strace")?;
     log_exit("traced workload exited", &status);
+    let observations: learn::SessionObservations = reader
+        .join()
+        .ok()
+        .filter(|b| !b.is_empty())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
 
     let trace = std::fs::read_to_string(&trace_path)
         .with_context(|| format!("reading the strace log {}", trace_path.display()))?;
@@ -1695,9 +1947,35 @@ fn learn_run_linux(
         &catalog,
         run_id,
         records,
+        &observations,
         &status,
     )?;
     std::process::exit(exit_code(&status));
+}
+
+/// A close-on-exec pipe, read end first (`std::io::pipe` postdates the MSRV, and macOS has no
+/// `pipe2`). Created before any child is spawned from this thread.
+fn cloexec_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe writes two descriptors into `fds`; both are owned below.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fresh descriptors from pipe, owned from here on.
+    let (read, write) = unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    };
+    for fd in fds {
+        // SAFETY: F_SETFD on a descriptor owned above.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok((read, write))
 }
 
 /// The operator channel's compile-time itemization (FW-CRED7). The full roll-call is identical

@@ -60,6 +60,9 @@ pub struct SupervisorConfig {
     pub registry: Arc<Mutex<HashSet<u16>>>,
     /// Pathname sockets admitted besides in-session ones (FW-ISO12).
     pub unix_grants: Vec<PathPattern>,
+    /// Every pathname socket refused, as the supervisor resolved it, for `learn` to map onto the
+    /// channels behind them (FW-DISC12).
+    pub refused_sockets: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 /// The filter program and the child's end of the listener handoff, built before the fork so the
@@ -785,6 +788,9 @@ fn admit_unix(
         ),
         &format!("formwork explain {}", real.display()),
     );
+    if let Ok(mut refused) = config.refused_sockets.lock() {
+        refused.push(real);
+    }
     Err(libc::EACCES)
 }
 

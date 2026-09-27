@@ -82,6 +82,24 @@ pub struct Violation {
     pub reason: String,
     pub rule: Option<String>,
     pub explain: String,
+    /// What the session needed, when the refusal was a policy decision `learn` can propose a rule
+    /// for (FW-DISC12). Absent for protocol refusals (malformed, smuggling-shaped, mismatched).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub need: Option<formwork_blueprint::EgressObservation>,
+}
+
+/// A refused destination, as `learn` sees it.
+pub(crate) fn need(
+    host: &CanonicalHost,
+    port: u16,
+    request: Option<(&str, &str)>,
+) -> Option<formwork_blueprint::EgressObservation> {
+    Some(formwork_blueprint::EgressObservation {
+        host: host.to_string(),
+        port,
+        method: request.map(|(m, _)| m.to_string()),
+        path: request.map(|(_, p)| p.to_string()),
+    })
 }
 
 /// A running egress listener. Dropping it stops the listener and joins its thread.
@@ -197,12 +215,26 @@ impl Shared {
         rule: Option<String>,
         explain: String,
     ) {
+        self.refuse_needing(kind, target, reason, rule, explain, None)
+    }
+
+    /// As [`Shared::refuse`], recording what the session needed (FW-DISC12).
+    pub(crate) fn refuse_needing(
+        &self,
+        kind: &'static str,
+        target: &str,
+        reason: &str,
+        rule: Option<String>,
+        explain: String,
+        need: Option<formwork_blueprint::EgressObservation>,
+    ) {
         let v = Violation {
             kind,
             target: target.to_string(),
             reason: reason.to_string(),
             rule,
             explain,
+            need,
         };
         // FW-FID9: one operator-channel line naming what was refused, the deciding rule, and the
         // reproduction; the confined client sees only a generic refusal.
@@ -635,12 +667,13 @@ async fn serve_connect(
                 .await;
         }
         EgressDecision::Deny { reason, rule } => {
-            shared.refuse(
+            shared.refuse_needing(
                 "connect",
                 &format!("{host}:{port}"),
                 &reason,
                 rule.map(|r| r.to_string()),
                 hint,
+                need(&host, port, None),
             );
             return respond(&mut stream, "403 Forbidden", "").await;
         }
@@ -649,7 +682,14 @@ async fn serve_connect(
     let addr = match resolve(&shared, &host, port).await {
         Ok(a) => a,
         Err(reason) => {
-            shared.refuse("connect", &format!("{host}:{port}"), &reason, None, hint);
+            shared.refuse_needing(
+                "connect",
+                &format!("{host}:{port}"),
+                &reason,
+                None,
+                hint,
+                need(&host, port, None),
+            );
             return respond(&mut stream, "403 Forbidden", "").await;
         }
     };
@@ -765,19 +805,27 @@ async fn serve_plain(
         other => other,
     };
     if let EgressDecision::Deny { reason, rule } = decision {
-        shared.refuse(
+        shared.refuse_needing(
             "request",
             &format!("{} {host}:{port}{path}", head.method),
             &reason,
             rule.map(|r| r.to_string()),
             hint,
+            need(&host, port, Some((&head.method, &path))),
         );
         return respond(&mut stream, "403 Forbidden", "").await;
     }
     let addr = match resolve(&shared, &host, port).await {
         Ok(a) => a,
         Err(reason) => {
-            shared.refuse("request", &format!("{host}:{port}"), &reason, None, hint);
+            shared.refuse_needing(
+                "request",
+                &format!("{host}:{port}"),
+                &reason,
+                None,
+                hint,
+                need(&host, port, None),
+            );
             return respond(&mut stream, "403 Forbidden", "").await;
         }
     };

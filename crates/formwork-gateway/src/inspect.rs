@@ -659,12 +659,13 @@ where
         {
             EgressDecision::Allow { .. } => {}
             EgressDecision::Deny { reason, rule } => {
-                shared.refuse(
+                shared.refuse_needing(
                     "request",
                     &format!("{} {host}{path}", head.method),
                     &reason,
                     rule.map(|r| r.to_string()),
                     hint(&path),
+                    crate::egress::need(&host, port, Some((&head.method, &path))),
                 );
                 return deny(&mut client_w).await;
             }
@@ -693,12 +694,13 @@ where
             let addr = match crate::egress::resolve(&shared, &host, port).await {
                 Ok(a) => a,
                 Err(reason) => {
-                    shared.refuse(
+                    shared.refuse_needing(
                         "connect",
                         &format!("{host}:{port}"),
                         &reason,
                         None,
                         hint(""),
+                        crate::egress::need(&host, port, None),
                     );
                     return deny(&mut client_w).await;
                 }

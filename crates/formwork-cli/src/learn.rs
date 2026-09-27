@@ -17,6 +17,10 @@
 //!
 //! On hosts with neither feed, learning says so loudly and proposes nothing -- never a silent
 //! pretend (FW-INV5/6, FW-XR9).
+//!
+//! Beyond paths, a learning run proposes host rules from the Gateway's refusals and channels from
+//! the opener shim's and the connect supervisor's refusals (FW-DISC12). These always wait for
+//! review: the auto-widen zone is a filesystem notion.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,8 +29,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use formwork_blueprint::{
-    reverse_compile, Blueprint, BlueprintLayer, Candidate, CandidateTag, DenialAccess,
-    DenialRecord, ProvenanceEntry, ResolvedCatalog,
+    propose_channels, propose_host_rules, reverse_compile, Blueprint, BlueprintLayer, Candidate,
+    CandidateTag, Channel, ChannelPolicy, DenialAccess, DenialRecord, EgressObservation,
+    ProvenanceEntry, ResolvedCatalog,
 };
 
 /// The reviewable proposal artifact (FW-DISC5). Candidates only: withheld credential matches are
@@ -41,6 +46,54 @@ pub struct ProposalFile {
     pub blueprint: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<ProposalEntry>,
+    /// Host rules the Gateway's refusals call for (FW-DISC12); always needs-review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<RuleProposal>,
+    /// Channels the session was refused (FW-DISC12); always needs-review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<ChannelProposal>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RuleProposal {
+    /// A host rule in `rules` syntax (`https:host`, `post:host/path`).
+    pub rule: String,
+    pub run_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ChannelProposal {
+    pub channel: String,
+    pub run_id: String,
+}
+
+/// What a run was refused beyond paths (FW-DISC12). It crosses the Linux learning shim as JSON
+/// over an inherited descriptor, so the shim's Gateway and supervisor can report to `learn`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SessionObservations {
+    #[serde(default)]
+    pub egress: Vec<EgressObservation>,
+    /// Channel names.
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// `(what, why)` withheld before proposal, for the operator channel.
+    #[serde(default)]
+    pub withheld: Vec<(String, String)>,
+}
+
+/// The environment variable naming the descriptor the Linux learning shim reports on.
+pub const REPORT_FD_ENV: &str = "FORMWORK_LEARN_REPORT_FD";
+
+/// Provenance keys for non-path discovered entries.
+pub(crate) fn rule_key(rule: &str) -> String {
+    format!("rule:{rule}")
+}
+
+pub(crate) fn channel_key(channel: &str) -> String {
+    format!("channel:{channel}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +334,7 @@ pub fn conclude_learning_run(
     catalog: &ResolvedCatalog,
     run_id: &str,
     records: Vec<DenialRecord>,
+    observations: &SessionObservations,
     workload_status: &std::process::ExitStatus,
 ) -> Result<()> {
     let outcome = reverse_compile(
@@ -298,6 +352,18 @@ pub fn conclude_learning_run(
             "learning: denial withheld by the credential floor (FW-DISC3); lift only via --allow-cred"
         );
     }
+
+    // FW-DISC12: hosts at the grade the host already has; restricted destinations withheld.
+    let egress = propose_host_rules(&observations.egress, blueprint.net.host_table());
+    for (target, why) in egress.withheld.iter().chain(observations.withheld.iter()) {
+        tracing::info!(target = %target, "learning: withheld, not proposed (FW-DISC12): {why}");
+    }
+    let observed_channels: Vec<Channel> = observations
+        .channels
+        .iter()
+        .filter_map(|c| Channel::from_name(c))
+        .collect();
+    let channels = propose_channels(&observed_channels, &blueprint.channels);
 
     let auto: Vec<ProposalEntry> = outcome
         .candidates
@@ -320,13 +386,15 @@ pub fn conclude_learning_run(
     }
 
     let path = proposal_path(blueprint_path);
-    let previous: Vec<ProposalEntry> = match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            toml::from_str::<ProposalFile>(&text)
-                .with_context(|| format!("parsing existing proposal {}", path.display()))?
-                .candidates
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+    let previous: ProposalFile = match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str::<ProposalFile>(&text)
+            .with_context(|| format!("parsing existing proposal {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProposalFile {
+            blueprint: String::new(),
+            candidates: Vec::new(),
+            hosts: Vec::new(),
+            channels: Vec::new(),
+        },
         Err(e) => return Err(e).context(format!("reading {}", path.display())),
     };
     let observed: Vec<ProposalEntry> = outcome
@@ -337,7 +405,30 @@ pub fn conclude_learning_run(
             run_id: run_id.to_string(),
         })
         .collect();
-    let (candidates, carried) = merge_proposal_entries(previous, observed);
+    let (candidates, carried) = merge_proposal_entries(previous.candidates, observed);
+    let hosts = merge_keyed(
+        previous.hosts,
+        egress
+            .rules
+            .iter()
+            .map(|r| RuleProposal {
+                rule: r.to_string(),
+                run_id: run_id.to_string(),
+            })
+            .collect(),
+        |e| e.rule.clone(),
+    );
+    let channel_entries = merge_keyed(
+        previous.channels,
+        channels
+            .iter()
+            .map(|c| ChannelProposal {
+                channel: c.name().to_string(),
+                run_id: run_id.to_string(),
+            })
+            .collect(),
+        |e| e.channel.clone(),
+    );
     if carried > 0 {
         tracing::info!(
             carried,
@@ -352,6 +443,8 @@ pub fn conclude_learning_run(
             .display()
             .to_string(),
         candidates,
+        hosts,
+        channels: channel_entries,
     };
     let body = format!(
         "# formwork learn proposal -- list with `formwork learn --list`, then accept per entry\n\
@@ -365,18 +458,21 @@ pub fn conclude_learning_run(
         .candidates
         .iter()
         .filter(|c| c.candidate.tag == CandidateTag::NeedsReview)
-        .count();
+        .count()
+        + proposal.hosts.len()
+        + proposal.channels.len();
+    let total = proposal.candidates.len() + proposal.hosts.len() + proposal.channels.len();
     // The proposal pointer is the run's RESULT, so it goes to stdout; telemetry stays on stderr.
     println!(
         "proposal: {} ({} candidates, {} needs review) -- review with `formwork learn --list`",
         path.display(),
-        proposal.candidates.len(),
+        total,
         needs_review
     );
     tracing::info!(
         workload_exit = workload_status.code().unwrap_or(-1),
         proposal = %path.display(),
-        candidates = proposal.candidates.len(),
+        candidates = total,
         needs_review,
         withheld = outcome.withheld.len(),
         "learning run complete (proposal written regardless of workload exit)"
@@ -410,11 +506,34 @@ fn merge_proposal_entries(
     (merged.into_values().collect(), carried)
 }
 
+/// Sticky merge for the non-path entries: earlier unreviewed entries are kept, a re-observed one
+/// is refreshed with the newest run id. Deterministic by key.
+fn merge_keyed<T, K: Ord>(previous: Vec<T>, observed: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T> {
+    let mut merged: std::collections::BTreeMap<K, T> =
+        previous.into_iter().map(|e| (key(&e), e)).collect();
+    for entry in observed {
+        merged.insert(key(&entry), entry);
+    }
+    merged.into_values().collect()
+}
+
 /// Append accepted entries to the discovered layer with provenance (FW-DISC6), deduped and
 /// canonical. The file is itself a BlueprintLayer, so the next run stacks it like any base.
 fn merge_into_discovered(
     path: &Path,
     accepted: &[&ProposalEntry],
+    added_via: &str,
+) -> Result<usize> {
+    merge_all_into_discovered(path, accepted, &[], &[], added_via)
+}
+
+/// As [`merge_into_discovered`], with host rules (kept in `rules`, host syntax only) and channels
+/// (the `channels` allow scope), each with provenance (FW-DISC12).
+fn merge_all_into_discovered(
+    path: &Path,
+    accepted: &[&ProposalEntry],
+    rules: &[&RuleProposal],
+    channels: &[&ChannelProposal],
     added_via: &str,
 ) -> Result<usize> {
     let mut layer: BlueprintLayer = match std::fs::read_to_string(path) {
@@ -436,6 +555,39 @@ fn merge_into_discovered(
             },
         );
     }
+    for entry in rules {
+        if !layer.rules.contains(&entry.rule) {
+            layer.rules.push(entry.rule.clone());
+        }
+        layer.discovery.provenance.insert(
+            rule_key(&entry.rule),
+            ProvenanceEntry {
+                added_via: added_via.to_string(),
+                run_id: entry.run_id.clone(),
+            },
+        );
+    }
+    layer.rules.sort();
+    if !channels.is_empty() {
+        let mut lifted: Vec<Channel> = layer
+            .channels
+            .as_ref()
+            .map(|c| c.allowed().iter().copied().collect())
+            .unwrap_or_default();
+        for entry in channels {
+            let channel = Channel::from_name(&entry.channel)
+                .ok_or_else(|| anyhow::anyhow!("unknown channel {:?}", entry.channel))?;
+            lifted.push(channel);
+            layer.discovery.provenance.insert(
+                channel_key(&entry.channel),
+                ProvenanceEntry {
+                    added_via: added_via.to_string(),
+                    run_id: entry.run_id.clone(),
+                },
+            );
+        }
+        layer.channels = Some(ChannelPolicy::allow(lifted));
+    }
     layer.fs.reads = formwork_blueprint::canonicalize_set(&layer.fs.reads);
     layer.fs.writes = formwork_blueprint::canonicalize_set(&layer.fs.writes);
     let body = format!(
@@ -444,7 +596,7 @@ fn merge_into_discovered(
         toml::to_string_pretty(&layer).context("serializing discovered layer")?
     );
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
-    Ok(accepted.len())
+    Ok(accepted.len() + rules.len() + channels.len())
 }
 
 /// `formwork learn --list`/`--accept` (and the hidden `accept` alias): per-entry,
@@ -466,9 +618,12 @@ pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -
         .with_context(|| format!("parsing proposal {}", proposal_file.display()))?;
 
     // The listing IS this invocation's result, so it goes to stdout -- under RUST_LOG=warn a
-    // stderr listing would silently vanish, hiding the one thing the user asked for.
+    // stderr listing would silently vanish, hiding the one thing the user asked for. Numbering
+    // runs through paths, then host rules, then channels.
+    let paths_n = proposal.candidates.len();
+    let hosts_n = proposal.hosts.len();
     if !all && entries.is_empty() {
-        if proposal.candidates.is_empty() {
+        if paths_n + hosts_n + proposal.channels.len() == 0 {
             println!("proposal has no candidates; nothing to review");
             return Ok(());
         }
@@ -488,31 +643,70 @@ pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -
                 entry.run_id
             );
         }
+        for (index, entry) in proposal.hosts.iter().enumerate() {
+            println!(
+                "{:>3}. rules += {:?} (host rule, needs-review, observed by {})",
+                paths_n + index + 1,
+                entry.rule,
+                entry.run_id
+            );
+        }
+        for (index, entry) in proposal.channels.iter().enumerate() {
+            println!(
+                "{:>3}. channels += {:?} (channel, needs-review, observed by {})",
+                paths_n + hosts_n + index + 1,
+                entry.channel,
+                entry.run_id
+            );
+        }
         println!(
-            "select with `formwork learn --accept <number|pattern>` (repeatable) or --accept-all; \
-             auto-accepted entries are already in the discovered layer and are listed for audit only"
+            "select with `formwork learn --accept <number|pattern|rule|channel>` (repeatable) or \
+             --accept-all; auto-accepted entries are already in the discovered layer and are \
+             listed for audit only"
         );
         return Ok(());
     }
 
-    let matches_selection = |index: usize, entry: &ProposalEntry| -> bool {
-        all || entries.iter().any(|sel| {
-            sel.parse::<usize>()
-                .map(|n| n == index + 1)
-                .unwrap_or(false)
-                || *sel == entry.candidate.pattern.canonical()
-        })
+    let picked = |number: usize, name: &str| -> bool {
+        all || entries
+            .iter()
+            .any(|sel| sel.parse::<usize>().map(|n| n == number).unwrap_or(false) || sel == name)
     };
     let selected: Vec<&ProposalEntry> = proposal
         .candidates
         .iter()
         .enumerate()
         .filter(|(_, e)| e.candidate.tag == CandidateTag::NeedsReview)
-        .filter(|(i, e)| matches_selection(*i, e))
+        .filter(|(i, e)| picked(i + 1, &e.candidate.pattern.canonical()))
         .map(|(_, e)| e)
         .collect();
-    if selected.is_empty() {
+    let selected_rules: Vec<&RuleProposal> = proposal
+        .hosts
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| picked(paths_n + i + 1, &e.rule))
+        .map(|(_, e)| e)
+        .collect();
+    let selected_channels: Vec<&ChannelProposal> = proposal
+        .channels
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| picked(paths_n + hosts_n + i + 1, &e.channel))
+        .map(|(_, e)| e)
+        .collect();
+    if selected.is_empty() && selected_rules.is_empty() && selected_channels.is_empty() {
         bail!("no needs-review candidate matched the selection (run with no selection to list)");
+    }
+    // A forged proposal must not smuggle a path rule through the host-rule door.
+    for entry in &selected_rules {
+        let Some((atoms, target)) = entry.rule.split_once(':') else {
+            bail!("refusing to accept {:?}: not a host rule", entry.rule);
+        };
+        if !formwork_blueprint::target_is_host(target) {
+            bail!("refusing to accept {:?}: not a host rule", entry.rule);
+        }
+        formwork_blueprint::HostRule::parse(atoms, target)
+            .map_err(|e| anyhow::anyhow!("refusing to accept {:?}: {e}", entry.rule))?;
     }
 
     // Same enforcement-time resolution as a run: proposal paths are kernel-resolved, so a
@@ -534,7 +728,13 @@ pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -
 
     let blueprint_path = PathBuf::from(&proposal.blueprint);
     let discovered = discovered_path(&blueprint_path);
-    let count = merge_into_discovered(&discovered, &selected, "discovery")?;
+    let count = merge_all_into_discovered(
+        &discovered,
+        &selected,
+        &selected_rules,
+        &selected_channels,
+        "discovery",
+    )?;
 
     // Rewrite the proposal without the accepted entries so acceptance is visibly consumed.
     // Keyed by (pattern, access), matching the merge key: a same-pattern read and write are
@@ -549,6 +749,18 @@ pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -
             .candidates
             .iter()
             .filter(|e| !accepted.contains(&(e.candidate.pattern.canonical(), e.candidate.access)))
+            .cloned()
+            .collect(),
+        hosts: proposal
+            .hosts
+            .iter()
+            .filter(|e| !selected_rules.contains(e))
+            .cloned()
+            .collect(),
+        channels: proposal
+            .channels
+            .iter()
+            .filter(|e| !selected_channels.contains(e))
             .cloned()
             .collect(),
     };

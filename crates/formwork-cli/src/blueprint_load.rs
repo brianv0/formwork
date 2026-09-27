@@ -680,7 +680,7 @@ fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer
     let mut value: toml::Value = toml::from_str(&text)
         .with_context(|| format!("parsing discovered layer {}", path.display()))?;
     sigils.expand_value(&mut value);
-    let layer: BlueprintLayer = value
+    let mut layer: BlueprintLayer = value
         .try_into()
         .with_context(|| format!("interpreting discovered layer {}", path.display()))?;
     if !layer.extends.is_empty() {
@@ -698,6 +698,55 @@ fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer
             );
         }
     }
+    // FW-DISC12: learned host rules and channel lifts, each attributable. Only host rules may
+    // sit in `rules` here -- a path rule would dodge the fs provenance check above.
+    for rule in &layer.rules {
+        let is_host = rule
+            .split_once(':')
+            .map(|(_, target)| formwork_blueprint::target_is_host(target))
+            .unwrap_or(false);
+        if !is_host {
+            bail!(
+                "discovered layer {} carries the rule {rule:?}, which is not a host rule; learned \
+                 paths belong in [fs] with provenance (FW-DISC6)",
+                path.display()
+            );
+        }
+        if !layer
+            .discovery
+            .provenance
+            .contains_key(&crate::learn::rule_key(rule))
+        {
+            bail!(
+                "discovered layer {} adds the host rule {rule:?} without provenance; refusing an \
+                 unattributable grant (FW-DISC6)",
+                path.display()
+            );
+        }
+    }
+    if let Some(channels) = &layer.channels {
+        if !channels.denied().is_empty() {
+            bail!(
+                "discovered layer {} denies channels; a learned layer only lifts",
+                path.display()
+            );
+        }
+        for channel in channels.allowed() {
+            if !layer
+                .discovery
+                .provenance
+                .contains_key(&crate::learn::channel_key(channel.name()))
+            {
+                bail!(
+                    "discovered layer {} lifts the channel {:?} without provenance; refusing an \
+                     unattributable lift (FW-DISC6)",
+                    path.display(),
+                    channel.name()
+                );
+            }
+        }
+    }
+    desugar_rules(&mut layer, sigils)?;
     Ok(layer)
 }
 
