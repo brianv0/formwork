@@ -343,9 +343,8 @@ allow-credentials = ["claude", "broker:anthropic", "broker:github"]
 
 ```toml
 extends = ["builtin:default"]
-rules = ["readwrite:$CWD/**"]
-net = { hosts = ["api.anthropic.com"] }             # egress to this host only, via the gateway
-allow-credentials = ["broker:anthropic"]           # the agent sees a placeholder, never the key
+rules = ["readwrite:$CWD/**", "https:api.anthropic.com"]   # this host only, via the gateway
+allow-credentials = ["broker:anthropic"]                   # the agent sees a placeholder, never the key
 ```
 
 ### 3.3 Process isolation (G5, G8)
@@ -557,7 +556,7 @@ Each one is explainable with the tools the operator already uses, and discoverab
 - **`learn` proposes hosts and channels** (`FW-DISC12`). Two new denial sources reverse-compile into
   proposal entries, which go through the existing list/accept loop
   ([FW-DISC11](../formwork.md#fw-disc11)):
-  - Gateway egress violations become `net.hosts` entries, with methods and paths when inspected;
+  - Gateway egress violations become host rules (`https:<host>`, or `<methods>:<host>/<path>` when inspected);
   - channel denials become `channels` entries. The source on Linux is supervisor violations; on
     macOS it is unified-log `mach-lookup`/`lsopen`/`appleevent-send` denials, mapped back to the
     portable name.
@@ -686,7 +685,7 @@ These continue existing families: EGR, ISO, CRED, BP, FID, DISC and XR.
 | `FW-FID8` **Per-backend report lines** | The FidelityReport shall carry per-backend verdicts, each under a stable JSON key (§3.5), for: host scoping, inspection (with the client-trust caveat), UDP, pathname sockets, resolver closure, brokering, each `isolate` member, private tmp, each channel, privileged interfaces, and process-environment disclosure; and a `withheld` list naming every rule the backend could not install. |
 | `FW-FID9` **Self-explaining refusals** | For each refusal this FEP introduces — Gateway 403s, supervised-connect denials, opener-shim refusals, and TLS `unknown_ca` rejections of the session CA — Formwork shall emit on the operator channel, within the run, one line naming what was refused, the deciding rule, and the `explain` invocation that reproduces the verdict. The confined process shall receive only a generic refusal ([FW-CRED7](../formwork.md#fw-cred7)). |
 | `FW-FID10` **Host-session disclosure** | `detect` shall probe for the host facilities that make each §3.4 channel reachable (session bus, user manager, display server, keyring service; GUI session on macOS) and for nesting inside a PID namespace, and record them in the HostProfile. The FidelityReport shall state per channel whether it is reachable on this host and through which socket or service, or that it is not present. |
-| `FW-DISC12` **Host and channel discovery** | `learn` shall reverse-compile Gateway egress violations and channel denials into proposal entries (`net.hosts`, `channels`) on both backends. It shall withhold, and itemize to the operator, metadata and private-IP destinations and credential-typed channels. |
+| `FW-DISC12` **Host and channel discovery** | `learn` shall reverse-compile Gateway egress violations and channel denials into proposal entries (host rules in `rules`, `channels`) on both backends. It shall withhold, and itemize to the operator, metadata and private-IP destinations and credential-typed channels. |
 | `FW-XR10` **Exit-code contract** | Wrapper subcommands shall exit with the workload's status and write nothing of their own to stdout. A Formwork failure after the workload is spawned shall exit `125` and emit one `formwork:`-prefixed line on stderr attributing the failure to Formwork. |
 
 Invariants:
@@ -768,7 +767,7 @@ these rules:
 The macOS characterization suite (§8) runs first. Its results decide the **(characterize)** marks;
 the requirement tests below depend on it.
 
-- `FW-E2E-075` **Sole egress path (both).** Under `net = { hosts = ["allowed.test"] }`:
+- `FW-E2E-075` **Sole egress path (both).** Under `rules = ["https:allowed.test"]`:
   - a request through `HTTP_PROXY` reaches the fixture;
   - each of the following is denied, with a violation record:
     - a direct `connect()` to the fixture;
@@ -817,7 +816,7 @@ the requirement tests below depend on it.
     `FW-E2E-081`/`082` probes in the same session.
 - `FW-E2E-091` **Loopback callback (macOS).** A confined process binds `localhost:<ephemeral>`, an
   unconfined control process connects and sends a nonce, and the confined process receives it, under
-  `net = "deny"`, `ports` and `hosts`.
+  `net = "deny"`, `ports`, and host rules.
 - `FW-E2E-081` **Channels (macOS).** Under the default profile, each of the following is denied with
   a sandbox deny record, and no marker appears:
   - `open -g -n fixture.app`;
@@ -849,7 +848,7 @@ the requirement tests below depend on it.
   shim, loopback callback) is exercised with the fixture opener standing in for the browser.
 - `FW-E2E-085` **Discovery of hosts and channels (both).** `learn` runs a millisecond workload that
   does two things and exits: hits `blocked.test` through the proxy, and touches the clipboard.
-  - It proposes `net.hosts = ["blocked.test"]` and `channels = ["clipboard"]`.
+  - It proposes `https:blocked.test` and `channels = ["clipboard"]`.
   - A workload that hits `169.254.169.254` produces a withheld line, not a proposal.
 - `FW-E2E-087` **Host-session disclosure (both).**
   - Linux, bare runner: `detect` reports each channel `not present on this host`.
@@ -886,7 +885,7 @@ the requirement tests below depend on it.
   - if characterization found the peer check unreliable, the report is `Partial` and names this
     residual.
 - `FW-ADV-020` **Exfiltration through a host service (both).** Under
-  `net = { hosts = ["allowed.test"] }`, the agent tries to send a nonce to the `blocked.test`
+  ``rules = ["https:allowed.test"]``, the agent tries to send a nonce to the `blocked.test`
   fixture through each channel:
   - `open` of the fixture app with a URL argument;
   - an AppleEvent;
@@ -924,20 +923,43 @@ Conditional on the characterization suite confirming the **(characterize)** mark
 - **Blueprint fields.** Two are new; two are extended. (An earlier draft had three new fields and a
   second embedded profile; §10 removed `broker-credentials`, `isolate`'s `tmp` member and
   `builtin:desktop`.)
-  - **`net` (extended).** `net = { hosts = [...] }` is FEP-1's `AllowHosts`. An entry is either a
-    host string or a table `{ host, methods, paths }` (a TOML 1.0 mixed array). A bare string stays
-    a host-only rule. Two entries for the same host union their rules. The grammar, pinned here
-    because an embedder must translate into it:
-    - `host`: an exact DNS name, or `*.example.com` for one or more labels under `example.com`
+  - **`rules` (extended) carries host rules; `net` is unchanged.** Host-scoped egress is written
+    in the verb-rule form the file already uses for paths, so there is one mini-language, not two:
+
+    ```toml
+    rules = [
+      "readwrite:$CWD/**",                          # fs rule (landed)
+      "https:api.anthropic.com",                    # plain host grant: CONNECT/SNI grade, not inspected
+      "get,post,patch:api.github.com/repos/acme/**",# HTTP methods ⇒ inspected grade, path-scoped
+      "get:*.npmjs.org/**",                         # wildcard host
+      "https:internal.corp:8443",                   # explicit port
+      "deny:telemetry.example.com",                 # terminal, as for paths
+    ]
+    ```
+
+    The verb decides the axis: fs verbs and HTTP methods (`get`, `post`, `put`, `patch`, `delete`,
+    `head`, `options`, `any`) are disjoint sets, `https` is the host-only verb, and `deny` applies to
+    both. The verb position is a comma-separated list of atoms on both axes. For fs the atoms are
+    `read`, `write` (create included, per Vocabulary), `modify` and `exec`, so `read,write:` is
+    `readwrite:` and `read,exec:` is `readexec:`; the landed compound spellings stay as aliases and
+    keep their meaning, so no landed blueprint changes. `write` alone still implies read
+    ([FW-TRA3](../formwork.md#fw-tra3)). One grammar therefore covers every rule:
+    `<atom>[,<atom>…]:<target>`, where the target is a path pattern or `host[:port][/path-glob]`.
+    The presence of any host rule sets the net posture to FEP-1's `AllowHosts`; combining host rules
+    with `net = { ports = [...] }` is a compile error, as FEP-1 already requires. An earlier draft
+    spelled this as `net = { hosts = [{ host, methods, paths }] }` tables; the table form is
+    withdrawn because it was a second grammar, and it reached TOML's nesting limit at the first
+    real rule. Grammar of the target, pinned because an embedder must translate into it:
+    - **host**: an exact DNS name, or `*.example.com` for one or more labels under `example.com`
       (the apex is not included; write it separately). This closes FEP-1's open host-pattern
       question. IP literals are accepted and, for private ranges, are the explicit naming
       [FW-EGR4](fep-1.md#fw-egr4) requires.
-    - `port`: optional, default 443; plain HTTP (`port = 80`) is proxied unencrypted and reported
-      so.
-    - `methods`: a list of HTTP methods, or `["*"]`.
-    - `paths`: a list of globs over the canonicalized path without query: `*` matches one segment,
-      `**` any depth, `?` one character; default `["/**"]`. The same grammar Omnigent uses, so
-      `egress_rules` translate one to one.
+    - **port**: `host:port`, default 443; port 80 is proxied unencrypted and reported so.
+    - **path**: optional after the host, a glob over the canonicalized path without query: `*`
+      matches one segment, `**` any depth, `?` one character; absent means `/**`. The same grammar
+      Omnigent uses, so its `"GET,POST host/path"` rules translate by moving the space to a colon.
+    - Two rules for the same host union; a `deny:` for the host is terminal. An HTTP-method rule
+      makes the host inspected (TLS terminated at the Gateway); `https:` alone does not.
   - **`allow-credentials` (extended).** Entries are a bare Catalog type (expose, unchanged),
     `broker:<type>`, or an inline binding table `{ name, env, hosts, scheme }` for a credential the
     Catalog does not know. One list governs the Catalog; the earlier `broker-credentials` list and
@@ -981,7 +1003,7 @@ Conditional on the characterization suite confirming the **(characterize)** mark
   ([FW-E2E-020](../formwork.md#fw-e2e-020)..023) on both OSes.
 - **Examples.**
   - The `claude-code`, `codex` and `opencode` blueprints move from `ports = [443]` to
-    `net = { hosts = [...] }` with brokering.
+    host rules with brokering.
   - Each gains a short "what the baseline blocks and how to lift it" note.
   - The README quickstart stays at most five lines, and FW IDs stay out of the README (document
     audience rule).
@@ -997,7 +1019,7 @@ Conditional on the characterization suite confirming the **(characterize)** mark
 ## 7. Proposed amendments to the landed docs (apply on landing)
 
 - **`docs/fep-1.md` Non-goals.** Replace the TLS-interception and credential-masking bullets with a
-  pointer to FEP-5 §3.2. Fix the `AllowHosts` TOML spelling as `net = { hosts = [...] }`. Close the
+  pointer to FEP-5 §3.2. Fix the `AllowHosts` spelling as host rules in `rules`. Close the
   open host-pattern question with the §6 grammar.
 - **`formwork.md` [FW-XR7](../formwork.md#fw-xr7).** The confined process *issues* a `connect()`;
   under supervised connect the Gateway *performs* it and installs the result. Reword "never
@@ -1128,7 +1150,7 @@ changed the text above.
 | **Examples** | The baseline would have silently broken the flagship Claude Code example on macOS (keychain credential, browser login) | `claude` Catalog type gains its keychain location; the example documents a login-only `open-url` layer; `FW-E2E-084` runs every example on both OSes |
 | **Explainability** ([FW-FID6](../formwork.md#fw-fid6)) | New denial kinds (host, request, channel, socket) had no `explain` path and no runtime message | `explain` accepts URLs, channels and sockets; `FW-FID9` puts a rule and an `explain` hint on every new refusal, including the TLS `unknown_ca` diagnosis |
 | **Good defaults** / CLI simplicity | Six channel names with no grouping: a laptop user had to list them one by one, and a CI blueprint extending a team profile had no way to close them again | `desktop` and `media` groups inside `channels`, deny terminal across layers (`FW-BP9`, §3.4). A `builtin:desktop` profile was added here and then withdrawn in §10 |
-| **Good defaults** | The operator had to know an agent's hosts and channels in advance to write `net.hosts` / `channels` | `learn` proposes both (`FW-DISC12`), with the floor rule extended to metadata IPs and keyring channels |
+| **Good defaults** | The operator had to know an agent's hosts and channels in advance to write host rules / `channels` | `learn` proposes both (`FW-DISC12`), with the floor rule extended to metadata IPs and keyring channels |
 | Resolved-input disclosure ([FW-FID7](../formwork.md#fw-fid7)) | Listener endpoint, CA path, session tmp, and the D3 layout were auto-chosen and undisclosed | All are named in `compile` / `explain` output (§3.5); placeholders are named by type, never by value |
 | Discovery trust scope ([FW-BP8](../formwork.md#fw-bp8)) | D3's first fix moved learned grants to a machine-local state directory, which changed the team workflow | Recommended `.formwork/` in the project, inside the unchanged BP8 walk (§2, §8.2) |
 | Loop drivability ([FW-DISC11](../formwork.md#fw-disc11)) | New denial kinds had no path into the observe/list/accept loop | `FW-DISC12` feeds them into the existing loop; no new artifact files |
@@ -1206,7 +1228,7 @@ what held up, what was rejected, and what changed. Everything marked *changed* i
 ### 10.3 Complexity verdict
 
 Concepts an operator meets, before and after this section: `channels` (+ two groups), brokering as
-a grade of `allow-credentials`, `net.hosts` entries that may carry `methods`/`paths` (which makes a
+a grade of `allow-credentials`, host rules that may carry HTTP methods (which makes a
 host inspected), and `isolate`. That is four, down from seven (`broker-credentials`,
 `isolate.tmp`, `builtin:desktop` gone; `--blueprint -` and `--gateway` gone). The README quickstart
 is unchanged at three lines and still honest; the five-line variant with a host allowlist and one
