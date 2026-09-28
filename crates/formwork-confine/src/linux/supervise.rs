@@ -1093,7 +1093,10 @@ mod tests {
         for (maj, min) in [(8u32, 1u32), (259, 3), (0, 34), (0, 300), (253, 70_000)] {
             let st_dev = libc::makedev(maj, min) as u64;
             assert!(same_dev((maj << 20) | min, st_dev), "{maj}:{min}");
-            assert!(!same_dev((maj << 20) | (min + 1), st_dev), "{maj}:{min} vs a neighbour");
+            assert!(
+                !same_dev((maj << 20) | (min + 1), st_dev),
+                "{maj}:{min} vs a neighbour"
+            );
         }
     }
 
