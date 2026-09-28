@@ -975,7 +975,8 @@ fn sockets_bound_to(ino: u64, dev: u64) -> Option<HashSet<u32>> {
                     if atype == UNIX_DIAG_VFS && alen >= 12 {
                         let vfs_ino = u32::from_ne_bytes(body[a + 4..a + 8].try_into().ok()?);
                         let vfs_dev = u32::from_ne_bytes(body[a + 8..a + 12].try_into().ok()?);
-                        if u64::from(vfs_ino) == ino && same_dev(vfs_dev, dev) {
+                        // The record carries `i_ino` truncated to 32 bits.
+                        if vfs_ino == ino as u32 && same_dev(vfs_dev, dev) {
                             found.insert(sock_ino);
                         }
                     }
@@ -987,13 +988,12 @@ fn sockets_bound_to(ino: u64, dev: u64) -> Option<HashSet<u32>> {
     }
 }
 
-/// `unix_diag_vfs` carries the device in the kernel's `new_encode_dev` form; `stat` reports the
-/// glibc encoding. Compare major and minor.
+/// `unix_diag_vfs` carries the superblock's raw kernel `dev_t` (`sk_diag_dump_vfs` copies
+/// `d_sb->s_dev`): major in the top 12 bits, minor in the low 20. `stat` reports the glibc
+/// encoding. Compare major and minor. (The two agree only for major 0 with a minor below 256 --
+/// tmpfs and the like -- which is why a disk-backed socket path once never matched.)
 fn same_dev(diag: u32, st_dev: u64) -> bool {
-    let (dmaj, dmin) = (
-        (diag & 0xfff00) >> 8,
-        (diag & 0xff) | ((diag >> 12) & 0xfff00),
-    );
+    let (dmaj, dmin) = (diag >> 20, diag & 0xf_ffff);
     let smaj = libc::major(st_dev as libc::dev_t);
     let smin = libc::minor(st_dev as libc::dev_t);
     dmaj == smaj && dmin == smin
@@ -1086,6 +1086,15 @@ mod tests {
         assert_eq!(f[NOTIFY].k, libc::SECCOMP_RET_USER_NOTIF);
         assert_eq!(f[ALLOW].k, libc::SECCOMP_RET_ALLOW);
         assert_eq!(f[ERRNO].k, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32);
+    }
+
+    #[test]
+    fn diag_devices_decode_the_kernel_encoding() {
+        for (maj, min) in [(8u32, 1u32), (259, 3), (0, 34), (0, 300), (253, 70_000)] {
+            let st_dev = libc::makedev(maj, min) as u64;
+            assert!(same_dev((maj << 20) | min, st_dev), "{maj}:{min}");
+            assert!(!same_dev((maj << 20) | (min + 1), st_dev), "{maj}:{min} vs a neighbour");
+        }
     }
 
     #[test]
