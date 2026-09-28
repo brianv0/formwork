@@ -10,15 +10,21 @@
 use std::io;
 use std::sync::Arc;
 
-use rustls::pki_types::ServerName;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use formwork_blueprint::{
-    canonicalize_request_path, BrokerScheme, CanonicalHost, EgressDecision, HttpMethod,
+    canonicalize_request_path, split_host_port, BrokerScheme, CanonicalHost, HttpMethod,
+    RequestDecision, DEFAULT_HTTPS_PORT,
 };
 
-use crate::egress::{base64, parse_head, Head, Shared};
+use crate::egress::{
+    connect_upstream, explain_hint, parse_head, parse_response_head, respond, Head, ResponseHead,
+    Shared, MAX_HEAD_BYTES,
+};
 
 /// Bound on a chunk-size or trailer line.
 const MAX_LINE: usize = 8 * 1024;
@@ -44,56 +50,43 @@ impl std::fmt::Debug for Broker {
     }
 }
 
-/// Where upstream certificates are verified: the host trust store, or -- for the Gateway's own
-/// tests -- a fixture root (a controlled input, reachable only through the library API).
-#[derive(Clone, Debug)]
-pub enum UpstreamRoots {
-    System,
-    Fixture(Vec<rustls::pki_types::CertificateDer<'static>>),
-}
-
-/// Inspection's session state: the CA and the upstream trust.
+/// Inspection's session state: the CA, and the upstream TLS config -- built once, so every
+/// upstream connection shares its roots and resumption state.
 #[derive(Clone, Debug)]
 pub struct Inspection {
     pub ca: Arc<crate::ca::SessionCa>,
-    pub upstream_roots: UpstreamRoots,
+    upstream: Arc<rustls::ClientConfig>,
 }
 
-pub(crate) fn upstream_config(roots: &UpstreamRoots) -> Arc<rustls::ClientConfig> {
-    let mut store = rustls::RootCertStore::empty();
-    match roots {
-        UpstreamRoots::System => {
-            let loaded = rustls_native_certs::load_native_certs();
-            for e in &loaded.errors {
-                tracing::warn!(error = %e, "loading a host trust-store certificate failed");
-            }
-            let (added, ignored) = store.add_parsable_certificates(loaded.certs);
-            tracing::debug!(added, ignored, "upstream trust store loaded");
-        }
-        UpstreamRoots::Fixture(certs) => {
-            for c in certs {
-                let _ = store.add(c.clone());
-            }
+impl Inspection {
+    /// `roots` are what upstream certificates must chain to: the host trust store
+    /// ([`crate::native_roots`]) in a session, a fixture root in the Gateway's own tests.
+    pub fn new(ca: Arc<crate::ca::SessionCa>, roots: &[CertificateDer<'static>]) -> Inspection {
+        let mut store = rustls::RootCertStore::empty();
+        let (added, ignored) = store.add_parsable_certificates(roots.iter().cloned());
+        tracing::debug!(added, ignored, "upstream trust store loaded");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default protocol versions")
+            .with_root_certificates(store)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Inspection {
+            ca,
+            upstream: Arc::new(config),
         }
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default protocol versions")
-        .with_root_certificates(store)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Arc::new(config)
 }
 
-/// A read side with a buffer, so a request head and whatever follows it can be taken apart.
-struct Buffered<S> {
-    s: S,
-    buf: Vec<u8>,
+/// A read side with a buffer, so a head and whatever follows it can be taken apart.
+pub(crate) struct Buffered<S> {
+    pub(crate) s: S,
+    pub(crate) buf: Vec<u8>,
 }
 
 impl<S: AsyncRead + Unpin> Buffered<S> {
-    fn new(s: S, initial: Vec<u8>) -> Self {
+    pub(crate) fn new(s: S, initial: Vec<u8>) -> Self {
         Buffered { s, buf: initial }
     }
 
@@ -104,30 +97,25 @@ impl<S: AsyncRead + Unpin> Buffered<S> {
         Ok(n)
     }
 
-    /// One head through the blank line, or `None` at a clean EOF between messages.
-    async fn head(&mut self, max: usize) -> io::Result<Option<Head>> {
-        self.head_as(max, false).await
+    /// One request head through the blank line, or `None` at a clean EOF between messages.
+    pub(crate) async fn head(&mut self) -> io::Result<Option<Head>> {
+        self.head_with(parse_head).await
     }
 
-    async fn response_head(&mut self, max: usize) -> io::Result<Option<Head>> {
-        self.head_as(max, true).await
+    async fn response_head(&mut self) -> io::Result<Option<ResponseHead>> {
+        self.head_with(parse_response_head).await
     }
 
-    async fn head_as(&mut self, max: usize, response: bool) -> io::Result<Option<Head>> {
+    async fn head_with<T>(&mut self, parse: fn(&[u8]) -> Option<T>) -> io::Result<Option<T>> {
         loop {
             if let Some(end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 let rest = self.buf.split_off(end + 4);
                 let raw = std::mem::replace(&mut self.buf, rest);
-                let parsed = if response {
-                    crate::egress::parse_response_head(&raw)
-                } else {
-                    parse_head(&raw)
-                };
-                return parsed
+                return parse(&raw)
                     .map(Some)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed head"));
             }
-            if self.buf.len() > max {
+            if self.buf.len() > MAX_HEAD_BYTES {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "head too large"));
             }
             if self.fill().await? == 0 {
@@ -181,7 +169,7 @@ impl<S: AsyncRead + Unpin> Buffered<S> {
             let take = (self.buf.len() as u64).min(n) as usize;
             let rest = self.buf.split_off(take);
             let data = std::mem::replace(&mut self.buf, rest);
-            out.write_all(&scrub.push(&data)).await?;
+            out.write_all(&scrub.push(data)).await?;
             n -= take as u64;
         }
         out.write_all(&scrub.finish()).await
@@ -223,7 +211,7 @@ impl<S: AsyncRead + Unpin> Buffered<S> {
             if self.take(2).await? != b"\r\n" {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk framing"));
             }
-            let emit = scrub.push(&data);
+            let emit = scrub.push(data);
             if !emit.is_empty() {
                 out.write_all(format!("{:x}\r\n", emit.len()).as_bytes())
                     .await?;
@@ -241,7 +229,7 @@ impl<S: AsyncRead + Unpin> Buffered<S> {
         loop {
             if !self.buf.is_empty() {
                 let data = std::mem::take(&mut self.buf);
-                out.write_all(&scrub.push(&data)).await?;
+                out.write_all(&scrub.push(data)).await?;
             }
             if self.fill().await? == 0 {
                 return out.write_all(&scrub.finish()).await;
@@ -253,14 +241,14 @@ impl<S: AsyncRead + Unpin> Buffered<S> {
 /// Masks every occurrence of a brokered secret in a byte stream with same-length `*`s, holding back
 /// the last `longest - 1` bytes so an occurrence split across reads is still caught (FW-INV13).
 pub(crate) struct Scrubber {
-    secrets: Vec<Vec<u8>>,
+    /// The session's non-empty brokered secrets, shared by every scrubber.
+    secrets: Arc<[Vec<u8>]>,
     pending: Vec<u8>,
     hold: usize,
 }
 
 impl Scrubber {
-    pub(crate) fn new(secrets: Vec<Vec<u8>>) -> Scrubber {
-        let secrets: Vec<Vec<u8>> = secrets.into_iter().filter(|s| !s.is_empty()).collect();
+    pub(crate) fn new(secrets: Arc<[Vec<u8>]>) -> Scrubber {
         let hold = secrets.iter().map(|s| s.len()).max().unwrap_or(1) - 1;
         Scrubber {
             secrets,
@@ -269,8 +257,17 @@ impl Scrubber {
         }
     }
 
+    /// The secrets a session's scrubbers mask: every brokered secret that is not empty.
+    pub(crate) fn secrets_of(brokers: &[Broker]) -> Arc<[Vec<u8>]> {
+        brokers
+            .iter()
+            .map(|b| b.secret.clone().into_bytes())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
     fn mask(&self, data: &mut [u8]) {
-        for s in &self.secrets {
+        for s in self.secrets.iter() {
             let mut i = 0;
             while i + s.len() <= data.len() {
                 if &data[i..i + s.len()] == s.as_slice() {
@@ -289,11 +286,11 @@ impl Scrubber {
         v
     }
 
-    pub(crate) fn push(&mut self, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn push(&mut self, data: Vec<u8>) -> Vec<u8> {
         if self.secrets.is_empty() {
-            return data.to_vec();
+            return data;
         }
-        self.pending.extend_from_slice(data);
+        self.pending.extend_from_slice(&data);
         let mut pending = std::mem::take(&mut self.pending);
         self.mask(&mut pending);
         let keep = self.hold.min(pending.len());
@@ -309,13 +306,10 @@ impl Scrubber {
 }
 
 fn host_header_matches(value: &str, host: &CanonicalHost, port: u16) -> bool {
-    let value = value.trim();
-    let (h, p) = match value.rsplit_once(':') {
-        Some((h, p)) if !value.ends_with(']') => (h, p.parse::<u16>().ok()),
-        _ => (value, None),
+    let Ok((h, p)) = split_host_port(value.trim()) else {
+        return false;
     };
-    let port_ok = p.map(|p| p == port).unwrap_or(port == 443);
-    port_ok
+    p.unwrap_or(DEFAULT_HTTPS_PORT) == port
         && formwork_blueprint::canonicalize_host(h)
             .map(|c| &c == host)
             .unwrap_or(false)
@@ -354,10 +348,7 @@ fn present(
             ),
             BrokerScheme::Header(name) => set_auth(headers, name, &b.placeholder, &b.secret),
             BrokerScheme::Basic { user } => {
-                let value = format!(
-                    "Basic {}",
-                    base64(format!("{user}:{}", b.secret).as_bytes())
-                );
+                let value = basic_value(user, &b.secret);
                 let pos = headers
                     .iter()
                     .position(|(n, _)| n.eq_ignore_ascii_case("authorization"));
@@ -391,24 +382,29 @@ fn set_auth(headers: &mut Vec<(String, String)>, name: &str, placeholder: &str, 
     }
 }
 
+/// `Basic base64(<user>:<password>)` (RFC 7617).
+pub(crate) fn basic_value(user: &str, password: &str) -> String {
+    format!("Basic {}", BASE64.encode(format!("{user}:{password}")))
+}
+
 /// Does a `Basic` authorization value carry the placeholder in its decoded password?
 fn basic_carries(value: &str, placeholder: &str) -> bool {
     value
         .strip_prefix("Basic ")
-        .and_then(|b64| crate::egress::base64_decode(b64.trim()))
+        .and_then(|b64| BASE64.decode(b64.trim()).ok())
         .map(|raw| String::from_utf8_lossy(&raw).contains(placeholder))
         .unwrap_or(false)
 }
 
 /// Body framing of a message (FW-EGR11): exactly one of these, or refused.
-enum Framing {
+pub(crate) enum Framing {
     None,
     Length(u64),
     Chunked,
     UntilClose,
 }
 
-fn request_framing(head: &Head) -> Result<Framing, String> {
+pub(crate) fn request_framing(head: &Head) -> Result<Framing, String> {
     let te: Vec<&str> = head
         .headers
         .iter()
@@ -442,7 +438,8 @@ fn request_framing(head: &Head) -> Result<Framing, String> {
     }
 }
 
-fn response_framing(head: &Head, status: u16, request_method: &str) -> Framing {
+fn response_framing(head: &ResponseHead, request_method: &str) -> Framing {
+    let status = head.status;
     if request_method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 || status < 200
     {
         return Framing::None;
@@ -463,7 +460,7 @@ fn response_framing(head: &Head, status: u16, request_method: &str) -> Framing {
     }
 }
 
-fn render_request(head: &Head, target: &str, headers: &[(String, String)]) -> Vec<u8> {
+pub(crate) fn render_request(head: &Head, target: &str, headers: &[(String, String)]) -> Vec<u8> {
     let mut out = format!("{} {} HTTP/1.1\r\n", head.method, target);
     for (n, v) in headers {
         out.push_str(&format!("{n}: {v}\r\n"));
@@ -473,19 +470,19 @@ fn render_request(head: &Head, target: &str, headers: &[(String, String)]) -> Ve
 }
 
 async fn deny<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
-    w.write_all(
-        b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 26\r\nConnection: close\r\n\r\ndenied by formwork policy\n",
-    )
-    .await?;
-    w.flush().await
+    respond(w, "403 Forbidden", "").await
 }
 
 /// Is this TLS failure a client rejecting the session CA? (FW-FID9's `unknown_ca` line.)
 fn rejected_our_ca(e: &io::Error) -> bool {
-    let text = format!("{e:?}");
-    text.contains("UnknownCA")
-        || text.contains("BadCertificate")
-        || text.contains("CertificateUnknown")
+    use rustls::AlertDescription as A;
+    matches!(
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::AlertReceived(
+            A::UnknownCA | A::BadCertificate | A::CertificateUnknown
+        ))
+    )
 }
 
 /// One upstream TLS connection, split: the buffered read side and the write side.
@@ -508,12 +505,12 @@ pub(crate) async fn serve_inspected(
             &target,
             "the host is inspected, and this session has no inspection CA",
             None,
-            format!("formwork explain https://{host}"),
+            explain_hint("https", &host, port, ""),
         );
         return deny(&mut stream).await;
     };
-    let leaf = match inspection.ca.leaf_for(&host) {
-        Ok(l) => l,
+    let server = match inspection.ca.server_config(&host) {
+        Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, host = %host, "minting an inspection leaf failed");
             return deny(&mut stream).await;
@@ -522,16 +519,7 @@ pub(crate) async fn serve_inspected(
     stream
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut server = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default protocol versions")
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(FixedCert(leaf.clone())));
-    // The leaf is the CONNECT target's whatever SNI the client sends; the SNI is checked against
-    // the target below, after the handshake.
-    server.alpn_protocols = vec![b"http/1.1".to_vec()];
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+    let acceptor = tokio_rustls::TlsAcceptor::from(server);
     let prefixed = Prefixed {
         prefix: leftover,
         inner: stream,
@@ -567,7 +555,7 @@ pub(crate) async fn serve_inspected(
             &target,
             "the TLS SNI does not match the CONNECT target (FW-EGR10)",
             None,
-            format!("formwork explain https://{host}"),
+            explain_hint("https", &host, port, ""),
         );
         return deny(&mut write).await;
     }
@@ -594,18 +582,13 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let secrets: Vec<Vec<u8>> = shared
-        .config
-        .brokers
-        .iter()
-        .map(|b| b.secret.clone().into_bytes())
-        .collect();
+    let secrets = shared.secrets.clone();
     let mut upstream: Option<Upstream> = None;
     loop {
-        let Some(head) = client.head(64 * 1024).await? else {
+        let Some(head) = client.head().await? else {
             return Ok(());
         };
-        let hint = |path: &str| format!("formwork explain https://{host}{path}");
+        let hint = |path: &str| explain_hint("https", &host, port, path);
         let target = head.target.clone();
         if !head
             .header("host")
@@ -657,8 +640,8 @@ where
             .table
             .decide_request(&host, port, method, &path)
         {
-            EgressDecision::Allow { .. } => {}
-            EgressDecision::Deny { reason, rule } => {
+            RequestDecision::Allow(_) => {}
+            RequestDecision::Deny(formwork_blueprint::Denial { reason, rule }) => {
                 shared.refuse_needing(
                     "request",
                     &format!("{} {host}{path}", head.method),
@@ -669,7 +652,6 @@ where
                 );
                 return deny(&mut client_w).await;
             }
-            _ => return deny(&mut client_w).await,
         }
         let mut headers: Vec<(String, String)> = head
             .headers
@@ -705,9 +687,14 @@ where
                     return deny(&mut client_w).await;
                 }
             };
-            let tcp = TcpStream::connect(addr).await?;
-            let connector =
-                tokio_rustls::TlsConnector::from(upstream_config(&inspection.upstream_roots));
+            let tcp = match connect_upstream(addr).await {
+                Ok(t) => t,
+                Err(reason) => {
+                    tracing::info!(target = %format!("{host}:{port}"), %reason, "egress upstream unavailable");
+                    return respond(&mut client_w, "502 Bad Gateway", "").await;
+                }
+            };
+            let connector = tokio_rustls::TlsConnector::from(inspection.upstream.clone());
             let name = match &host {
                 CanonicalHost::Name(n) => ServerName::try_from(n.clone())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
@@ -717,10 +704,7 @@ where
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(host = %host, error = %e, "formwork: the upstream certificate for {host} did not verify against the host trust store");
-                    client_w
-                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                        .await?;
-                    return Ok(());
+                    return respond(&mut client_w, "502 Bad Gateway", "").await;
                 }
             };
             let (r, w) = tokio::io::split(tls);
@@ -733,7 +717,7 @@ where
         };
         up_w.write_all(&render_request(&head, &forwarded_target, &headers))
             .await?;
-        let mut none = Scrubber::new(Vec::new());
+        let mut none = Scrubber::new(Arc::new([]));
         match framing {
             Framing::Length(n) => client.copy_exact(n, up_w, &mut none).await?,
             Framing::Chunked => client.copy_chunked(up_w, &mut none).await?,
@@ -746,12 +730,12 @@ where
             .unwrap_or(false);
         // Response(s): 1xx interim responses are relayed until the final one.
         loop {
-            let Some(resp) = up_r.response_head(64 * 1024).await? else {
+            let Some(resp) = up_r.response_head().await? else {
                 return Ok(());
             };
-            let status: u16 = resp.target.parse().unwrap_or(502);
+            let status = resp.status;
             let scrub_head = Scrubber::new(secrets.clone());
-            let mut raw = format!("{} {} {}\r\n", resp.method, resp.target, resp.reason);
+            let mut raw = format!("{} {} {}\r\n", resp.version, status, resp.reason);
             for (n, v) in &resp.headers {
                 let v = String::from_utf8_lossy(&scrub_head.mask_whole(v.as_bytes())).into_owned();
                 raw.push_str(&format!("{n}: {v}\r\n"));
@@ -776,7 +760,7 @@ where
                 continue;
             }
             let mut scrub = Scrubber::new(secrets.clone());
-            let framing = response_framing(&resp, status, &head.method);
+            let framing = response_framing(&resp, &head.method);
             let server_close = resp
                 .header("connection")
                 .map(|v| v.eq_ignore_ascii_case("close"))
@@ -797,19 +781,6 @@ where
             }
             break;
         }
-    }
-}
-
-/// Answers every handshake with the CONNECT target's leaf.
-#[derive(Debug)]
-struct FixedCert(Arc<rustls::sign::CertifiedKey>);
-
-impl rustls::server::ResolvesServerCert for FixedCert {
-    fn resolve(
-        &self,
-        _hello: rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        Some(self.0.clone())
     }
 }
 
@@ -863,11 +834,32 @@ impl AsyncWrite for Prefixed {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_client_rejecting_the_session_ca_is_recognized() {
+        // FW-FID9: a client that does not trust the session CA fails the handshake with an alert
+        // the Gateway must recognize to emit its diagnosis line.
+        let ca = crate::ca::SessionCa::generate().unwrap();
+        let host = CanonicalHost::Name("api.test".into());
+        let acceptor = tokio_rustls::TlsAcceptor::from(ca.server_config(&host).unwrap());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let name = ServerName::try_from("api.test").unwrap();
+        let (server, _client) = tokio::join!(acceptor.accept(a), connector.connect(name, b));
+        let err = server.expect_err("the handshake fails");
+        assert!(rejected_our_ca(&err), "{err:?}");
+    }
+
     #[test]
     fn scrubber_masks_across_split_reads() {
-        let mut s = Scrubber::new(vec![b"sk-secret".to_vec()]);
-        let mut out = s.push(b"before sk-se");
-        out.extend(s.push(b"cret after"));
+        let mut s = Scrubber::new(Arc::new([b"sk-secret".to_vec()]));
+        let mut out = s.push(b"before sk-se".to_vec());
+        out.extend(s.push(b"cret after".to_vec()));
         out.extend(s.finish());
         assert_eq!(out, b"before ********* after");
     }
@@ -906,7 +898,7 @@ mod tests {
         present(&mut git, &gh, &basic).unwrap();
         assert_eq!(
             git[0].1,
-            format!("Basic {}", base64(b"x-access-token:ghp_REAL"))
+            format!("Basic {}", BASE64.encode(b"x-access-token:ghp_REAL"))
         );
     }
 
@@ -915,7 +907,6 @@ mod tests {
         let head = |h: &[(&str, &str)]| Head {
             method: "POST".into(),
             target: "/".into(),
-            reason: String::new(),
             headers: h
                 .iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))

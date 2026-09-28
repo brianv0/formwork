@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{PathError, PathPattern};
 
+/// The Catalog type for the OS keyring, which Linux reaches over the session bus (Secret
+/// Service): exposing it admits the bus address and socket.
+pub const OS_KEYRING: &str = "os-keyring";
+
 /// The name under which the generic backstop (FW-CRED6) can be lifted via `allow-credentials`.
 /// Deliberately coarse: it lifts every backstop row at once, so narrowing a real type is always
 /// preferable; it exists so a backstop false positive has a visible, explicit escape hatch.

@@ -11,6 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The default port for a host rule without one.
 pub const DEFAULT_HTTPS_PORT: u16 = 443;
+/// The default port of an `http://` URL.
+pub const DEFAULT_HTTP_PORT: u16 = 80;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HttpMethod {
@@ -73,11 +75,7 @@ impl HostPattern {
     pub fn matches(&self, host: &CanonicalHost) -> bool {
         match (self, host) {
             (HostPattern::Exact(e), CanonicalHost::Name(h)) => e == h,
-            (HostPattern::Wildcard(suffix), CanonicalHost::Name(h)) => {
-                h.len() > suffix.len() + 1
-                    && h.ends_with(suffix.as_str())
-                    && h.as_bytes()[h.len() - suffix.len() - 1] == b'.'
-            }
+            (HostPattern::Wildcard(suffix), CanonicalHost::Name(h)) => under(h, suffix),
             (HostPattern::Ip(a), CanonicalHost::Ip(b)) => a == b,
             _ => false,
         }
@@ -85,11 +83,6 @@ impl HostPattern {
 
     /// Could one host match both patterns (FW-BP14)?
     pub fn overlaps(&self, other: &HostPattern) -> bool {
-        let under = |name: &str, suffix: &str| {
-            name.len() > suffix.len() + 1
-                && name.ends_with(suffix)
-                && name.as_bytes()[name.len() - suffix.len() - 1] == b'.'
-        };
         match (self, other) {
             (HostPattern::Exact(a), HostPattern::Exact(b)) => a == b,
             (HostPattern::Exact(e), HostPattern::Wildcard(s))
@@ -101,10 +94,13 @@ impl HostPattern {
             _ => false,
         }
     }
+}
 
-    pub fn is_ip(&self) -> bool {
-        matches!(self, HostPattern::Ip(_))
-    }
+/// Is `name` one or more labels under `suffix` (the apex excluded)?
+fn under(name: &str, suffix: &str) -> bool {
+    name.len() > suffix.len() + 1
+        && name.ends_with(suffix)
+        && name.as_bytes()[name.len() - suffix.len() - 1] == b'.'
 }
 
 impl fmt::Display for HostPattern {
@@ -124,6 +120,17 @@ impl fmt::Display for HostPattern {
 pub enum CanonicalHost {
     Name(String),
     Ip(IpAddr),
+}
+
+impl CanonicalHost {
+    /// A metadata hostname or a restricted address (FW-EGR4): reachable only when a rule names it
+    /// exactly, and never proposed by `learn`.
+    pub fn is_restricted(&self) -> bool {
+        match self {
+            CanonicalHost::Ip(ip) => is_restricted_ip(*ip),
+            CanonicalHost::Name(n) => METADATA_HOSTNAMES.contains(&n.as_str()),
+        }
+    }
 }
 
 impl fmt::Display for CanonicalHost {
@@ -351,7 +358,7 @@ pub struct HostRule {
     pub access: HostAccess,
 }
 
-/// The HTTP-axis verb atoms (FW-BP15).
+/// The HTTP-axis verb atoms (FW-BP15): every [`HttpMethod::atom`], then `any` and `https`.
 pub const HTTP_ATOMS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "head", "options", "any", "https",
 ];
@@ -426,7 +433,7 @@ impl HostRule {
         matches!(self.access, HostAccess::Inspected { .. })
     }
 
-    fn port_matches(&self, port: u16) -> bool {
+    pub fn port_matches(&self, port: u16) -> bool {
         self.port.map(|p| p == port).unwrap_or(true)
     }
 
@@ -478,14 +485,62 @@ impl Serialize for HostRule {
     }
 }
 
-impl<'de> Deserialize<'de> for HostRule {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
+impl std::str::FromStr for HostRule {
+    type Err = String;
+
+    /// A whole `<atoms>:<target>` rule string.
+    fn from_str(raw: &str) -> Result<HostRule, String> {
         let (atoms, target) = raw
             .split_once(':')
-            .ok_or_else(|| serde::de::Error::custom(format!("host rule {raw:?} has no verb")))?;
-        HostRule::parse(atoms, target).map_err(serde::de::Error::custom)
+            .ok_or_else(|| format!("host rule {raw:?} has no verb"))?;
+        HostRule::parse(atoms, target)
     }
+}
+
+impl<'de> Deserialize<'de> for HostRule {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Split `host[:port]` or `[v6][:port]` -- the one authority parser rules, the Gateway and
+/// `explain` share. The host keeps its brackets for [`canonicalize_host`].
+pub fn split_host_port(hostport: &str) -> Result<(&str, Option<u16>), String> {
+    if let Some(rest) = hostport.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| format!("unclosed IPv6 literal in {hostport:?}"))?;
+        let port = match &rest[end + 1..] {
+            "" => None,
+            p => Some(parse_port(p.strip_prefix(':').unwrap_or("x"), hostport)?),
+        };
+        return Ok((&hostport[..end + 2], port));
+    }
+    match hostport.rsplit_once(':') {
+        Some((h, p)) => Ok((h, Some(parse_port(p, hostport)?))),
+        None => Ok((hostport, None)),
+    }
+}
+
+/// Split an absolute `http://` or `https://` URL into its host, port (the scheme's default when
+/// absent) and raw path -- shared by the Gateway's plain-HTTP path and `explain` (FW-FID9).
+pub fn split_url(url: &str) -> Result<(&str, u16, &str), String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("{url:?} is not an absolute URL"))?;
+    let default_port = match scheme {
+        "https" => DEFAULT_HTTPS_PORT,
+        "http" => DEFAULT_HTTP_PORT,
+        other => return Err(format!("only http:// and https:// URLs, not {other}://")),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = split_host_port(authority)?;
+    Ok((host, port.unwrap_or(default_port), path))
 }
 
 fn parse_target(target: &str) -> Result<(HostPattern, Option<u16>, Option<PathGlob>), String> {
@@ -493,21 +548,7 @@ fn parse_target(target: &str) -> Result<(HostPattern, Option<u16>, Option<PathGl
         Some(i) => (&target[..i], Some(PathGlob::parse(&target[i..])?)),
         None => (target, None),
     };
-    let (host_raw, port) = if let Some(rest) = hostport.strip_prefix('[') {
-        let end = rest
-            .find(']')
-            .ok_or_else(|| format!("unclosed IPv6 literal in {target:?}"))?;
-        let port = match &rest[end + 1..] {
-            "" => None,
-            p => Some(parse_port(p.strip_prefix(':').unwrap_or("x"), target)?),
-        };
-        (&hostport[..end + 2], port)
-    } else {
-        match hostport.rsplit_once(':') {
-            Some((h, p)) => (h, Some(parse_port(p, target)?)),
-            None => (hostport, None),
-        }
-    };
+    let (host_raw, port) = split_host_port(hostport).map_err(|e| format!("{e} in {target:?}"))?;
     let host = if let Some(suffix) = host_raw.strip_prefix("*.") {
         match canonicalize_host(suffix).map_err(|e| format!("{e} in {target:?}"))? {
             CanonicalHost::Name(n) => HostPattern::Wildcard(n),
@@ -524,9 +565,9 @@ fn parse_target(target: &str) -> Result<(HostPattern, Option<u16>, Option<PathGl
     Ok((host, port, path))
 }
 
-fn parse_port(p: &str, target: &str) -> Result<u16, String> {
+fn parse_port(p: &str, hostport: &str) -> Result<u16, String> {
     match p.parse::<u16>() {
-        Ok(0) | Err(_) => Err(format!("invalid port {p:?} in {target:?}")),
+        Ok(0) | Err(_) => Err(format!("invalid port {p:?} in {hostport:?}")),
         Ok(port) => Ok(port),
     }
 }
@@ -571,25 +612,28 @@ pub fn validate_host_rules(rules: &[HostRule]) -> Result<(), Vec<String>> {
     }
 }
 
-/// The Gateway's verdict for a CONNECT or a proxied request.
+/// The Gateway's verdict on a CONNECT, or on the host half of a plain-HTTP request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EgressDecision {
+pub enum ConnectDecision<'a> {
     /// Tunnel: splice bytes to the upstream, request opaque.
-    Tunnel { rule: HostRule },
+    Tunnel(&'a HostRule),
     /// Terminate TLS and decide per request.
     Inspect,
-    /// Admitted request on an inspected host.
-    Allow { rule: HostRule },
-    Deny {
-        reason: String,
-        rule: Option<HostRule>,
-    },
+    Deny(Denial<'a>),
 }
 
-impl EgressDecision {
-    pub fn is_denied(&self) -> bool {
-        matches!(self, EgressDecision::Deny { .. })
-    }
+/// The verdict on one request to an inspected host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestDecision<'a> {
+    Allow(&'a HostRule),
+    Deny(Denial<'a>),
+}
+
+/// Why a destination was refused, and the `deny:` rule that refused it, if one did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Denial<'a> {
+    pub reason: String,
+    pub rule: Option<&'a HostRule>,
 }
 
 /// The merged, validated host table (FW-EGR1). Empty means deny everything (FW-EGR2).
@@ -608,16 +652,16 @@ impl HostTable {
 
     /// Decide a CONNECT (or the host half of a plain-HTTP request): a host-level deny is terminal;
     /// otherwise the host's single grade decides.
-    pub fn decide_connect(&self, host: &CanonicalHost, port: u16) -> EgressDecision {
+    pub fn decide_connect(&self, host: &CanonicalHost, port: u16) -> ConnectDecision<'_> {
         if let Some(rule) = self.rules.iter().find(|r| {
             matches!(r.access, HostAccess::Deny { path: None })
                 && r.port_matches(port)
                 && r.host.matches(host)
         }) {
-            return EgressDecision::Deny {
+            return ConnectDecision::Deny(Denial {
                 reason: format!("{host} is denied"),
-                rule: Some(rule.clone()),
-            };
+                rule: Some(rule),
+            });
         }
         let matching: Vec<&HostRule> = self
             .rules
@@ -625,20 +669,18 @@ impl HostTable {
             .filter(|r| r.port_matches(port) && r.host.matches(host))
             .collect();
         if matching.iter().any(|r| r.is_inspected()) {
-            return EgressDecision::Inspect;
+            return ConnectDecision::Inspect;
         }
         if let Some(rule) = matching
-            .iter()
+            .into_iter()
             .find(|r| matches!(r.access, HostAccess::Tunnel))
         {
-            return EgressDecision::Tunnel {
-                rule: (*rule).clone(),
-            };
+            return ConnectDecision::Tunnel(rule);
         }
-        EgressDecision::Deny {
+        ConnectDecision::Deny(Denial {
             reason: format!("no host rule admits {host}:{port}"),
             rule: None,
-        }
+        })
     }
 
     /// Decide one request on an inspected host: a path deny is terminal, then any inspected rule
@@ -649,7 +691,7 @@ impl HostTable {
         port: u16,
         method: Option<HttpMethod>,
         path: &str,
-    ) -> EgressDecision {
+    ) -> RequestDecision<'_> {
         let for_host = || {
             self.rules
                 .iter()
@@ -658,10 +700,10 @@ impl HostTable {
         for r in for_host() {
             if let HostAccess::Deny { path: deny } = &r.access {
                 if deny.as_ref().map(|g| g.matches(path)).unwrap_or(true) {
-                    return EgressDecision::Deny {
+                    return RequestDecision::Deny(Denial {
                         reason: format!("{host}{path} is denied"),
-                        rule: Some(r.clone()),
-                    };
+                        rule: Some(r),
+                    });
                 }
             }
         }
@@ -674,16 +716,35 @@ impl HostTable {
                 let method_ok =
                     methods.is_empty() || method.map(|m| methods.contains(&m)).unwrap_or(false);
                 if method_ok && glob.matches(path) {
-                    return EgressDecision::Allow { rule: r.clone() };
+                    return RequestDecision::Allow(r);
                 }
             }
         }
         let shown = method
             .map(|m| m.atom().to_ascii_uppercase())
             .unwrap_or_else(|| "request".into());
-        EgressDecision::Deny {
+        RequestDecision::Deny(Denial {
             reason: format!("no rule admits {shown} {host}{path}"),
             rule: None,
+        })
+    }
+
+    /// Decide a plain-HTTP request (and `explain`'s question about one): the host decides, then
+    /// the method and canonical path when the host is inspected. `Ok` carries the admitting rule.
+    pub fn decide(
+        &self,
+        host: &CanonicalHost,
+        port: u16,
+        method: Option<HttpMethod>,
+        path: &str,
+    ) -> Result<&HostRule, Denial<'_>> {
+        match self.decide_connect(host, port) {
+            ConnectDecision::Tunnel(rule) => Ok(rule),
+            ConnectDecision::Deny(d) => Err(d),
+            ConnectDecision::Inspect => match self.decide_request(host, port, method, path) {
+                RequestDecision::Allow(rule) => Ok(rule),
+                RequestDecision::Deny(d) => Err(d),
+            },
         }
     }
 
@@ -692,11 +753,8 @@ impl HostTable {
     pub fn names_explicitly(&self, host: &CanonicalHost) -> bool {
         self.rules.iter().any(|r| {
             !matches!(r.access, HostAccess::Deny { .. })
-                && match (&r.host, host) {
-                    (HostPattern::Exact(e), CanonicalHost::Name(h)) => e == h,
-                    (HostPattern::Ip(a), CanonicalHost::Ip(b)) => a == b,
-                    _ => false,
-                }
+                && !matches!(r.host, HostPattern::Wildcard(_))
+                && r.host.matches(host)
         })
     }
 }
@@ -774,6 +832,40 @@ mod tests {
         canonicalize_host(s).unwrap()
     }
 
+    trait Denied {
+        fn is_denied(&self) -> bool;
+    }
+
+    impl Denied for ConnectDecision<'_> {
+        fn is_denied(&self) -> bool {
+            matches!(self, ConnectDecision::Deny(_))
+        }
+    }
+
+    impl Denied for RequestDecision<'_> {
+        fn is_denied(&self) -> bool {
+            matches!(self, RequestDecision::Deny(_))
+        }
+    }
+
+    #[test]
+    fn authorities_and_urls_split_one_way() {
+        assert_eq!(split_host_port("a.test:8443"), Ok(("a.test", Some(8443))));
+        assert_eq!(split_host_port("a.test"), Ok(("a.test", None)));
+        assert_eq!(split_host_port("[::1]:9"), Ok(("[::1]", Some(9))));
+        assert!(split_host_port("a.test:x").is_err());
+        assert!(split_host_port("a.test:0").is_err());
+        assert_eq!(split_url("http://a.test/x"), Ok(("a.test", 80, "/x")));
+        assert_eq!(split_url("https://[::1]"), Ok(("[::1]", 443, "/")));
+        assert!(split_url("ftp://a.test/").is_err());
+    }
+
+    #[test]
+    fn http_atoms_list_every_method() {
+        let methods: Vec<&str> = HttpMethod::ALL.iter().map(|m| m.atom()).collect();
+        assert_eq!(HTTP_ATOMS, [methods, vec!["any", "https"]].concat());
+    }
+
     #[test]
     fn rules_parse_and_round_trip_through_their_canonical_text() {
         for s in [
@@ -838,11 +930,11 @@ mod tests {
         ]);
         assert!(matches!(
             t.decide_connect(&host("api.anthropic.com"), 443),
-            EgressDecision::Tunnel { .. }
+            ConnectDecision::Tunnel(_)
         ));
         assert_eq!(
             t.decide_connect(&host("api.github.com"), 443),
-            EgressDecision::Inspect
+            ConnectDecision::Inspect
         );
         assert!(t
             .decide_connect(&host("telemetry.example.com"), 443)
@@ -854,7 +946,7 @@ mod tests {
         let gh = host("api.github.com");
         assert!(matches!(
             t.decide_request(&gh, 443, Some(HttpMethod::Post), "/repos/acme/x"),
-            EgressDecision::Allow { .. }
+            RequestDecision::Allow(_)
         ));
         assert!(t
             .decide_request(&gh, 443, Some(HttpMethod::Post), "/repos/other/x")

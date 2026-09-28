@@ -150,10 +150,6 @@ pub struct ChannelPolicy {
 }
 
 impl ChannelPolicy {
-    pub fn deny_all() -> ChannelPolicy {
-        ChannelPolicy::default()
-    }
-
     pub fn allow<I: IntoIterator<Item = Channel>>(channels: I) -> ChannelPolicy {
         ChannelPolicy {
             allow: channels.into_iter().collect(),

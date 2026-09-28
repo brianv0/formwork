@@ -261,48 +261,52 @@ pub fn resolve_brokers(
     let mut plans = Vec::new();
     let mut errors = Vec::new();
     for entry in entries {
-        let (name, env_sources, raw_bindings): (String, Vec<String>, Vec<(String, String)>) =
-            match entry {
-                CredentialEntry::Expose(_) => continue,
-                CredentialEntry::Broker(t) => match catalog.types.get(t) {
-                    None => {
-                        errors.push(format!("broker:{t}: no such Catalog type"));
-                        continue;
-                    }
-                    Some(e) if e.broker.is_empty() => {
-                        errors.push(format!(
-                            "broker:{t}: the Catalog has no broker binding for {t}; write an inline \
-                             binding {{ name, env, hosts, scheme }} instead"
-                        ));
-                        continue;
-                    }
-                    Some(e) => (
-                        t.clone(),
-                        e.envs.clone(),
-                        e.broker
-                            .iter()
-                            .flat_map(|b| b.hosts.iter().map(|h| (h.clone(), b.scheme.clone())))
-                            .collect(),
-                    ),
-                },
-                CredentialEntry::Inline(b) => {
-                    if catalog.types.contains_key(&b.name) {
-                        errors.push(format!(
-                            "inline binding {:?} shadows a Catalog type; use `broker:{}`",
-                            b.name, b.name
-                        ));
-                        continue;
-                    }
-                    (
-                        b.name.clone(),
-                        vec![b.env.clone()],
-                        b.hosts
-                            .iter()
-                            .map(|h| (h.clone(), b.scheme.to_string()))
-                            .collect(),
-                    )
+        type RawBinding = (String, Result<BrokerScheme, String>);
+        let (name, env_sources, raw_bindings): (String, Vec<String>, Vec<RawBinding>) = match entry
+        {
+            CredentialEntry::Expose(_) => continue,
+            CredentialEntry::Broker(t) => match catalog.types.get(t) {
+                None => {
+                    errors.push(format!("broker:{t}: no such Catalog type"));
+                    continue;
                 }
-            };
+                Some(e) if e.broker.is_empty() => {
+                    errors.push(format!(
+                        "broker:{t}: the Catalog has no broker binding for {t}; write an inline \
+                             binding {{ name, env, hosts, scheme }} instead"
+                    ));
+                    continue;
+                }
+                Some(e) => (
+                    t.clone(),
+                    e.envs.clone(),
+                    e.broker
+                        .iter()
+                        .flat_map(|b| {
+                            let scheme = BrokerScheme::parse(&b.scheme);
+                            b.hosts.iter().map(move |h| (h.clone(), scheme.clone()))
+                        })
+                        .collect(),
+                ),
+            },
+            CredentialEntry::Inline(b) => {
+                if catalog.types.contains_key(&b.name) {
+                    errors.push(format!(
+                        "inline binding {:?} shadows a Catalog type; use `broker:{}`",
+                        b.name, b.name
+                    ));
+                    continue;
+                }
+                (
+                    b.name.clone(),
+                    vec![b.env.clone()],
+                    b.hosts
+                        .iter()
+                        .map(|h| (h.clone(), Ok(b.scheme.clone())))
+                        .collect(),
+                )
+            }
+        };
         let mut bindings = Vec::new();
         for (raw_host, raw_scheme) in raw_bindings {
             let host = match crate::canonicalize_host(&raw_host) {
@@ -312,7 +316,7 @@ pub fn resolve_brokers(
                     continue;
                 }
             };
-            let scheme = match BrokerScheme::parse(&raw_scheme) {
+            let scheme = match raw_scheme {
                 Ok(s) => s,
                 Err(e) => {
                     errors.push(format!("{name}: {e}"));
@@ -323,10 +327,8 @@ pub fn resolve_brokers(
                 .map(|t| {
                     t.rules.iter().any(|r| {
                         r.is_inspected()
+                            && r.port_matches(crate::DEFAULT_HTTPS_PORT)
                             && r.host.matches(&host)
-                            && r.port
-                                .map(|p| p == crate::DEFAULT_HTTPS_PORT)
-                                .unwrap_or(true)
                     })
                 })
                 .unwrap_or(false);

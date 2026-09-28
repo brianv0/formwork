@@ -752,33 +752,17 @@ fn explain_url(
     provenance: &formwork_blueprint::Provenance,
     url: &str,
 ) -> Result<EgressExplanation> {
-    use formwork_blueprint::{EgressDecision, HttpMethod};
-    let (scheme, rest) = url.split_once("://").expect("caller checked");
-    let default_port = match scheme {
-        "https" => 443,
-        "http" => 80,
-        other => bail!("explain takes http:// or https:// URLs, not {other}://"),
-    };
-    let (authority, raw_path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let (raw_host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.ends_with(']') || authority.starts_with('[') => (
-            h.to_string(),
-            p.parse::<u16>().with_context(|| format!("port in {url}"))?,
-        ),
-        _ => (authority.to_string(), default_port),
-    };
+    use formwork_blueprint::{ConnectDecision, Denial, HttpMethod, RequestDecision};
+    let (raw_host, port, raw_path) =
+        formwork_blueprint::split_url(url).map_err(|e| anyhow!("explain: {e}"))?;
     let host =
-        formwork_blueprint::canonicalize_host(&raw_host).map_err(|e| anyhow!("{url}: {e}"))?;
+        formwork_blueprint::canonicalize_host(raw_host).map_err(|e| anyhow!("{url}: {e}"))?;
     let path = formwork_blueprint::canonicalize_request_path(raw_path)
         .map_err(|e| anyhow!("{url}: {e}"))?;
     let empty = formwork_blueprint::HostTable::default();
     let table = blueprint.net.host_table().unwrap_or(&empty);
-    let source_of = |rule: &Option<formwork_blueprint::HostRule>| {
-        rule.as_ref()
-            .and_then(|r| provenance.host_rule_source(r).cloned())
+    let source_of = |rule: Option<&formwork_blueprint::HostRule>| {
+        rule.and_then(|r| provenance.host_rule_source(r).cloned())
     };
     let mut out = EgressExplanation {
         url: url.to_string(),
@@ -801,23 +785,21 @@ fn explain_url(
         return Ok(out);
     }
     match table.decide_connect(&host, port) {
-        EgressDecision::Tunnel { rule } => {
+        ConnectDecision::Tunnel(rule) => {
             out.grade = "tunnel";
-            out.source = source_of(&Some(rule.clone()));
+            out.source = source_of(Some(rule));
             out.rule = Some(rule.to_string());
             out.reason = Some(
                 "admitted at CONNECT by host and port; the request itself is opaque (FW-EGR5)"
                     .to_string(),
             );
         }
-        EgressDecision::Inspect => {
+        ConnectDecision::Inspect => {
             out.grade = "inspected";
             for m in HttpMethod::ALL {
-                let d = table.decide_request(&host, port, Some(m), &path);
-                let (admitted, rule) = match d {
-                    EgressDecision::Allow { rule } => (true, Some(rule)),
-                    EgressDecision::Deny { rule, .. } => (false, rule),
-                    _ => (false, None),
+                let (admitted, rule) = match table.decide_request(&host, port, Some(m), &path) {
+                    RequestDecision::Allow(rule) => (true, Some(rule)),
+                    RequestDecision::Deny(Denial { rule, .. }) => (false, rule),
                 };
                 out.methods.push(MethodVerdict {
                     method: m.atom().to_ascii_uppercase(),
@@ -826,12 +808,11 @@ fn explain_url(
                 });
             }
         }
-        EgressDecision::Deny { reason, rule } => {
-            out.source = source_of(&rule);
+        ConnectDecision::Deny(Denial { reason, rule }) => {
+            out.source = source_of(rule);
             out.rule = rule.map(|r| r.to_string());
             out.reason = Some(reason);
         }
-        EgressDecision::Allow { .. } => {}
     }
     Ok(out)
 }
@@ -1286,9 +1267,10 @@ fn prepare_inspection(
         formwork_blueprint::resolve_brokers(&blueprint.allow_credentials, catalog, Some(table))
             .map_err(|errors| anyhow!("allow-credentials:\n  {}", errors.join("\n  ")))?;
     let ca = formwork_gateway::SessionCa::generate().context("generating the session CA")?;
+    let roots = formwork_gateway::native_roots();
     let trust_dir = tmp.sibling("trust")?;
     let file = trust_dir.join("ca-bundle.pem");
-    write_launcher_file(&file, ca.trust_bundle().as_bytes(), 0o400)?;
+    write_launcher_file(&file, ca.trust_bundle(&roots).as_bytes(), 0o400)?;
     grant_launcher_dir(blueprint, &trust_dir, false)?;
     let file = file.display().to_string();
     let mut env: Vec<(String, String)> = TRUST_VARS
@@ -1324,10 +1306,7 @@ fn prepare_inspection(
         });
     }
     Ok(Some(PreparedInspection {
-        inspection: formwork_gateway::Inspection {
-            ca: std::sync::Arc::new(ca),
-            upstream_roots: formwork_gateway::UpstreamRoots::System,
-        },
+        inspection: formwork_gateway::Inspection::new(std::sync::Arc::new(ca), &roots),
         brokers,
         env,
     }))
@@ -1666,8 +1645,9 @@ fn session_observations(session: &Session) -> learn::SessionObservations {
     if let Some(opener) = &session.opener {
         if let Ok(slot) = opener.service.lock() {
             if let Some(service) = slot.as_ref() {
+                // Unlifted, every URL is refused for the channel alone (FW-DISC12).
                 let records = service.records_within(std::time::Duration::from_millis(500));
-                if records.iter().any(|r| r.channel_denied) {
+                if !session.blueprint.channels.lifted(Channel::OpenUrl) && !records.is_empty() {
                     obs.channels.push(Channel::OpenUrl.name().to_string());
                 }
             }

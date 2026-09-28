@@ -81,31 +81,12 @@ fn start(
 }
 
 fn auth() -> String {
-    // base64("fw:test-nonce-0123456789")
+    use base64::Engine as _;
     let raw = format!("fw:{CREDENTIAL}");
-    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in raw.as_bytes().chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(table[(n >> 18) as usize & 63] as char);
-        out.push(table[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            table[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            table[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    format!("Basic {out}")
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    )
 }
 
 /// Send one raw request head to the proxy and read everything it returns.

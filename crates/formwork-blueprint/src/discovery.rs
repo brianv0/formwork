@@ -238,8 +238,8 @@ pub fn propose_host_rules(
     table: Option<&crate::HostTable>,
 ) -> EgressProposal {
     use crate::{
-        canonicalize_host, is_restricted_ip, CanonicalHost, EgressDecision, HostRule, HostTable,
-        HttpMethod, DEFAULT_HTTPS_PORT, METADATA_HOSTNAMES,
+        canonicalize_host, ConnectDecision, Denial, HostRule, HostTable, HttpMethod,
+        DEFAULT_HTTPS_PORT,
     };
     let empty = HostTable::default();
     let table = table.unwrap_or(&empty);
@@ -249,11 +249,7 @@ pub fn propose_host_rules(
             continue;
         };
         let target = format!("{host}:{}", obs.port);
-        let restricted = match &host {
-            CanonicalHost::Ip(ip) => is_restricted_ip(*ip),
-            CanonicalHost::Name(n) => METADATA_HOSTNAMES.contains(&n.as_str()),
-        };
-        if restricted {
+        if host.is_restricted() {
             out.withheld.push((
                 target,
                 "a metadata, private, loopback or link-local destination is never proposed \
@@ -268,17 +264,17 @@ pub fn propose_host_rules(
             format!(":{}", obs.port)
         };
         let rule = match table.decide_connect(&host, obs.port) {
-            EgressDecision::Deny {
+            ConnectDecision::Deny(Denial {
                 rule: Some(rule), ..
-            } => {
+            }) => {
                 out.withheld
                     .push((target, format!("denied by the rule `{rule}`")));
                 continue;
             }
-            EgressDecision::Deny { rule: None, .. } => {
+            ConnectDecision::Deny(Denial { rule: None, .. }) => {
                 HostRule::parse("https", &format!("{host}{port}"))
             }
-            EgressDecision::Inspect => {
+            ConnectDecision::Inspect => {
                 let (Some(method), Some(path)) = (&obs.method, &obs.path) else {
                     continue;
                 };
@@ -303,7 +299,7 @@ pub fn propose_host_rules(
             }
             // Admitted already: the refusal was not a missing rule (e.g. the name resolved to a
             // restricted address).
-            EgressDecision::Tunnel { .. } | EgressDecision::Allow { .. } => continue,
+            ConnectDecision::Tunnel(_) => continue,
         };
         match rule {
             Ok(rule) => out.rules.push(rule),

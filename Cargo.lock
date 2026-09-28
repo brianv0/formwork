@@ -284,6 +284,7 @@ dependencies = [
 name = "formwork-gateway"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "formwork-blueprint",
  "formwork-compile",
  "formwork-confine",

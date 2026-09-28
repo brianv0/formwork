@@ -15,25 +15,29 @@
 //! `explain` invocation that reproduces it (FW-FID5, FW-FID9), while the client gets a generic 403
 //! (FW-CRED7).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use formwork_blueprint::{
-    canonicalize_host, canonicalize_request_path, is_restricted_ip, CanonicalHost, EgressDecision,
-    HostTable, HttpMethod, METADATA_HOSTNAMES,
+    canonicalize_host, canonicalize_request_path, is_restricted_ip, split_host_port, split_url,
+    CanonicalHost, ConnectDecision, Denial, HostTable, HttpMethod, DEFAULT_HTTPS_PORT,
 };
 
-use crate::inspect::{Broker, Inspection};
+use crate::inspect::{
+    basic_value, render_request, request_framing, Broker, Buffered, Inspection, Scrubber,
+};
 use crate::GatewayError;
 
-/// Bound on a request head, so a client that never ends its headers cannot make the Gateway buffer
+/// Bound on a message head, so a peer that never ends its headers cannot make the Gateway buffer
 /// without limit (a stability bound, like `MAX_FRAME_BYTES`).
-const MAX_HEAD_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_HEAD_BYTES: usize = 64 * 1024;
+/// The reproduction for a refusal that names no destination.
+const EXPLAIN_HOSTS: &str = "formwork explain --hosts";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Violation records kept for an embedder or test to read back; older ones are dropped.
 const MAX_KEPT_VIOLATIONS: usize = 1024;
@@ -106,7 +110,7 @@ pub(crate) fn need(
 pub struct EgressProxy {
     addr: SocketAddr,
     credential: String,
-    violations: Arc<Mutex<Vec<Violation>>>,
+    violations: Arc<Mutex<VecDeque<Violation>>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -118,10 +122,12 @@ impl EgressProxy {
         let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         std_listener.set_nonblocking(true)?;
         let addr = std_listener.local_addr()?;
-        let violations = Arc::new(Mutex::new(Vec::new()));
+        let violations = Arc::new(Mutex::new(VecDeque::new()));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let credential = config.admission.credential.clone();
         let shared = Arc::new(Shared {
+            expected_auth: basic_value("fw", &credential),
+            secrets: Scrubber::secrets_of(&config.brokers),
             config,
             violations: violations.clone(),
         });
@@ -176,7 +182,7 @@ impl EgressProxy {
     pub fn violations(&self) -> Vec<Violation> {
         self.violations
             .lock()
-            .map(|v| v.clone())
+            .map(|v| v.iter().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -203,7 +209,11 @@ impl Drop for EgressProxy {
 
 pub(crate) struct Shared {
     pub(crate) config: EgressConfig,
-    violations: Arc<Mutex<Vec<Violation>>>,
+    /// The `Proxy-Authorization` value every admitted request carries (FW-EGR9).
+    expected_auth: String,
+    /// The brokered secrets response scrubbers mask (FW-INV13).
+    pub(crate) secrets: Arc<[Vec<u8>]>,
+    violations: Arc<Mutex<VecDeque<Violation>>>,
 }
 
 impl Shared {
@@ -249,9 +259,9 @@ impl Shared {
         );
         if let Ok(mut all) = self.violations.lock() {
             if all.len() >= MAX_KEPT_VIOLATIONS {
-                all.remove(0);
+                all.pop_front();
             }
-            all.push(v);
+            all.push_back(v);
         }
     }
 }
@@ -278,7 +288,7 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     &peer.to_string(),
                     "the connection was not made through the session's supervisor",
                     None,
-                    "formwork explain --hosts".to_string(),
+                    EXPLAIN_HOSTS.into(),
                 );
                 continue;
             }
@@ -292,70 +302,50 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
-/// A parsed message head. For a response, `method` holds the version, `target` the status code,
-/// and `reason` the reason phrase.
+/// A parsed request head.
 pub(crate) struct Head {
     pub(crate) method: String,
     pub(crate) target: String,
+    pub(crate) headers: Vec<(String, String)>,
+}
+
+/// A parsed response head.
+pub(crate) struct ResponseHead {
+    pub(crate) version: String,
+    pub(crate) status: u16,
     pub(crate) reason: String,
     pub(crate) headers: Vec<(String, String)>,
 }
 
+fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
 impl Head {
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        find_header(&self.headers, name)
     }
 }
 
-/// Read one request head (through the blank line), returning it and any bytes read past it.
-async fn read_head(stream: &mut TcpStream) -> std::io::Result<Option<(Head, Vec<u8>)>> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut chunk = [0u8; 4096];
-    loop {
-        if let Some(end) = find_head_end(&buf) {
-            let rest = buf.split_off(end);
-            let head = parse_head(&buf).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed request head")
-            })?;
-            return Ok(Some((head, rest)));
-        }
-        if buf.len() > MAX_HEAD_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "request head exceeded the maximum size",
-            ));
-        }
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        buf.extend_from_slice(&chunk[..n]);
+impl ResponseHead {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        find_header(&self.headers, name)
     }
 }
 
-fn find_head_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-/// Strict head parsing: CRLF line endings, no obsolete line folding, no NUL, one `name: value` per
-/// line. Anything else is refused rather than guessed at (FW-EGR11's spirit at the head).
-pub(crate) fn parse_head(raw: &[u8]) -> Option<Head> {
+/// Split a head into its start line and strictly parsed headers: CRLF line endings, no obsolete
+/// line folding, no NUL, one `name: value` per line with a token name. Anything else is refused
+/// rather than guessed at (FW-EGR11's spirit at the head).
+fn parse_lines(raw: &[u8]) -> Option<(&str, Vec<(String, String)>)> {
     let text = std::str::from_utf8(raw).ok()?;
     if text.contains('\0') {
         return None;
     }
     let mut lines = text.split("\r\n");
-    let request_line = lines.next()?;
-    let mut parts = request_line.split(' ');
-    let method = parts.next()?.to_string();
-    let target = parts.next()?.to_string();
-    let version = parts.next()?;
-    if parts.next().is_some() || !(version == "HTTP/1.1" || version == "HTTP/1.0") {
-        return None;
-    }
+    let start = lines.next()?;
     let mut headers = Vec::new();
     for line in lines {
         if line.is_empty() {
@@ -374,52 +364,55 @@ pub(crate) fn parse_head(raw: &[u8]) -> Option<Head> {
         }
         headers.push((name.to_string(), value.trim().to_string()));
     }
+    Some((start, headers))
+}
+
+fn http_version(v: &str) -> bool {
+    v == "HTTP/1.1" || v == "HTTP/1.0"
+}
+
+/// A request head: `METHOD target HTTP/1.x`, then headers.
+pub(crate) fn parse_head(raw: &[u8]) -> Option<Head> {
+    let (start, headers) = parse_lines(raw)?;
+    let mut parts = start.split(' ');
+    let method = parts.next()?.to_string();
+    let target = parts.next()?.to_string();
+    let version = parts.next()?;
+    if parts.next().is_some() || !http_version(version) {
+        return None;
+    }
     Some(Head {
         method,
         target,
-        reason: String::new(),
         headers,
     })
 }
 
-/// A response head: `HTTP/1.x <3-digit status> [reason]`, then headers under the same strict rules.
-pub(crate) fn parse_response_head(raw: &[u8]) -> Option<Head> {
-    let text = std::str::from_utf8(raw).ok()?;
-    if text.contains('\0') {
-        return None;
-    }
-    let mut lines = text.split("\r\n");
-    let status_line = lines.next()?;
-    let mut parts = status_line.splitn(3, ' ');
+/// A response head: `HTTP/1.x <3-digit status> [reason]`, then headers.
+pub(crate) fn parse_response_head(raw: &[u8]) -> Option<ResponseHead> {
+    let (start, headers) = parse_lines(raw)?;
+    let mut parts = start.splitn(3, ' ');
     let version = parts.next()?;
     let status = parts.next()?;
     let reason = parts.next().unwrap_or("").to_string();
-    if !(version == "HTTP/1.1" || version == "HTTP/1.0")
-        || status.len() != 3
-        || !status.bytes().all(|b| b.is_ascii_digit())
-    {
+    if !http_version(version) || status.len() != 3 || !status.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with(' ') || line.starts_with('\t') {
-            return None;
-        }
-        let (name, value) = line.split_once(':')?;
-        headers.push((name.to_string(), value.trim().to_string()));
-    }
-    Some(Head {
-        method: version.to_string(),
-        target: status.to_string(),
+    Some(ResponseHead {
+        version: version.to_string(),
+        status: status.parse().ok()?,
         reason,
         headers,
     })
 }
 
-async fn respond(stream: &mut TcpStream, status: &str, extra: &str) -> std::io::Result<()> {
+/// A Gateway-originated response, then close. A 403 carries the one generic refusal body the
+/// confined client ever sees (FW-CRED7).
+pub(crate) async fn respond<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    status: &str,
+    extra: &str,
+) -> std::io::Result<()> {
     let body = if status.starts_with("403") {
         "denied by formwork policy\n"
     } else {
@@ -433,79 +426,6 @@ async fn respond(stream: &mut TcpStream, status: &str, extra: &str) -> std::io::
     stream.shutdown().await
 }
 
-fn basic_credential(credential: &str) -> String {
-    format!("Basic {}", base64(format!("fw:{credential}").as_bytes()))
-}
-
-/// Decode standard base64 (RFC 4648 §4); `None` on any malformed input.
-pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    let val = |c: u8| -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        } as u32)
-    };
-    let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
-        if pad > 2 {
-            return None;
-        }
-        let mut n = 0u32;
-        for (i, &c) in chunk.iter().enumerate() {
-            n <<= 6;
-            if i < 4 - pad {
-                n |= val(c)?;
-            } else if c != b'=' {
-                return None;
-            }
-        }
-        out.push((n >> 16) as u8);
-        if pad < 2 {
-            out.push((n >> 8) as u8);
-        }
-        if pad < 1 {
-            out.push(n as u8);
-        }
-    }
-    Some(out)
-}
-
-/// Standard base64 with padding (RFC 4648 §4).
-pub(crate) fn base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 /// Compare without an early exit on the first differing byte.
 fn same_secret(a: &str, b: &str) -> bool {
     a.len() == b.len()
@@ -515,8 +435,12 @@ fn same_secret(a: &str, b: &str) -> bool {
             == 0
 }
 
-fn explain_hint(scheme: &str, host: &str, port: u16, path: &str) -> String {
-    let default = if scheme == "https" { 443 } else { 80 };
+pub(crate) fn explain_hint(scheme: &str, host: &CanonicalHost, port: u16, path: &str) -> String {
+    let default = if scheme == "https" {
+        DEFAULT_HTTPS_PORT
+    } else {
+        formwork_blueprint::DEFAULT_HTTP_PORT
+    };
     if port == default {
         format!("formwork explain {scheme}://{host}{path}")
     } else {
@@ -524,13 +448,14 @@ fn explain_hint(scheme: &str, host: &str, port: u16, path: &str) -> String {
     }
 }
 
-async fn serve(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
-    let Some((head, leftover)) = read_head(&mut stream).await? else {
+async fn serve(stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
+    let mut client = Buffered::new(stream, Vec::new());
+    let Some(head) = client.head().await? else {
         return Ok(());
     };
-    let expected = basic_credential(&shared.config.admission.credential);
+    let (mut stream, leftover) = (client.s, client.buf);
     let presented = head.header("Proxy-Authorization").unwrap_or("");
-    if !same_secret(presented, &expected) {
+    if !same_secret(presented, &shared.expected_auth) {
         return respond(
             &mut stream,
             "407 Proxy Authentication Required",
@@ -545,23 +470,6 @@ async fn serve(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()
     }
 }
 
-/// Split `host:port` (or `[v6]:port`), with a default port.
-fn split_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = &authority[..end + 2];
-        let port = match &rest[end + 1..] {
-            "" => default_port,
-            p => p.strip_prefix(':')?.parse().ok()?,
-        };
-        return Some((host.to_string(), port));
-    }
-    match authority.rsplit_once(':') {
-        Some((h, p)) => Some((h.to_string(), p.parse().ok()?)),
-        None => Some((authority.to_string(), default_port)),
-    }
-}
-
 /// Resolve and pin (FW-EGR4, FW-ADV-008): the first address that is not restricted -- unless the
 /// host is an IP literal a rule names, which is the explicit naming EGR4 requires.
 pub(crate) async fn resolve(
@@ -569,23 +477,20 @@ pub(crate) async fn resolve(
     host: &CanonicalHost,
     port: u16,
 ) -> Result<SocketAddr, String> {
-    let table = &shared.config.table;
+    if host.is_restricted() && !shared.config.table.names_explicitly(host) {
+        return Err(match host {
+            CanonicalHost::Ip(ip) => format!(
+                "{ip} is a restricted address (metadata, private, loopback or link-local) and no \
+                 rule names it (FW-EGR4)"
+            ),
+            CanonicalHost::Name(name) => {
+                format!("{name} is a metadata service and no rule names it (FW-EGR4)")
+            }
+        });
+    }
     match host {
-        CanonicalHost::Ip(ip) => {
-            if is_restricted_ip(*ip) && !table.names_explicitly(host) {
-                return Err(format!(
-                    "{ip} is a restricted address (metadata, private, loopback or link-local) and \
-                     no rule names it (FW-EGR4)"
-                ));
-            }
-            Ok(SocketAddr::new(*ip, port))
-        }
+        CanonicalHost::Ip(ip) => Ok(SocketAddr::new(*ip, port)),
         CanonicalHost::Name(name) => {
-            if METADATA_HOSTNAMES.contains(&name.as_str()) && !table.names_explicitly(host) {
-                return Err(format!(
-                    "{name} is a metadata service and no rule names it (FW-EGR4)"
-                ));
-            }
             let (candidates, loopback_ok): (Vec<IpAddr>, bool) = match &shared.config.resolver {
                 Resolver::Fixture {
                     map,
@@ -621,7 +526,7 @@ pub(crate) async fn resolve(
     }
 }
 
-async fn connect_upstream(addr: SocketAddr) -> Result<TcpStream, String> {
+pub(crate) async fn connect_upstream(addr: SocketAddr) -> Result<TcpStream, String> {
     match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => Ok(s),
         Ok(Err(e)) => Err(format!("upstream {addr} refused: {e}")),
@@ -635,38 +540,39 @@ async fn serve_connect(
     leftover: Vec<u8>,
     shared: Arc<Shared>,
 ) -> std::io::Result<()> {
-    let target = head.target.clone();
-    let Some((raw_host, port)) = split_authority(&target, 443) else {
+    let target = head.target.as_str();
+    let Ok((raw_host, port)) = split_host_port(target) else {
         shared.refuse(
             "connect",
-            &target,
+            target,
             "malformed CONNECT target",
             None,
-            "formwork explain --hosts".into(),
+            EXPLAIN_HOSTS.into(),
         );
         return respond(&mut stream, "400 Bad Request", "").await;
     };
-    let host = match canonicalize_host(&raw_host) {
+    let port = port.unwrap_or(DEFAULT_HTTPS_PORT);
+    let host = match canonicalize_host(raw_host) {
         Ok(h) => h,
         Err(e) => {
             shared.refuse(
                 "connect",
-                &target,
+                target,
                 &e.to_string(),
                 None,
-                "formwork explain --hosts".into(),
+                EXPLAIN_HOSTS.into(),
             );
             return respond(&mut stream, "403 Forbidden", "").await;
         }
     };
-    let hint = explain_hint("https", &host.to_string(), port, "");
+    let hint = explain_hint("https", &host, port, "");
     match shared.config.table.decide_connect(&host, port) {
-        EgressDecision::Tunnel { .. } => {}
-        EgressDecision::Inspect => {
+        ConnectDecision::Tunnel(_) => {}
+        ConnectDecision::Inspect => {
             return crate::inspect::serve_inspected(stream, host, port, leftover, shared.clone())
                 .await;
         }
-        EgressDecision::Deny { reason, rule } => {
+        ConnectDecision::Deny(Denial { reason, rule }) => {
             shared.refuse_needing(
                 "connect",
                 &format!("{host}:{port}"),
@@ -677,7 +583,6 @@ async fn serve_connect(
             );
             return respond(&mut stream, "403 Forbidden", "").await;
         }
-        EgressDecision::Allow { .. } => unreachable_allow(),
     }
     let addr = match resolve(&shared, &host, port).await {
         Ok(a) => a,
@@ -711,12 +616,6 @@ async fn serve_connect(
     Ok(())
 }
 
-/// `decide_connect` never returns `Allow`; kept as a named unreachable so the match is exhaustive
-/// without a wildcard that would swallow a future variant.
-fn unreachable_allow() -> ! {
-    unreachable!("decide_connect returns Tunnel, Inspect or Deny")
-}
-
 /// A plain-HTTP request in absolute form (`GET http://host/path HTTP/1.1`): decided by host, and by
 /// method and canonical path when the host is inspected, then forwarded once.
 async fn serve_plain(
@@ -725,32 +624,30 @@ async fn serve_plain(
     leftover: Vec<u8>,
     shared: Arc<Shared>,
 ) -> std::io::Result<()> {
-    let Some(rest) = head.target.strip_prefix("http://") else {
+    let parsed = head
+        .target
+        .starts_with("http://")
+        .then(|| split_url(&head.target).ok())
+        .flatten();
+    let Some((raw_host, port, raw_path)) = parsed else {
         shared.refuse(
             "request",
             &head.target,
             "only CONNECT and absolute-form http:// requests reach the Gateway",
             None,
-            "formwork explain --hosts".into(),
+            EXPLAIN_HOSTS.into(),
         );
         return respond(&mut stream, "400 Bad Request", "").await;
     };
-    let (authority, raw_path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let Some((raw_host, port)) = split_authority(authority, 80) else {
-        return respond(&mut stream, "400 Bad Request", "").await;
-    };
-    let host = match canonicalize_host(&raw_host) {
+    let host = match canonicalize_host(raw_host) {
         Ok(h) => h,
         Err(e) => {
             shared.refuse(
                 "request",
-                authority,
+                raw_host,
                 &e.to_string(),
                 None,
-                "formwork explain --hosts".into(),
+                EXPLAIN_HOSTS.into(),
             );
             return respond(&mut stream, "403 Forbidden", "").await;
         }
@@ -763,22 +660,22 @@ async fn serve_plain(
                 &format!("{host}{raw_path}"),
                 &reason,
                 None,
-                "formwork explain --hosts".into(),
+                EXPLAIN_HOSTS.into(),
             );
             return respond(&mut stream, "403 Forbidden", "").await;
         }
     };
-    if head.header("Content-Length").is_some() && head.header("Transfer-Encoding").is_some() {
+    if let Err(reason) = request_framing(&head) {
         shared.refuse(
             "request",
             &format!("{host}{path}"),
-            "a request carrying both Content-Length and Transfer-Encoding (FW-EGR11)",
+            &format!("request smuggling shape: {reason} (FW-EGR11)"),
             None,
-            "formwork explain --hosts".into(),
+            EXPLAIN_HOSTS.into(),
         );
         return respond(&mut stream, "403 Forbidden", "").await;
     }
-    let hint = explain_hint("http", &host.to_string(), port, &path);
+    let hint = explain_hint("http", &host, port, &path);
     // A brokered credential is never presented over plain HTTP, and its placeholder never leaves
     // unencrypted (FW-CRED11).
     if let Some(b) = shared
@@ -797,14 +694,7 @@ async fn serve_plain(
         return respond(&mut stream, "403 Forbidden", "").await;
     }
     let method = HttpMethod::from_token(&head.method);
-    let decision = match shared.config.table.decide_connect(&host, port) {
-        EgressDecision::Inspect => shared
-            .config
-            .table
-            .decide_request(&host, port, method, &path),
-        other => other,
-    };
-    if let EgressDecision::Deny { reason, rule } = decision {
+    if let Err(Denial { reason, rule }) = shared.config.table.decide(&host, port, method, &path) {
         shared.refuse_needing(
             "request",
             &format!("{} {host}:{port}{path}", head.method),
@@ -834,20 +724,22 @@ async fn serve_plain(
         Err(_) => return respond(&mut stream, "502 Bad Gateway", "").await,
     };
     // Origin-form request line; the proxy credential and hop-by-hop headers stay here.
-    let mut out = format!("{} {} HTTP/1.1\r\n", head.method, raw_path);
     let hop = [
         "proxy-authorization",
         "proxy-connection",
         "connection",
         "keep-alive",
     ];
-    for (name, value) in &head.headers {
-        if !hop.contains(&name.to_ascii_lowercase().as_str()) {
-            out.push_str(&format!("{name}: {value}\r\n"));
-        }
-    }
-    out.push_str("Connection: close\r\n\r\n");
-    upstream.write_all(out.as_bytes()).await?;
+    let mut headers: Vec<(String, String)> = head
+        .headers
+        .iter()
+        .filter(|(name, _)| !hop.contains(&name.to_ascii_lowercase().as_str()))
+        .cloned()
+        .collect();
+    headers.push(("Connection".into(), "close".into()));
+    upstream
+        .write_all(&render_request(&head, raw_path, &headers))
+        .await?;
     if !leftover.is_empty() {
         upstream.write_all(&leftover).await?;
     }
@@ -860,15 +752,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base64_matches_rfc4648_vectors() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-    }
-
-    #[test]
     fn heads_parse_strictly() {
         let h = parse_head(b"CONNECT a.test:443 HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap();
         assert_eq!(h.method, "CONNECT");
@@ -877,27 +760,7 @@ mod tests {
         assert!(parse_head(b"GET / HTTP/2\r\n\r\n").is_none());
         assert!(parse_head(b"GET  / HTTP/1.1\r\n\r\n").is_none());
         let r = parse_response_head(b"HTTP/1.1 404 Not Found\r\nA: b\r\n\r\n").unwrap();
-        assert_eq!((r.target.as_str(), r.reason.as_str()), ("404", "Not Found"));
+        assert_eq!((r.status, r.reason.as_str()), (404, "Not Found"));
         assert!(parse_response_head(b"HTTP/1.1 20 X\r\n\r\n").is_none());
-    }
-
-    #[test]
-    fn base64_round_trips() {
-        for s in [&b""[..], b"f", b"fo", b"foo", b"x-access-token:ghp_1"] {
-            assert_eq!(base64_decode(&base64(s)).unwrap(), s);
-        }
-        assert!(base64_decode("abc").is_none());
-        assert!(base64_decode("ab!=").is_none());
-    }
-
-    #[test]
-    fn authorities_split_with_defaults() {
-        assert_eq!(
-            split_authority("a.test:8443", 443),
-            Some(("a.test".into(), 8443))
-        );
-        assert_eq!(split_authority("a.test", 80), Some(("a.test".into(), 80)));
-        assert_eq!(split_authority("[::1]:9", 443), Some(("[::1]".into(), 9)));
-        assert_eq!(split_authority("a.test:x", 443), None);
     }
 }

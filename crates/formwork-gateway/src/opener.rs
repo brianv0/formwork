@@ -91,9 +91,6 @@ pub struct OpenRecord {
     pub url: String,
     /// `None` when opened; otherwise why it was refused.
     pub refused: Option<String>,
-    /// Refused only because the blueprint does not lift `open-url` -- what `learn` proposes
-    /// the channel from (FW-DISC12).
-    pub channel_denied: bool,
 }
 
 /// The FW-ISO18 decision, pure: `http` and `https` only, printable ASCII, bounded, and only when
@@ -134,6 +131,8 @@ pub fn decide(url: &str, lifted: bool) -> Result<(), String> {
 pub struct OpenerService {
     records: Arc<Mutex<Vec<OpenRecord>>>,
     thread: Option<JoinHandle<()>>,
+    /// Disconnects when the serving thread returns.
+    done: std::sync::mpsc::Receiver<()>,
 }
 
 impl OpenerService {
@@ -141,12 +140,17 @@ impl OpenerService {
     pub fn start(stream: UnixStream, lifted: bool, host_opener: PathBuf) -> std::io::Result<Self> {
         let records = Arc::new(Mutex::new(Vec::new()));
         let sink = records.clone();
+        let (finished, done) = std::sync::mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("formwork-opener".into())
-            .spawn(move || serve(stream, lifted, &host_opener, &sink))?;
+            .spawn(move || {
+                let _finished = finished;
+                serve(stream, lifted, &host_opener, &sink)
+            })?;
         Ok(OpenerService {
             records,
             thread: Some(thread),
+            done,
         })
     }
 
@@ -166,13 +170,7 @@ impl OpenerService {
     /// As [`OpenerService::finish`], but give up waiting after `limit`: a process the session
     /// left running may still hold the socket.
     pub fn records_within(&self, limit: std::time::Duration) -> Vec<OpenRecord> {
-        let deadline = std::time::Instant::now() + limit;
-        while let Some(t) = &self.thread {
-            if t.is_finished() || std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let _ = self.done.recv_timeout(limit);
         self.records()
     }
 }
@@ -246,11 +244,7 @@ fn serve(
             if r.len() >= MAX_RECORDS {
                 continue;
             }
-            r.push(OpenRecord {
-                url,
-                channel_denied: !lifted && refused.is_some(),
-                refused,
-            });
+            r.push(OpenRecord { url, refused });
         }
     }
 }

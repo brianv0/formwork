@@ -94,7 +94,7 @@ impl CompileInput {
                 .allow_credentials
                 .iter()
                 .any(|e| !matches!(e, formwork_blueprint::CredentialEntry::Expose(_))),
-            keyring_lifted: exposed.iter().any(|t| t == "os-keyring"),
+            keyring_lifted: exposed.iter().any(|t| t == formwork_blueprint::OS_KEYRING),
             // A literal (non-subtree) write grant names one file; that is how a session grants a
             // socket (`readwrite:$SSH_AUTH_SOCK`). Subtree grants never admit sockets, or a
             // writable `/tmp/**` would admit the X11 socket beneath it.

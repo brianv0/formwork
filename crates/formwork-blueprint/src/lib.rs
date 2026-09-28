@@ -12,7 +12,9 @@ mod narrow;
 mod path;
 mod provenance;
 
-pub use catalog::{BrokerBlock, Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP};
+pub use catalog::{
+    BrokerBlock, Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP, OS_KEYRING,
+};
 pub use channel::{
     valid_channel_names, Channel, ChannelError, ChannelGroup, ChannelPolicy, IsolateMember,
 };
@@ -26,9 +28,10 @@ pub use discovery::{
     ProposalOutcome, WithheldEntry,
 };
 pub use egress::{
-    canonical_ip, canonicalize_host, canonicalize_request_path, is_restricted_ip, target_is_host,
-    validate_host_rules, CanonicalHost, EgressDecision, HostAccess, HostError, HostPattern,
-    HostRule, HostTable, HttpMethod, PathGlob, DEFAULT_HTTPS_PORT, HTTP_ATOMS, METADATA_HOSTNAMES,
+    canonical_ip, canonicalize_host, canonicalize_request_path, is_restricted_ip, split_host_port,
+    split_url, target_is_host, validate_host_rules, CanonicalHost, ConnectDecision, Denial,
+    HostAccess, HostError, HostPattern, HostRule, HostTable, HttpMethod, PathGlob, RequestDecision,
+    DEFAULT_HTTPS_PORT, DEFAULT_HTTP_PORT, HTTP_ATOMS, METADATA_HOSTNAMES,
 };
 pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};

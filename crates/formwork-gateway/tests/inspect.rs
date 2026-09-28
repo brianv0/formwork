@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use formwork_blueprint::{BrokerScheme, CanonicalHost, HostRule, HostTable};
 use formwork_gateway::{
-    Admission, Broker, EgressConfig, EgressProxy, Inspection, Resolver, SessionCa, UpstreamRoots,
+    Admission, Broker, EgressConfig, EgressProxy, Inspection, Resolver, SessionCa,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -125,36 +125,19 @@ fn start(rules: &[String], up: &Upstream, ca: Arc<SessionCa>, brokers: Vec<Broke
             credential: CREDENTIAL.into(),
             registry: None::<Arc<Mutex<HashSet<u16>>>>,
         },
-        inspection: Some(Inspection {
-            ca,
-            upstream_roots: UpstreamRoots::Fixture(vec![up.cert.clone()]),
-        }),
+        inspection: Some(Inspection::new(ca, std::slice::from_ref(&up.cert))),
         brokers,
     })
     .unwrap()
 }
 
 fn proxy_auth() -> String {
+    use base64::Engine as _;
     let raw = format!("fw:{CREDENTIAL}");
-    let t = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for c in raw.as_bytes().chunks(3) {
-        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(t[(n >> 18) as usize & 63] as char);
-        out.push(t[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 {
-            t[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if c.len() > 2 {
-            t[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    format!("Basic {out}")
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    )
 }
 
 /// CONNECT through the proxy and complete TLS as `sni`, trusting only the session CA.

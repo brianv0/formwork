@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
+use rustls::ServerConfig;
 
 use formwork_blueprint::CanonicalHost;
 
@@ -19,7 +20,8 @@ const LEAF_DAYS_AFTER: i64 = 30;
 pub struct SessionCa {
     cert: rcgen::Certificate,
     key: KeyPair,
-    leaves: Mutex<HashMap<String, Arc<CertifiedKey>>>,
+    /// One TLS server config per inspected host, around the leaf minted for it.
+    servers: Mutex<HashMap<String, Arc<ServerConfig>>>,
 }
 
 impl std::fmt::Debug for SessionCa {
@@ -86,7 +88,7 @@ impl SessionCa {
         Ok(SessionCa {
             cert,
             key,
-            leaves: Mutex::new(HashMap::new()),
+            servers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -95,15 +97,12 @@ impl SessionCa {
         self.cert.pem()
     }
 
-    /// The bundle confined clients trust: this CA first, then the host's roots, so a tunneled
-    /// (uninspected) host still verifies for a client that reads only the bundle.
-    pub fn trust_bundle(&self) -> String {
+    /// The bundle confined clients trust: this CA first, then `roots` (the host's, from
+    /// [`native_roots`]), so a tunneled (uninspected) host still verifies for a client that reads
+    /// only the bundle.
+    pub fn trust_bundle(&self, roots: &[CertificateDer<'_>]) -> String {
         let mut out = self.cert_pem();
-        let native = rustls_native_certs::load_native_certs();
-        for e in &native.errors {
-            tracing::warn!(error = %e, "loading a host trust-store certificate failed");
-        }
-        out.push_str(&pem_bundle(&native.certs));
+        out.push_str(&pem_bundle(roots));
         out
     }
 
@@ -111,12 +110,31 @@ impl SessionCa {
         self.cert.der().clone()
     }
 
-    /// The leaf for one inspected host, minted on first use.
-    pub fn leaf_for(&self, host: &CanonicalHost) -> Result<Arc<CertifiedKey>, CaError> {
+    /// The TLS server config for one inspected host, around a leaf minted on first use. It
+    /// answers every handshake with that leaf whatever SNI the client sends; the Gateway checks
+    /// the SNI against the CONNECT target after the handshake.
+    pub fn server_config(&self, host: &CanonicalHost) -> Result<Arc<ServerConfig>, CaError> {
         let name = host.to_string();
-        if let Some(k) = self.leaves.lock().map_err(err)?.get(&name) {
-            return Ok(k.clone());
+        if let Some(c) = self.servers.lock().map_err(err)?.get(&name) {
+            return Ok(c.clone());
         }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(err)?
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(FixedCert(self.mint_leaf(host)?)));
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let config = Arc::new(config);
+        self.servers
+            .lock()
+            .map_err(err)?
+            .insert(name, config.clone());
+        Ok(config)
+    }
+
+    fn mint_leaf(&self, host: &CanonicalHost) -> Result<Arc<CertifiedKey>, CaError> {
+        let name = host.to_string();
         let mut params = CertificateParams::default();
         params.subject_alt_names = vec![match host {
             CanonicalHost::Name(n) => SanType::DnsName(n.clone().try_into().map_err(err)?),
@@ -135,24 +153,40 @@ impl SessionCa {
             .map_err(err)?;
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
         let signing = rustls::crypto::ring::sign::any_supported_type(&key_der).map_err(err)?;
-        let certified = Arc::new(CertifiedKey::new(
+        Ok(Arc::new(CertifiedKey::new(
             vec![leaf.der().clone(), self.cert.der().clone()],
             signing,
-        ));
-        self.leaves
-            .lock()
-            .map_err(err)?
-            .insert(name, certified.clone());
-        Ok(certified)
+        )))
     }
 }
 
+/// Answers every handshake with the CONNECT target's leaf.
+#[derive(Debug)]
+struct FixedCert(Arc<CertifiedKey>);
+
+impl rustls::server::ResolvesServerCert for FixedCert {
+    fn resolve(&self, _hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.clone())
+    }
+}
+
+/// The host trust store, loaded once per session: the roots upstreams are verified against and
+/// the second half of the confined clients' bundle.
+pub fn native_roots() -> Vec<CertificateDer<'static>> {
+    let loaded = rustls_native_certs::load_native_certs();
+    for e in &loaded.errors {
+        tracing::warn!(error = %e, "loading a host trust-store certificate failed");
+    }
+    loaded.certs
+}
+
 /// PEM-encode DER certificates, for the bundle confined clients read.
-pub fn pem_bundle(certs: &[CertificateDer<'_>]) -> String {
+fn pem_bundle(certs: &[CertificateDer<'_>]) -> String {
+    use base64::Engine as _;
     let mut out = String::new();
     for c in certs {
         out.push_str("-----BEGIN CERTIFICATE-----\n");
-        let b64 = crate::egress::base64(c.as_ref());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(c.as_ref());
         for line in b64.as_bytes().chunks(64) {
             out.push_str(std::str::from_utf8(line).unwrap_or(""));
             out.push('\n');
@@ -174,13 +208,13 @@ mod tests {
     }
 
     #[test]
-    fn a_leaf_chains_to_the_session_ca_and_is_cached() {
+    fn a_leaf_chains_to_the_session_ca_and_its_config_is_cached() {
         let ca = SessionCa::generate().unwrap();
         let host = CanonicalHost::Name("api.test".into());
-        let a = ca.leaf_for(&host).unwrap();
-        let b = ca.leaf_for(&host).unwrap();
+        assert_eq!(ca.mint_leaf(&host).unwrap().cert.len(), 2);
+        let a = ca.server_config(&host).unwrap();
+        let b = ca.server_config(&host).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
-        assert_eq!(a.cert.len(), 2);
         assert!(ca.cert_pem().starts_with("-----BEGIN CERTIFICATE-----"));
     }
 }
