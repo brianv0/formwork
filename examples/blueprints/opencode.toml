@@ -11,7 +11,9 @@
 # sandbox (`mkdir -p ~/.local/share/opencode ~/.local/state/opencode ~/.cache/opencode
 # ~/.config/opencode`). Deliberately refused: registry.npmjs.org (runtime package installs). On
 # Linux, opencode's walk up the tree for config files is refused at directories above a denied path
-# (Landlock can list neither; see docs/linux-backend.md); opencode carries on.
+# (Landlock can list neither; see docs/linux-backend.md); opencode carries on. Its runtime also
+# tries to open /sys/kernel/debug/tracing/trace_marker for writing, which only root may do: an
+# unprivileged `formwork learn` proposes it on Linux, and declining it changes nothing.
 #
 #   formwork explain --blueprint examples/blueprints/opencode.toml --hosts
 

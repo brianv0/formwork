@@ -32,8 +32,9 @@ fn fail(msg: impl Into<String>) -> ConfineError {
 ///
 /// `/etc` and `/proc` are whole (D11): a grandchild's `/proc/self` is a different directory from
 /// the child's, and runtimes (`node`, `cargo`, `go`) read `/etc` and `/proc/self/*` at start. The
-/// absolute floor rows under `/etc` are still holes in the expansion. `/proc` makes same-uid
-/// processes' environments readable, which the report states (`process-environment`, D9).
+/// absolute floor rows under `/etc` are still holes in the expansion. Other processes'
+/// `/proc/<pid>/environ` stays closed under `/proc`: Landlock refuses ptrace-class access outside
+/// the domain, unless the process holds a capability that lifts it (`process-environment`, D9).
 const READ_ESSENTIALS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc"];
 const RW_DEVICES: &[&str] = &[
     "/dev/null",

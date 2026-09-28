@@ -711,18 +711,31 @@ fn baseline_rows(
                 backend: Backend::Namespaces,
             }
         }
-        Os::Linux => Fidelity::Partial {
+        // Landlock refuses a confined process ptrace-class access to any process outside its
+        // domain, which is the check `/proc/<pid>/environ` goes through (FW-ISO16).
+        Os::Linux if host.landlock_abi.is_some() && !facilities.ptrace_privileged => {
+            Fidelity::Enforced {
+                backend: Backend::Landlock,
+            }
+        }
+        Os::Linux if host.landlock_abi.is_some() => Fidelity::Partial {
             backend: Backend::Landlock,
-            reason: if facilities.pid_ns_nested {
-                "same-uid processes' /proc/<pid>/environ and cmdline are readable \
-                 (ptrace_may_access is outside Landlock); an outer PID namespace limits this to \
-                 processes inside it; isolate = [\"processes\"] closes it"
-                    .to_string()
-            } else {
-                "same-uid processes' /proc/<pid>/environ and cmdline are readable \
-                 (ptrace_may_access is outside Landlock); isolate = [\"processes\"] closes it"
-                    .to_string()
-            },
+            reason: format!(
+                "Landlock refuses ptrace-class access, /proc/<pid>/environ included, to processes \
+                 outside the session, but formwork runs with CAP_SYS_ADMIN, CAP_PERFMON or \
+                 CAP_SYS_PTRACE, which the confined process keeps and which can lift that \
+                 refusal{}; run formwork unprivileged, or isolate = [\"processes\"] closes it",
+                if facilities.pid_ns_nested {
+                    " (an outer PID namespace limits it to processes inside that namespace)"
+                } else {
+                    ""
+                }
+            ),
+        },
+        Os::Linux => Fidelity::Unenforceable {
+            reason: "Landlock unavailable on this host; same-uid processes' /proc/<pid>/environ \
+                     is readable; isolate = [\"processes\"] closes it"
+                .to_string(),
         },
     };
     caps.insert(Capability::ProcessEnvironment, environment);

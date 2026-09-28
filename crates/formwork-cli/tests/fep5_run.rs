@@ -219,9 +219,11 @@ fn fw_e2e_088_channel_locator_variables_follow_the_lift() {
     );
 }
 
-/// FW-E2E-083 (Linux default-profile half, D9): a same-uid sibling's environment is readable under
-/// the default profile, and the report says `partial` with that residual -- the report and the
-/// observation agree.
+/// FW-E2E-083 (Linux default-profile half, D9): whether a same-uid sibling's environment is
+/// readable under the default profile agrees with the report. Landlock refuses ptrace-class access
+/// outside the domain, so an unprivileged run (every CI runner) sees `enforced` and a refused read;
+/// a run holding `CAP_SYS_ADMIN`, `CAP_PERFMON` or `CAP_SYS_PTRACE` (a root container) sees
+/// `partial`, and never `enforced` with the canary readable.
 #[cfg(target_os = "linux")]
 #[test]
 fn fw_e2e_083_environment_disclosure_matches_the_report() {
@@ -259,12 +261,22 @@ fn fw_e2e_083_environment_disclosure_matches_the_report() {
     let report = formwork(dir.path(), &["compile", "--report-only"], &[]);
     let v: serde_json::Value = serde_json::from_str(&report.stdout).unwrap();
     let line = &v["per-capability"]["process-environment"];
-    assert_eq!(line["status"], "partial", "{line}");
+    let privileged = v["host"]["facilities"]["ptrace-privileged"] == true;
+    // Never an over-claim: a readable canary is never reported enforced.
     assert!(
-        observed,
-        "the default profile reports this residual, so the observation must show it: {}",
-        confined.stderr
+        !(observed && line["status"] == "enforced"),
+        "reported enforced, yet the sibling's environment was read: {line}"
     );
+    if privileged {
+        assert_eq!(line["status"], "partial", "{line}");
+    } else {
+        // Nor an under-claim: without the capabilities, Landlock's refusal holds.
+        assert_eq!(line["status"], "enforced", "{line}");
+        assert!(
+            !observed,
+            "an unprivileged run read the sibling's environment"
+        );
+    }
 }
 
 /// FEP-5 D3: a blueprint at `.formwork/blueprint.toml` is discovered, its derived proposal path
@@ -996,14 +1008,20 @@ fn fw_e2e_084_agent_examples_under_the_baseline() {
         ("ANTHROPIC_API_KEY", "sk-fixture-084"),
         ("OPENAI_API_KEY", "sk-fixture-084"),
     ];
-    let examples = [
-        ("claude-code.toml", "claude"),
-        ("claude-code-api-key.toml", "claude"),
-        ("codex.toml", "codex"),
-        ("codex-api-key.toml", "codex"),
-        ("opencode.toml", "opencode"),
+    // Denials the host imposes whatever the sandbox does, which each example documents: the strace
+    // feed sees them as the same EACCES a Landlock denial produces.
+    let examples: [(&str, &str, &[&str]); 5] = [
+        ("claude-code.toml", "claude", &[]),
+        ("claude-code-api-key.toml", "claude", &[]),
+        ("codex.toml", "codex", &[]),
+        ("codex-api-key.toml", "codex", &[]),
+        (
+            "opencode.toml",
+            "opencode",
+            &["/sys/kernel/debug/tracing/trace_marker"],
+        ),
     ];
-    for (file, agent) in examples {
+    for (file, agent, host_imposed) in examples {
         let blueprint = copy.join(file);
         let blueprint = blueprint.to_str().unwrap();
         let started = formwork(
@@ -1048,7 +1066,7 @@ fn fw_e2e_084_agent_examples_under_the_baseline() {
                 let pattern = c.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
                 let read = c.get("access").and_then(|a| a.as_str()) == Some("read");
                 // The launch directory is also `$HOME` here, itself an ancestor of the floor.
-                !(read && launch.starts_with(pattern))
+                !(read && launch.starts_with(pattern)) && !host_imposed.contains(&pattern)
             })
             .map(|c| c.to_string())
             .collect();
@@ -1156,6 +1174,9 @@ fn fw_e2e_087_host_session_detection() {
         let with_display = explain(&[]);
         let _ = xvfb.kill();
         let _ = xvfb.wait();
+        // A killed Xvfb leaves its socket and lock behind; later runs would see a phantom display.
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(format!("/tmp/.X{display}-lock"));
         let clipboard = &with_display["report"]["channels"]["clipboard"]["host"];
         assert_eq!(clipboard["present"], true, "{clipboard}");
     } else {

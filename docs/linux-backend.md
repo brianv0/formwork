@@ -17,9 +17,12 @@ seccomp=unconfined --security-opt apparmor=unconfined` so only Formwork's sandbo
 - **`/proc` and `/etc` are read essentials (FEP-5 D11).** A rule is bound to one inode at spawn, and
   each descendant's `/proc/self` resolves to a different directory, so granting `/proc/self` in the
   child left grandchildren (a shell's `node`, `cargo`, `go`) unable to read their own
-  `/proc/self/{maps,exe,status}`. `/proc` is granted read in every mode instead, and the report
-  says process-environment disclosure is `Partial`: `ptrace_may_access` decides `/proc/<pid>/environ`,
-  which Landlock does not govern. `isolate = ["processes"]` closes it with a fresh procfs.
+  `/proc/self/{maps,exe,status}`. `/proc` is granted read in every mode instead. Other processes'
+  `/proc/<pid>/environ` stays closed: `ptrace_may_access` decides it, and Landlock refuses a
+  confined process ptrace-class access outside its domain. A process holding `CAP_SYS_ADMIN` or
+  `CAP_PERFMON` (a root container) gets past that refusal; `detect` records those capabilities and
+  `CAP_SYS_PTRACE`, and the report says `Partial` then. `isolate = ["processes"]` closes it
+  regardless, with a fresh procfs.
 - **Net-deny is carried by seccomp, not Landlock.** Landlock net governs only TCP; carrying deny with
   it left UDP/raw open (an exfil channel). Deny now denies inet `socket(2)` creation at the family
   level (TCP + UDP + raw), matching macOS `(deny network*)`. Landlock net carries the port tier,

@@ -140,6 +140,14 @@ here rather than silently deviated.
   `FW-E2E-084` exempts listings of the launch directory and its ancestors, and
   `docs/linux-backend.md` states the residual.
 
+- **Linux environment disclosure is `Enforced` for an unprivileged run.** D9 recorded
+  `/proc/<pid>/environ` as readable from a root container. The first CI run, on ordinary
+  runners, showed Landlock refusing it: ptrace-class access outside the domain is denied, and
+  only `CAP_SYS_ADMIN` or `CAP_PERFMON` lifts the refusal (bisected capability by capability).
+  `detect` now records those two and `CAP_SYS_PTRACE` in the effective set, and the report says
+  `Enforced` without them and `Partial` with them. `FW-E2E-083` checks both directions; the whole
+  suite was also run as an unprivileged user before the push.
+
 ## 4. Tests
 
 | ID | Where | Runs on |

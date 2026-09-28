@@ -495,7 +495,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 - Exec restriction: Landlock `FS_EXECUTE` on allowed paths, or seccomp on `execve`. Optional ([FW-ISO4](#fw-iso4)).
 - Net default-deny: no Landlock net grants; deny is the absence of grant plus scope flags.
 - Net port allowlist: Landlock `ACCESS_NET_CONNECT_TCP` (ABI v4+, port-only, no host filtering). Reported Unenforceable below v4.
-- Cross-domain socket scoping: `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` and `LANDLOCK_SCOPE_SIGNAL` (ABI v6) are recent and coarse (they block abstract sockets and signals toward processes outside the domain by parent/child relationship, not per-path allowlisting). Pathname UNIX sockets are not scoped by any Landlock ABI, so a confined process can `connect()` to a socket file it can reach, and `/proc/<pid>/environ` of same-uid processes stays readable (`ptrace_may_access` is outside Landlock). Formwork uses the scopes where present for [FW-ADV-006](#fw-adv-006) and reports the gap otherwise — and does *not* rely on them for the transport (that is the injected fd, [FW-XR7](#fw-xr7)).
+- Cross-domain socket scoping: `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` and `LANDLOCK_SCOPE_SIGNAL` (ABI v6) are recent and coarse (they block abstract sockets and signals toward processes outside the domain by parent/child relationship, not per-path allowlisting). Pathname UNIX sockets are not scoped by any Landlock ABI, so a confined process can `connect()` to a socket file it can reach. `/proc/<pid>/environ` of processes outside the domain is refused, because Landlock denies ptrace-class access across the domain boundary, unless the confined process holds `CAP_SYS_ADMIN` or `CAP_PERFMON`, as in a root container (FEP-5 D9, [FW-ISO16](docs/fep-5.md#fw-iso16)). Formwork uses the scopes where present for [FW-ADV-006](#fw-adv-006) and reports the gap otherwise — and does *not* rely on them for the transport (that is the injected fd, [FW-XR7](#fw-xr7)).
 - Anti-shedding: `NO_NEW_PRIVS` + seccomp baseline ([FW-ISO8](#fw-iso8)).
 - Datagram and raw closure: seccomp denies AF_INET/AF_INET6 `SOCK_DGRAM` and `SOCK_RAW` under every net posture ([FW-ISO11](docs/fep-5.md#fw-iso11)), so under the port tier nothing resolves names.
 - Connect supervisor (FEP-5): under host rules, seccomp user notification routes every `connect()` and addressed `sendto()` to the `formwork` process, which copies the address once, takes the target's socket with `pidfd_getfd`, and performs the operation itself: to the Gateway egress listener, or to a pathname socket that is granted or bound in the session ([FW-EGR7](docs/fep-5.md#fw-egr7), [FW-ISO12](docs/fep-5.md#fw-iso12)). Needs Linux 5.6+ and Yama `ptrace_scope` 0 or 1; `run` refuses host rules without it.
@@ -523,7 +523,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | UDP / raw sockets | Enforced (seccomp, every posture) | Enforced (Seatbelt) |
 | name resolution under the port tier | none (UDP closed, no Gateway) | mDNSResponder literal (reported, D8) |
 | host-service channels (FEP-5) | Enforced under host rules; else Partial (locators stripped) | Partial (SBPL denies; characterization pending) |
-| other processes' environment | Partial; Enforced under `isolate` | Partial (`kern.procargs2` denied; characterization pending) |
+| other processes' environment | Enforced unprivileged (Landlock ptrace refusal); Partial with `CAP_SYS_ADMIN`/`CAP_PERFMON`/`CAP_SYS_PTRACE`; Enforced under `isolate` | Partial (`kern.procargs2` denied; characterization pending) |
 | `isolate` tier (FEP-5) | Enforced where user namespaces exist; refused otherwise | Partial (SBPL filters) |
 | private temporary directory | directory form; tmpfs under `isolate` | directory form |
 | net port allowlist (direct) | Enforced (ABI v4+) / else Reported | Enforced |
@@ -549,7 +549,7 @@ FidelityReport says `Partial` until the macOS characterization suite (FEP-5 §6.
 | TLS inspection clients | all env-trust clients | excludes Security.framework clients | no per-process trust on macOS |
 | Keychain lift granularity | per bus name (Secret Service as a whole) | whole keychain channel | Seatbelt gates `securityd` as one service |
 | `os-keyring` lift | `Partial` (shares the session bus with `run-outside`) | `Enforced` (own mach service) | D-Bus routes by bus name inside the socket |
-| Other processes' environment | `Partial` without `isolate` | `Enforced` (sysctl deny) | `ptrace_may_access` is outside Landlock |
+| Other processes' environment | `Enforced` unprivileged; `Partial` with `CAP_SYS_ADMIN`/`CAP_PERFMON`/`CAP_SYS_PTRACE` | `Enforced` (sysctl deny) | Landlock's ptrace refusal yields to those capabilities |
 | Any-depth `**/` rows | `Partial` | `Enforced` | Landlock cannot root them |
 | `stat` on denied paths | `Partial` | `Enforced` | kernel mechanism |
 | `isolate` members | `Enforced` where user namespaces exist | `Partial` or `Enforced` per characterization | no namespaces on macOS |

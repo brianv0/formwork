@@ -619,7 +619,18 @@ async fn fw_e2e_019_backend_confinement_recursion() {
     use formwork_compile::compile;
     use formwork_detect::detect;
 
-    // Grant read of the repo tree (so the fixture binary + cwd load), net denied. /etc/hosts is out.
+    // Grant read of the repo tree (so the fixture binary + cwd load), net denied. The probe target is
+    // a file outside both the grant and the platform read essentials (`/private/etc` is one since
+    // FEP-5 D11, so `/etc/hosts` no longer serves).
+    let outside = std::env::temp_dir().join(format!("fw-e2e-019-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).unwrap();
+    let outside = std::fs::canonicalize(&outside).unwrap();
+    let target = outside.join("secret");
+    std::fs::write(&target, "outside the grant").unwrap();
+    assert!(
+        std::fs::read(&target).is_ok(),
+        "control: readable unconfined"
+    );
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -680,7 +691,10 @@ async fn fw_e2e_019_backend_confinement_recursion() {
 
     // Its out-of-scope read and direct connect are both denied by its own confinement.
     agent
-        .notify("trigger/probe", json!({"path": "/etc/hosts"}))
+        .notify(
+            "trigger/probe",
+            json!({"path": target.display().to_string()}),
+        )
         .await;
     let note = agent.recv().await;
     assert_eq!(note["method"], "note/probe");
@@ -692,6 +706,7 @@ async fn fw_e2e_019_backend_confinement_recursion() {
         note["params"]["net_ok"], false,
         "backend direct egress must be denied"
     );
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// FW-ADV-016 (FEP-5 D6): the three frame-level bypasses of per-call shading. A batch array is

@@ -264,14 +264,17 @@ allow-credentials = ["broker:anthropic"]                   # the agent sees a pl
 
 Environment disclosure is a credential-disclosure path, so it is not part of the opt-in tier. On
 macOS the default profile denies `sysctl-read` of `kern.procargs2` **(characterize)**, which returns
-the full environment of same-uid processes. On Linux a confined process reads a same-uid sibling's
-`/proc/<pid>/environ` today (verified); access is decided by `ptrace_may_access`, which Landlock does
-not govern, and a Landlock deny cannot be written for "every pid but the caller's" because a rule is
-bound to one inode at spawn while each descendant's `/proc/self` resolves to a different directory.
-The Linux verdicts are `Partial` in the default profile, with the residual named; `Enforced` under
-`isolate = ["processes"]`, where the fresh `procfs` lists only session processes; and `Enforced` when
-stacked under an outer PID namespace, which `detect` recognizes from a multi-field `NSpid` in
-`/proc/self/status` and records in the HostProfile.
+the full environment of same-uid processes. On Linux, access to `/proc/<pid>/environ` is decided
+by `ptrace_may_access`, and Landlock hooks that check: a confined process is refused ptrace-class
+access to any process outside its domain. A process holding `CAP_SYS_ADMIN` or `CAP_PERFMON` gets
+past the refusal, so a root container reads a same-uid sibling's environment while an ordinary user
+does not (both verified; the first observation, from a root container, was recorded as "readable"
+and is corrected here). The Linux verdicts are `Enforced` by Landlock for an unprivileged run;
+`Partial` when `detect` finds `CAP_SYS_ADMIN`, `CAP_PERFMON` or `CAP_SYS_PTRACE` in the effective
+set, with the residual named; `Unenforceable` without Landlock; and `Enforced` under
+`isolate = ["processes"]`, where the fresh `procfs` lists only session processes. An outer PID
+namespace, which `detect` recognizes from a multi-field `NSpid` in `/proc/self/status`, narrows the
+residual and is named in it.
 
 #### Default-on: a private temporary directory (`FW-TRA10`)
 
@@ -460,7 +463,7 @@ explainable with the tools the operator already uses and discoverable through `l
 | TLS inspection clients | all env-trust clients | excludes Security.framework clients | no per-process trust on macOS |
 | Keychain lift granularity | per bus name (Secret Service as a whole) | whole keychain channel | Seatbelt gates `securityd` as one service |
 | `os-keyring` lift | `Partial` (shares the session bus with `run-outside`) | `Enforced` (own mach service) | D-Bus routes by bus name inside the socket |
-| Other processes' environment | `Partial` without `isolate` | `Enforced` (sysctl deny) | `ptrace_may_access` is outside Landlock |
+| Other processes' environment | `Enforced` unprivileged; `Partial` with `CAP_SYS_ADMIN`/`CAP_PERFMON`/`CAP_SYS_PTRACE` | `Enforced` (sysctl deny) | Landlock's ptrace refusal yields to those capabilities |
 | Any-depth `**/` rows | `Partial` | `Enforced` | Landlock cannot root them |
 | `stat` on denied paths | `Partial` | `Enforced` | kernel mechanism |
 | `isolate` members | `Enforced` where user namespaces exist | `Partial` or `Enforced` per characterization | no namespaces on macOS |
@@ -941,9 +944,11 @@ revision under `read-mode = "closed"`, and the findings below cite them by role.
 - **Report lines have stable JSON keys, and host probing lives in `detect`.** The embedder could not
   gate on prose, and a filesystem probe in the compiler broke its purity
   ([FW-CAP5](../formwork.md#fw-cap5)).
-- **Environment disclosure is `Partial` on Linux without the tier.** An earlier claim that Landlock
-  blocked `/proc/<pid>/environ` was checked and found false (D9); the honest verdict is stated rather
-  than the mechanism invented.
+- **Environment disclosure on Linux follows the process's capabilities.** An earlier claim that
+  Landlock blocked `/proc/<pid>/environ` was checked in a root container and found false (D9). CI
+  on ordinary runners then showed it true: Landlock refuses ptrace-class access outside the domain,
+  and only `CAP_SYS_ADMIN` or `CAP_PERFMON` gets past it. The verdict is `Enforced` for an
+  unprivileged run and `Partial`, with the capability named, otherwise.
 - **`.formwork/` in the project for D3.** A per-user state directory would keep the root unsplit but
   make learned grants machine-local; the team workflow commits them.
 - **Accepted limitations.** Brokering a credential whose client verifies through Security.framework
@@ -1022,7 +1027,7 @@ Conditional on the characterization suite confirming the **(characterize)** mark
 | Pathname AF_UNIX | unreachable (not mounted) | denied | mediated (supervisor) | Enforced (literals) |
 | Host-service channels | closed | partly (mach open) | closed under supervised connect, else `Partial` | closed; keychain lift is whole-channel |
 | Privileged interfaces | seccomp | not granted | seccomp | denied, IOKit allowlist |
-| Other processes' environment | hidden | open **(characterize)** | `Partial` by default; `Enforced` under `isolate` | blocked, default-on |
+| Other processes' environment | hidden | open **(characterize)** | `Enforced` unprivileged (Landlock); `Partial` with ptrace-class capabilities; `Enforced` under `isolate` | blocked, default-on |
 | Process visibility / IPC | namespaces | self-only signal/info | opt-in, namespaces | opt-in, filters |
 | Runs without user namespaces | no | n/a | yes, except `isolate` | n/a |
 | `explain` / `learn` for egress and channels | no | no | yes | yes |

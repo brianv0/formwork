@@ -79,6 +79,13 @@ pub struct HostFacilities {
     /// so other host processes are not visible to it regardless of the blueprint.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pid_ns_nested: bool,
+    /// Linux: this process holds `CAP_SYS_ADMIN`, `CAP_PERFMON` or `CAP_SYS_PTRACE`, which a
+    /// confined child keeps. Landlock refuses a confined process ptrace-class access to processes
+    /// outside its domain, `/proc/<pid>/environ` included; a process with `CAP_SYS_ADMIN` or
+    /// `CAP_PERFMON` gets past that refusal (observed on 6.18), and `CAP_SYS_PTRACE` is counted
+    /// too, as the capability that means "may inspect any process" (FW-ISO16).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ptrace_privileged: bool,
 }
 
 impl HostFacilities {
@@ -364,7 +371,22 @@ mod linux {
             video_device: first_device("video"),
             gui_session: false,
             pid_ns_nested: pid_ns_nested(),
+            ptrace_privileged: ptrace_privileged(),
         }
+    }
+
+    /// `CAP_SYS_PTRACE` (19), `CAP_SYS_ADMIN` (21) or `CAP_PERFMON` (38) in the effective set.
+    fn ptrace_privileged() -> bool {
+        const MASK: u64 = (1 << 19) | (1 << 21) | (1 << 38);
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("CapEff:"))
+                    .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            })
+            .map(|eff| eff & MASK != 0)
+            .unwrap_or(true)
     }
 
     fn first_device(prefix: &str) -> Option<String> {
