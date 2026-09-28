@@ -94,7 +94,17 @@ impl HostFacilities {
     }
 }
 
+/// What the Linux `connect()` supervisor needs from the host (FW-EGR7), for messages naming why a
+/// host cannot carry it.
+pub const CONNECT_SUPERVISION_NEEDS: &str =
+    "seccomp user notification, pidfd_getfd (Linux 5.6+), and Yama ptrace_scope 0 or 1";
+
 impl HostProfile {
+    /// Can the Linux `connect()` supervisor carry host-scoped egress here (FW-EGR7)?
+    pub fn can_supervise_connect(&self) -> bool {
+        self.os == Os::Linux && self.seccomp && self.connect_supervision
+    }
+
     pub fn synthetic_linux(landlock_abi: Option<u32>) -> Self {
         HostProfile {
             os: Os::Linux,

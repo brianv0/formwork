@@ -90,10 +90,7 @@ impl CompileInput {
             channels: blueprint.channels.clone(),
             isolate: blueprint.isolate.clone(),
             gateway_port: None,
-            brokered: blueprint
-                .allow_credentials
-                .iter()
-                .any(|e| !matches!(e, formwork_blueprint::CredentialEntry::Expose(_))),
+            brokered: blueprint.brokered_credentials().next().is_some(),
             keyring_lifted: exposed.iter().any(|t| t == formwork_blueprint::OS_KEYRING),
             // A literal (non-subtree) write grant names one file; that is how a session grants a
             // socket (`readwrite:$SSH_AUTH_SOCK`). Subtree grants never admit sockets, or a
@@ -111,14 +108,6 @@ impl CompileInput {
     }
 }
 
-/// Per-spawn facts that are not blueprint content: the Gateway listener port the session's egress
-/// goes to (FW-EGR8/FW-EGR14). A dry-run compiles with none, and the macOS profile then allows no
-/// outbound endpoint at all (fail-closed).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SessionEndpoints {
-    pub gateway_port: Option<u16>,
-}
-
 /// Pure and deterministic in `(blueprint, host, catalog)`. The catalog is a mandatory input by
 /// design: the credential floor (FW-CRED4) cannot be forgotten, only explicitly resolved (or,
 /// in tests, explicitly emptied) at the edge that knows `$HOME`.
@@ -127,50 +116,33 @@ pub fn compile(
     host: &HostProfile,
     catalog: &ResolvedCatalog,
 ) -> CompiledPolicy {
-    compile_for_session(blueprint, host, catalog, &SessionEndpoints::default())
+    compile_for_session(blueprint, host, catalog, None)
 }
 
-/// [`compile`] with the per-spawn endpoints a session adds. Still pure and deterministic in its
-/// inputs (FW-FID4).
+/// [`compile`] for a session: `gateway_port` is the per-spawn Gateway listener the session's
+/// egress goes to (FW-EGR8/FW-EGR14), not blueprint content. A dry run compiles with none, and
+/// the macOS profile then allows no outbound endpoint at all (fail-closed). Still pure and
+/// deterministic in its inputs (FW-FID4).
 pub fn compile_for_session(
     blueprint: &Blueprint,
     host: &HostProfile,
     catalog: &ResolvedCatalog,
-    session: &SessionEndpoints,
+    gateway_port: Option<u16>,
 ) -> CompiledPolicy {
     let blueprint = blueprint.canonicalize();
     let mut input = CompileInput::from_blueprint(&blueprint, catalog);
-    input.gateway_port = session.gateway_port;
+    input.gateway_port = gateway_port;
 
     let mut per_capability: BTreeMap<Capability, Fidelity> = BTreeMap::new();
-    let mut semantics: BTreeMap<Capability, DenialSemantics> = BTreeMap::new();
     let mut withheld: Vec<String> = Vec::new();
 
     let (confiner, direct_tcp_ports) = match host.os {
-        Os::MacOs => compile_macos(&input, host, &mut per_capability, &mut semantics),
-        Os::Linux => compile_linux(
-            &input,
-            host,
-            &mut per_capability,
-            &mut semantics,
-            &mut withheld,
-        ),
+        Os::MacOs => compile_macos(&input, host, &mut per_capability),
+        Os::Linux => compile_linux(&input, host, &mut per_capability, &mut withheld),
     };
     let supervised = supervised(&input, host);
-    egress_rows(
-        &input,
-        host,
-        supervised,
-        &mut per_capability,
-        &mut semantics,
-    );
-    let channels = baseline_rows(
-        &input,
-        host,
-        supervised,
-        &mut per_capability,
-        &mut semantics,
-    );
+    egress_rows(&input, host, supervised, &mut per_capability);
+    let channels = baseline_rows(&input, host, supervised, &mut per_capability);
 
     // Filesystem invisibility is never provided; document it as an explicit, reported fact.
     per_capability.insert(
@@ -180,7 +152,6 @@ pub fn compile_for_session(
                 .to_string(),
         },
     );
-    semantics.insert(Capability::FsInvisibility, DenialSemantics::Deny);
 
     // Environment posture is applied at spawn by the CLI shell, independent of the OS confiner (like
     // MCP shading below). Passthrough asks for nothing, so it earns no row. Allowlist is exact
@@ -195,7 +166,6 @@ pub fn compile_for_session(
                     backend: Backend::Launcher,
                 },
             );
-            semantics.insert(Capability::EnvScrub, DenialSemantics::Hide);
         }
         EnvPosture::Scrub(_) => {
             per_capability.insert(
@@ -205,7 +175,6 @@ pub fn compile_for_session(
                     reason: "heuristic: drops secret-shaped names and values; a secret with neither a known marker name nor a recognized value shape (e.g. an inline credential in DATABASE_URL) is not caught -- pin it with an explicit deny or use an allowlist".to_string(),
                 },
             );
-            semantics.insert(Capability::EnvScrub, DenialSemantics::Hide);
         }
     }
 
@@ -217,10 +186,13 @@ pub fn compile_for_session(
                 backend: Backend::Gateway,
             },
         );
-        semantics.insert(Capability::McpShading, DenialSemantics::Hide);
     }
 
     let credentials = credential_report(catalog, &blueprint, host, &per_capability);
+    let semantics = per_capability
+        .keys()
+        .map(|&cap| (cap, cap.semantics()))
+        .collect();
     withheld.sort();
     withheld.dedup();
     let report = FidelityReport {
@@ -292,9 +264,7 @@ fn credential_report(
     }
     let backstop_lifted = exposed.iter().any(|a| a == formwork_blueprint::BACKSTOP);
     let mut brokered: Vec<String> = blueprint
-        .allow_credentials
-        .iter()
-        .filter(|e| !matches!(e, formwork_blueprint::CredentialEntry::Expose(_)))
+        .brokered_credentials()
         .map(|e| e.name().to_string())
         .collect();
     brokered.sort();
@@ -316,7 +286,6 @@ fn compile_macos(
     input: &CompileInput,
     host: &HostProfile,
     caps: &mut BTreeMap<Capability, Fidelity>,
-    sem: &mut BTreeMap<Capability, DenialSemantics>,
 ) -> (ConfinerPolicy, Vec<u16>) {
     let sbpl = sbpl::render(input);
 
@@ -333,36 +302,32 @@ fn compile_macos(
             }
         }
     };
-    let mut put = |cap: Capability, f: Fidelity| {
-        caps.insert(cap, f);
-        sem.insert(cap, DenialSemantics::Deny);
-    };
-    put(Capability::FsRead, seatbelt("filesystem read scope"));
-    put(Capability::FsWrite, seatbelt("filesystem write scope"));
-    put(Capability::NetDefaultDeny, seatbelt("network default-deny"));
+    caps.insert(Capability::FsRead, seatbelt("filesystem read scope"));
+    caps.insert(Capability::FsWrite, seatbelt("filesystem write scope"));
+    caps.insert(Capability::NetDefaultDeny, seatbelt("network default-deny"));
     // Seatbelt path-gates UNIX sockets under `(deny network*)`, so cross-domain socket control and
     // pathname sockets are closed apart from granted literals.
-    put(
+    caps.insert(
         Capability::CrossDomainSocket,
         seatbelt("UNIX-socket control"),
     );
-    put(
+    caps.insert(
         Capability::NetUnixSocket,
         seatbelt("pathname-socket control"),
     );
-    put(Capability::NetUdp, seatbelt("UDP/raw closure"));
+    caps.insert(Capability::NetUdp, seatbelt("UDP/raw closure"));
     if !input.write_subtract.is_empty() {
-        put(Capability::TamperVectors, seatbelt("the tamper-vector set"));
+        caps.insert(Capability::TamperVectors, seatbelt("the tamper-vector set"));
     }
 
     let mut direct_ports = Vec::new();
     match &input.net {
         NetPosture::Ports(ports) => {
-            put(Capability::NetPortTier, seatbelt("the direct port tier"));
+            caps.insert(Capability::NetPortTier, seatbelt("the direct port tier"));
             direct_ports = ports.clone();
             // D8: the port tier re-allows the mDNSResponder literal, a name-resolution channel the
             // report must list.
-            put(
+            caps.insert(
                 Capability::NetResolver,
                 Fidelity::Partial {
                     backend: Backend::Seatbelt,
@@ -377,11 +342,11 @@ fn compile_macos(
         // FW-EGR12: under host rules the resolver literal is dropped and every lookup happens in
         // the Gateway, which pins it (FW-ADV-008).
         NetPosture::Deny | NetPosture::AllowHosts(_) => {
-            put(Capability::NetResolver, seatbelt("resolver closure"))
+            caps.insert(Capability::NetResolver, seatbelt("resolver closure"));
         }
     }
     if let ExecPosture::Allowlist(_) = &input.exec {
-        put(Capability::Exec, seatbelt("the exec allow-list"));
+        caps.insert(Capability::Exec, seatbelt("the exec allow-list"));
     }
 
     (ConfinerPolicy::Macos(MacosPolicy { sbpl }), direct_ports)
@@ -395,7 +360,6 @@ fn compile_linux(
     input: &CompileInput,
     host: &HostProfile,
     caps: &mut BTreeMap<Capability, Fidelity>,
-    sem: &mut BTreeMap<Capability, DenialSemantics>,
     withheld: &mut Vec<String>,
 ) -> (ConfinerPolicy, Vec<u16>) {
     let abi = host.landlock_abi.unwrap_or(0);
@@ -419,8 +383,6 @@ fn compile_linux(
         );
         caps.insert(Capability::FsWrite, Fidelity::Unenforceable { reason });
     }
-    sem.insert(Capability::FsRead, DenialSemantics::Deny);
-    sem.insert(Capability::FsWrite, DenialSemantics::Deny);
 
     let (net_plan, inet_deny, tier) = linux::net_plan(host, &input.net);
     // Net default-deny is seccomp-carried on every Linux path: an outright deny blocks the inet
@@ -441,9 +403,7 @@ fn compile_linux(
         Capability::NetDefaultDeny,
         seccomp_or("direct egress denial"),
     );
-    sem.insert(Capability::NetDefaultDeny, DenialSemantics::Deny);
     caps.insert(Capability::NetUdp, seccomp_or("UDP/raw closure"));
-    sem.insert(Capability::NetUdp, DenialSemantics::Deny);
     // D8/FW-EGR12: UDP resolution is closed with the inet deny, but the pathname resolver sockets
     // stay connect()-reachable without the supervisor, so resolution is not closed.
     caps.insert(
@@ -456,14 +416,12 @@ fn compile_linux(
                 .to_string(),
         },
     );
-    sem.insert(Capability::NetResolver, DenialSemantics::Deny);
 
     let mut direct_ports = Vec::new();
     match tier {
         PortTier::NotRequested => {}
         PortTier::Enforced => {
             caps.insert(Capability::NetPortTier, landlock());
-            sem.insert(Capability::NetPortTier, DenialSemantics::Deny);
             if let NetPosture::Ports(ports) = &input.net {
                 direct_ports = ports.clone();
             }
@@ -478,7 +436,6 @@ fn compile_linux(
                     ),
                 },
             );
-            sem.insert(Capability::NetPortTier, DenialSemantics::Deny);
         }
     }
 
@@ -497,7 +454,6 @@ fn compile_linux(
                     },
                 );
             }
-            sem.insert(Capability::Exec, DenialSemantics::Deny);
             ExecPlan::Allowlist {
                 paths: paths.clone(),
             }
@@ -530,7 +486,6 @@ fn compile_linux(
             },
         );
     }
-    sem.insert(Capability::CrossDomainSocket, DenialSemantics::Deny);
     caps.insert(
         Capability::NetUnixSocket,
         Fidelity::Partial {
@@ -538,7 +493,6 @@ fn compile_linux(
             reason: pathname_gap.to_string(),
         },
     );
-    sem.insert(Capability::NetUnixSocket, DenialSemantics::Deny);
 
     // D1: any-depth write-subtract rows cannot be rooted Landlock rules; they are withheld as the
     // floor's are and reported, never silently pretended (FW-INV5/6).
@@ -563,7 +517,6 @@ fn compile_linux(
             }
         };
         caps.insert(Capability::TamperVectors, fidelity);
-        sem.insert(Capability::TamperVectors, DenialSemantics::Deny);
     }
     if has_landlock {
         withheld.extend(any_depth_ws.iter().map(|p| format!("write-subtract {p}")));
@@ -635,7 +588,6 @@ fn baseline_rows(
     host: &HostProfile,
     supervised: bool,
     caps: &mut BTreeMap<Capability, Fidelity>,
-    sem: &mut BTreeMap<Capability, DenialSemantics>,
 ) -> BTreeMap<String, ChannelReport> {
     let mut channels = BTreeMap::new();
     let fs_enforced = caps
@@ -677,7 +629,6 @@ fn baseline_rows(
         };
         let cap = Capability::Channel(channel);
         caps.insert(cap, fidelity);
-        sem.insert(cap, DenialSemantics::Deny);
     }
 
     let privileged = match host.os {
@@ -696,7 +647,6 @@ fn baseline_rows(
         },
     };
     caps.insert(Capability::PrivilegedInterfaces, privileged);
-    sem.insert(Capability::PrivilegedInterfaces, DenialSemantics::Deny);
 
     let environment = match host.os {
         Os::MacOs => Fidelity::Partial {
@@ -739,7 +689,6 @@ fn baseline_rows(
         },
     };
     caps.insert(Capability::ProcessEnvironment, environment);
-    sem.insert(Capability::ProcessEnvironment, DenialSemantics::Deny);
 
     // FW-TRA10: the Launcher's per-session directory is private; `/tmp` stays shared when the
     // blueprint grants it (the default profile does, so tools that hardcode `/tmp` keep working).
@@ -770,7 +719,6 @@ fn baseline_rows(
         }
     };
     caps.insert(Capability::PrivateTmp, private_tmp);
-    sem.insert(Capability::PrivateTmp, DenialSemantics::Deny);
 
     for member in &input.isolate {
         let cap = match member {
@@ -799,7 +747,6 @@ fn baseline_rows(
             },
         };
         caps.insert(cap, fidelity);
-        sem.insert(cap, DenialSemantics::Deny);
     }
     channels
 }
@@ -864,10 +811,7 @@ fn linux_channel_fidelity(
 
 /// Whether the Linux `connect()` supervisor carries this session (FW-EGR7).
 fn supervised(input: &CompileInput, host: &HostProfile) -> bool {
-    host.os == Os::Linux
-        && matches!(input.net, NetPosture::AllowHosts(_))
-        && host.seccomp
-        && host.connect_supervision
+    matches!(input.net, NetPosture::AllowHosts(_)) && host.can_supervise_connect()
 }
 
 /// The sockets the Linux supervisor admits besides in-session ones (FW-ISO12): literal write
@@ -905,14 +849,9 @@ fn egress_rows(
     host: &HostProfile,
     supervised: bool,
     caps: &mut BTreeMap<Capability, Fidelity>,
-    sem: &mut BTreeMap<Capability, DenialSemantics>,
 ) {
     let NetPosture::AllowHosts(table) = &input.net else {
         return;
-    };
-    let mut put = |cap: Capability, f: Fidelity| {
-        caps.insert(cap, f);
-        sem.insert(cap, DenialSemantics::Deny);
     };
     let has_tunnel = table
         .rules
@@ -920,12 +859,14 @@ fn egress_rows(
         .any(|r| matches!(r.access, formwork_blueprint::HostAccess::Tunnel));
     let has_inspected = table.rules.iter().any(|r| r.is_inspected());
     let tunnel_gap = "tunnel-grade hosts (`https:`) are admitted by the CONNECT target and trust the client's SNI and Host; domain fronting is not caught (FW-EGR5)";
-    let unavailable = "connect supervision is unavailable on this host: it needs seccomp user \
-                        notification, pidfd_getfd (Linux 5.6+), and Yama ptrace_scope 0 or 1; \
-                        egress fails closed and `run` refuses the host rules";
+    let unavailable = format!(
+        "connect supervision is unavailable on this host: it needs {}; egress fails closed and \
+         `run` refuses the host rules",
+        formwork_detect::CONNECT_SUPERVISION_NEEDS
+    );
     match host.os {
         Os::Linux if !supervised => {
-            put(
+            caps.insert(
                 Capability::NetHostScope,
                 Fidelity::Unenforceable {
                     reason: unavailable.to_string(),
@@ -934,7 +875,7 @@ fn egress_rows(
             return;
         }
         Os::Linux => {
-            put(
+            caps.insert(
                 Capability::NetHostScope,
                 if has_tunnel {
                     Fidelity::Partial {
@@ -950,17 +891,17 @@ fn egress_rows(
             let supervisor = || Fidelity::Enforced {
                 backend: Backend::Supervisor,
             };
-            put(Capability::NetDefaultDeny, supervisor());
-            put(Capability::NetResolver, supervisor());
+            caps.insert(Capability::NetDefaultDeny, supervisor());
+            caps.insert(Capability::NetResolver, supervisor());
             let sendmsg_gap = "addressed sendmsg()/sendmmsg() on an AF_UNIX datagram socket is not mediated (its destination sits in memory seccomp cannot read); connect() and addressed sendto() are";
-            put(
+            caps.insert(
                 Capability::NetUnixSocket,
                 Fidelity::Partial {
                     backend: Backend::Supervisor,
                     reason: sendmsg_gap.to_string(),
                 },
             );
-            put(
+            caps.insert(
                 Capability::CrossDomainSocket,
                 Fidelity::Partial {
                     backend: Backend::Supervisor,
@@ -983,7 +924,7 @@ fn egress_rows(
             if has_tunnel {
                 reason = format!("{reason}; {tunnel_gap}");
             }
-            put(
+            caps.insert(
                 Capability::NetHostScope,
                 if host.seatbelt {
                     Fidelity::Partial {
@@ -1003,7 +944,7 @@ fn egress_rows(
         // not trust the session CA fails its handshake and is refused -- fail-closed, not a bypass.
         // The macOS limit (Security.framework clients ignore SSL_CERT_FILE) is a compatibility
         // note the operator channel carries (FW-FID9), not a gap in what is enforced.
-        put(
+        caps.insert(
             Capability::NetInspection,
             Fidelity::Enforced {
                 backend: Backend::Gateway,
@@ -1011,7 +952,7 @@ fn egress_rows(
         );
     }
     if input.brokered {
-        put(
+        caps.insert(
             Capability::CredentialBroker,
             Fidelity::Enforced {
                 backend: Backend::Gateway,

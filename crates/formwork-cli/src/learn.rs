@@ -39,7 +39,7 @@ use formwork_blueprint::{
 /// grant, and itemizing catalog matches in it would hand the agent an oracle (FW-INV9).
 /// Unreviewed entries ACCUMULATE across learning runs (each stamped with the run that observed
 /// it, so acceptance provenance stays truthful); a re-observed entry is refreshed in place.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProposalFile {
     /// The blueprint the proposal was learned against, for `accept` to find the discovered layer.
@@ -389,12 +389,7 @@ pub fn conclude_learning_run(
     let previous: ProposalFile = match std::fs::read_to_string(&path) {
         Ok(text) => toml::from_str::<ProposalFile>(&text)
             .with_context(|| format!("parsing existing proposal {}", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProposalFile {
-            blueprint: String::new(),
-            candidates: Vec::new(),
-            hosts: Vec::new(),
-            channels: Vec::new(),
-        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProposalFile::default(),
         Err(e) => return Err(e).context(format!("reading {}", path.display())),
     };
     let observed: Vec<ProposalEntry> = outcome
@@ -542,30 +537,31 @@ fn merge_all_into_discovered(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => BlueprintLayer::default(),
         Err(e) => return Err(e).context(format!("reading {}", path.display())),
     };
+    let attribute = |layer: &mut BlueprintLayer, key: String, run_id: &str| {
+        layer.discovery.provenance.insert(
+            key,
+            ProvenanceEntry {
+                added_via: added_via.to_string(),
+                run_id: run_id.to_string(),
+            },
+        );
+    };
     for entry in accepted {
         match entry.candidate.access {
             DenialAccess::Read => layer.fs.reads.push(entry.candidate.pattern.clone()),
             DenialAccess::Write => layer.fs.writes.push(entry.candidate.pattern.clone()),
         }
-        layer.discovery.provenance.insert(
+        attribute(
+            &mut layer,
             entry.candidate.pattern.canonical(),
-            ProvenanceEntry {
-                added_via: added_via.to_string(),
-                run_id: entry.run_id.clone(),
-            },
+            &entry.run_id,
         );
     }
     for entry in rules {
         if !layer.rules.contains(&entry.rule) {
             layer.rules.push(entry.rule.clone());
         }
-        layer.discovery.provenance.insert(
-            rule_key(&entry.rule),
-            ProvenanceEntry {
-                added_via: added_via.to_string(),
-                run_id: entry.run_id.clone(),
-            },
-        );
+        attribute(&mut layer, rule_key(&entry.rule), &entry.run_id);
     }
     layer.rules.sort();
     if !channels.is_empty() {
@@ -578,13 +574,7 @@ fn merge_all_into_discovered(
             let channel = Channel::from_name(&entry.channel)
                 .ok_or_else(|| anyhow::anyhow!("unknown channel {:?}", entry.channel))?;
             lifted.push(channel);
-            layer.discovery.provenance.insert(
-                channel_key(&entry.channel),
-                ProvenanceEntry {
-                    added_via: added_via.to_string(),
-                    run_id: entry.run_id.clone(),
-                },
-            );
+            attribute(&mut layer, channel_key(&entry.channel), &entry.run_id);
         }
         layer.channels = Some(ChannelPolicy::allow(lifted));
     }
@@ -672,40 +662,51 @@ pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -
             .iter()
             .any(|sel| sel.parse::<usize>().map(|n| n == number).unwrap_or(false) || sel == name)
     };
-    let selected: Vec<&ProposalEntry> = proposal
-        .candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.candidate.tag == CandidateTag::NeedsReview)
-        .filter(|(i, e)| picked(i + 1, &e.candidate.pattern.canonical()))
-        .map(|(_, e)| e)
-        .collect();
-    let selected_rules: Vec<&RuleProposal> = proposal
-        .hosts
-        .iter()
-        .enumerate()
-        .filter(|(i, e)| picked(paths_n + i + 1, &e.rule))
-        .map(|(_, e)| e)
-        .collect();
-    let selected_channels: Vec<&ChannelProposal> = proposal
-        .channels
-        .iter()
-        .enumerate()
-        .filter(|(i, e)| picked(paths_n + hosts_n + i + 1, &e.channel))
-        .map(|(_, e)| e)
-        .collect();
+    // Entries are numbered paths first, then hosts, then channels, as listed above.
+    fn pick<'a, T>(
+        entries: &'a [T],
+        first: usize,
+        name: impl Fn(&T) -> String,
+        picked: &impl Fn(usize, &str) -> bool,
+    ) -> Vec<&'a T> {
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| picked(first + i, &name(e)))
+            .map(|(_, e)| e)
+            .collect()
+    }
+    let selected: Vec<&ProposalEntry> = pick(
+        &proposal.candidates,
+        1,
+        |e| e.candidate.pattern.canonical(),
+        &picked,
+    )
+    .into_iter()
+    .filter(|e| e.candidate.tag == CandidateTag::NeedsReview)
+    .collect();
+    let selected_rules = pick(&proposal.hosts, paths_n + 1, |e| e.rule.clone(), &picked);
+    let selected_channels = pick(
+        &proposal.channels,
+        paths_n + hosts_n + 1,
+        |e| e.channel.clone(),
+        &picked,
+    );
     if selected.is_empty() && selected_rules.is_empty() && selected_channels.is_empty() {
         bail!("no needs-review candidate matched the selection (run with no selection to list)");
     }
     // A forged proposal must not smuggle a path rule through the host-rule door.
     for entry in &selected_rules {
-        let Some((atoms, target)) = entry.rule.split_once(':') else {
-            bail!("refusing to accept {:?}: not a host rule", entry.rule);
-        };
-        if !formwork_blueprint::target_is_host(target) {
+        let is_host = entry
+            .rule
+            .split_once(':')
+            .is_some_and(|(_, target)| formwork_blueprint::target_is_host(target));
+        if !is_host {
             bail!("refusing to accept {:?}: not a host rule", entry.rule);
         }
-        formwork_blueprint::HostRule::parse(atoms, target)
+        entry
+            .rule
+            .parse::<formwork_blueprint::HostRule>()
             .map_err(|e| anyhow::anyhow!("refusing to accept {:?}: {e}", entry.rule))?;
     }
 

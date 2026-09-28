@@ -487,14 +487,7 @@ fn main() -> Result<()> {
             blueprint,
             confine_self,
             argv,
-        } => {
-            let posture = if confine_self {
-                Posture::Self_
-            } else {
-                Posture::Spawn
-            };
-            run(blueprint, argv, posture)?
-        }
+        } => run(blueprint, argv, confine_self)?,
         Cmd::Learn {
             blueprint,
             list,
@@ -834,15 +827,7 @@ fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
                 }
                 formwork_blueprint::HostAccess::Inspected { methods, path } => (
                     "inspected",
-                    if methods.is_empty() {
-                        "any".to_string()
-                    } else {
-                        methods
-                            .iter()
-                            .map(|m| m.atom())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    },
+                    formwork_blueprint::HttpMethod::atoms(methods),
                     path.as_str().to_string(),
                 ),
                 formwork_blueprint::HostAccess::Deny { path } => (
@@ -934,11 +919,6 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
         print!("{}", render::report_summary(&policy.report));
     }
     Ok(())
-}
-
-enum Posture {
-    Spawn,
-    Self_,
 }
 
 /// `exit_code=1`, never Rust's `Some(1)`; a signal death is named, not `None`.
@@ -1104,10 +1084,13 @@ fn grant_launcher_dir(
 /// write URLs to. The host end is served after the spawn (FW-ISO18).
 struct OpenerSetup {
     dir: PathBuf,
-    host_end: std::sync::Mutex<Option<std::os::unix::net::UnixStream>>,
-    session_end: std::sync::Mutex<Option<std::os::fd::OwnedFd>>,
+    /// Served from this process once the workload is spawned.
+    host_end: Option<std::os::unix::net::UnixStream>,
+    /// The workload's copy, dropped here once it has inherited it.
+    session_end: Option<std::os::fd::OwnedFd>,
+    /// `session_end`'s number, which the workload's environment names.
     session_fd: std::os::fd::RawFd,
-    service: std::sync::Mutex<Option<formwork_gateway::OpenerService>>,
+    service: Option<formwork_gateway::OpenerService>,
 }
 
 fn prepare_opener(blueprint: &mut Blueprint, tmp: &mut SessionTmp) -> Result<OpenerSetup> {
@@ -1128,17 +1111,16 @@ fn prepare_opener(blueprint: &mut Blueprint, tmp: &mut SessionTmp) -> Result<Ope
     let session_end = std::os::fd::OwnedFd::from(session_end);
     Ok(OpenerSetup {
         dir,
-        host_end: std::sync::Mutex::new(Some(host_end)),
+        host_end: Some(host_end),
         session_fd: session_end.as_raw_fd(),
-        session_end: std::sync::Mutex::new(Some(session_end)),
-        service: std::sync::Mutex::new(None),
+        session_end: Some(session_end),
+        service: None,
     })
 }
 
-fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
+fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) -> Result<Session> {
     let resolved = args.resolve()?;
     let mut blueprint = args.load(&resolved.path, &home())?;
-    let host = detect();
     refuse_unavailable_isolation(&blueprint, &host, purpose)?;
     let catalog =
         ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
@@ -1187,10 +1169,8 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
         None => (Vec::new(), None, Vec::new()),
     };
     let egress = start_egress(&blueprint, &host, purpose, inspection, brokers)?;
-    let endpoints = formwork_compile::SessionEndpoints {
-        gateway_port: egress.as_ref().map(|e| e.proxy.addr().port()),
-    };
-    let policy = formwork_compile::compile_for_session(&blueprint, &host, &catalog, &endpoints);
+    let gateway_port = egress.as_ref().map(|e| e.proxy.addr().port());
+    let policy = formwork_compile::compile_for_session(&blueprint, &host, &catalog, gateway_port);
     itemize_credential_floor(&policy.report, &catalog);
     Ok(Session {
         blueprint,
@@ -1207,23 +1187,15 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose) -> Result<Session> {
 }
 
 /// FW-ISO18: serve the opener socket from this process, outside the sandbox.
-fn start_opener(session: &Session, opener: &OpenerSetup) {
-    let Some(host_end) = opener.host_end.lock().ok().and_then(|mut h| h.take()) else {
+fn start_opener(opener: &mut OpenerSetup, lifted: bool) {
+    let Some(host_end) = opener.host_end.take() else {
         return;
     };
-    let lifted = session
-        .blueprint
-        .channels
-        .lifted(formwork_blueprint::Channel::OpenUrl);
     let host_opener = std::env::var_os("FORMWORK_HOST_OPENER")
         .map(PathBuf::from)
         .unwrap_or_else(formwork_gateway::opener::host_opener);
     match formwork_gateway::OpenerService::start(host_end, lifted, host_opener) {
-        Ok(service) => {
-            if let Ok(mut slot) = opener.service.lock() {
-                *slot = Some(service);
-            }
-        }
+        Ok(service) => opener.service = Some(service),
         Err(e) => tracing::warn!(error = %e, "the open-url service failed to start"),
     }
 }
@@ -1338,11 +1310,11 @@ fn start_egress(
              `net = \"deny\"` or a port tier"
         ),
     }
-    if host.os == formwork_detect::Os::Linux && !(host.seccomp && host.connect_supervision) {
+    if host.os == formwork_detect::Os::Linux && !host.can_supervise_connect() {
         bail!(
-            "host rules need connect supervision, which this host lacks: seccomp user \
-             notification, pidfd_getfd (Linux 5.6+), and Yama ptrace_scope 0 or 1. Alternatives: \
-             `net = {{ ports = [443] }}` (any host on the port), or `net = \"deny\"`"
+            "host rules need connect supervision, which this host lacks: {}. Alternatives: \
+             `net = {{ ports = [443] }}` (any host on the port), or `net = \"deny\"`",
+            formwork_detect::CONNECT_SUPERVISION_NEEDS
         );
     }
     let registry = (host.os == formwork_detect::Os::Linux)
@@ -1488,7 +1460,7 @@ fn announce_split_root(
 }
 
 fn spawn_confined_child(
-    session: &Session,
+    session: &mut Session,
     program: &str,
     args: &[String],
 ) -> Result<std::process::ExitStatus> {
@@ -1537,11 +1509,15 @@ fn spawn_confined_child(
     }
     tracing::info!(program = %program, "spawning confined command");
     let child = command.spawn();
-    if let Some(opener) = &session.opener {
+    let lifted = session
+        .blueprint
+        .channels
+        .lifted(formwork_blueprint::Channel::OpenUrl);
+    if let Some(opener) = &mut session.opener {
         // The session holds the only copies now; EOF arrives when its last process exits.
-        drop(opener.session_end.lock().ok().and_then(|mut e| e.take()));
+        opener.session_end = None;
         if child.is_ok() {
-            start_opener(session, opener);
+            start_opener(opener, lifted);
         }
     }
     let mut child = match child {
@@ -1624,15 +1600,11 @@ fn session_observations(session: &Session) -> learn::SessionObservations {
             .filter_map(|v| v.need)
             .collect();
     }
-    if let Some(opener) = &session.opener {
-        if let Ok(slot) = opener.service.lock() {
-            if let Some(service) = slot.as_ref() {
-                // Unlifted, every URL is refused for the channel alone (FW-DISC12).
-                let records = service.records_within(std::time::Duration::from_millis(500));
-                if !session.blueprint.channels.lifted(Channel::OpenUrl) && !records.is_empty() {
-                    obs.channels.push(Channel::OpenUrl.name().to_string());
-                }
-            }
+    if let Some(service) = session.opener.as_ref().and_then(|o| o.service.as_ref()) {
+        // Unlifted, every URL is refused for the channel alone (FW-DISC12).
+        let records = service.records_within(std::time::Duration::from_millis(500));
+        if !session.blueprint.channels.lifted(Channel::OpenUrl) && !records.is_empty() {
+            obs.channels.push(Channel::OpenUrl.name().to_string());
         }
     }
     let f = &session.host.facilities;
@@ -1682,33 +1654,30 @@ fn report_to_learning_run(session: &Session) {
     }
 }
 
-fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<()> {
-    let purpose = match posture {
-        Posture::Spawn => Purpose::Spawn,
-        Posture::Self_ => Purpose::ConfineSelf,
+fn run(blueprint: BlueprintArgs, argv: Vec<String>, confine_self: bool) -> Result<()> {
+    let purpose = if confine_self {
+        Purpose::ConfineSelf
+    } else {
+        Purpose::Spawn
     };
-    let session = prepare_session(&blueprint, purpose)?;
+    let mut session = prepare_session(&blueprint, purpose, detect())?;
     let (program, args) = argv.split_first().expect("argv is required");
-    match posture {
-        Posture::Spawn => {
-            let status = spawn_confined_child(&session, program, args)?;
-            report_to_learning_run(&session);
-            std::process::exit(exit_code(&status));
-        }
-        Posture::Self_ => {
-            formwork_confine::enforce_self(&session.policy).context("confining self")?;
-            tracing::info!(program = %program, "exec after confine-self");
-            // The session temp directory outlives an exec in place: no launcher remains to remove it.
-            let err = exec_replace(
-                program,
-                args,
-                &session.blueprint,
-                &session.catalog,
-                &session_env(&session),
-            );
-            bail!("exec failed after confine-self: {err}");
-        }
+    if !confine_self {
+        let status = spawn_confined_child(&mut session, program, args)?;
+        report_to_learning_run(&session);
+        std::process::exit(exit_code(&status));
     }
+    formwork_confine::enforce_self(&session.policy).context("confining self")?;
+    tracing::info!(program = %program, "exec after confine-self");
+    // The session temp directory outlives an exec in place: no launcher remains to remove it.
+    let err = exec_replace(
+        program,
+        args,
+        &session.blueprint,
+        &session.catalog,
+        &session_env(&session),
+    );
+    bail!("exec failed after confine-self: {err}");
 }
 
 /// Which denial feed this host carries (FW-XR6 parity on the discovery axis), or -- as the error
@@ -1776,9 +1745,9 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
         Ok(feed) => feed,
         Err(_) => {
             // --observe-anyway: enforced run, loudly observation-free, no proposal (FW-E2E-062).
-            let session = prepare_session(&blueprint, Purpose::Spawn)?;
+            let mut session = prepare_session(&blueprint, Purpose::Spawn, host.clone())?;
             let (program, args) = argv.split_first().expect("argv is non-empty");
-            let status = spawn_confined_child(&session, program, args)?;
+            let status = spawn_confined_child(&mut session, program, args)?;
             tracing::warn!(
                 "--observe-anyway: ran enforced, but this host has no denial feed -- no proposal was written (FW-INV5: reported, not pretended)"
             );
@@ -1787,13 +1756,13 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
     };
     match feed {
         DenialFeed::MacosUnifiedLog => {
-            let session = prepare_session(&blueprint, Purpose::Spawn)?;
+            let mut session = prepare_session(&blueprint, Purpose::Spawn, host.clone())?;
             tracing::info!(
                 "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
             );
             let started = std::time::Instant::now();
             let (program, args) = argv.split_first().expect("argv is non-empty");
-            let status = spawn_confined_child(&session, program, args)?;
+            let status = spawn_confined_child(&mut session, program, args)?;
             let observations = session_observations(&session);
             let records = learn::collect_denials_quiescent(started)?;
             learn::conclude_learning_run(
@@ -2032,7 +2001,7 @@ fn apply_env(
 /// `[mcp.<server>]` entry shades the protocol, its fs/net grant confines the backend the same way
 /// `run` confines any command (FW-GW5), so the backend spawns behind the same wall.
 fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Result<()> {
-    let session = prepare_session(&blueprint, Purpose::GatewayBackend)?;
+    let session = prepare_session(&blueprint, Purpose::GatewayBackend, detect())?;
 
     // An unlisted server is a config error, not a silent deny: a typo would otherwise masquerade as
     // a backend that legitimately exposes nothing, hiding the mistake.

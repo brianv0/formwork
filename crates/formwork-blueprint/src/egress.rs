@@ -58,6 +58,18 @@ impl HttpMethod {
     fn from_atom(atom: &str) -> Option<HttpMethod> {
         HttpMethod::ALL.into_iter().find(|m| m.atom() == atom)
     }
+
+    /// A rule's method list as written: `any` for none, else the atoms comma-joined.
+    pub fn atoms(methods: &[HttpMethod]) -> String {
+        if methods.is_empty() {
+            return "any".to_string();
+        }
+        methods
+            .iter()
+            .map(|m| m.atom())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 /// A host pattern (FEP-5 §4): an exact DNS name, `*.example.com` for one or more labels under the
@@ -463,17 +475,8 @@ impl fmt::Display for HostRule {
             HostAccess::Tunnel => write!(f, "https:{}", target(None)),
             HostAccess::Deny { path } => write!(f, "deny:{}", target(path.as_ref())),
             HostAccess::Inspected { methods, path } => {
-                let atoms = if methods.is_empty() {
-                    "any".to_string()
-                } else {
-                    methods
-                        .iter()
-                        .map(|m| m.atom())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                };
                 let shown = (path.as_str() != "/**").then_some(path);
-                write!(f, "{atoms}:{}", target(shown))
+                write!(f, "{}:{}", HttpMethod::atoms(methods), target(shown))
             }
         }
     }

@@ -179,6 +179,15 @@ pub struct CredentialFidelity {
 }
 
 impl Capability {
+    /// How a denial of this capability looks to the confined process: the launcher's env scrub
+    /// and the Gateway's MCP shading hide what they deny; everything else refuses it.
+    pub fn semantics(self) -> DenialSemantics {
+        match self {
+            Capability::EnvScrub | Capability::McpShading => DenialSemantics::Hide,
+            _ => DenialSemantics::Deny,
+        }
+    }
+
     /// Every non-channel capability, for key lookup.
     const FIXED: [Capability; 21] = [
         Capability::FsRead,

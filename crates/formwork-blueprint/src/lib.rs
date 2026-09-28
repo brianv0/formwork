@@ -75,6 +75,14 @@ pub struct Blueprint {
 }
 
 impl Blueprint {
+    /// The `allow-credentials` entries the Gateway brokers (FW-CRED11): every one but a plain
+    /// exposure.
+    pub fn brokered_credentials(&self) -> impl Iterator<Item = &CredentialEntry> {
+        self.allow_credentials
+            .iter()
+            .filter(|e| !matches!(e, CredentialEntry::Expose(_)))
+    }
+
     /// The types whose floor is lifted (FW-CRED5): bare entries not also brokered.
     pub fn exposed_credentials(&self) -> Vec<String> {
         exposed_types(&self.allow_credentials)

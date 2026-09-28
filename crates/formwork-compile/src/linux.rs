@@ -127,7 +127,7 @@ pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, InetSecc
         }
         // FW-EGR7: the supervisor mediates every connect; without it the posture fails closed to
         // the full inet deny and the report says so (FW-INV6).
-        NetPosture::AllowHosts(_) if host.seccomp && host.connect_supervision => (
+        NetPosture::AllowHosts(_) if host.can_supervise_connect() => (
             LinuxNetPlan::SupervisedConnect,
             InetSeccompDeny::DgramRawOnly,
             PortTier::NotRequested,

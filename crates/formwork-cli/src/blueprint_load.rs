@@ -193,11 +193,7 @@ pub fn load_stack(
     sugar: BlueprintLayer,
     sigils: &Sigils,
 ) -> Result<Blueprint> {
-    let layers = load_layers(path, sets, sugar, sigils)?;
-    let (blueprint, _) = merge_with_provenance(&layers);
-    refuse_universe_row(&layers, &blueprint)?;
-    validate_net(&layers, &blueprint)?;
-    validate(blueprint, sigils.home)
+    load_stack_with_provenance(path, sets, sugar, sigils).map(|(blueprint, _)| blueprint)
 }
 
 /// FEP-5 D10: the ambient universe is a property of the read mode, never a row. Under `closed`
