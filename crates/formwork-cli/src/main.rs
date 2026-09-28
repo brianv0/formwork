@@ -1532,18 +1532,8 @@ fn spawn_confined_child(
     formwork_confine::spawn_confined(&mut command, &session.policy)
         .context("applying confinement")?;
     if let Some(opener) = &session.opener {
-        let fd = opener.session_fd;
-        // SAFETY: the closure runs post-fork and issues only fcntl(2) on a descriptor the session
-        // holds open until after the spawn.
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            command.pre_exec(move || {
-                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // The session holds the descriptor open until after the spawn.
+        formwork_confine::inherit_fd(&mut command, opener.session_fd);
     }
     tracing::info!(program = %program, "spawning confined command");
     let child = command.spawn();
@@ -1562,36 +1552,28 @@ fn spawn_confined_child(
         }
     };
     #[cfg(target_os = "linux")]
-    let _supervisor = match pending {
-        None => None,
-        Some(pending) => {
-            let Some(egress) = &session.egress else {
-                let _ = child.kill();
-                formwork_failure(
-                    "the policy needs the connect supervisor but no Gateway is running",
-                );
-            };
-            let unix_grants = match &session.policy.confiner {
-                formwork_compile::ConfinerPolicy::Linux(l) => l.unix_socket_grants.clone(),
-                _ => Vec::new(),
-            };
-            let config = formwork_confine::SupervisorConfig {
-                gateway: egress.proxy.addr(),
-                registry: egress.registry.clone().unwrap_or_default(),
-                unix_grants,
-                refused_sockets: session.refused_sockets.clone(),
-            };
-            match pending.start(config) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    session.tmp_dir.remove();
-                    formwork_failure(&format!("the connect supervisor failed to start: {e}"));
-                }
-            }
+    if let Some(pending) = pending {
+        let Some(egress) = &session.egress else {
+            let _ = child.kill();
+            formwork_failure("the policy needs the connect supervisor but no Gateway is running");
+        };
+        let unix_grants = match &session.policy.confiner {
+            formwork_compile::ConfinerPolicy::Linux(l) => l.unix_socket_grants.clone(),
+            _ => Vec::new(),
+        };
+        let config = formwork_confine::SupervisorConfig {
+            gateway: egress.proxy.addr(),
+            registry: egress.registry.clone().unwrap_or_default(),
+            unix_grants,
+            refused_sockets: session.refused_sockets.clone(),
+        };
+        if let Err(e) = pending.start(config) {
+            let _ = child.kill();
+            let _ = child.wait();
+            session.tmp_dir.remove();
+            formwork_failure(&format!("the connect supervisor failed to start: {e}"));
         }
-    };
+    }
     let status = child.wait();
     session.tmp_dir.remove();
     let status = status.context("waiting for the confined command")?;
@@ -1891,17 +1873,8 @@ fn learn_run_linux(
         report_write.as_raw_fd()
     };
     command.env(learn::REPORT_FD_ENV, report_fd.to_string());
-    // SAFETY: the closure runs post-fork and issues only fcntl(2) on a descriptor held open until
-    // the spawn returns.
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(move || {
-            if libc::fcntl(report_fd, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    // `report_write` stays open until the spawn returns.
+    formwork_confine::inherit_fd(&mut command, report_fd);
     let reader = std::thread::spawn(move || {
         let mut body = Vec::new();
         let _ = std::io::Read::read_to_end(&mut &report_read, &mut body);

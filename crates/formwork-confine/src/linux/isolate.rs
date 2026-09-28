@@ -18,7 +18,7 @@
 //! `formwork:` line (FW-XR11); nothing runs weaker than asked (FW-INV6).
 
 use std::convert::Infallible;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -77,36 +77,19 @@ pub fn configure(
     let json = serde_json::to_vec(&spec)
         .map_err(|e| ConfineError::MechanismFailed(format!("isolation stage spec: {e}")))?;
     let spec_fd = memfd_with(&json)?;
-    let raw_spec = spec_fd.as_raw_fd();
-    command.env(STAGE_ENV, raw_spec.to_string());
-    // SAFETY: the closure runs post-fork and issues only fcntl(2) on descriptors that are open in
-    // the parent until the Command (which owns `spec_fd`) is dropped, after the spawn.
-    unsafe {
-        command.pre_exec(move || {
-            let _keep = &spec_fd;
-            inherit(raw_spec)?;
-            if let Some(fd) = handoff {
-                inherit(fd)?;
-            }
-            Ok(())
-        });
+    command.env(STAGE_ENV, spec_fd.as_raw_fd().to_string());
+    // The command owns the spec until it is dropped, after the spawn; the handoff is held open
+    // by `pending`.
+    crate::inherit_fd(command, spec_fd);
+    if let Some(fd) = handoff {
+        crate::inherit_fd(command, fd);
     }
     Ok(pending)
 }
 
-/// Clear `FD_CLOEXEC` so the descriptor survives into the stage's `execve`.
-fn inherit(fd: RawFd) -> io::Result<()> {
-    // SAFETY: F_SETFD with a scalar flag on a descriptor this process owns.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 fn memfd_with(bytes: &[u8]) -> Result<OwnedFd, ConfineError> {
-    let name = CString::new("formwork-isolate-spec").expect("no NUL");
     // SAFETY: memfd_create with a valid name; the result is checked and owned.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(c"formwork-isolate-spec".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error().into());
     }
@@ -198,58 +181,59 @@ fn stage(raw_fd: &str) -> Result<Infallible, StageError> {
 }
 
 fn mount_session_filesystems(private_tmp: Option<&Path>) -> Result<(), StageError> {
-    let none = std::ptr::null::<libc::c_char>();
-    let root = CString::new("/").expect("no NUL");
-    // SAFETY: mount(2) with valid C strings or NULLs; each result is checked.
-    if unsafe {
-        libc::mount(
-            none,
-            root.as_ptr(),
-            none,
-            libc::MS_REC | libc::MS_PRIVATE,
-            std::ptr::null(),
-        )
-    } != 0
-    {
-        return Err(setup("making the mount namespace private")(
-            io::Error::last_os_error(),
-        ));
-    }
-    let proc_ = CString::new("proc").expect("no NUL");
-    let proc_dir = CString::new("/proc").expect("no NUL");
-    // SAFETY: as above.
-    if unsafe {
-        libc::mount(
-            proc_.as_ptr(),
-            proc_dir.as_ptr(),
-            proc_.as_ptr(),
-            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            std::ptr::null(),
-        )
-    } != 0
-    {
-        return Err(setup("mounting a fresh /proc")(io::Error::last_os_error()));
-    }
+    mount(
+        None,
+        c"/",
+        None,
+        libc::MS_REC | libc::MS_PRIVATE,
+        None,
+        "making the mount namespace private",
+    )?;
+    mount(
+        Some(c"proc"),
+        c"/proc",
+        Some(c"proc"),
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        None,
+        "mounting a fresh /proc",
+    )?;
     if let Some(tmp) = private_tmp {
         let target = CString::new(tmp.as_os_str().as_encoded_bytes())
             .map_err(setup("the session temp directory"))?;
-        let tmpfs = CString::new("tmpfs").expect("no NUL");
-        let opts = CString::new("mode=0700").expect("no NUL");
-        // SAFETY: as above.
-        if unsafe {
-            libc::mount(
-                tmpfs.as_ptr(),
-                target.as_ptr(),
-                tmpfs.as_ptr(),
-                libc::MS_NOSUID | libc::MS_NODEV,
-                opts.as_ptr().cast(),
-            )
-        } != 0
-        {
-            return Err(setup("mounting the session tmpfs")(
-                io::Error::last_os_error(),
-            ));
-        }
+        mount(
+            Some(c"tmpfs"),
+            &target,
+            Some(c"tmpfs"),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            Some(c"mode=0700"),
+            "mounting the session tmpfs",
+        )?;
+    }
+    Ok(())
+}
+
+/// mount(2), its failure named by `what`.
+fn mount(
+    source: Option<&CStr>,
+    target: &CStr,
+    fstype: Option<&CStr>,
+    flags: libc::c_ulong,
+    data: Option<&CStr>,
+    what: &str,
+) -> Result<(), StageError> {
+    let ptr = |s: Option<&CStr>| s.map_or(std::ptr::null(), CStr::as_ptr);
+    // SAFETY: mount(2) with NUL-terminated strings or NULLs that outlive the call.
+    if unsafe {
+        libc::mount(
+            ptr(source),
+            target.as_ptr(),
+            ptr(fstype),
+            flags,
+            ptr(data).cast(),
+        )
+    } != 0
+    {
+        return Err(setup(what)(io::Error::last_os_error()));
     }
     Ok(())
 }

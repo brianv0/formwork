@@ -118,7 +118,7 @@ fn run(
         formwork_compile::ConfinerPolicy::Linux(l) => l.unix_socket_grants.clone(),
         _ => unreachable!(),
     };
-    let _sup = pending
+    pending
         .start(SupervisorConfig {
             gateway,
             registry,

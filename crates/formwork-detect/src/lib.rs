@@ -161,22 +161,14 @@ mod linux {
     /// container whose `/proc` is partly masked fails the last. The children call only
     /// async-signal-safe functions over strings built before the fork.
     fn user_namespaces() -> bool {
-        use std::ffi::CString;
+        use std::ffi::CStr;
         // SAFETY: getuid/getgid have no failure modes.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        let c = |s: String| CString::new(s).expect("no NUL");
-        let setgroups = c("/proc/self/setgroups".into());
-        let uid_map = c("/proc/self/uid_map".into());
-        let gid_map = c("/proc/self/gid_map".into());
-        let deny = b"deny";
         let uid_line = format!("{uid} {uid} 1\n");
         let gid_line = format!("{gid} {gid} 1\n");
-        let root = c("/".into());
-        let proc_ = c("proc".into());
-        let proc_dir = c("/proc".into());
 
         // SAFETY: async-signal-safe open/write/close only.
-        let write_file = |path: &CString, bytes: &[u8]| -> bool {
+        let write_file = |path: &CStr, bytes: &[u8]| -> bool {
             unsafe {
                 let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
                 if fd < 0 {
@@ -212,9 +204,9 @@ mod linux {
                 if libc::unshare(flags) != 0 {
                     libc::_exit(1);
                 }
-                if !write_file(&setgroups, deny)
-                    || !write_file(&uid_map, uid_line.as_bytes())
-                    || !write_file(&gid_map, gid_line.as_bytes())
+                if !write_file(c"/proc/self/setgroups", b"deny")
+                    || !write_file(c"/proc/self/uid_map", uid_line.as_bytes())
+                    || !write_file(c"/proc/self/gid_map", gid_line.as_bytes())
                 {
                     libc::_exit(2);
                 }
@@ -226,16 +218,16 @@ mod linux {
                     let none = std::ptr::null::<libc::c_char>();
                     let private = libc::mount(
                         none,
-                        root.as_ptr(),
+                        c"/".as_ptr(),
                         none,
                         libc::MS_REC | libc::MS_PRIVATE,
                         std::ptr::null(),
                     ) == 0;
                     let procfs = private
                         && libc::mount(
-                            proc_.as_ptr(),
-                            proc_dir.as_ptr(),
-                            proc_.as_ptr(),
+                            c"proc".as_ptr(),
+                            c"/proc".as_ptr(),
+                            c"proc".as_ptr(),
                             libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
                             std::ptr::null(),
                         ) == 0;
@@ -308,19 +300,17 @@ mod linux {
     fn session_bus(runtime: Option<&Path>) -> Option<String> {
         // `unix:path=/run/user/1000/bus[,guid=…]` is the common shape; an abstract address has
         // no path and is scoped by Landlock ABI 6, so it is not a pathname-socket facility.
-        if let Some(addr) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
-            let addr = addr.to_string_lossy().into_owned();
-            for part in addr.split(';') {
-                if let Some(rest) = part.strip_prefix("unix:") {
-                    for kv in rest.split(',') {
-                        if let Some(path) = kv.strip_prefix("path=") {
-                            if is_socket(Path::new(path)) {
-                                return Some(path.to_string());
-                            }
-                        }
-                    }
-                }
-            }
+        let from_env = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").and_then(|addr| {
+            addr.to_string_lossy()
+                .split(';')
+                .filter_map(|part| part.strip_prefix("unix:"))
+                .flat_map(|rest| rest.split(','))
+                .filter_map(|kv| kv.strip_prefix("path="))
+                .find(|path| is_socket(Path::new(path)))
+                .map(str::to_string)
+        });
+        if from_env.is_some() {
+            return from_env;
         }
         let bus = runtime?.join("bus");
         is_socket(&bus).then(|| bus.display().to_string())
@@ -333,35 +323,13 @@ mod linux {
             let p = rt?.join(rel);
             is_socket(&p).then(|| p.display().to_string())
         };
-        let mut display = Vec::new();
-        if let Ok(entries) = std::fs::read_dir("/tmp/.X11-unix") {
-            let mut found: Vec<String> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| is_socket(p))
-                .map(|p| p.display().to_string())
-                .collect();
-            found.sort();
-            display.extend(found);
-        }
+        let mut display = sockets_in(Path::new("/tmp/.X11-unix"), |_| true);
         if let Some(rt) = rt {
-            if let Ok(entries) = std::fs::read_dir(rt) {
-                let mut found: Vec<String> = entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|n| n.starts_with("wayland-") && !n.ends_with(".lock"))
-                            .unwrap_or(false)
-                            && is_socket(p)
-                    })
-                    .map(|p| p.display().to_string())
-                    .collect();
-                found.sort();
-                display.extend(found);
-            }
+            display.extend(sockets_in(rt, |n| {
+                n.starts_with("wayland-") && !n.ends_with(".lock")
+            }));
         }
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         HostFacilities {
             session_bus: session_bus(rt),
             user_manager: in_runtime("systemd/private"),
@@ -370,46 +338,54 @@ mod linux {
             audio: in_runtime("pulse/native").or_else(|| in_runtime("pipewire-0")),
             video_device: first_device("video"),
             gui_session: false,
-            pid_ns_nested: pid_ns_nested(),
-            ptrace_privileged: ptrace_privileged(),
+            pid_ns_nested: pid_ns_nested(&status),
+            ptrace_privileged: ptrace_privileged(&status),
         }
     }
 
-    /// `CAP_SYS_PTRACE` (19), `CAP_SYS_ADMIN` (21) or `CAP_PERFMON` (38) in the effective set.
-    fn ptrace_privileged() -> bool {
+    /// The sockets directly in `dir` whose names pass `keep`, sorted.
+    fn sockets_in(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut found: Vec<String> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(&keep) && is_socket(p))
+            .map(|p| p.display().to_string())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// `CAP_SYS_PTRACE` (19), `CAP_SYS_ADMIN` (21) or `CAP_PERFMON` (38) in the effective set of
+    /// `/proc/self/status`; assumed held when unreadable.
+    fn ptrace_privileged(status: &str) -> bool {
         const MASK: u64 = (1 << 19) | (1 << 21) | (1 << 38);
-        std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.strip_prefix("CapEff:"))
-                    .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
-            })
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
             .map(|eff| eff & MASK != 0)
             .unwrap_or(true)
     }
 
     fn first_device(prefix: &str) -> Option<String> {
-        let mut found: Vec<String> = std::fs::read_dir("/dev")
+        std::fs::read_dir("/dev")
             .ok()?
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
             .map(|e| e.path().display().to_string())
-            .collect();
-        found.sort();
-        found.into_iter().next()
+            .min()
     }
 
-    /// A multi-field `NSpid` line means this process sits in a nested PID namespace.
-    fn pid_ns_nested() -> bool {
-        std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("NSpid:"))
-                    .map(|l| l.split_whitespace().count() > 2)
-            })
-            .unwrap_or(false)
+    /// A multi-field `NSpid` line in `/proc/self/status` means this process sits in a nested PID
+    /// namespace.
+    fn pid_ns_nested(status: &str) -> bool {
+        status
+            .lines()
+            .find(|l| l.starts_with("NSpid:"))
+            .is_some_and(|l| l.split_whitespace().count() > 2)
     }
 
     // ABI-version query: landlock_create_ruleset(NULL, 0, VERSION).

@@ -244,7 +244,12 @@ fn recv_fd(sock: &UnixStream) -> io::Result<OwnedFd> {
             return Err(io::Error::last_os_error());
         }
         let c = libc::CMSG_FIRSTHDR(&msg);
-        if n == 0 || c.is_null() || (*c).cmsg_type != libc::SCM_RIGHTS {
+        if n == 0
+            || msg.msg_flags & libc::MSG_CTRUNC != 0
+            || c.is_null()
+            || (*c).cmsg_level != libc::SOL_SOCKET
+            || (*c).cmsg_type != libc::SCM_RIGHTS
+        {
             return Err(io::Error::other(
                 "the confined child exited before handing over its supervisor listener",
             ));
@@ -259,26 +264,12 @@ fn recv_fd(sock: &UnixStream) -> io::Result<OwnedFd> {
     }
 }
 
-/// The running supervisor. Dropping it detaches the thread, which ends when every process holding
-/// the filter has exited (the listener reports hang-up).
-pub struct Supervisor {
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Supervisor {
-    pub fn is_running(&self) -> bool {
-        self.thread
-            .as_ref()
-            .map(|t| !t.is_finished())
-            .unwrap_or(false)
-    }
-}
-
 impl Pending {
-    /// Call after the child is spawned: receive its listener and start servicing notifications.
-    /// Makes this process a child subreaper, so a session process that double-forks stays a
-    /// descendant and its sockets still count as bound in the session.
-    pub fn start(self, config: SupervisorConfig) -> Result<Supervisor, ConfineError> {
+    /// Call after the child is spawned: receive its listener and start servicing notifications on
+    /// a detached thread, which ends when every process holding the filter has exited (the
+    /// listener reports hang-up). Makes this process a child subreaper, so a session process that
+    /// double-forks stays a descendant and its sockets still count as bound in the session.
+    pub fn start(self, config: SupervisorConfig) -> Result<(), ConfineError> {
         let Pending {
             parent_end,
             child_end,
@@ -291,13 +282,11 @@ impl Pending {
         })?;
         // SAFETY: PR_SET_CHILD_SUBREAPER takes a scalar flag and affects only this process.
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-        let thread = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("formwork-supervisor".into())
             .spawn(move || serve(listener, config))?;
         tracing::info!("connect supervisor running (FW-EGR7)");
-        Ok(Supervisor {
-            thread: Some(thread),
-        })
+        Ok(())
     }
 }
 
@@ -310,15 +299,11 @@ fn serve(listener: OwnedFd, config: SupervisorConfig) {
             revents: 0,
         };
         // SAFETY: one valid pollfd.
-        let rc = unsafe { libc::poll(&mut pfd, 1, 500) };
-        if rc < 0 {
+        if unsafe { libc::poll(&mut pfd, 1, -1) } < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             break;
-        }
-        if rc == 0 {
-            continue;
         }
         if pfd.revents & libc::POLLIN == 0 {
             // POLLHUP: every process that carried the filter has exited.
@@ -392,16 +377,20 @@ fn thread_group(tid: u32) -> Option<libc::pid_t> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// A duplicate of the target's socket descriptor `fd`, taken through a pidfd of its thread group.
-fn take_socket(listener: RawFd, id: u64, tid: u32, fd: i32) -> Result<OwnedFd, i32> {
-    let tgid = thread_group(tid).ok_or(libc::ESRCH)?;
+fn pidfd_open(pid: libc::pid_t) -> Option<OwnedFd> {
     // SAFETY: pidfd_open on a pid; the result is owned below.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, tgid, 0) };
-    if pidfd < 0 {
-        return Err(libc::ESRCH);
-    }
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     // SAFETY: pidfd_open returned a new descriptor we own.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// A duplicate of the target's socket descriptor `fd`, taken through a pidfd of its thread group.
+/// The notifying thread is usually its group's leader, whose tid opens the pidfd directly; any
+/// other thread's group is looked up first.
+fn take_socket(listener: RawFd, id: u64, tid: u32, fd: i32) -> Result<OwnedFd, i32> {
+    let pidfd = pidfd_open(tid as libc::pid_t)
+        .or_else(|| thread_group(tid).and_then(pidfd_open))
+        .ok_or(libc::ESRCH)?;
     if !id_valid(listener, id) {
         return Err(libc::ESRCH);
     }
@@ -436,6 +425,30 @@ fn last_errno() -> i32 {
     io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EIO)
+}
+
+/// A zero-or-minus-one syscall result as `Ok` or the errno.
+fn check(rc: libc::c_int) -> Result<(), i32> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// A path as process `pid` sees it: through its root, or relative to its working directory.
+fn seen_from(pid: impl std::fmt::Display, path: &str) -> String {
+    if path.starts_with('/') {
+        format!("/proc/{pid}/root{path}")
+    } else {
+        format!("/proc/{pid}/cwd/{path}")
+    }
+}
+
+/// The one refusal every addressed-send and connect path shares for abstract sockets.
+fn refuse_abstract(pid: libc::pid_t) -> Reply {
+    refuse(pid, "an abstract UNIX socket", "formwork explain --hosts");
+    Reply::Errno(libc::EACCES)
 }
 
 /// A parsed destination, from the supervisor's own copy of the target's `sockaddr`.
@@ -554,10 +567,9 @@ fn connect_for(
                     std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
                 )
             };
-            if rc == 0 {
-                Reply::Value(0)
-            } else {
-                Reply::Errno(last_errno())
+            match check(rc) {
+                Ok(()) => Reply::Value(0),
+                Err(e) => Reply::Errno(e),
             }
         }
         Dest::Inet(addr) if (domain == libc::AF_INET || domain == libc::AF_INET6) => {
@@ -581,10 +593,7 @@ fn connect_for(
             }
             Err(e) => Reply::Errno(e),
         },
-        Dest::Abstract => {
-            refuse(pid, "an abstract UNIX socket", "formwork explain --hosts");
-            Reply::Errno(libc::EACCES)
-        }
+        Dest::Abstract => refuse_abstract(pid),
         _ => Reply::Errno(libc::EAFNOSUPPORT),
     }
 }
@@ -677,21 +686,13 @@ fn to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
 fn bind_inet(fd: RawFd, addr: SocketAddr) -> Result<(), i32> {
     let (ss, len) = to_raw(addr);
     // SAFETY: a valid sockaddr of `len` bytes.
-    if unsafe { libc::bind(fd, (&ss as *const libc::sockaddr_storage).cast(), len) } == 0 {
-        Ok(())
-    } else {
-        Err(last_errno())
-    }
+    check(unsafe { libc::bind(fd, (&ss as *const libc::sockaddr_storage).cast(), len) })
 }
 
 fn connect_inet(fd: RawFd, addr: SocketAddr) -> Result<(), i32> {
     let (ss, len) = to_raw(addr);
     // SAFETY: a valid sockaddr of `len` bytes.
-    if unsafe { libc::connect(fd, (&ss as *const libc::sockaddr_storage).cast(), len) } == 0 {
-        Ok(())
-    } else {
-        Err(last_errno())
-    }
+    check(unsafe { libc::connect(fd, (&ss as *const libc::sockaddr_storage).cast(), len) })
 }
 
 fn local_port(fd: RawFd) -> Option<u16> {
@@ -733,11 +734,7 @@ fn unix_addr(path: &str) -> Option<(libc::sockaddr_un, libc::socklen_t)> {
 fn connect_unix(fd: RawFd, path: &str) -> Result<(), i32> {
     let (sun, len) = unix_addr(path).ok_or(libc::ENAMETOOLONG)?;
     // SAFETY: a valid sockaddr_un of `len` bytes.
-    if unsafe { libc::connect(fd, (&sun as *const libc::sockaddr_un).cast(), len) } == 0 {
-        Ok(())
-    } else {
-        Err(last_errno())
-    }
+    check(unsafe { libc::connect(fd, (&sun as *const libc::sockaddr_un).cast(), len) })
 }
 
 /// Resolve a pathname socket as the target would see it (its root and working directory), open
@@ -753,12 +750,7 @@ fn admit_unix(
         return Err(libc::EINVAL);
     }
     let path = std::str::from_utf8(raw_path).map_err(|_| libc::EACCES)?;
-    let seen_from = if path.starts_with('/') {
-        format!("/proc/{pid}/root{path}")
-    } else {
-        format!("/proc/{pid}/cwd/{path}")
-    };
-    let c = CString::new(seen_from).map_err(|_| libc::EINVAL)?;
+    let c = CString::new(seen_from(pid, path)).map_err(|_| libc::EINVAL)?;
     // SAFETY: open with a NUL-terminated path; the result is owned below.
     let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if fd < 0 {
@@ -805,11 +797,13 @@ fn admit_unix(
 /// without them (`CONFIG_UNIX_DIAG`), `/proc/net/unix` gives each held socket's bound path, which
 /// is resolved from the holder's view and compared with the file.
 fn bound_in_session(ino: u64, dev: u64) -> bool {
-    let held = session_sockets();
-    if held.is_empty() {
+    // One netlink dump first: a file no socket is bound to needs no walk of the session's fds.
+    let bound_to = sockets_bound_to(ino, dev);
+    if bound_to.as_ref().is_some_and(HashSet::is_empty) {
         return false;
     }
-    if let Some(sockets) = sockets_bound_to(ino, dev) {
+    let held = session_sockets();
+    if let Some(sockets) = bound_to {
         return held.iter().any(|(_, s)| sockets.contains(s));
     }
     let bound = proc_net_unix_paths();
@@ -817,12 +811,7 @@ fn bound_in_session(ino: u64, dev: u64) -> bool {
         let Some(path) = bound.get(sock) else {
             return false;
         };
-        let seen = if path.starts_with('/') {
-            format!("/proc/{pid}/root{path}")
-        } else {
-            format!("/proc/{pid}/cwd/{path}")
-        };
-        std::fs::metadata(&seen)
+        std::fs::metadata(seen_from(pid, path))
             .map(|m| {
                 use std::os::unix::fs::MetadataExt;
                 m.ino() == ino && m.dev() == dev
@@ -1043,10 +1032,7 @@ fn sendto_for(
                 Reply::Value(n as i64)
             }
         }
-        Dest::Abstract => {
-            refuse(pid, "an abstract UNIX socket", "formwork explain --hosts");
-            Reply::Errno(libc::EACCES)
-        }
+        Dest::Abstract => refuse_abstract(pid),
         Dest::Inet(addr) => {
             refuse(
                 pid,

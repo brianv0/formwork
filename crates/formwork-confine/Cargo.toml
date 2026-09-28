@@ -8,7 +8,6 @@ repository.workspace = true
 
 [dependencies]
 formwork-blueprint = { workspace = true }
-formwork-detect = { workspace = true }
 formwork-compile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -25,6 +24,8 @@ seccompiler = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# serde_json parses host rules in the supervised-connect tests.
+# serde_json parses host rules in the supervised-connect tests; detect picks what the host can
+# enforce.
 [dev-dependencies]
 serde_json = { workspace = true }
+formwork-detect = { workspace = true }
