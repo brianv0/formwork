@@ -194,7 +194,7 @@ fn send_fd_raw(sock: RawFd, fd: RawFd) -> io::Result<()> {
     #[repr(C, align(8))]
     struct Cmsg([u8; 64]);
     let mut cmsg = Cmsg([0u8; 64]);
-    let mut byte = [b'L'];
+    let mut byte = *b"L";
     let mut iov = libc::iovec {
         iov_base: byte.as_mut_ptr().cast(),
         iov_len: 1,
