@@ -129,6 +129,16 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
    enforcement are not covered — fail-closed, acceptable, and TOCTOU-safe because Landlock rules bind
    to the opened directory fds, not to path strings.
 
+   A second consequence: a split directory itself — every ancestor of a hole, typically `/`, `/home`
+   and `$HOME` — is traversable but not listable, so `ls /` and a tool's walk up the tree for config
+   files are refused, while every file beneath stays readable. The comparison is OpenBSD unveil:
+   `unveil("/", "r")` plus `unveil("~/.ssh", "")` lists `/` and `~` but hides `~/.ssh` entirely,
+   names included. Landlock cannot express both halves, because a listing right on `~` also applies
+   inside `~/.ssh`. Formwork keeps the half that never allows more than unveil would: ancestors stay
+   unlisted, and a denied directory's names stay hidden. (Under the closed read mode,
+   `mode = "unveil"`, the behavior matches unveil exactly: ancestors of a grant are traversable, not
+   listable.) Decided in FEP-5 review; `docs/fep-5-plan.md` §3.
+
 ## seccomp baseline (`seccompiler`) — and its hazards
 
 Researched API (`seccompiler` 0.4):

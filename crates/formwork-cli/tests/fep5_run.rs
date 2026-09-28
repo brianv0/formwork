@@ -1023,10 +1023,36 @@ fn fw_e2e_084_agent_examples_under_the_baseline() {
             &keys,
         );
         assert_eq!(smoke.code, 0, "{file}: {}", smoke.stderr);
+        // A listing of the launch directory or an ancestor is the documented Landlock residual
+        // (docs/linux-backend.md: an ancestor of a denied path is traversable but not listable,
+        // as under unveil's closed mode); any other candidate is a denial the example missed.
+        let proposal = format!("{blueprint}.proposal.toml");
+        let text = std::fs::read_to_string(&proposal).unwrap_or_default();
+        let parsed: toml::Value =
+            toml::from_str(&text).unwrap_or(toml::Value::Table(Default::default()));
+        let launch = dir.path();
+        let unexpected: Vec<String> = parsed
+            .get("candidates")
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|c| {
+                let pattern = c.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
+                let read = c.get("access").and_then(|a| a.as_str()) == Some("read");
+                // The launch directory is also `$HOME` here, itself an ancestor of the floor.
+                !(read && launch.starts_with(pattern))
+            })
+            .map(|c| c.to_string())
+            .collect();
+        let others = ["hosts", "channels"]
+            .iter()
+            .filter_map(|k| parsed.get(*k))
+            .filter_map(|v| v.as_array())
+            .map(|a| a.len())
+            .sum::<usize>();
         assert!(
-            smoke.stdout.contains("(0 candidates"),
-            "{file}: `{agent} --version` was denied something: {}\n{}",
-            smoke.stdout,
+            unexpected.is_empty() && others == 0,
+            "{file}: `{agent} --version` was denied something: {unexpected:?} (+{others} hosts/channels)\n{}",
             smoke.stderr
         );
     }

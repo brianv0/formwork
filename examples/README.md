@@ -53,8 +53,9 @@ examples/
   blueprints/agent-base.toml      # the filesystem and environment every agent example shares
   blueprints/claude-code.toml     # Axis A for Claude Code: host-scoped egress, login through open-url
   blueprints/claude-code-api-key.toml  # the same with ANTHROPIC_API_KEY brokered, never held by the agent
-  blueprints/codex.toml           # Axis A for codex: host-scoped egress
-  blueprints/opencode.toml        # Axis A for opencode: host-scoped egress, one rule per provider
+  blueprints/codex.toml           # Axis A for codex signed in with ChatGPT: host-scoped egress
+  blueprints/codex-api-key.toml   # the same with OPENAI_API_KEY brokered, never held by the agent
+  blueprints/opencode.toml        # Axis A for opencode: host-scoped egress, ANTHROPIC_API_KEY brokered
   blueprints/mcp-gateway.toml      # Axis B: gateway policy — [mcp.files] shading + backend confinement
   blueprints/rules-demo.toml       # flat verb rules (rules/mode) — same model, terser to write
   gateway-demo.sh             # runnable Axis B demo against the built-in fixture (no external deps)

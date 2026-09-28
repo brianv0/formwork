@@ -121,6 +121,20 @@ here rather than silently deviated.
   `--blueprint agent-base.toml --net ports:443 --allow-cred claude`. `FW-E2E-024` (macOS port tier)
   and `FW-E2E-026` (dry-run compile) moved onto those blueprints.
 
+- **codex and opencode broker their keys too.** Both were run for real under brokered blueprints
+  and trust the session CA: codex's request reached OpenAI through the inspected rule over HTTPS
+  and WebSocket carrying the substituted key, and opencode's reached Anthropic. `codex.toml` is the
+  ChatGPT-login variant, `codex-api-key.toml` brokers `OPENAI_API_KEY`, and `opencode.toml` brokers
+  `ANTHROPIC_API_KEY`. Each agent's state directory must exist before the first run; the examples
+  say so.
+- **Linux: ancestors of a denied path stay unlisted.** Landlock cannot grant listing on `$HOME`
+  without granting it inside `~/.ssh`. Measured against OpenBSD unveil, keeping ancestors unlisted
+  refuses some listings unveil would allow, while granting listing would expose names unveil hides;
+  Formwork never allows more than unveil would, so ancestors stay unlisted (`ls /` is refused on
+  Linux in the subtractive mode; the closed mode already matches unveil). This predates FEP-5.
+  `FW-E2E-084` exempts listings of the launch directory and its ancestors, and
+  `docs/linux-backend.md` states the residual.
+
 ## 4. Tests
 
 | ID | Where | Runs on |
@@ -132,7 +146,7 @@ here rather than silently deviated.
 | `FW-E2E-079` | `fep5_run.rs` (tier on 22.04, refusal on 24.04) | Linux |
 | `FW-E2E-082` | `fep5_run.rs` against a fixture `dbus-daemon` | Linux |
 | `FW-E2E-083` | `fep5_run.rs` | Linux |
-| `FW-E2E-084` | `fep5_run.rs`; the `agent-examples` CI job installs Claude Code | Linux |
+| `FW-E2E-084` | `fep5_run.rs`; the `agent-examples` CI job installs Claude Code, codex and opencode | Linux |
 | `FW-E2E-085` | `fep5_run.rs` | Linux |
 | `FW-E2E-086` | `fep5_run.rs` (first half) | both |
 | `FW-E2E-087` | `fep5_run.rs` against a fixture `dbus-daemon` and `Xvfb` | Linux |
@@ -158,7 +172,5 @@ instead of skipping. The README quickstart is read verbatim from `README.md` and
 - **macOS channel proposals in `learn`.** The unified-log feed yields path denials; mapping Seatbelt
   service denials (pasteboard, AppleEvents) onto channels is not built. Opener and Gateway
   refusals are proposed on macOS, since the spawn is in-process there.
-- **`FW-E2E-084` for codex and opencode.** The CI job installs Claude Code only; the other two
-  agents' smoke commands have not been observed under their blueprints.
 - **The `uv` recipe.** `uv` ignores `SSL_CERT_FILE` unless `UV_NATIVE_TLS=1`; the examples README
   carries the recipe, and the Launcher does not set it.

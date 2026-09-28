@@ -9,7 +9,9 @@
 #
 # opencode keeps its sessions and caches under the XDG directories; create them once outside the
 # sandbox (`mkdir -p ~/.local/share/opencode ~/.local/state/opencode ~/.cache/opencode
-# ~/.config/opencode`). Deliberately refused: registry.npmjs.org (runtime package installs).
+# ~/.config/opencode`). Deliberately refused: registry.npmjs.org (runtime package installs). On
+# Linux, opencode's walk up the tree for config files is refused at directories above a denied path
+# (Landlock can list neither; see docs/linux-backend.md); opencode carries on.
 #
 #   formwork explain --blueprint examples/blueprints/opencode.toml --hosts
 

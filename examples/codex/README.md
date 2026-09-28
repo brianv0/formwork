@@ -20,6 +20,11 @@ formwork run --blueprint ./examples/blueprints/codex.toml -- \
     codex exec --dangerously-bypass-approvals-and-sandbox "summarize the build"
 ```
 
+`codex.toml` is for a ChatGPT sign-in; with an API key use `codex-api-key.toml`, which brokers
+`OPENAI_API_KEY` so codex holds a placeholder and the Gateway presents the real key to
+`api.openai.com` only. Either way, create codex's state directory once outside the sandbox
+(`mkdir -p ~/.codex`), since the sandbox cannot create it in your home directory.
+
 The point isn't to disable safety — it's to move it down a layer. One Formwork blueprint then scopes
 codex, Claude Code, and opencode identically, instead of each agent's bespoke sandbox settings.
 
