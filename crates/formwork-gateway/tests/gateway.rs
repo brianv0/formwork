@@ -712,10 +712,26 @@ async fn fw_adv_016_gateway_frame_bypass() {
     );
     assert!(batch.get("result").is_none());
 
-    // An id-less call to a shaded tool is dropped; the next request's reply is the first frame
-    // back, so nothing the dropped call produced is interleaved.
+    // Id-less calls to shaded items are dropped on every gated axis; the fixture announces any
+    // id-less call it receives, so the next request's reply being the first frame back shows none
+    // reached it.
     agent
         .notify("tools/call", json!({"name": "http_fetch", "arguments": {}}))
+        .await;
+    agent
+        .notify("resources/subscribe", json!({"uri": "file:///secret"}))
+        .await;
+    agent
+        .notify(
+            "completion/complete",
+            json!({"ref": {"type": "ref/prompt", "name": "secret_prompt"}, "argument": {"name": "a", "value": ""}}),
+        )
+        .await;
+    agent
+        .notify(
+            "completion/complete",
+            json!({"ref": {"type": "ref/unknown"}, "argument": {"name": "a", "value": ""}}),
+        )
         .await;
     agent
         .request(

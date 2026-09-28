@@ -121,6 +121,8 @@ enum Axis {
     Tool,
     Resource,
     Prompt,
+    /// A reference no grant can name (a malformed `completion/complete` ref): always dropped.
+    Unknown,
 }
 
 /// The target a `completion/complete` frame refers to, on whichever axis governs it.
@@ -220,6 +222,21 @@ impl Frame {
                 target: pointer_str("/params/name"),
                 raw,
             },
+            (Some("resources/subscribe" | "resources/unsubscribe"), None) => {
+                Frame::GatedNotification {
+                    axis: Axis::Resource,
+                    target: pointer_str("/params/uri"),
+                    raw,
+                }
+            }
+            (Some("completion/complete"), None) => {
+                let (axis, target) = match pointer_str("/params/ref/type").as_str() {
+                    "ref/prompt" => (Axis::Prompt, pointer_str("/params/ref/name")),
+                    "ref/resource" => (Axis::Resource, pointer_str("/params/ref/uri")),
+                    _ => (Axis::Unknown, String::new()),
+                };
+                Frame::GatedNotification { axis, target, raw }
+            }
             (None, Some(id)) => Frame::Response { id, raw },
             _ => Frame::Passthrough(raw),
         }
@@ -424,6 +441,7 @@ where
                     Axis::Tool => policy.tools.permits(&target),
                     Axis::Resource => policy.resources.permits(&target),
                     Axis::Prompt => policy.prompts.permits(&target),
+                    Axis::Unknown => false,
                 };
                 if permitted {
                     write_frame(&backend_w, &raw).await?;
