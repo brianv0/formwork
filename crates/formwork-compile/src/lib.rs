@@ -1099,6 +1099,80 @@ mod tests {
         assert!(policy.report.per_capability[&Capability::McpShading].is_enforced());
     }
 
+    /// A blueprint exercising every Seatbelt-carried macOS capability at once: fs reads + writes
+    /// (FsRead/FsWrite), a default-deny net posture with a direct port tier (NetDefaultDeny/
+    /// CrossDomainSocket/NetPortTier), and an exec allowlist (Exec). Used to prove all six caps
+    /// track `host.seatbelt` together -- both the deny arm (unavailable -> Unenforceable) and the
+    /// allow arm (available -> Enforced{Seatbelt}), a paired report-soundness check (FW-INV5).
+    fn macos_all_caps_blueprint() -> Blueprint {
+        Blueprint {
+            fs: FsBlueprint {
+                read_mode: ReadMode::Closed,
+                reads: vec![pp("/work/**")],
+                writes: vec![pp("/work/project/**")],
+                writes_no_create: vec![],
+                subtract: vec![],
+                write_subtract: vec![],
+            },
+            net: NetPosture::Ports(vec![443]),
+            exec: ExecPosture::Allowlist(vec![pp("/usr/bin/git")]),
+            ..Blueprint::empty()
+        }
+    }
+
+    /// The six macOS capabilities that ride Seatbelt; all must appear in a report compiled from
+    /// `macos_all_caps_blueprint`.
+    const MACOS_SEATBELT_CAPS: [Capability; 6] = [
+        Capability::FsRead,
+        Capability::FsWrite,
+        Capability::NetDefaultDeny,
+        Capability::CrossDomainSocket,
+        Capability::NetPortTier,
+        Capability::Exec,
+    ];
+
+    #[test]
+    fn macos_without_seatbelt_reports_unenforceable_not_enforced() {
+        // A macOS host lacking Seatbelt must not silently over-claim (FW-INV5/FW-XR1); ALL six
+        // Seatbelt-carried caps -- including the direct port tier and the exec allowlist -- degrade
+        // to Unenforceable, mirroring the Linux no-Landlock branch. Never a silent Enforced.
+        let mut host = HostProfile::synthetic_macos();
+        host.seatbelt = false;
+        let policy = compile(&macos_all_caps_blueprint(), &host);
+        for cap in MACOS_SEATBELT_CAPS {
+            assert!(
+                matches!(
+                    policy.report.per_capability[&cap],
+                    Fidelity::Unenforceable { .. }
+                ),
+                "{cap:?} should be Unenforceable without Seatbelt, got {:?}",
+                policy.report.per_capability[&cap]
+            );
+        }
+    }
+
+    #[test]
+    fn macos_with_seatbelt_reports_all_caps_enforced() {
+        // The paired allow arm (FW-INV5 report soundness): the SAME six caps that degrade above are
+        // reported Enforced{Seatbelt} when the host carries Seatbelt -- not self-agreement, a real
+        // allow/deny split against the identical blueprint.
+        let host = HostProfile::synthetic_macos();
+        assert!(host.seatbelt, "synthetic macOS host has Seatbelt");
+        let policy = compile(&macos_all_caps_blueprint(), &host);
+        for cap in MACOS_SEATBELT_CAPS {
+            assert!(
+                matches!(
+                    policy.report.per_capability[&cap],
+                    Fidelity::Enforced {
+                        backend: Backend::Seatbelt
+                    }
+                ),
+                "{cap:?} should be Enforced{{Seatbelt}} with Seatbelt, got {:?}",
+                policy.report.per_capability[&cap]
+            );
+        }
+    }
+
     #[test]
     fn linux_modern_uses_landlock_fs_and_seccomp_netdeny() {
         let policy = compile(&sample_blueprint(), &HostProfile::synthetic_linux(Some(6)));
@@ -1118,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_port_tier_uses_landlock_tcp() {
+    fn linux_port_tier_uses_landlock_tcp_plus_seccomp_dgram_raw_deny() {
         let blueprint = Blueprint {
             net: NetPosture::Ports(vec![443]),
             ..Blueprint::empty()
@@ -1126,14 +1200,64 @@ mod tests {
         let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(6)));
         match &policy.confiner {
             ConfinerPolicy::Linux(l) => {
-                assert_eq!(l.net.landlock_tcp_ports(), Some(&[443][..]));
+                // The TCP port tier is carried by Landlock net...
+                assert!(
+                    matches!(&l.net, LinuxNetPlan::LandlockTcpSeccompDgramRawDeny { ports } if ports == &vec![443]),
+                    "the TCP port tier is carried by Landlock net"
+                );
+                // ...and the inet DGRAM/RAW deny is carried by seccomp, so direct UDP/raw egress
+                // (DNS tunneling) is closed while STREAM survives for Landlock to govern (FW-INV3).
                 assert!(
                     l.seccomp.deny_inet_dgram_raw,
-                    "the port tier must seccomp-deny inet UDP/raw (FW-ISO11)"
+                    "the port tier must seccomp-deny inet UDP/raw, not leave them open"
+                );
+                assert!(
+                    !l.seccomp.deny_socket_families.contains(&SocketFamily::Inet)
+                        && !l
+                            .seccomp
+                            .deny_socket_families
+                            .contains(&SocketFamily::Inet6),
+                    "the inet families must not be denied wholesale, or TCP dies too"
                 );
             }
             other => panic!("expected Linux confiner, got {other:?}"),
         }
+    }
+
+    /// The report must NOT over-claim (FW-INV5): under the Landlock TCP port tier, net default-deny is
+    /// genuinely Enforced -- because the port tier now seccomp-denies inet UDP/raw (not TCP-only
+    /// Landlock, which would leave UDP open). And it degrades honestly to Unenforceable if the host
+    /// carries no seccomp to install that deny.
+    #[test]
+    fn linux_port_tier_net_default_deny_is_honestly_enforced() {
+        let blueprint = Blueprint {
+            net: NetPosture::Ports(vec![443]),
+            ..Blueprint::empty()
+        };
+        // ABI 6 host with seccomp: UDP/raw are actually denied, so Enforced (via seccomp) is honest.
+        let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(6)));
+        assert_eq!(
+            policy.report.per_capability[&Capability::NetDefaultDeny],
+            Fidelity::Enforced {
+                backend: Backend::Seccomp
+            },
+            "net-deny under the port tier is carried by seccomp (UDP/raw) + Landlock (TCP)"
+        );
+        assert!(policy.report.per_capability[&Capability::NetPortTier].is_enforced());
+        assert!(policy.report.net_is_fail_closed());
+
+        // Same ABI but no seccomp: the DGRAM/RAW deny cannot install, so net-deny must NOT be claimed
+        // Enforced -- the report degrades rather than silently leaving UDP/raw open.
+        let mut no_seccomp = HostProfile::synthetic_linux(Some(6));
+        no_seccomp.seccomp = false;
+        let policy = compile(&blueprint, &no_seccomp);
+        assert!(
+            matches!(
+                policy.report.per_capability[&Capability::NetDefaultDeny],
+                Fidelity::Unenforceable { .. }
+            ),
+            "without seccomp the UDP/raw deny cannot hold; net-deny must not over-claim Enforced"
+        );
     }
 
     #[test]

@@ -148,6 +148,71 @@ async fn fw_e2e_014_adv_004_ungranted_call_refused_no_oracle() {
         .contains("denied"));
 }
 
+/// FW-INV4 (shading completeness): no ungranted tool, resource, or prompt is invocable -- whether or
+/// not it appears in any listing. With exactly one grant on each axis, every other identity is
+/// non-invocable: a hidden-*real* backend item (exists but ungranted) and a fully out-of-band guessed
+/// name both fail on tools/call, resources/read, and prompts/get. The granted identity on each axis
+/// still works, so the deny is shading, not a blanket outage. FW-INV4: this is a targeted case
+/// standing in for the spec's fuzzing over guessed names and out-of-band identifiers, tracked as an
+/// exception in docs/STATUS.md.
+#[tokio::test]
+async fn fw_inv4_shading_completeness() {
+    let policy = McpPolicy {
+        tools: Visibility::allow_exact(["read_file"]),
+        resources: Visibility::allow_exact(["file:///pub"]),
+        prompts: Visibility::allow_exact(["greeting"]),
+        ..Default::default()
+    };
+    let mut agent = start(policy);
+
+    // Each row: (method, a hidden-REAL ungranted item, an OUT-OF-BAND guess). http_fetch /
+    // file:///secret / secret_prompt exist on the fixture backend but are ungranted; the zzz_guessed_*
+    // identities never existed at all. Every one must be refused -- none invocable.
+    let cases = [
+        (
+            "tools/call",
+            json!({"name": "http_fetch", "arguments": {}}),
+            json!({"name": "zzz_guessed_tool", "arguments": {}}),
+        ),
+        (
+            "resources/read",
+            json!({"uri": "file:///secret"}),
+            json!({"uri": "file:///zzz_guessed"}),
+        ),
+        (
+            "prompts/get",
+            json!({"name": "secret_prompt", "arguments": {}}),
+            json!({"name": "zzz_guessed_prompt", "arguments": {}}),
+        ),
+    ];
+    let mut id = 0;
+    for (method, hidden_real, out_of_band) in cases {
+        for params in [hidden_real, out_of_band] {
+            id += 1;
+            agent.request(id, method, params).await;
+            let resp = agent.recv().await;
+            assert!(
+                resp["error"].is_object() && resp.get("result").is_none(),
+                "{method} on an ungranted identity must be refused, not invoked: {resp}"
+            );
+        }
+    }
+
+    // Control: the one granted identity IS invocable, proving the deny-all is shading, not an outage.
+    id += 1;
+    agent
+        .request(
+            id,
+            "tools/call",
+            json!({"name": "read_file", "arguments": {}}),
+        )
+        .await;
+    assert_eq!(
+        agent.recv().await["result"]["content"][0]["text"],
+        "ok:read_file"
+    );
+}
+
 /// FW-E2E-015: resources and prompts are shaded like tools, on both list and fetch.
 #[tokio::test]
 async fn fw_e2e_015_resource_and_prompt_shading() {
@@ -191,6 +256,122 @@ async fn fw_e2e_015_resource_and_prompt_shading() {
         .await;
     let ok = agent.recv().await;
     assert_eq!(ok["result"]["contents"][0]["uri"], "file:///pub");
+}
+
+/// FW-GW3 / FW-INV4: `resources/subscribe`, `resources/unsubscribe`, and `completion/complete` are
+/// shaded on the same axes as read/get, so an ungranted resource cannot be subscribed and an
+/// ungranted completion is refused -- oracle-free (FW-ADV-004), never falling through to the backend.
+#[tokio::test]
+async fn fw_gw3_subscribe_and_completion_are_shaded() {
+    let policy = McpPolicy {
+        resources: Visibility::allow_exact(["file:///pub"]),
+        prompts: Visibility::allow_exact(["greeting"]),
+        ..Default::default()
+    };
+    let mut agent = start(policy);
+
+    // Granted subscribe round-trips to the backend.
+    agent
+        .request(1, "resources/subscribe", json!({"uri": "file:///pub"}))
+        .await;
+    assert!(
+        agent.recv().await["result"].is_object(),
+        "granted subscribe must reach the backend"
+    );
+
+    // Ungranted subscribe of a real-but-hidden resource is refused, and identically to a nonexistent
+    // one, so subscribe is not an oracle.
+    agent
+        .request(2, "resources/subscribe", json!({"uri": "file:///secret"}))
+        .await;
+    let hidden = agent.recv().await;
+    agent
+        .request(3, "resources/subscribe", json!({"uri": "file:///nope"}))
+        .await;
+    let absent = agent.recv().await;
+    assert!(hidden["error"].is_object(), "ungranted subscribe refused");
+    assert_eq!(hidden["error"]["code"], absent["error"]["code"]);
+    let strip = |v: &Value| {
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .replace("file:///secret", "X")
+            .replace("file:///nope", "X")
+    };
+    assert_eq!(
+        strip(&hidden),
+        strip(&absent),
+        "subscribe refusal must be oracle-free"
+    );
+    assert!(!hidden["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_lowercase()
+        .contains("denied"));
+
+    // Granted completion (prompt ref) round-trips.
+    agent
+        .request(
+            4,
+            "completion/complete",
+            json!({"ref": {"type": "ref/prompt", "name": "greeting"}, "argument": {"name": "x", "value": ""}}),
+        )
+        .await;
+    assert!(
+        agent.recv().await["result"]["completion"].is_object(),
+        "granted completion must reach the backend"
+    );
+
+    // Ungranted completion referencing a hidden prompt is refused, oracle-free vs a nonexistent one.
+    agent
+        .request(
+            5,
+            "completion/complete",
+            json!({"ref": {"type": "ref/prompt", "name": "secret_prompt"}, "argument": {"name": "x", "value": ""}}),
+        )
+        .await;
+    let hidden_prompt = agent.recv().await;
+    agent
+        .request(
+            6,
+            "completion/complete",
+            json!({"ref": {"type": "ref/prompt", "name": "no_such_prompt"}, "argument": {"name": "x", "value": ""}}),
+        )
+        .await;
+    let absent_prompt = agent.recv().await;
+    assert!(
+        hidden_prompt["error"].is_object(),
+        "ungranted completion refused"
+    );
+    assert_eq!(
+        hidden_prompt["error"]["code"],
+        absent_prompt["error"]["code"]
+    );
+    let strip_p = |v: &Value| {
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .replace("secret_prompt", "X")
+            .replace("no_such_prompt", "X")
+    };
+    assert_eq!(
+        strip_p(&hidden_prompt),
+        strip_p(&absent_prompt),
+        "completion refusal must be oracle-free"
+    );
+
+    // A completion referencing an ungranted resource is refused too.
+    agent
+        .request(
+            7,
+            "completion/complete",
+            json!({"ref": {"type": "ref/resource", "uri": "file:///secret"}, "argument": {"name": "x", "value": ""}}),
+        )
+        .await;
+    assert!(
+        agent.recv().await["error"].is_object(),
+        "ungranted resource completion refused"
+    );
 }
 
 /// FW-E2E-015 (resource templates): templates are shaded by `uriTemplate`, not by `name` (design §4

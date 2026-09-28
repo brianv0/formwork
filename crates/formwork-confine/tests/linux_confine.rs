@@ -286,10 +286,15 @@ fn net_default_deny_blocks_udp() {
     );
 }
 
-/// FW-ISO11 (Linux): under the direct TCP port tier, direct UDP/raw egress is denied -- there is
-/// no direct-DNS hole (FEP-5 D4). Landlock net governs TCP only, so the port tier pairs its per-port
-/// TCP allow with a seccomp deny of inet DGRAM/RAW `socket(2)`; below ABI 4 the tier falls back to
-/// the full inet deny. Either way the UDP socket fails with EPERM (exit 7).
+/// FW-INV3 / FW-E2E-007 / FW-ISO11 (Linux): under the direct TCP port tier, direct UDP/raw egress
+/// is denied -- there is no direct-DNS hole. Landlock net governs TCP only, so the port tier pairs its per-port
+/// TCP allow with a seccomp filter that denies inet DGRAM/RAW `socket(2)`; resolution then goes
+/// through the gateway, matching the egress-through-the-gateway model. This holds regardless of the
+/// reported tier fidelity, so the assertion is unconditional (both halves fail UDP closed):
+///
+///   * tier Enforced (Landlock net, ABI 4+): the seccomp DGRAM/RAW deny rejects the UDP `socket(2)`.
+///   * tier Unenforceable (below ABI 4): the tier falls back to a full seccomp inet deny, which also
+///     rejects it. FW-INV6 honesty either way -- never a silent UDP hole.
 #[test]
 fn port_tier_denies_direct_udp_egress() {
     let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-udp-probe"));
@@ -302,42 +307,56 @@ fn port_tier_denies_direct_udp_egress() {
     let code = run(&policy, Command::new(&probe));
     assert_eq!(
         code, 7,
-        "a direct UDP socket under the port tier must be denied with EPERM; got {code}"
+        "a direct UDP socket under the port tier must be denied with EPERM (exit 7); got {code} \
+         -- an open UDP hole is arbitrary egress / DNS tunneling (FW-INV3)"
     );
 }
 
-/// FW-ISO5 (Linux, Landlock net, ABI 4+): the port tier is TCP-selective -- a granted TCP port is
-/// not denied at connect() (the STREAM socket survives the DGRAM/RAW deny), a non-granted port is.
+/// FW-ISO5 / FW-E2E-009 (Linux, Landlock net, ABI 4+): the port tier is TCP-selective -- a granted
+/// TCP port is reachable (the `socket(AF_INET, SOCK_STREAM)` survives the DGRAM/RAW seccomp deny and
+/// Landlock allow-connects the port), while a non-granted TCP port is denied at connect(). Skips
+/// cleanly where the tier is not Landlock-enforced (no Landlock, or ABI below net support), so the
+/// report and behavior never disagree.
 #[test]
 fn port_tier_tcp_selective_under_landlock() {
     use formwork_compile::{Capability, Fidelity};
     let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-connect-probe"));
     let probe_dir = probe.parent().expect("probe has a parent directory");
+    let granted: u16 = 443;
+    let non_granted: u16 = 9090;
+
     let mut blueprint = Blueprint::empty();
     blueprint.fs.read_mode = ReadMode::Closed;
     blueprint.fs.reads = vec![pp(probe_dir)];
-    blueprint.net = NetPosture::Ports(vec![443]);
+    blueprint.net = NetPosture::Ports(vec![granted]);
     let policy = compile(&blueprint, &detect());
-    if !matches!(
+
+    // Only a Landlock-enforced tier makes port-level TCP claims; otherwise the tier fell back to a
+    // full seccomp inet deny (no per-port distinction) and this test would be asserting the wrong
+    // mechanism. Drive the skip off the report so it always matches actual behavior (FW-E2E-024).
+    let enforced = matches!(
         policy.report.per_capability.get(&Capability::NetPortTier),
         Some(Fidelity::Enforced { .. })
-    ) {
+    );
+    if !enforced {
         eprintln!("skipping: no Landlock net port tier on this host");
         return;
     }
-    let mut granted = Command::new(&probe);
-    granted.arg("443");
+
+    let mut granted_cmd = Command::new(&probe);
+    granted_cmd.arg(granted.to_string());
     assert_ne!(
-        run(&policy, granted),
+        run(&policy, granted_cmd),
         7,
-        "a granted TCP port must not be denied"
+        "a granted TCP port must not be denied at connect() (a sandboxed runner may still time out)"
     );
-    let mut denied = Command::new(&probe);
-    denied.arg("9090");
+
+    let mut denied_cmd = Command::new(&probe);
+    denied_cmd.arg(non_granted.to_string());
     assert_eq!(
-        run(&policy, denied),
+        run(&policy, denied_cmd),
         7,
-        "a non-granted TCP port must be denied"
+        "a non-granted TCP port must be denied by Landlock at connect() (exit 7)"
     );
 }
 
@@ -370,6 +389,237 @@ fn baseline_denies_new_user_namespace() {
         0,
         "unshare(CLONE_NEWUSER) must be denied by the seccomp baseline"
     );
+}
+
+/// FW-ADV-001 (Linux): the full sandbox-shedding sequence. A confined process attempts, in order,
+/// the setuid-exec vector (neutralized by NO_NEW_PRIVS), clearing NO_NEW_PRIVS (a one-way latch),
+/// and re-exec to drop the seccomp filter (inherited across execve). The probe exits 0 only when
+/// every attempt fails and confinement persists across the re-exec; any nonzero names the specific
+/// break. Complements `baseline_denies_new_user_namespace`, which covers only the userns vector.
+/// Runs on any seccomp host (no Landlock required); the shedding defenses are seccomp/prctl-carried.
+#[test]
+fn fw_adv_001_full_sandbox_shedding_sequence() {
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-shed-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    // The probe re-execs /proc/self/exe, so grant its own tree (read = loadable/executable).
+    let policy = closed_policy(vec![pp(probe_dir)], vec![], vec![]);
+    let code = run(&policy, Command::new(&probe));
+    assert_eq!(
+        code, 0,
+        "every shedding vector must fail and confinement persist across the re-exec \
+         (20=not confined, 21=NNP cleared, 22=shed syscall allowed, 24=filter dropped on re-exec, \
+         25=NNP lost); got {code}"
+    );
+}
+
+/// FW-INV2 (Linux): descendant containment. Confinement is inherited by descendants and cannot be
+/// relaxed anywhere in a spawn tree (FW-XR4). A shell forks a nested child down to the shed-probe
+/// leaf; the probe (itself re-execing once) proves NO_NEW_PRIVS and the seccomp filter still hold at
+/// depth -- no descendant escaped or relaxed the confiner. FW-INV2: this is a targeted case standing
+/// in for the spec's fuzzing over random spawn trees, tracked as an exception in docs/STATUS.md.
+#[test]
+fn fw_inv2_descendant_containment_over_spawn_tree() {
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-shed-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    // Only the probe tree is granted explicitly; Closed-mode essentials load /bin/sh and the runtime.
+    let policy = closed_policy(vec![pp(probe_dir)], vec![], vec![]);
+    // Two forked shells deep, then exec the probe: a small spawn tree, not a single re-exec.
+    let script = format!("/bin/sh -c '{}'", probe.display());
+    let code = run(&policy, sh(&script));
+    assert_eq!(
+        code, 0,
+        "a nested forked descendant must stay confined (the shed-probe passes at depth); got {code}"
+    );
+}
+
+/// FW-INV3 (Linux): egress only via the gateway fd. A confined process has no network path except
+/// the injected fd, so every *direct* egress primitive fails closed under default deny: a TCP
+/// `connect()` (EPERM -> exit 7), a raw socket (denied at creation -> exit 0), and direct DNS (a
+/// UDP:53 datagram, EPERM -> exit 7). Net-deny is seccomp-carried, so this runs on any seccomp host.
+#[test]
+fn fw_inv3_egress_only_via_gateway_fd() {
+    let connect = PathBuf::from(env!("CARGO_BIN_EXE_fw-connect-probe"));
+    let udp = PathBuf::from(env!("CARGO_BIN_EXE_fw-udp-probe"));
+    let raw = PathBuf::from(env!("CARGO_BIN_EXE_fw-rawsock-probe"));
+    // Grant each probe's directory so it loads; grants never open network (net stays default-deny).
+    let dirs = [
+        connect.parent().unwrap(),
+        udp.parent().unwrap(),
+        raw.parent().unwrap(),
+    ];
+    let policy = closed_policy(dirs.iter().map(|d| pp(d)).collect(), vec![], vec![]);
+
+    assert_eq!(
+        run(&policy, Command::new(&connect)),
+        7,
+        "a direct TCP connect() must fail closed (EPERM -> exit 7)"
+    );
+    assert_eq!(
+        run(&policy, Command::new(&udp)),
+        7,
+        "direct DNS (UDP:53) must fail closed (EPERM -> exit 7)"
+    );
+    // FW-INV3: this arm is only load-bearing under CAP_NET_RAW (the root-in-container Docker/Lima
+    // matrix Testing mandates). An unprivileged process is denied SOCK_RAW by ordinary Linux
+    // capability checks regardless of the seccomp filter, so off that matrix this is a vacuous pass
+    // and the connect()/UDP arms above carry the verdict. The probe stays: raw sockets are a distinct
+    // egress vector.
+    assert_eq!(
+        run(&policy, Command::new(&raw)),
+        0,
+        "a raw socket must be denied at creation (exit 0 = denied; 4 = a raw egress path opened)"
+    );
+}
+
+/// FW-ADV-005 (Linux): fd smuggling. A confined stdio backend cannot manufacture a new egress socket
+/// (the raw material of a smuggled fd) -- only the seam mints egress fds. The probe proves inet
+/// `socket()` is denied while the seam's own AF_UNIX socketpair transport still works, so the deny is
+/// scoped to egress, never the seam (FW-XR7). Net-deny is seccomp-carried, so this runs on any
+/// seccomp host. It asserts the socket-manufacture arm; the SCM_RIGHTS hand-off arm is exercised by
+/// the macOS `seam_confined` suite (FW-E2E-011) and the recursion test (FW-E2E-019).
+#[test]
+fn fw_adv_005_confined_backend_cannot_manufacture_egress_fd() {
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-fdsmuggle-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    let policy = closed_policy(vec![pp(probe_dir)], vec![], vec![]);
+    let code = run(&policy, Command::new(&probe));
+    assert_eq!(
+        code, 0,
+        "a confined backend must not manufacture an inet egress fd, yet keep its AF_UNIX seam \
+         transport (0 = both hold; 4 = egress fd manufactured; 5 = seam socketpair broken); got {code}"
+    );
+}
+
+/// FW-ADV-006 (Linux): cross-domain UNIX-socket reach-around. Landlock ABI v6 scoping covers
+/// *abstract* UNIX sockets and signals; it does not mediate *pathname* `connect()` (formwork.md
+/// section 9). On an ABI>=6 kernel the confined process therefore cannot reach an out-of-domain
+/// abstract socket, while an out-of-domain pathname socket stays reachable and the report says
+/// `Partial` for it -- a paired allow/deny probe against the real mechanism, with the report and the
+/// behavior checked against each other (FW-E2E-024). Below v6 the capability is reported
+/// Unenforceable/Partial and the fail-closed net posture still holds.
+#[test]
+fn fw_adv_006_cross_domain_unix_socket_reach_around() {
+    use formwork_compile::{Capability, Fidelity};
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+
+    let host = detect();
+    let policy = compile(&Blueprint::empty(), &host);
+    let cross = policy
+        .report
+        .per_capability
+        .get(&Capability::CrossDomainSocket)
+        .expect("the cross-domain-socket capability is always reported");
+
+    if host.landlock_abi.unwrap_or(0) >= 6 {
+        // Both listeners are owned by this unconfined test process, so both are out of the
+        // confined child's domain. Only the abstract one is within Landlock's scope.
+        let name = format!("fw-adv006-{}", std::process::id());
+        let abstract_addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let abstract_listener = UnixListener::bind_addr(&abstract_addr).unwrap();
+        let sock = std::env::temp_dir().join(format!("{name}.sock"));
+        let _ = fs::remove_file(&sock);
+        let path_listener = UnixListener::bind(&sock).unwrap();
+
+        let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-unix-connect-probe"));
+        // Grant the probe's tree (so it loads) and the socket's directory, so a path denial cannot be
+        // mistaken for a scope denial: reaching connect() is the point.
+        let sock_dir = fs::canonicalize(sock.parent().unwrap()).unwrap();
+        let policy = closed_policy(
+            vec![pp(probe.parent().unwrap()), pp(&sock_dir)],
+            vec![],
+            vec![],
+        );
+
+        let mut abstract_cmd = Command::new(&probe);
+        abstract_cmd.arg(format!("@{name}"));
+        let abstract_code = run(&policy, abstract_cmd);
+        let mut path_cmd = Command::new(&probe);
+        path_cmd.arg(&sock);
+        let path_code = run(&policy, path_cmd);
+        drop(abstract_listener);
+        drop(path_listener);
+        let _ = fs::remove_file(&sock);
+
+        assert_eq!(
+            abstract_code, 0,
+            "an out-of-domain abstract UNIX socket must be unreachable under ABI>=6 scoping"
+        );
+        assert_eq!(
+            path_code, 4,
+            "a pathname UNIX socket is not mediated by Landlock; if this connect is now blocked, the \
+             mechanism changed and the report's Partial residual must be revisited"
+        );
+        assert!(
+            matches!(cross, Fidelity::Partial { .. }),
+            "with pathname connect unmediated the report must say Partial, never Enforced; got {cross:?}"
+        );
+    } else {
+        // Below v6: the gap is reported (never silently pretended), and net still fails closed.
+        assert!(
+            matches!(cross, Fidelity::Unenforceable { .. } | Fidelity::Partial { .. }),
+            "below ABI v6 the cross-domain-socket capability must be reported Unenforceable/Partial, \
+             got {cross:?}"
+        );
+        assert!(
+            policy.report.net_is_fail_closed(),
+            "the fail-closed net posture must still prevent remote egress when scoping is unavailable"
+        );
+        eprintln!("skipping capable-kernel arm: no Landlock ABI v6 on this host");
+    }
+}
+
+/// FW-E2E-045 (Linux/Landlock credential floor): the §9 matrix claims absolute credential rows are
+/// Enforced via Landlock deny, but the enforcement probes for it were all macOS-only. Under a broad
+/// `read` grant with the default catalog, a catalog credential path (`~/.aws/credentials`) is denied
+/// (EACCES) while an ordinary in-grant file stays readable -- the floor is a hole, not a wall. Gated
+/// on Landlock (the floor's path arm rides the Landlock subtract); skips cleanly without it.
+#[test]
+fn fw_e2e_045_credential_floor_denies_catalog_path_linux() {
+    if !have_landlock() {
+        eprintln!("skipping: no Landlock on this host (the credential floor's path arm needs it)");
+        return;
+    }
+    // A realpath'd fake home with a planted fake credential and an ordinary file, so the developer's
+    // real secrets are never in play and the catalog resolves against a controlled tree.
+    let home = std::env::temp_dir().join(format!("fw-credfloor-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join(".aws")).unwrap();
+    let home = fs::canonicalize(&home).unwrap();
+    fs::write(
+        home.join(".aws/credentials"),
+        b"[default]\naws_secret_access_key = FAKE\n",
+    )
+    .unwrap();
+    fs::write(home.join("notes.txt"), b"ordinary home file\n").unwrap();
+
+    // Compile a broad read grant over the fake home with the builtin catalog resolved for it: the
+    // floor subtracts the credential path even though the grant covers it (FW-CRED4).
+    let blueprint = Blueprint {
+        fs: FsBlueprint {
+            read_mode: ReadMode::Closed,
+            reads: vec![pp(&home)],
+            writes: Vec::new(),
+            writes_no_create: Vec::new(),
+            subtract: Vec::new(),
+            write_subtract: Vec::new(),
+        },
+        ..Blueprint::empty()
+    };
+    let catalog = ResolvedCatalog::builtin_for_home(&home.to_string_lossy()).unwrap();
+    let policy = formwork_compile::compile(&blueprint, &detect(), &catalog);
+
+    assert_eq!(
+        run(&policy, cat(&home.join("notes.txt"))),
+        0,
+        "an ordinary file under the broad grant stays readable (the floor is a hole, not a wall)"
+    );
+    assert_ne!(
+        run(&policy, cat(&home.join(".aws/credentials"))),
+        0,
+        "a catalog credential path must be denied (EACCES) despite the broad read grant"
+    );
+    let _ = fs::remove_dir_all(&home);
 }
 
 /// Sanity: the confiner really is the Linux one and targets the host's ABI, so the tests above are

@@ -192,6 +192,9 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
         .set_compatibility(CompatLevel::HardRequirement) // no silent downgrade (FW-INV6)
         .handle_access(handled_fs)
         .map_err(|e| fail(format!("landlock handle_access(fs): {e}")))?;
+    // The port-tier plan carries the TCP ports; the pure seccomp inet deny carries none. Landlock net
+    // (ACCESS_NET_CONNECT_TCP) is available only at ABI v4+ -- the seccomp DGRAM/RAW deny that pairs
+    // with it closes UDP/raw (built separately in seccomp.rs).
     let net_governed = policy.net.landlock_tcp_ports().is_some() && abi_ver >= 4;
     if net_governed {
         ruleset = ruleset

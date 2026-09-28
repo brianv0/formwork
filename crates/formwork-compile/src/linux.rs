@@ -75,6 +75,8 @@ pub fn seccomp_plan(inet_deny: InetSeccompDeny, supervise_connect: bool) -> Secc
             ],
             false,
         ),
+        // Port tier: keep packet + non-route netlink denied, but replace the blanket inet/inet6 deny
+        // with a DGRAM/RAW-only deny so STREAM survives for the Landlock TCP port rules to govern.
         InetSeccompDeny::DgramRawOnly => (
             vec![SocketFamily::Packet, SocketFamily::NetlinkNonRoute],
             true,
@@ -104,6 +106,8 @@ pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, InetSecc
         ),
         NetPosture::Ports(ports) => {
             if abi >= LANDLOCK_NET_ABI {
+                // Landlock allow-connects the granted TCP ports; seccomp denies inet DGRAM/RAW so the
+                // TCP-only Landlock grant cannot be sidestepped with a UDP/raw socket (FW-ISO3/INV3).
                 (
                     LinuxNetPlan::LandlockTcpSeccompDgramRawDeny {
                         ports: ports.clone(),
@@ -149,6 +153,7 @@ mod tests {
 
     #[test]
     fn baseline_is_sorted_and_denies_escalation_surfaces() {
+        // The escalation/shedding baseline is present regardless of which inet deny rides along.
         let plan = seccomp_plan(InetSeccompDeny::FullInet, false);
         assert!(plan.deny_syscalls.windows(2).all(|w| w[0] < w[1]));
         assert!(plan.deny_syscalls.iter().any(|s| s == "bpf"));
@@ -165,23 +170,36 @@ mod tests {
         }
         assert!(plan.restrict_userns);
         assert!(plan.set_no_new_privs);
+    }
+
+    #[test]
+    fn full_inet_deny_blocks_whole_families() {
+        let plan = seccomp_plan(InetSeccompDeny::FullInet, false);
         assert!(plan.deny_socket_families.contains(&SocketFamily::Inet));
+        assert!(plan.deny_socket_families.contains(&SocketFamily::Inet6));
+        assert!(plan.deny_socket_families.contains(&SocketFamily::Packet));
+        assert!(plan
+            .deny_socket_families
+            .contains(&SocketFamily::NetlinkNonRoute));
+        // The whole family is denied at the domain level, so no type-conditioned rule is needed.
         assert!(!plan.deny_inet_dgram_raw);
     }
 
     #[test]
     fn port_tier_seccomp_denies_dgram_raw_but_not_stream() {
+        // Under the port tier the blanket inet/inet6 deny is replaced by a DGRAM/RAW-only deny (so
+        // STREAM survives for Landlock), while packet + non-route netlink stay blocked.
         let plan = seccomp_plan(InetSeccompDeny::DgramRawOnly, false);
-        assert!(
-            plan.deny_inet_dgram_raw,
-            "UDP/raw must be denied (FW-ISO11)"
-        );
+        assert!(plan.deny_inet_dgram_raw, "UDP/raw must be denied");
         assert!(
             !plan.deny_socket_families.contains(&SocketFamily::Inet)
                 && !plan.deny_socket_families.contains(&SocketFamily::Inet6),
-            "the inet families must not be denied wholesale, or TCP dies too"
+            "the inet families must NOT be denied wholesale, or TCP STREAM dies too"
         );
         assert!(plan.deny_socket_families.contains(&SocketFamily::Packet));
+        assert!(plan
+            .deny_socket_families
+            .contains(&SocketFamily::NetlinkNonRoute));
     }
 
     #[test]
@@ -200,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn port_tier_unenforceable_below_abi4_falls_back_to_deny() {
+    fn port_tier_pairs_landlock_tcp_with_seccomp_dgram_raw_deny() {
         let old = HostProfile::synthetic_linux(Some(1));
         let (plan, inet_deny, tier) = net_plan(&old, &NetPosture::Ports(vec![8080]));
         assert!(matches!(plan, LinuxNetPlan::SeccompDenyInet));
@@ -209,7 +227,11 @@ mod tests {
 
         let new = HostProfile::synthetic_linux(Some(4));
         let (plan, inet_deny, tier) = net_plan(&new, &NetPosture::Ports(vec![8080]));
+        assert!(
+            matches!(&plan, LinuxNetPlan::LandlockTcpSeccompDgramRawDeny { ports } if ports == &vec![8080])
+        );
         assert_eq!(plan.landlock_tcp_ports(), Some(&[8080][..]));
+        // The port tier is NOT Landlock-only: seccomp must carry the DGRAM/RAW deny, or UDP/raw leaks.
         assert_eq!(inet_deny, InetSeccompDeny::DgramRawOnly);
         assert_eq!(tier, PortTier::Enforced);
     }

@@ -49,6 +49,9 @@ net = { ports = [443] }              # HTTPS egress only; omit for no network at
 rules = ["readwrite:$CWD/**"]        # the project directory is the writable working set
 ```
 
+On Linux the port tier closes UDP too, so hostnames do not resolve inside the sandbox; host rules
+(below) resolve them through the Gateway. See [`examples/`](examples/README.md).
+
 ```sh
 # Run your agent behind the kernel wall — its in-app permission prompts stop being what protects you:
 formwork run -- claude --dangerously-skip-permissions

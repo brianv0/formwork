@@ -39,7 +39,8 @@ pretending (it never fails open).
 
 Where host rules are refused (Linux without connect supervision), fall back to the port tier on the
 shared base. It allows any HTTPS host, so there the filesystem sandbox is what stops secrets being
-read to exfiltrate:
+read to exfiltrate. On Linux the port tier also denies UDP and raw sockets, so a confined process
+cannot resolve hostnames there; on macOS it re-allows the system resolver:
 
 ```sh
 formwork run --blueprint examples/blueprints/agent-base.toml --net ports:443 \

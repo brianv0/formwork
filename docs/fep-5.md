@@ -957,7 +957,9 @@ revision under `read-mode = "closed"`, and the findings below cite them by role.
   write-subtract. The options are to narrow the row to the executable parts of that tree
   (`**/.claude/settings.json`, `**/.claude/hooks/**`) or to make the typed exclusion lift the
   matching write-subtract rows. This FEP recommends the first, since a typed exclusion that lifts
-  tamper protection widens what "exclude" means; the decision belongs with PR #28.
+  tamper protection widens what "exclude" means; the decision belongs with PR #28. *Resolved: PR
+  #28 landed the first, narrowing the row to `**/.claude/settings.json` and
+  `**/.claude/settings.local.json`.*
 
 ---
 
