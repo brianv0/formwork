@@ -143,6 +143,28 @@ pub fn compile_for_session(
     let supervised = supervised(&input, host);
     egress_rows(&input, host, supervised, &mut per_capability);
     let channels = baseline_rows(&input, host, supervised, &mut per_capability);
+    // A brokered secret lives in the environment formwork was launched with, so it is only as
+    // private as that process's environment is from the session (FW-INV13, FW-ISO16).
+    if let (Some(broker), Some(environment)) = (
+        per_capability.get(&Capability::CredentialBroker),
+        per_capability.get(&Capability::ProcessEnvironment),
+    ) {
+        if broker.is_enforced() && !environment.is_enforced() {
+            let reason =
+                format!(
+                "the Gateway holds each brokered secret outside the session, but it arrived in \
+                 formwork's own environment, which the session may read here: {}",
+                environment.reason().unwrap_or("process environments are not hidden")
+            );
+            per_capability.insert(
+                Capability::CredentialBroker,
+                Fidelity::Partial {
+                    backend: Backend::Gateway,
+                    reason,
+                },
+            );
+        }
+    }
 
     // Filesystem invisibility is never provided; document it as an explicit, reported fact.
     per_capability.insert(
@@ -622,6 +644,17 @@ fn baseline_rows(
                     Fidelity::Unenforceable {
                         reason: "Seatbelt unavailable on this host".to_string(),
                     }
+                }
+            }
+            // The Secret Service lives on the session bus, so exposing `os-keyring` admits the
+            // bus, and the bus carries `systemd --user` too (FEP-5 §3.4: reported coupled).
+            Os::Linux if channel == Channel::RunOutside && input.keyring_lifted => {
+                Fidelity::Partial {
+                    backend: Backend::Supervisor,
+                    reason: "os-keyring is exposed, and on Linux the Secret Service shares the \
+                             session bus with run-outside, so the bus -- systemd --user included \
+                             -- is admitted"
+                        .to_string(),
                 }
             }
             Os::Linux => linux_channel_fidelity(channel, fs_enforced, supervised, host),
@@ -1124,6 +1157,39 @@ mod tests {
                 policy.report.per_capability[&cap]
             );
         }
+    }
+
+    #[test]
+    fn a_brokered_secret_is_only_as_private_as_process_environments() {
+        let mut bp = Blueprint::empty();
+        bp.net = NetPosture::AllowHosts(formwork_blueprint::HostTable::new(vec![
+            "any:api.anthropic.com".parse().unwrap(),
+        ]));
+        bp.allow_credentials = vec![formwork_blueprint::CredentialEntry::parse(
+            "broker:anthropic",
+        )];
+        let mut host = HostProfile::synthetic_linux(Some(6));
+        host.connect_supervision = true;
+        let broker = |host: &HostProfile| {
+            compile(&bp, host).report.per_capability[&Capability::CredentialBroker].clone()
+        };
+        assert!(broker(&host).is_enforced());
+        host.facilities.ptrace_privileged = true;
+        assert!(matches!(broker(&host), Fidelity::Partial { .. }));
+    }
+
+    #[test]
+    fn an_exposed_os_keyring_reports_run_outside_coupled_on_linux() {
+        let mut bp = Blueprint::empty();
+        bp.allow_credentials = vec![formwork_blueprint::CredentialEntry::parse("os-keyring")];
+        let home = "/home/x";
+        let catalog = ResolvedCatalog::builtin_for_home(home).unwrap();
+        let policy = super::compile(&bp, &HostProfile::synthetic_linux(Some(6)), &catalog);
+        let verdict = &policy.report.per_capability[&Capability::Channel(Channel::RunOutside)];
+        assert!(
+            matches!(verdict, Fidelity::Partial { reason, .. } if reason.contains("session bus")),
+            "{verdict:?}"
+        );
     }
 
     #[test]

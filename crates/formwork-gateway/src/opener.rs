@@ -4,9 +4,9 @@
 //! accepts `http` and `https` URLs when the blueprint lifts `open-url`, records each on the operator
 //! channel, and opens it with the host opener. No host service is lifted on either platform.
 //!
-//! The transport is one-way: the shim cannot learn the verdict, so a refused URL simply does not
-//! open (the confined process sees nothing that distinguishes a refusal), and the operator channel
-//! carries the reason with the `explain` invocation that reproduces it (FW-FID9).
+//! The transport is one-way, so the shim mirrors the verdict itself: a URL either side refuses
+//! makes it exit 1 with a generic refusal, while the operator channel carries the reason with the
+//! `explain` invocation that reproduces it (FW-FID9).
 
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::net::UnixStream;
@@ -51,6 +51,8 @@ pub fn shim_script(lifted: bool) -> String {
 # counts.
 LC_ALL=C
 export LC_ALL
+nl='
+'
 fd="${{{env}:-}}"
 lifted={lifted}
 case "$fd" in
@@ -59,6 +61,9 @@ esac
 status=2
 for url in "$@"; do
   case "$url" in -*) continue ;; esac
+  # One URL is one line on the socket: a URL carrying a newline is cut there and marked, so the
+  # Gateway receives one URL it refuses rather than two it might open.
+  case "$url" in *"$nl"*) url="${{url%%"$nl"*}} (newline)" ;; esac
   printf '%s\n' "$url" >&"$fd" 2>/dev/null || {{
     echo "formwork: open-url: the opener is not available in this process" >&2
     exit 1
@@ -298,6 +303,7 @@ mod tests {
             "https://".to_string(),
             "https:///path".to_string(),
             "https://exa mple.com".to_string(),
+            "https://a.test/\nhttps://b.test/".to_string(),
             format!("https://x/{}", "a".repeat(MAX_URL)),
         ];
         for lifted in [true, false] {
@@ -313,7 +319,11 @@ mod tests {
                     .output()
                     .unwrap();
                 let shim_ok = out.status.code() == Some(0);
-                let gateway_ok = decide(url, lifted).is_ok();
+                // The Gateway decides what it receives: exactly one line per URL.
+                let handed = String::from_utf8(out.stdout).unwrap();
+                let lines: Vec<&str> = handed.lines().collect();
+                assert_eq!(lines.len(), 1, "one line per URL: {url:.60?}");
+                let gateway_ok = decide(lines[0], lifted).is_ok();
                 assert_eq!(shim_ok, gateway_ok, "lifted={lifted} url={:.60}", url);
             }
             let _ = std::fs::remove_dir_all(&dir);

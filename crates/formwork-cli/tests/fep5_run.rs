@@ -138,7 +138,7 @@ fn readme_quickstart_starts_and_reports_what_it_withholds() {
 fn fw_e2e_089_launcher_owned_paths_under_closed_mode() {
     let dir = Scratch::new("closed");
     if !landlock_host(dir.path()) {
-        eprintln!("skipping: no Landlock on this host");
+        not_exercised("no Landlock on this host");
         return;
     }
     std::fs::write(
@@ -175,7 +175,7 @@ printf '%s' "$TMPDIR"
 fn fw_e2e_088_channel_locator_variables_follow_the_lift() {
     let dir = Scratch::new("locators");
     if !landlock_host(dir.path()) {
-        eprintln!("skipping: no Landlock on this host");
+        not_exercised("no Landlock on this host");
         return;
     }
     let locators = [
@@ -229,7 +229,7 @@ fn fw_e2e_088_channel_locator_variables_follow_the_lift() {
 fn fw_e2e_083_environment_disclosure_matches_the_report() {
     let dir = Scratch::new("environ");
     if !landlock_host(dir.path()) {
-        eprintln!("skipping: no Landlock on this host");
+        not_exercised("no Landlock on this host");
         return;
     }
     std::fs::write(dir.path().join("FORMWORK.toml"), QUICKSTART).unwrap();
@@ -280,7 +280,8 @@ fn fw_e2e_083_environment_disclosure_matches_the_report() {
 }
 
 /// FEP-5 D3: a blueprint at `.formwork/blueprint.toml` is discovered, its derived proposal path
-/// sits beside it inside `.formwork/`, and `compile` stamps where it came from.
+/// sits beside it inside `.formwork/`, and `compile` stamps where it came from. On Linux `run`
+/// says the project root is split around it, as it is in the `FORMWORK.toml` layout.
 #[test]
 fn dotdir_blueprint_is_discovered() {
     let dir = Scratch::new("dotdir");
@@ -298,6 +299,50 @@ fn dotdir_blueprint_is_discovered() {
         .as_str()
         .unwrap()
         .ends_with(".formwork/blueprint.toml"));
+    if cfg!(target_os = "linux") {
+        let out = formwork(dir.path(), &["run", "--", "/bin/true"], &[]);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(
+            out.stderr.contains("new files cannot be created"),
+            "{}",
+            out.stderr
+        );
+    }
+}
+
+/// FEP-5 §3.5 (embedding): a generated blueprint on a pipe needs no temp file. It is read once,
+/// disclosed as `fd:N`, and a run under it starts; nothing is written beside it.
+#[test]
+fn a_blueprint_on_a_pipe_is_read_once_and_disclosed_as_fd() {
+    let dir = Scratch::new("fd-blueprint");
+    let pipe = |sub: &str, rest: &str| {
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "printf '%s' \"$BP\" | \"$FW\" {sub} --blueprint /dev/fd/3 {rest} 3<&0 </dev/null"
+            ))
+            .env("BP", QUICKSTART)
+            .env("FW", env!("CARGO_BIN_EXE_formwork"))
+            .env("HOME", dir.path())
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, stdout, stderr) = pipe("compile", "--target linux-v6 --report-only");
+    assert_eq!(code, Some(0), "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["blueprint"]["path"], "fd:3");
+    #[cfg(target_os = "linux")]
+    if landlock_host(dir.path()) {
+        let (code, _, stderr) = pipe("run", "-- /bin/true");
+        assert_eq!(code, Some(0), "{stderr}");
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 /// FW-FID11 (channel half): `explain <channel>` and `explain <group>` print each member's verdict,

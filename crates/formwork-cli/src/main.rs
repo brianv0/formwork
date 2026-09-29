@@ -541,6 +541,16 @@ fn main() -> Result<()> {
                          <file>` instead."
                     );
                 }
+                if let Some(n) = blueprint
+                    .blueprint
+                    .as_deref()
+                    .and_then(blueprint_load::descriptor)
+                {
+                    bail!(
+                        "learn writes its proposal beside the blueprint file, and a blueprint read \
+                         from fd:{n} has none; write the blueprint to a file for learning runs"
+                    );
+                }
                 learn_run(blueprint, argv, observe_anyway)?;
             }
         }
@@ -578,7 +588,7 @@ fn attach_blueprint_info(value: &mut serde_json::Value, resolved: &ResolvedBluep
         map.insert(
             "blueprint".to_string(),
             serde_json::json!({
-                "path": resolved.path.display().to_string(),
+                "path": blueprint_load::describe(&resolved.path),
                 "source": resolved.source.as_str(),
             }),
         );
@@ -595,6 +605,11 @@ fn attach_blueprint_info(value: &mut serde_json::Value, resolved: &ResolvedBluep
 /// fidelity report (host-only when no blueprint exists) -- the human door `detect`'s JSON never was.
 fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> Result<()> {
     if hosts {
+        if !paths.is_empty() {
+            bail!(
+                "`explain --hosts` prints the whole host table and takes no paths, URLs or names"
+            );
+        }
         return explain_net(&args, json);
     }
     if paths.is_empty() {
@@ -609,13 +624,23 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
         ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
     let host = detect();
     // Channel verdicts come from the compiled report so the enforcement line is this host's.
-    let report = compile(&blueprint, &host, &catalog).report;
+    let policy = compile(&blueprint, &host, &catalog);
+    // Under supervised connect, the supervisor admits a pathname socket only if it is granted or
+    // bound inside the session (FW-ISO12).
+    let socket_grants = match &policy.confiner {
+        formwork_compile::ConfinerPolicy::Linux(l) if l.seccomp.supervise_connect => {
+            Some(l.unix_socket_grants.clone())
+        }
+        _ => None,
+    };
+    let report = policy.report;
     let landlock_withholds = host.os == formwork_detect::Os::Linux && host.landlock_abi.is_some();
     // Shape rides beside the verdict, not into the JSON: only the human door prints the lift hint,
     // the machine shape stays stable (FW-CRED7).
     let mut rows = Vec::new();
     let mut channel_rows = Vec::new();
     let mut url_rows = Vec::new();
+    let mut keyring_rows = Vec::new();
     for arg in &paths {
         if arg.contains("://") {
             url_rows.push(explain_url(&blueprint, &provenance, arg)?);
@@ -630,6 +655,11 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
             for channel in group.members() {
                 channel_rows.push(provenance.explain_channel(*channel));
             }
+            continue;
+        }
+        // The credential-typed channel is lifted through `allow-credentials` (FEP-5 §3.4).
+        if arg == formwork_blueprint::OS_KEYRING {
+            keyring_rows.push(explain_os_keyring(&blueprint, &host));
             continue;
         }
         let path = arg;
@@ -679,6 +709,23 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
                 );
             }
         }
+        if let Some(grants) = &socket_grants {
+            use std::os::unix::fs::FileTypeExt;
+            let is_socket =
+                std::fs::metadata(target.base()).is_ok_and(|m| m.file_type().is_socket());
+            if is_socket {
+                explanation.connect = Some(
+                    match grants.iter().find(|g| g.matches_path(target.base())) {
+                        Some(g) => format!("admitted by the supervisor (granted by `{g}`)"),
+                        None => {
+                            "refused by the supervisor unless a session process bound it; grant \
+                             it with a literal write rule (`write:<path>`)"
+                                .to_string()
+                        }
+                    },
+                );
+            }
+        }
         rows.push((explanation, floor, shape));
     }
     if json {
@@ -690,12 +737,15 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
         if !url_rows.is_empty() {
             value["egress"] = serde_json::to_value(&url_rows)?;
         }
+        if !keyring_rows.is_empty() {
+            value["credential-channels"] = serde_json::to_value(&keyring_rows)?;
+        }
         attach_blueprint_info(&mut value, &resolved);
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!(
             "blueprint: {} ({})",
-            resolved.path.display(),
+            blueprint_load::describe(&resolved.path),
             resolved.source.as_str()
         );
         for (explanation, floor, shape) in &rows {
@@ -710,8 +760,54 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
         for url in &url_rows {
             print!("{}", render::egress_explanation(url));
         }
+        for keyring in &keyring_rows {
+            print!(
+                "{}\n  verdict: {}\n  note: {}\n",
+                keyring.name,
+                if keyring.lifted {
+                    "lifted by allow-credentials"
+                } else {
+                    "denied (credential floor); lift with allow-credentials = [\"os-keyring\"]"
+                },
+                keyring.note
+            );
+        }
     }
     Ok(())
+}
+
+/// `explain os-keyring`: the credential-typed channel, with what a lift opens on this platform.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct KeyringExplanation {
+    name: &'static str,
+    lifted: bool,
+    note: &'static str,
+}
+
+fn explain_os_keyring(
+    blueprint: &Blueprint,
+    host: &formwork_detect::HostProfile,
+) -> KeyringExplanation {
+    let lifted = blueprint
+        .exposed_credentials()
+        .iter()
+        .any(|t| t == formwork_blueprint::OS_KEYRING);
+    let note = match host.os {
+        formwork_detect::Os::Linux => {
+            "partial on Linux: the Secret Service shares the session bus with run-outside, so a \
+             lift admits the bus, and with it systemd --user"
+        }
+        formwork_detect::Os::MacOs => {
+            "on macOS the keychain is one service: a lift opens every item that does not prompt \
+             and lets the agent trigger keychain prompts"
+        }
+    };
+    KeyringExplanation {
+        name: formwork_blueprint::OS_KEYRING,
+        lifted,
+        note,
+    }
 }
 
 /// One URL's egress verdict (FW-FID11): the host's grade, which methods the path admits, the
@@ -730,6 +826,9 @@ pub struct EgressExplanation {
     pub rule: Option<String>,
     pub source: Option<formwork_blueprint::RuleSource>,
     pub reason: Option<String>,
+    /// What the scheme changes: plain HTTP crosses the network unencrypted (FEP-5 §4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -738,6 +837,7 @@ pub struct MethodVerdict {
     pub method: String,
     pub admitted: bool,
     pub rule: Option<String>,
+    pub source: Option<formwork_blueprint::RuleSource>,
 }
 
 fn explain_url(
@@ -766,6 +866,9 @@ fn explain_url(
         rule: None,
         source: None,
         reason: None,
+        note: url.starts_with("http://").then(|| {
+            "plain HTTP: the request and the response cross the network unencrypted".to_string()
+        }),
     };
     if blueprint.net.host_table().is_none() {
         out.reason = Some(match &blueprint.net {
@@ -782,10 +885,14 @@ fn explain_url(
             out.grade = "tunnel";
             out.source = source_of(Some(rule));
             out.rule = Some(rule.to_string());
-            out.reason = Some(
+            out.reason = Some(if url.starts_with("http://") {
+                "admitted by host and port; the request is forwarded without a method or path \
+                 check"
+                    .to_string()
+            } else {
                 "admitted at CONNECT by host and port; the request itself is opaque (FW-EGR5)"
-                    .to_string(),
-            );
+                    .to_string()
+            });
         }
         ConnectDecision::Inspect => {
             out.grade = "inspected";
@@ -798,6 +905,7 @@ fn explain_url(
                     method: m.atom().to_ascii_uppercase(),
                     admitted,
                     rule: rule.map(|r| r.to_string()),
+                    source: source_of(rule),
                 });
             }
         }
@@ -813,7 +921,26 @@ fn explain_url(
 /// `explain --hosts` (FW-FID11): every host rule once, with its grade and the layer that wrote it.
 fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
     let resolved = args.resolve()?;
-    let (blueprint, provenance) = args.load_with_provenance(&resolved.path, &home())?;
+    let home = home();
+    let (blueprint, provenance) = args.load_with_provenance(&resolved.path, &home)?;
+    let catalog =
+        ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
+    // The load already checked FW-CRED12, so every broker resolves here.
+    let brokers = formwork_blueprint::resolve_brokers(
+        &blueprint.allow_credentials,
+        &catalog,
+        blueprint.net.host_table(),
+    )
+    .unwrap_or_default();
+    let broker_of = |r: &formwork_blueprint::HostRule| -> Option<String> {
+        let bound: Vec<String> = brokers
+            .iter()
+            .flat_map(|b| b.bindings.iter().map(move |(h, s)| (b, h, s)))
+            .filter(|(_, h, _)| r.is_inspected() && r.host.matches(h))
+            .map(|(b, h, s)| format!("{} on {h} ({s})", b.name))
+            .collect();
+        (!bound.is_empty()).then(|| bound.join(", "))
+    };
     let rules: Vec<serde_json::Value> = blueprint
         .net
         .host_table()
@@ -844,7 +971,8 @@ fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
                 "grade": grade,
                 "methods": methods,
                 "paths": path,
-                "broker": serde_json::Value::Null,
+                "broker": broker_of(r),
+                "cleartext": r.port == Some(formwork_blueprint::DEFAULT_HTTP_PORT),
                 "source": provenance.host_rule_source(r),
                 "layer": provenance.host_rule_source(r).map(render::source),
             })
@@ -858,7 +986,7 @@ fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
     }
     println!(
         "blueprint: {} ({})",
-        resolved.path.display(),
+        blueprint_load::describe(&resolved.path),
         resolved.source.as_str()
     );
     print!("{}", render::net_table(&blueprint.net, &rules));
@@ -908,7 +1036,7 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
     } else {
         println!(
             "blueprint: {} ({})",
-            resolved.path.display(),
+            blueprint_load::describe(&resolved.path),
             resolved.source.as_str()
         );
         println!(
@@ -945,7 +1073,7 @@ struct Session {
     /// The Gateway egress listener, when the blueprint carries host rules (FW-EGR14).
     egress: Option<Egress>,
     /// Variables the Launcher sets for inspection and brokering: the trust-bundle variables
-    /// (FW-EGR13) and each brokered credential's placeholder (FW-CRED14).
+    /// (FW-TRA9) and each brokered credential's placeholder (FW-CRED14).
     egress_env: Vec<(String, String)>,
     /// The opener shim and its socket (FW-ISO17), in the spawn posture.
     opener: Option<OpenerSetup>,
@@ -1169,6 +1297,24 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
     let gateway_port = egress.as_ref().map(|e| e.proxy.addr().port());
     let policy = formwork_compile::compile_for_session(&blueprint, &host, &catalog, gateway_port);
     itemize_credential_floor(&policy.report, &catalog);
+    // FEP-5 §3.3: an isolation member the host provides only in part runs, with one line naming
+    // what is left open.
+    for member in &blueprint.isolate {
+        let capability = match member {
+            formwork_blueprint::IsolateMember::Processes => {
+                formwork_compile::Capability::IsolateProcesses
+            }
+            formwork_blueprint::IsolateMember::Ipc => formwork_compile::Capability::IsolateIpc,
+        };
+        if let Some(formwork_compile::Fidelity::Partial { reason, .. }) =
+            policy.report.per_capability.get(&capability)
+        {
+            tracing::info!(
+                member = member.name(),
+                "isolate: partial on this host -- {reason}"
+            );
+        }
+    }
     Ok(Session {
         blueprint,
         catalog,
@@ -1184,16 +1330,18 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
 }
 
 /// FW-ISO18: serve the opener socket from this process, outside the sandbox.
-fn start_opener(opener: &mut OpenerSetup, lifted: bool) {
+fn start_opener(opener: &mut OpenerSetup, lifted: bool) -> std::io::Result<()> {
     let Some(host_end) = opener.host_end.take() else {
-        return;
+        return Ok(());
     };
     let host_opener = std::env::var_os("FORMWORK_HOST_OPENER")
         .map_or_else(formwork_gateway::opener::host_opener, PathBuf::from);
-    match formwork_gateway::OpenerService::start(host_end, lifted, host_opener) {
-        Ok(service) => opener.service = Some(service),
-        Err(e) => tracing::warn!(error = %e, "the open-url service failed to start"),
-    }
+    opener.service = Some(formwork_gateway::OpenerService::start(
+        host_end,
+        lifted,
+        host_opener,
+    )?);
+    Ok(())
 }
 
 /// What inspection and brokering add to a session.
@@ -1204,7 +1352,7 @@ struct PreparedInspection {
 }
 
 /// Clients that honor one of these read the trust bundle; the list is the common set across
-/// OpenSSL, Node, Python requests, curl, git, and pip (FW-EGR13).
+/// OpenSSL, Node, Python requests, curl, git, and pip (FEP-5 §3.2).
 const TRUST_VARS: &[&str] = &[
     "SSL_CERT_FILE",
     "NODE_EXTRA_CA_CERTS",
@@ -1246,6 +1394,14 @@ fn prepare_inspection(
         .map(|v| (v.to_string(), file.clone()))
         .collect();
     tracing::info!(bundle = %file, "inspection trust bundle");
+    if cfg!(target_os = "macos") && !plans.is_empty() {
+        // FEP-5 §3.2: said before the run, since the failure it explains is opaque.
+        tracing::warn!(
+            "formwork: on macOS, clients that verify through Security.framework (gh, Swift, Apple \
+             tools) ignore SSL_CERT_FILE and will refuse the inspected hosts a brokered credential \
+             needs; use a client that honors the variable (curl, git, Node, Python)"
+        );
+    }
 
     let mut brokers = Vec::new();
     for plan in plans {
@@ -1312,6 +1468,13 @@ fn start_egress(
              `net = {{ ports = [443] }}` (any host on the port), or `net = \"deny\"`",
             formwork_detect::CONNECT_SUPERVISION_NEEDS
         );
+    }
+    for rule in table
+        .rules
+        .iter()
+        .filter(|r| !r.is_deny() && r.port == Some(formwork_blueprint::DEFAULT_HTTP_PORT))
+    {
+        tracing::info!(rule = %rule, "plain HTTP: requests to this host cross the network unencrypted");
     }
     let registry = (host.os == formwork_detect::Os::Linux)
         .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())));
@@ -1424,9 +1587,11 @@ fn refuse_unavailable_isolation(
     }
 }
 
-/// FEP-5 D3: a FORMWORK.toml inside a writable grant is write-protected, which splits the grant
-/// around it; on Linux the split directory cannot be granted whole, so new files cannot be created
-/// directly in it. Say so, and name the layout that avoids it.
+/// FEP-5 D3: a blueprint inside a writable grant is write-protected, which splits the grant around
+/// it. Landlock cannot grant a directory whole while denying a path beneath it, so on Linux every
+/// directory from the grant down to the blueprint is split -- the project root in both the
+/// `FORMWORK.toml` and the `.formwork/` layout -- and new files cannot be created directly in it.
+/// Say so, and name what avoids it.
 fn announce_split_root(
     blueprint: &Blueprint,
     blueprint_path: &std::path::Path,
@@ -1439,18 +1604,19 @@ fn announce_split_root(
         return;
     };
     let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    if dir.ends_with(".formwork") {
-        return;
-    }
-    let probe = dir.join(".formwork-split-probe");
+    let root = match dir.parent() {
+        Some(project) if dir.ends_with(".formwork") => project.to_path_buf(),
+        _ => dir,
+    };
+    let probe = root.join(".formwork-split-probe");
     if blueprint.fs.writes.iter().any(|w| w.matches_path(&probe)) {
         tracing::info!(
-            dir = %dir.display(),
+            dir = %root.display(),
             "the blueprint is write-protected inside a writable grant, which splits {} on Linux: \
              files that exist stay writable, but new files cannot be created directly in it. \
-             Move the blueprint to {} to keep the root whole",
-            dir.display(),
-            blueprint_load::DOTDIR_BLUEPRINT
+             Create new files in a subdirectory, or keep the blueprint outside the grant and pass \
+             it with --blueprint",
+            root.display()
         );
     }
 }
@@ -1509,11 +1675,12 @@ fn spawn_confined_child(
         .blueprint
         .channels
         .lifted(formwork_blueprint::Channel::OpenUrl);
+    let mut opener_started = Ok(());
     if let Some(opener) = &mut session.opener {
         // The session holds the only copies now; EOF arrives when its last process exits.
         opener.session_end = None;
         if child.is_ok() {
-            start_opener(opener, lifted);
+            opener_started = start_opener(opener, lifted);
         }
     }
     let mut child = match child {
@@ -1523,6 +1690,12 @@ fn spawn_confined_child(
             return Err(e).context("spawning confined command");
         }
     };
+    if let Err(e) = opener_started {
+        let _ = child.kill();
+        let _ = child.wait();
+        session.tmp_dir.remove();
+        formwork_failure(&format!("the open-url service failed to start: {e}"));
+    }
     #[cfg(target_os = "linux")]
     if let Some(pending) = pending {
         let Some(egress) = &session.egress else {
@@ -1548,7 +1721,8 @@ fn spawn_confined_child(
     }
     let status = child.wait();
     session.tmp_dir.remove();
-    let status = status.context("waiting for the confined command")?;
+    let status = status
+        .unwrap_or_else(|e| formwork_failure(&format!("waiting for the confined command: {e}")));
     log_exit("confined command exited", &status);
     if let Some(egress) = &session.egress {
         if !egress.proxy.is_alive() {

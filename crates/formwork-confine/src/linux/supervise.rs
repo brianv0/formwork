@@ -644,7 +644,16 @@ fn connect_gateway(
     };
     match connect_inet(fd, target) {
         Ok(()) => Reply::Value(0),
-        Err(e) => Reply::Errno(e),
+        Err(e) => {
+            // A definite failure means no connection will arrive from this port, so it must not
+            // stay admissible. A non-blocking connect still in progress will arrive.
+            if !matches!(e, libc::EINPROGRESS | libc::EALREADY | libc::EINTR) {
+                if let Ok(mut r) = config.registry.lock() {
+                    r.remove(&port);
+                }
+            }
+            Reply::Errno(e)
+        }
     }
 }
 

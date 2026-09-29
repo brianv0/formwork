@@ -73,6 +73,9 @@ pub fn explanation(e: &Explanation) -> String {
     if let Some(note) = &e.host_note {
         out.push_str(&format!("  on this host: {note}\n"));
     }
+    if let Some(connect) = &e.connect {
+        out.push_str(&format!("  connect: {connect}\n"));
+    }
     out
 }
 
@@ -84,23 +87,27 @@ pub fn egress_explanation(e: &crate::EgressExplanation) -> String {
         out.push_str(&format!("  rule: {rule} ({origin})\n"));
     }
     for m in &e.methods {
+        let by = match (&m.rule, &m.source) {
+            (Some(rule), Some(origin)) => format!(" by {rule} ({})", source(origin)),
+            (Some(rule), None) => format!(" by {rule}"),
+            _ => String::new(),
+        };
         out.push_str(&format!(
-            "  {:7} {}{}\n",
+            "  {:7} {}{by}\n",
             m.method,
             if m.admitted { "admitted" } else { "refused" },
-            m.rule
-                .as_ref()
-                .map(|r| format!(" by {r}"))
-                .unwrap_or_default()
         ));
     }
     if let Some(reason) = &e.reason {
         out.push_str(&format!("  {reason}\n"));
     }
+    if let Some(note) = &e.note {
+        out.push_str(&format!("  note: {note}\n"));
+    }
     out
 }
 
-/// The resolved host table (`explain --net`), one rule per line.
+/// The resolved host table (`explain --hosts`), one rule per line.
 pub fn net_table(net: &formwork_blueprint::NetPosture, rules: &[serde_json::Value]) -> String {
     use formwork_blueprint::NetPosture;
     let mut out = String::new();
@@ -115,8 +122,17 @@ pub fn net_table(net: &formwork_blueprint::NetPosture, rules: &[serde_json::Valu
     }
     for r in rules {
         let origin = r["layer"].as_str().unwrap_or("?");
+        let broker = r["broker"]
+            .as_str()
+            .map(|b| format!(" broker {b}"))
+            .unwrap_or_default();
+        let cleartext = if r["cleartext"].as_bool() == Some(true) {
+            " cleartext"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "  {:40} {:9} methods {:14} paths {:20} ({origin})\n",
+            "  {:40} {:9} methods {:14} paths {:20}{broker}{cleartext} ({origin})\n",
             r["rule"].as_str().unwrap_or(""),
             r["grade"].as_str().unwrap_or(""),
             r["methods"].as_str().unwrap_or(""),
@@ -311,6 +327,7 @@ mod tests {
             write: Verdict::Hidden,
             exec: Verdict::Ambient,
             host_note: None,
+            connect: None,
         };
         let text = explanation(&e);
         assert!(

@@ -135,8 +135,9 @@ pub enum CanonicalHost {
 }
 
 impl CanonicalHost {
-    /// A metadata hostname or a restricted address (FW-EGR4): reachable only when a rule names it
-    /// exactly, and never proposed by `learn`.
+    /// A metadata hostname or a restricted address (FW-EGR4), never proposed by `learn`. A
+    /// restricted address is reachable only when a rule names that IP literal; a name that resolves
+    /// into a restricted range is refused even when a rule names it.
     pub fn is_restricted(&self) -> bool {
         match self {
             CanonicalHost::Ip(ip) => is_restricted_ip(*ip),

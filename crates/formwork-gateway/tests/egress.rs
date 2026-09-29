@@ -32,7 +32,13 @@ impl Fixture {
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let request = String::from_utf8_lossy(&buf[..n]).into_owned();
                     let first = request.lines().next().unwrap_or("").to_string();
-                    let body = format!("fixture:{name} {first}");
+                    // A second request line in the same read means one was pipelined through.
+                    let extra = if request.matches(" HTTP/1.1\r\n").count() > 1 {
+                        " +pipelined"
+                    } else {
+                        ""
+                    };
+                    let body = format!("fixture:{name} {first}{extra}");
                     let _ = write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -349,4 +355,15 @@ fn plain_http_inspected_rules_decide_method_and_canonical_path() {
         "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n",
     );
     assert!(smuggle.starts_with("HTTP/1.1 403"), "{smuggle}");
+    // The upstream receives the path that was decided, with its query, not the raw spelling.
+    let dotted = req("GET", "/secret/%2e%2e/ok/x?q=1", "");
+    assert!(dotted.contains("fixture:api GET /ok/x?q=1 "), "{dotted}");
+    // A request pipelined behind an admitted one was never decided, so it never leaves.
+    let pipelined = req(
+        "GET",
+        "/ok/x",
+        &format!("Content-Length: 0\r\n\r\nPOST /secret HTTP/1.1\r\nHost: api.test:{p}\r\n"),
+    );
+    assert!(pipelined.contains("fixture:api GET /ok/x "), "{pipelined}");
+    assert!(!pipelined.contains("+pipelined"), "{pipelined}");
 }

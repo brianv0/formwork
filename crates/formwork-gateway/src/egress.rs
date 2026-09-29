@@ -29,7 +29,7 @@ use formwork_blueprint::{
 };
 
 use crate::inspect::{
-    basic_value, render_request, request_framing, Broker, Buffered, Inspection, Scrubber,
+    basic_value, render_request, request_framing, Broker, Buffered, Framing, Inspection, Scrubber,
 };
 use crate::GatewayError;
 
@@ -124,6 +124,9 @@ impl EgressProxy {
         let addr = std_listener.local_addr()?;
         let violations = Arc::new(Mutex::new(VecDeque::new()));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        // The listener is up only once its runtime is: report a failure here, before the workload
+        // is spawned, rather than after it exits (FW-XR11).
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
         let credential = config.admission.credential.clone();
         let shared = Arc::new(Shared {
             expected_auth: basic_value("fw", &credential),
@@ -141,7 +144,7 @@ impl EgressProxy {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        tracing::error!(error = %e, "formwork: egress listener runtime failed to start");
+                        let _ = ready_tx.send(Err(e));
                         return;
                     }
                 };
@@ -149,16 +152,22 @@ impl EgressProxy {
                     let listener = match TcpListener::from_std(std_listener) {
                         Ok(l) => l,
                         Err(e) => {
-                            tracing::error!(error = %e, "formwork: egress listener failed");
+                            let _ = ready_tx.send(Err(e));
                             return;
                         }
                     };
+                    let _ = ready_tx.send(Ok(()));
                     tokio::select! {
                         _ = rx => {}
                         _ = accept_loop(listener, shared) => {}
                     }
                 });
             })?;
+        ready_rx.recv().unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "the egress listener thread exited before starting",
+            ))
+        })?;
         tracing::info!(listener = %addr, "gateway egress listener started (FW-EGR14)");
         Ok(EgressProxy {
             addr,
@@ -274,8 +283,12 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         };
         if let Some(registry) = &shared.config.admission.registry {
             // FW-EGR9: only connections the supervisor performed (and registered) are admitted;
-            // a co-resident process that found the port is dropped before a byte is read.
-            let registered = registry.lock().is_ok_and(|mut r| r.remove(&peer.port()));
+            // a co-resident process that found the port is dropped before a byte is read. The
+            // supervisor connects from 127.0.0.1, so a registered port seen from any other loopback
+            // address (a process that bound 127.0.0.2 with the same port) is not the session's.
+            let from_supervisor = peer.ip().to_canonical() == std::net::Ipv4Addr::LOCALHOST;
+            let registered =
+                from_supervisor && registry.lock().is_ok_and(|mut r| r.remove(&peer.port()));
             if !registered {
                 shared.refuse(
                     "unregistered-connection",
@@ -623,7 +636,7 @@ async fn serve_plain(
         .starts_with("http://")
         .then(|| split_url(&head.target).ok())
         .flatten();
-    let Some((raw_host, port, raw_path)) = parsed else {
+    let Some((raw_host, port, raw_target)) = parsed else {
         shared.refuse(
             "request",
             &head.target,
@@ -646,12 +659,17 @@ async fn serve_plain(
             return respond(&mut stream, "403 Forbidden", "").await;
         }
     };
+    // The rule's path glob matches the path without its query (FEP-5 §4).
+    let (raw_path, query) = match raw_target.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (raw_target, None),
+    };
     let path = match canonicalize_request_path(raw_path) {
         Ok(p) => p,
         Err(reason) => {
             shared.refuse(
                 "request",
-                &format!("{host}{raw_path}"),
+                &format!("{host}{raw_target}"),
                 &reason,
                 None,
                 EXPLAIN_HOSTS.into(),
@@ -659,16 +677,19 @@ async fn serve_plain(
             return respond(&mut stream, "403 Forbidden", "").await;
         }
     };
-    if let Err(reason) = request_framing(&head) {
-        shared.refuse(
-            "request",
-            &format!("{host}{path}"),
-            &format!("request smuggling shape: {reason} (FW-EGR11)"),
-            None,
-            EXPLAIN_HOSTS.into(),
-        );
-        return respond(&mut stream, "403 Forbidden", "").await;
-    }
+    let framing = match request_framing(&head) {
+        Ok(f) => f,
+        Err(reason) => {
+            shared.refuse(
+                "request",
+                &format!("{host}{path}"),
+                &format!("request smuggling shape: {reason} (FW-EGR11)"),
+                None,
+                EXPLAIN_HOSTS.into(),
+            );
+            return respond(&mut stream, "403 Forbidden", "").await;
+        }
+    };
     let hint = explain_hint("http", &host, port, &path);
     // A brokered credential is never presented over plain HTTP, and its placeholder never leaves
     // unencrypted (FW-CRED11).
@@ -731,13 +752,23 @@ async fn serve_plain(
         .cloned()
         .collect();
     headers.push(("Connection".into(), "close".into()));
+    // Forward what was decided: the canonical path, and exactly the framed body. Anything the
+    // client pipelined after it was never decided, so it is dropped with the connection.
+    let target = match query {
+        Some(q) => format!("{path}?{q}"),
+        None => path,
+    };
     upstream
-        .write_all(&render_request(&head, raw_path, &headers))
+        .write_all(&render_request(&head, &target, &headers))
         .await?;
-    if !leftover.is_empty() {
-        upstream.write_all(&leftover).await?;
+    let mut client = Buffered::new(stream, leftover);
+    let mut none = Scrubber::new(Arc::new([]));
+    match framing {
+        Framing::Length(n) => client.copy_exact(n, &mut upstream, &mut none).await?,
+        Framing::Chunked => client.copy_chunked(&mut upstream, &mut none).await?,
+        Framing::None | Framing::UntilClose => {}
     }
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+    let _ = tokio::io::copy(&mut upstream, &mut client.s).await;
     Ok(())
 }
 

@@ -17,9 +17,9 @@ use formwork_blueprint::{
 pub const DEFAULT_BLUEPRINT_NAME: &str = "FORMWORK.toml";
 
 /// The second discovery location (FEP-5 D3): a blueprint inside `.formwork/`, so the file and its
-/// derived proposal/discovered layers sit in one directory. Write-protecting them then protects
-/// one directory instead of splitting the project root, where Landlock would lose the right to
-/// create files directly in the root.
+/// derived proposal/discovered layers sit in one directory. On Linux the project root is still
+/// split around the protected files (Landlock cannot deny a path beneath a whole-directory grant);
+/// on macOS the deny carves them out and the root stays whole.
 pub const DOTDIR_BLUEPRINT: &str = ".formwork/blueprint.toml";
 
 /// Profiles compiled into the binary, addressable as `extends = ["builtin:<name>"]` -- so a
@@ -27,6 +27,45 @@ pub const DOTDIR_BLUEPRINT: &str = ".formwork/blueprint.toml";
 /// has no `profiles/` directory to point at).
 const BUILTIN_PROFILES: &[(&str, &str)] =
     &[("default", include_str!("../../../profiles/default.toml"))];
+
+/// A blueprint named by a descriptor (`/dev/fd/N`, `/proc/self/fd/N`): an embedder's generated
+/// blueprint, possibly a pipe that reads once (FEP-5 §3.5). It is never a discovery input and has
+/// no directory for derived files.
+pub fn descriptor(path: &Path) -> Option<u32> {
+    let s = path.to_str()?;
+    s.strip_prefix("/dev/fd/")
+        .or_else(|| s.strip_prefix("/proc/self/fd/"))?
+        .parse()
+        .ok()
+}
+
+/// How a blueprint path is disclosed (FW-FID7): `fd:N` for a descriptor, else the path.
+pub fn describe(path: &Path) -> String {
+    match descriptor(path) {
+        Some(n) => format!("fd:{n}"),
+        None => path.display().to_string(),
+    }
+}
+
+/// A blueprint's text. A descriptor is read once and remembered, so every later load in this
+/// invocation sees the text a pipe gave the first time.
+fn read_blueprint(path: &Path) -> Result<String> {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    static READ: Mutex<BTreeMap<PathBuf, String>> = Mutex::new(BTreeMap::new());
+    if descriptor(path).is_none() {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("reading blueprint {}", path.display()));
+    }
+    let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(text) = read.get(path) {
+        return Ok(text.clone());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading blueprint {}", describe(path)))?;
+    read.insert(path.to_path_buf(), text.clone());
+    Ok(text)
+}
 
 /// How the blueprint path was chosen. Auto-discovery must never be silent (a policy the user
 /// never named still governs the session), so the source travels with the path into logs and
@@ -62,7 +101,7 @@ pub fn resolve_blueprint(
     home: &str,
 ) -> Result<Option<ResolvedBlueprint>> {
     if let Some(path) = flag {
-        tracing::info!(blueprint = %path.display(), source = "flag", "blueprint resolved");
+        tracing::info!(blueprint = %describe(path), source = "flag", "blueprint resolved");
         return Ok(Some(ResolvedBlueprint {
             path: path.to_path_buf(),
             source: BlueprintSource::Flag,
@@ -316,7 +355,7 @@ fn load_layers(
     // (FW-DISC4/6). It loads above the file (learned refinements) and below CLI overrides, and
     // only with valid provenance -- a grant nobody can attribute is refused loud.
     let discovered = crate::learn::discovered_path(path);
-    if discovered.exists() {
+    if descriptor(path).is_none() && discovered.exists() {
         let layer = parse_discovered_layer(&discovered, sigils)?;
         tracing::info!(
             file = %discovered.display(),
@@ -349,8 +388,13 @@ fn resolve_file(
     visiting: &mut Vec<PathBuf>,
     out: &mut Vec<(RuleSource, BlueprintLayer)>,
 ) -> Result<()> {
-    let canon = std::fs::canonicalize(path)
-        .with_context(|| format!("resolving blueprint {}", path.display()))?;
+    // A descriptor has no real path to canonicalize; its `extends` resolve against the launch
+    // directory.
+    let canon = match descriptor(path) {
+        Some(_) => path.to_path_buf(),
+        None => std::fs::canonicalize(path)
+            .with_context(|| format!("resolving blueprint {}", path.display()))?,
+    };
     if let Some(start) = visiting.iter().position(|p| p == &canon) {
         let cycle: Vec<String> = visiting[start..]
             .iter()
@@ -359,15 +403,17 @@ fn resolve_file(
             .collect();
         bail!("blueprint `extends` cycle: {}", cycle.join(" -> "));
     }
-    let text = std::fs::read_to_string(&canon)
-        .with_context(|| format!("reading blueprint {}", canon.display()))?;
+    let text = read_blueprint(&canon)?;
     let mut value: toml::Value =
-        toml::from_str(&text).with_context(|| format!("parsing blueprint {}", canon.display()))?;
+        toml::from_str(&text).with_context(|| format!("parsing blueprint {}", describe(&canon)))?;
     sigils.expand_value(&mut value);
     let layer: BlueprintLayer = value
         .try_into()
-        .with_context(|| format!("interpreting blueprint {}", canon.display()))?;
-    let base_dir = canon.parent().map(Path::to_path_buf).unwrap_or_default();
+        .with_context(|| format!("interpreting blueprint {}", describe(&canon)))?;
+    let base_dir = match descriptor(&canon) {
+        Some(_) => std::env::current_dir().context("resolving the launch directory")?,
+        None => canon.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
 
     visiting.push(canon);
     resolve_layer(layer, source, &base_dir, sigils, visiting, out)?;
@@ -751,6 +797,10 @@ fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer
 /// editing the files this run was built from (FW-XR8 / FW-INV8). Readable stays fine (FW-TRA7
 /// semantics); only writes are denied.
 pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -> Result<()> {
+    // A descriptor's blueprint is no file in the tree, and it has no derived files.
+    if descriptor(blueprint_path).is_some() {
+        return Ok(());
+    }
     let cwd = std::env::current_dir().context("resolving cwd to protect policy inputs")?;
     let absolute = |p: &Path| -> PathBuf {
         if p.is_absolute() {

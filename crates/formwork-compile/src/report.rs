@@ -108,6 +108,13 @@ impl Fidelity {
     pub fn is_enforced(&self) -> bool {
         matches!(self, Fidelity::Enforced { .. })
     }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Fidelity::Enforced { .. } => None,
+            Fidelity::Partial { reason, .. } | Fidelity::Unenforceable { reason } => Some(reason),
+        }
+    }
 }
 
 /// Whether the host facility behind a channel exists on this host (FW-FID10), from `detect`.

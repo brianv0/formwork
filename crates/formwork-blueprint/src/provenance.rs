@@ -109,6 +109,7 @@ pub enum Verdict {
 
 /// The read, write, and exec verdicts for a path.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Explanation {
     pub path: String,
     pub read: Verdict,
@@ -118,6 +119,10 @@ pub struct Explanation {
     /// the backend cannot install is withheld, so the verdict is the blueprint's, not the kernel's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_note: Option<String>,
+    /// For a socket under supervised connect: whether the supervisor admits a `connect()` to it
+    /// (FW-ISO12, FW-FID11).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect: Option<String>,
 }
 
 impl Provenance {
@@ -198,6 +203,7 @@ impl Provenance {
             write,
             exec,
             host_note: None,
+            connect: None,
         }
     }
 

@@ -156,7 +156,7 @@ impl<S: AsyncRead + Unpin> Buffered<S> {
     }
 
     /// Copy exactly `n` body bytes to `out`, through the scrubber.
-    async fn copy_exact<W: AsyncWrite + Unpin>(
+    pub(crate) async fn copy_exact<W: AsyncWrite + Unpin>(
         &mut self,
         mut n: u64,
         out: &mut W,
@@ -176,7 +176,7 @@ impl<S: AsyncRead + Unpin> Buffered<S> {
     }
 
     /// Relay a chunked body, re-framed (the scrubber may hold bytes back across chunk edges).
-    async fn copy_chunked<W: AsyncWrite + Unpin>(
+    pub(crate) async fn copy_chunked<W: AsyncWrite + Unpin>(
         &mut self,
         out: &mut W,
         scrub: &mut Scrubber,
@@ -257,13 +257,21 @@ impl Scrubber {
         }
     }
 
-    /// The secrets a session's scrubbers mask: every brokered secret that is not empty.
+    /// The secrets a session's scrubbers mask: every non-empty brokered secret, and the encoded
+    /// credential of each `Basic` binding, which is what an echoing host would send back.
     pub(crate) fn secrets_of(brokers: &[Broker]) -> Arc<[Vec<u8>]> {
-        brokers
-            .iter()
-            .map(|b| b.secret.clone().into_bytes())
-            .filter(|s| !s.is_empty())
-            .collect()
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for b in brokers.iter().filter(|b| !b.secret.is_empty()) {
+            out.push(b.secret.clone().into_bytes());
+            for (_, scheme) in &b.bindings {
+                if let BrokerScheme::Basic { user } = scheme {
+                    out.push(BASE64.encode(format!("{user}:{}", b.secret)).into_bytes());
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out.into()
     }
 
     fn mask(&self, data: &mut [u8]) {
@@ -315,12 +323,23 @@ fn host_header_matches(value: &str, host: &CanonicalHost, port: u16) -> bool {
 
 /// Present brokered credentials for a request to `host` (FW-CRED11): substitute the placeholder in
 /// the scheme's header, add the header when the request carries no credential, and refuse a request
-/// that carries a placeholder toward a host it is not bound to.
+/// that carries a placeholder toward a host it is not bound to. A bound host is asked for an
+/// uncompressed response, so the scrubber can see a secret it echoes (FW-INV13).
 fn present(
     headers: &mut Vec<(String, String)>,
     host: &CanonicalHost,
     brokers: &[Broker],
 ) -> Result<(), String> {
+    if brokers
+        .iter()
+        .any(|b| b.bindings.iter().any(|(h, _)| h == host))
+    {
+        headers.retain(|(n, _)| {
+            !n.eq_ignore_ascii_case("accept-encoding")
+                && !n.eq_ignore_ascii_case("sec-websocket-extensions")
+        });
+        headers.push(("Accept-Encoding".into(), "identity".into()));
+    }
     for b in brokers {
         let binding = b.bindings.iter().find(|(h, _)| h == host);
         let carries = headers.iter().any(|(_, v)| v.contains(&b.placeholder))
@@ -524,13 +543,34 @@ pub(crate) async fn serve_inspected(
         Ok(t) => t,
         Err(e) => {
             if rejected_our_ca(&e) {
-                // FW-FID9: the one line that turns an opaque x509 error into a diagnosis.
+                // FW-FID9: the one line that turns an opaque x509 error into a diagnosis, naming
+                // the rule that made the host inspected. A brokered host cannot drop to the tunnel
+                // grade while the broker entry stands (FW-CRED12), so the option names both.
+                let rule = shared
+                    .config
+                    .table
+                    .rules
+                    .iter()
+                    .find(|r| r.is_inspected() && r.host.matches(&host) && r.port_matches(port))
+                    .map_or_else(|| "an inspected rule".to_string(), |r| format!("`{r}`"));
+                let tunnel = match shared
+                    .config
+                    .brokers
+                    .iter()
+                    .find(|b| b.bindings.iter().any(|(h, _)| *h == host))
+                {
+                    Some(b) => format!(
+                        "replace {rule} with `https:{host}` and drop `broker:{}`",
+                        b.name
+                    ),
+                    None => format!("replace {rule} with `https:{host}`"),
+                };
                 tracing::warn!(
                     host = %host,
-                    "formwork: a client rejected the session CA for inspected host {host}: it does \
-                     not read SSL_CERT_FILE (on macOS, Security.framework clients such as Go and \
-                     Swift never do). Options: make the host tunnel-grade (`https:{host}`), or use \
-                     a client that honors the variable; reproduce: formwork explain https://{host}"
+                    "formwork: a client rejected the session CA for {host}, inspected by {rule}: \
+                     it does not read SSL_CERT_FILE (on macOS, Security.framework clients such as \
+                     Go and Swift never do). Options: {tunnel}, or use a client that honors the \
+                     variable; reproduce: formwork explain https://{host}"
                 );
             } else {
                 tracing::debug!(error = %e, host = %host, "inspection handshake failed");
@@ -871,9 +911,23 @@ mod tests {
         )];
         present(&mut h, &gh, &brokers).unwrap();
         assert_eq!(h[0].1, "Bearer ghp_REAL");
-        let mut none = vec![];
+        let header = |h: &[(String, String)], name: &str| {
+            h.iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        let mut none = vec![("Accept-Encoding".to_string(), "gzip, br".to_string())];
         present(&mut none, &gh, &brokers).unwrap();
-        assert_eq!(none[0].1, "Bearer ghp_REAL", "added when absent");
+        assert_eq!(
+            header(&none, "authorization").as_deref(),
+            Some("Bearer ghp_REAL"),
+            "added when absent"
+        );
+        assert_eq!(
+            header(&none, "accept-encoding").as_deref(),
+            Some("identity"),
+            "a bound host answers uncompressed, so the scrubber sees an echo"
+        );
         let mut leak = vec![("X-Token".to_string(), "fwcred-github-abc".to_string())];
         assert!(present(&mut leak, &other, &brokers).is_err());
         let basic = vec![Broker {
@@ -887,10 +941,14 @@ mod tests {
         }];
         let mut git = vec![];
         present(&mut git, &gh, &basic).unwrap();
+        let encoded = BASE64.encode(b"x-access-token:ghp_REAL");
         assert_eq!(
-            git[0].1,
-            format!("Basic {}", BASE64.encode(b"x-access-token:ghp_REAL"))
+            header(&git, "authorization"),
+            Some(format!("Basic {encoded}"))
         );
+        // The encoded form is masked too.
+        let scrub = Scrubber::new(Scrubber::secrets_of(&basic));
+        assert!(!String::from_utf8_lossy(&scrub.mask_whole(encoded.as_bytes())).contains(&encoded));
     }
 
     #[test]
