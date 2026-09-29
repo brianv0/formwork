@@ -459,6 +459,9 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
             .split_once(':')
             .ok_or_else(|| anyhow!("rule {raw:?} is not \"<verb>:<target>\""))?;
         let target = target.trim();
+        // Verbs are case-insensitive, so Omnigent's `GET,POST host/path` translates by moving the
+        // space to a colon (FEP-5 §4).
+        let verb = verb.to_ascii_lowercase();
         let atoms: Vec<&str> = verb.split(',').map(str::trim).collect();
         // The verb decides the axis (FW-BP15); `deny` belongs to both, and the target's shape --
         // a path or a host -- decides it there (FW-BP13).
@@ -467,14 +470,14 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
             .all(|a| formwork_blueprint::HTTP_ATOMS.contains(a));
         let host_deny = atoms == ["deny"] && formwork_blueprint::target_is_host(target);
         if http || host_deny {
-            let rule = formwork_blueprint::HostRule::parse(verb, target)
+            let rule = formwork_blueprint::HostRule::parse(&verb, target)
                 .map_err(|e| anyhow!("rule {raw:?}: {e}"))?;
             layer.hosts.push(rule);
             continue;
         }
+        let fs = fs_atoms(&atoms).map_err(|e| anyhow!("rule {raw:?}: {e}"))?;
         let pat =
             PathPattern::parse(&sigils.expand(target)).with_context(|| format!("rule {raw:?}"))?;
-        let fs = fs_atoms(&atoms).map_err(|e| anyhow!("rule {raw:?}: {e}"))?;
         if fs.deny {
             layer.fs.subtract.push(pat);
             continue;
@@ -543,19 +546,15 @@ fn fs_atoms(atoms: &[&str]) -> std::result::Result<FsAtoms, String> {
 /// FW-BP13/FW-EGR1: a port tier and host rules reach the network by different doors, so both in
 /// one blueprint is refused; FW-BP14: one host, one grade. Every conflict is named.
 fn validate_net(layers: &[(RuleSource, BlueprintLayer)], merged: &Blueprint) -> Result<()> {
-    let Some(table) = merged.net.host_table() else {
+    let Some(first) = layers.iter().flat_map(|(_, l)| &l.hosts).next() else {
         return Ok(());
     };
-    if let Some((source, _)) = layers
+    // The posture the host rules replace is the one the last `net`-setting layer chose.
+    let effective = layers
         .iter()
         .rev()
-        .find(|(_, l)| matches!(l.net, Some(formwork_blueprint::NetPosture::Ports(_))))
-    {
-        let first = table
-            .rules
-            .first()
-            .map(|r| r.to_string())
-            .unwrap_or_default();
+        .find_map(|(source, l)| l.net.as_ref().map(|net| (source, net)));
+    if let Some((source, formwork_blueprint::NetPosture::Ports(_))) = effective {
         bail!(
             "host rules (e.g. `{first}`) and a direct port tier (`net = {{ ports = [...] }}` in \
              {}) cannot both apply: host rules route all egress through the Gateway, and the port \
@@ -563,6 +562,9 @@ fn validate_net(layers: &[(RuleSource, BlueprintLayer)], merged: &Blueprint) -> 
             describe_source(source)
         );
     }
+    let Some(table) = merged.net.host_table() else {
+        return Ok(());
+    };
     if let Err(errors) = formwork_blueprint::validate_host_rules(&table.rules) {
         bail!("host rules conflict:\n  {}", errors.join("\n  "));
     }
@@ -996,6 +998,42 @@ mod tests {
         .unwrap();
         let bp = load(&dir.path().join("ok.toml"), "/home/x").unwrap();
         assert_eq!(bp.net.host_table().unwrap().rules.len(), 2);
+        // A port tier a later layer overrides is not the posture the host rules replace.
+        std::fs::write(dir.path().join("ports.toml"), "net = { ports = [443] }\n").unwrap();
+        std::fs::write(
+            dir.path().join("leaf.toml"),
+            "extends = [\"ports.toml\"]\nnet = \"deny\"\nrules = [\"https:a.test\"]\n",
+        )
+        .unwrap();
+        let bp = load(&dir.path().join("leaf.toml"), "/home/x").unwrap();
+        assert!(bp.net.host_table().is_some());
+    }
+
+    #[test]
+    fn verbs_are_case_insensitive_and_unknown_verbs_are_named() {
+        let dir = Scratch::new("verbs");
+        std::fs::write(
+            dir.path().join("upper.toml"),
+            "rules = [\"GET,POST:a.test/x\"]\n",
+        )
+        .unwrap();
+        let bp = load(&dir.path().join("upper.toml"), "/home/x").unwrap();
+        assert_eq!(
+            bp.net.host_table().unwrap().rules[0].to_string(),
+            "get,post:a.test/x"
+        );
+        for bad in ["fetch:a.test", "write,https:a.test"] {
+            std::fs::write(
+                dir.path().join("bad.toml"),
+                format!("rules = [\"{bad}\"]\n"),
+            )
+            .unwrap();
+            let msg = format!(
+                "{:#}",
+                load(&dir.path().join("bad.toml"), "/home/x").unwrap_err()
+            );
+            assert!(msg.contains("unknown rule verb"), "{bad}: {msg}");
+        }
     }
 
     #[test]

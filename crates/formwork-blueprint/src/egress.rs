@@ -366,24 +366,28 @@ pub struct HostRule {
     pub access: HostAccess,
 }
 
-/// The HTTP-axis verb atoms (FW-BP15): every [`HttpMethod::atom`], then `any` and `https`.
+/// The HTTP-axis verb atoms (FW-BP13): every [`HttpMethod::atom`], then `any` and `https`.
 pub const HTTP_ATOMS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "head", "options", "any", "https",
 ];
 
-/// Whether a rule target reads as a host rather than a path: paths start with `/`, `~`, `$CWD` or
-/// `**` (FW-BP5 sigils included).
+/// Whether a `deny:` target reads as a host rather than a path: paths start with `/`, `~`, `$CWD`
+/// or `**` (FW-BP5 sigils included), and a host names a dotted name, a bracketed IPv6 literal or
+/// `localhost`, so a relative-path typo such as `deny:node_modules` is a path error, never a host.
 pub fn target_is_host(target: &str) -> bool {
-    !(target.starts_with('/')
-        || target.starts_with('~')
-        || target.starts_with("$CWD")
-        || target.starts_with("**"))
+    if target.starts_with(['/', '~']) || target.starts_with("$CWD") || target.starts_with("**") {
+        return false;
+    }
+    let authority = target.split('/').next().unwrap_or_default();
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    authority.starts_with('[') || host.contains('.') || host == "localhost"
 }
 
 impl HostRule {
     /// Parse `<atoms>:<target>` where the atoms are HTTP atoms or `deny` and the target is
     /// `host[:port][/glob]` (FW-BP13). `atoms` is the part before the first `:`.
     pub fn parse(atoms: &str, target: &str) -> Result<HostRule, String> {
+        let atoms = atoms.to_ascii_lowercase();
         let atoms: Vec<&str> = atoms.split(',').map(str::trim).collect();
         let (host, port, path) = parse_target(target)?;
         if atoms == ["deny"] {
@@ -435,6 +439,10 @@ impl HostRule {
                 path: path.unwrap_or_else(PathGlob::any),
             },
         })
+    }
+
+    pub fn is_deny(&self) -> bool {
+        matches!(self.access, HostAccess::Deny { .. })
     }
 
     pub fn is_inspected(&self) -> bool {
@@ -592,10 +600,18 @@ pub fn validate_host_rules(rules: &[HostRule]) -> Result<(), Vec<String>> {
             }
         }
         if let HostAccess::Deny { path: Some(_) } = &a.access {
-            let covered = rules
+            let near = |r: &&HostRule| r.host.overlaps(&a.host) && r.same_port(a);
+            if let Some(tunnel) = rules
                 .iter()
-                .any(|r| r.is_inspected() && r.host.overlaps(&a.host) && r.same_port(a));
-            if !covered {
+                .filter(near)
+                .find(|r| r.access == HostAccess::Tunnel)
+            {
+                errors.push(format!(
+                    "`{a}` denies a path on hosts `{tunnel}` tunnels, so the Gateway cannot see the \
+                     path there; inspect those hosts instead (e.g. `any:{}`) or deny the host",
+                    tunnel.host
+                ));
+            } else if !rules.iter().filter(near).any(HostRule::is_inspected) {
                 errors.push(format!(
                     "`{a}` denies a path on a host that is not inspected, so the Gateway cannot see \
                      the path; add an inspected rule for the host (e.g. `any:{}`) or deny the host",
@@ -914,6 +930,46 @@ mod tests {
         assert!(validate_host_rules(&[rule("https:a.test"), rule("get:b.test")]).is_ok());
         // Same host on different ports are different endpoints.
         assert!(validate_host_rules(&[rule("https:a.test"), rule("get:a.test:8443")]).is_ok());
+        // A wildcard path deny reaching a tunnelled host is refused even when another host under
+        // the wildcard is inspected: the tunnelled one would ignore it.
+        let err = validate_host_rules(&[
+            rule("https:foo.github.com"),
+            rule("any:api.github.com"),
+            rule("deny:*.github.com/admin/**"),
+        ])
+        .unwrap_err();
+        assert!(err[0].contains("https:foo.github.com"), "{err:?}");
+    }
+
+    #[test]
+    fn deny_targets_read_as_hosts_only_when_host_shaped() {
+        for host in [
+            "telemetry.example.com",
+            "*.example.com",
+            "localhost",
+            "[::1]",
+            "a.test:8443",
+        ] {
+            assert!(target_is_host(host), "{host}");
+        }
+        for path in [
+            "node_modules",
+            "build/out",
+            "/etc",
+            "~/.ssh",
+            "$CWD/x",
+            "**/.env",
+        ] {
+            assert!(!target_is_host(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn http_atoms_are_case_insensitive() {
+        assert_eq!(
+            HostRule::parse("GET,POST", "a.test/x").unwrap(),
+            rule("get,post:a.test/x")
+        );
     }
 
     #[test]

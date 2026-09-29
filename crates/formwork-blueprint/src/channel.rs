@@ -220,7 +220,7 @@ impl ChannelPolicy {
 }
 
 /// The serde surface: a keyword, a bare list (sugar for `allow`), or an `{ allow, deny }` table.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(untagged)]
 enum ChannelRepr {
     Keyword(ChannelKeyword),
@@ -228,7 +228,7 @@ enum ChannelRepr {
     Table(ChannelTable),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum ChannelKeyword {
     Deny,
@@ -262,15 +262,48 @@ impl Serialize for ChannelPolicy {
     }
 }
 
+// A hand-written visitor rather than an untagged enum, so a wrong shape or an unknown table key
+// keeps its own message instead of serde's "did not match any variant".
 impl<'de> Deserialize<'de> for ChannelPolicy {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let repr = ChannelRepr::deserialize(deserializer)?;
-        let policy = match repr {
-            ChannelRepr::Keyword(ChannelKeyword::Deny) => Ok(ChannelPolicy::default()),
-            ChannelRepr::List(names) => ChannelPolicy::parse(&names, &[]),
-            ChannelRepr::Table(t) => ChannelPolicy::parse(&t.allow, &t.deny),
-        };
-        policy.map_err(serde::de::Error::custom)
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ChannelPolicy;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(
+                    r#""deny", a list of channel names, or { allow = [...], deny = [...] }"#,
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ChannelPolicy, E> {
+                if v == "deny" {
+                    return Ok(ChannelPolicy::default());
+                }
+                Err(E::custom(format!(
+                    r#"channels = "{v}": the only keyword is "deny"; to lift a channel, list it: ["{v}"]"#
+                )))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<ChannelPolicy, A::Error> {
+                let names =
+                    Vec::<String>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
+                ChannelPolicy::parse(&names, &[]).map_err(serde::de::Error::custom)
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<ChannelPolicy, A::Error> {
+                let t =
+                    ChannelTable::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                ChannelPolicy::parse(&t.allow, &t.deny).map_err(serde::de::Error::custom)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -319,6 +352,16 @@ mod tests {
         let p = parse(r#"{ allow = ["desktop"], deny = ["screen"] }"#).unwrap();
         assert!(p.lifted(Channel::Clipboard));
         assert!(!p.lifted(Channel::Screen));
+    }
+
+    #[test]
+    fn wrong_shapes_keep_their_own_message() {
+        let bare = parse(r#""clipboard""#).unwrap_err().to_string();
+        assert!(bare.contains(r#"["clipboard"]"#), "{bare}");
+        let typo = parse(r#"{ alow = ["clipboard"] }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(typo.contains("alow"), "{typo}");
     }
 
     #[test]

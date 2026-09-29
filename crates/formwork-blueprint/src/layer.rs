@@ -124,8 +124,17 @@ pub struct ProvenanceEntry {
 pub fn merge(layers: &[BlueprintLayer]) -> Blueprint {
     let mut out = Blueprint::empty();
     let mut hosts: Vec<crate::HostRule> = Vec::new();
-    for layer in layers {
+    // Where the last layer granting a host and the last layer writing `net = "deny"` sit: a deny
+    // downstream of every host grant narrows the session back to no network (FW-BP13).
+    let (mut last_grant, mut last_deny) = (None, None);
+    for (i, layer) in layers.iter().enumerate() {
         hosts.extend(layer.hosts.iter().cloned());
+        if layer.hosts.iter().any(|h| !h.is_deny()) {
+            last_grant = Some(i);
+        }
+        if layer.net == Some(NetPosture::Deny) {
+            last_deny = Some(i);
+        }
         if let Some(mode) = layer.fs.read_mode {
             out.fs.read_mode = mode;
         }
@@ -160,9 +169,10 @@ pub fn merge(layers: &[BlueprintLayer]) -> Blueprint {
         }
         out.isolate.extend(layer.isolate.iter().copied());
     }
-    // Any host rule is the host-allowlist posture (FW-BP13). A port tier alongside it is refused by
-    // the loader before merge ever sees it (FW-EGR1: the postures are exclusive).
-    if !hosts.is_empty() {
+    // A host grant is the host-allowlist posture (FW-BP13); `deny:` rules alone grant nothing and
+    // leave the posture as it was. A port tier alongside host rules is refused by the loader before
+    // merge ever sees it (FW-EGR1: the postures are exclusive).
+    if last_grant.is_some() && last_deny <= last_grant {
         out.net = NetPosture::AllowHosts(crate::HostTable::new(hosts));
     }
     out.canonicalize()
@@ -259,6 +269,31 @@ mod tests {
             NetPosture::Ports(vec![443])
         );
         assert_eq!(merge(&[a, b, c]).net, NetPosture::Deny);
+    }
+
+    #[test]
+    fn host_grants_set_the_posture_and_a_downstream_deny_narrows_it() {
+        let hosts = |rules: &[&str]| BlueprintLayer {
+            hosts: rules.iter().map(|r| r.parse().unwrap()).collect(),
+            ..BlueprintLayer::default()
+        };
+        let deny = layer_toml(r#"net = "deny""#);
+        let granted = merge(&[hosts(&["https:a.test"])]);
+        assert!(granted.net.host_table().is_some());
+        // `deny:` rules alone grant nothing, so they leave the posture where it was.
+        assert_eq!(
+            merge(&[hosts(&["deny:telemetry.example.com"])]).net,
+            NetPosture::Deny
+        );
+        // `net = "deny"` downstream of every host grant wins; upstream, the grants do.
+        assert_eq!(
+            merge(&[hosts(&["https:a.test"]), deny.clone()]).net,
+            NetPosture::Deny
+        );
+        assert!(merge(&[deny, hosts(&["https:a.test"])])
+            .net
+            .host_table()
+            .is_some());
     }
 
     #[test]

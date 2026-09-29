@@ -130,18 +130,31 @@ impl Serialize for CredentialEntry {
     }
 }
 
+// A hand-written visitor rather than an untagged enum, so an inline binding's own error (an
+// unknown scheme, a missing field) reaches the operator instead of "did not match any variant".
 impl<'de> Deserialize<'de> for CredentialEntry {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Name(String),
-            Inline(InlineBinding),
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = CredentialEntry;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a Catalog type, `broker:<type>`, or { name, env, hosts, scheme }")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<CredentialEntry, E> {
+                Ok(CredentialEntry::parse(v))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<CredentialEntry, A::Error> {
+                InlineBinding::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(CredentialEntry::Inline)
+            }
         }
-        Ok(match Repr::deserialize(deserializer)? {
-            Repr::Name(s) => CredentialEntry::parse(&s),
-            Repr::Inline(b) => CredentialEntry::Inline(b),
-        })
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -220,6 +233,13 @@ mod tests {
             }
         );
         assert!(BrokerScheme::parse("digest").is_err());
+        // The scheme's own message survives the entry's parse.
+        let err = toml::from_str::<std::collections::BTreeMap<String, Vec<CredentialEntry>>>(
+            r#"c = [{ name = "x", env = "X", hosts = ["x.test"], scheme = "digest" }]"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown broker scheme"), "{err}");
         assert!(BrokerScheme::parse("header:").is_err());
     }
 }
