@@ -341,7 +341,9 @@ mod linux {
             session_bus: session_bus(rt),
             user_manager: in_runtime("systemd/private"),
             display,
-            keyring: in_runtime("keyring/control").or_else(|| in_runtime("keyring/ssh")),
+            // Only the control socket: `keyring/ssh` is an SSH agent, an ssh credential that
+            // lifting `os-keyring` must not admit.
+            keyring: in_runtime("keyring/control"),
             audio: in_runtime("pulse/native").or_else(|| in_runtime("pipewire-0")),
             video_device: first_device("video"),
             gui_session: false,
