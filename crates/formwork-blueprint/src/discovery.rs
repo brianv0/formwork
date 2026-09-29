@@ -103,8 +103,7 @@ pub fn reverse_compile(
         let parent = pattern
             .base()
             .parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "/".to_string());
+            .map_or_else(|| "/".to_string(), |p| p.display().to_string());
         by_parent
             .entry((parent, *access))
             .or_default()

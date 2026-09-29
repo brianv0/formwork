@@ -592,8 +592,7 @@ fn baseline_rows(
     let mut channels = BTreeMap::new();
     let fs_enforced = caps
         .get(&Capability::FsRead)
-        .map(Fidelity::is_enforced)
-        .unwrap_or(false);
+        .is_some_and(Fidelity::is_enforced);
     let facilities = &host.facilities;
     for channel in Channel::ALL {
         let presence = channel_presence(host, channel);

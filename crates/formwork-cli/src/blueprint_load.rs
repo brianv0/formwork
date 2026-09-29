@@ -121,7 +121,7 @@ fn find_default_blueprint_trusting(
         let root_file = dir.join(DEFAULT_BLUEPRINT_NAME);
         let dotdir_file = dir.join(DOTDIR_BLUEPRINT);
         // `.formwork/` is one more directory level: it must be the user's too (FW-BP8).
-        let dotdir_ok = || dotdir_file.parent().map(trusted).unwrap_or(false);
+        let dotdir_ok = || dotdir_file.parent().is_some_and(trusted);
         let candidate = match (root_file.is_file(), dotdir_file.is_file()) {
             (true, true) => bail!(
                 "both {} and {} exist; one project has one blueprint -- remove one, or pass \
@@ -168,8 +168,7 @@ fn user_controls(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path)
         // SAFETY: geteuid is a trivial always-successful syscall with no memory effects.
-        .map(|m| m.uid() == unsafe { libc::geteuid() })
-        .unwrap_or(false)
+        .is_ok_and(|m| m.uid() == unsafe { libc::geteuid() })
 }
 
 /// Load the file's layer stack (extends chain flattened, bases first) and merge, with no CLI
@@ -699,8 +698,7 @@ fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer
     for rule in &layer.rules {
         let is_host = rule
             .split_once(':')
-            .map(|(_, target)| formwork_blueprint::target_is_host(target))
-            .unwrap_or(false);
+            .is_some_and(|(_, target)| formwork_blueprint::target_is_host(target));
         if !is_host {
             bail!(
                 "discovered layer {} carries the rule {rule:?}, which is not a host rule; learned \

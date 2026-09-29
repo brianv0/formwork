@@ -56,8 +56,7 @@ fn civil_from_days(days: i64) -> (i32, u8, u8) {
 fn today() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.as_secs() / 86_400) as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| (d.as_secs() / 86_400) as i64)
 }
 
 fn window(params: &mut CertificateParams, before: i64, after: i64) {
@@ -93,7 +92,7 @@ impl SessionCa {
     }
 
     /// The CA certificate, PEM. The only part of the CA that leaves memory.
-    pub fn cert_pem(&self) -> String {
+    fn cert_pem(&self) -> String {
         self.cert.pem()
     }
 

@@ -446,9 +446,7 @@ impl Pattern {
         match self {
             Pattern::Exact(s) => s == name,
             // Validated at parse; on the impossible recompile failure, fail closed (no match).
-            Pattern::Regex(inner) => Pattern::compile(inner)
-                .map(|re| re.is_match(name))
-                .unwrap_or(false),
+            Pattern::Regex(inner) => Pattern::compile(inner).is_ok_and(|re| re.is_match(name)),
         }
     }
 
@@ -786,7 +784,7 @@ mod tests {
     #[test]
     fn empty_allowlist_admits_nothing_but_is_not_all() {
         // Explicit empty allow = "none" (distinct from an absent allow, which is "all").
-        let v = tools_vis(r#"{ allow = [] }"#);
+        let v = tools_vis(r"{ allow = [] }");
         assert!(!v.permits("echo"));
         // An empty allowlist is the same capability as `deny`; canonicalize collapses it there.
         assert_eq!(v.canonicalize(), Visibility::default());

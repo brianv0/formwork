@@ -94,7 +94,7 @@ impl HostPattern {
     }
 
     /// Could one host match both patterns (FW-BP14)?
-    pub fn overlaps(&self, other: &HostPattern) -> bool {
+    fn overlaps(&self, other: &HostPattern) -> bool {
         match (self, other) {
             (HostPattern::Exact(a), HostPattern::Exact(b)) => a == b,
             (HostPattern::Exact(e), HostPattern::Wildcard(s))
@@ -220,8 +220,7 @@ pub fn canonicalize_host(raw: &str) -> Result<CanonicalHost, HostError> {
     // never a DNS name, so it cannot be matched as one.
     if labels
         .last()
-        .map(|l| l.bytes().all(|b| b.is_ascii_digit()) || l.starts_with("0x"))
-        .unwrap_or(false)
+        .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()) || l.starts_with("0x"))
     {
         return Err(HostError::Invalid(raw.to_string()));
     }
@@ -232,10 +231,7 @@ pub fn canonicalize_host(raw: &str) -> Result<CanonicalHost, HostError> {
 /// or block.
 pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
         v4 => v4,
     }
 }
@@ -446,7 +442,7 @@ impl HostRule {
     }
 
     pub fn port_matches(&self, port: u16) -> bool {
-        self.port.map(|p| p == port).unwrap_or(true)
+        self.port.is_none_or(|p| p == port)
     }
 
     fn same_port(&self, other: &HostRule) -> bool {
@@ -702,7 +698,7 @@ impl HostTable {
         };
         for r in for_host() {
             if let HostAccess::Deny { path: deny } = &r.access {
-                if deny.as_ref().map(|g| g.matches(path)).unwrap_or(true) {
+                if deny.as_ref().is_none_or(|g| g.matches(path)) {
                     return RequestDecision::Deny(Denial {
                         reason: format!("{host}{path} is denied"),
                         rule: Some(r),
@@ -716,16 +712,13 @@ impl HostTable {
                 path: glob,
             } = &r.access
             {
-                let method_ok =
-                    methods.is_empty() || method.map(|m| methods.contains(&m)).unwrap_or(false);
+                let method_ok = methods.is_empty() || method.is_some_and(|m| methods.contains(&m));
                 if method_ok && glob.matches(path) {
                     return RequestDecision::Allow(r);
                 }
             }
         }
-        let shown = method
-            .map(|m| m.atom().to_ascii_uppercase())
-            .unwrap_or_else(|| "request".into());
+        let shown = method.map_or_else(|| "request".into(), |m| m.atom().to_ascii_uppercase());
         RequestDecision::Deny(Denial {
             reason: format!("no rule admits {shown} {host}{path}"),
             rule: None,
@@ -788,7 +781,7 @@ pub fn canonicalize_request_path(raw: &str) -> Result<String, String> {
                 b'/' => return Err("an encoded `/` in the request path".to_string()),
                 b'\\' => return Err("an encoded backslash in the request path".to_string()),
                 b if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') => {
-                    decoded.push(b)
+                    decoded.push(b);
                 }
                 // Reserved and non-ASCII escapes stay encoded (uppercase hex, RFC 3986 §6.2.2.1).
                 b => decoded.extend_from_slice(format!("%{b:02X}").as_bytes()),

@@ -115,7 +115,7 @@ fn main() {
                     json!({"contents": [{"uri": uri, "text": format!("contents of {uri}")}]}),
                 );
             }
-            Some("resources/subscribe") | Some("resources/unsubscribe") => reply(&id, json!({})),
+            Some("resources/subscribe" | "resources/unsubscribe") => reply(&id, json!({})),
             Some("completion/complete") => {
                 let values = v
                     .pointer("/params/ref/name")

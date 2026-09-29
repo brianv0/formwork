@@ -834,8 +834,7 @@ fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
                     "deny",
                     "-".to_string(),
                     path.as_ref()
-                        .map(|p| p.as_str().to_string())
-                        .unwrap_or_else(|| "(all)".into()),
+                        .map_or_else(|| "(all)".into(), |p| p.as_str().to_string()),
                 ),
             };
             serde_json::json!({
@@ -923,12 +922,11 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
 
 /// `exit_code=1`, never Rust's `Some(1)`; a signal death is named, not `None`.
 fn log_exit(what: &'static str, status: &std::process::ExitStatus) {
-    match status.code() {
-        Some(code) => tracing::info!(exit_code = code, "{what}"),
-        None => {
-            use std::os::unix::process::ExitStatusExt;
-            tracing::info!(signal = status.signal(), "{what} (terminated by signal)");
-        }
+    if let Some(code) = status.code() {
+        tracing::info!(exit_code = code, "{what}");
+    } else {
+        use std::os::unix::process::ExitStatusExt;
+        tracing::info!(signal = status.signal(), "{what} (terminated by signal)");
     }
 }
 
@@ -1002,8 +1000,7 @@ impl SessionTmp {
         let root = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.subsec_nanos());
         let path = root.join(format!(
             "formwork-session-{}-{nanos:08x}",
             std::process::id()
@@ -1192,8 +1189,7 @@ fn start_opener(opener: &mut OpenerSetup, lifted: bool) {
         return;
     };
     let host_opener = std::env::var_os("FORMWORK_HOST_OPENER")
-        .map(PathBuf::from)
-        .unwrap_or_else(formwork_gateway::opener::host_opener);
+        .map_or_else(formwork_gateway::opener::host_opener, PathBuf::from);
     match formwork_gateway::OpenerService::start(host_end, lifted, host_opener) {
         Ok(service) => opener.service = Some(service),
         Err(e) => tracing::warn!(error = %e, "the open-url service failed to start"),
@@ -1738,21 +1734,19 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs())
     );
-    let feed = match feed {
-        Ok(feed) => feed,
-        Err(_) => {
-            // --observe-anyway: enforced run, loudly observation-free, no proposal (FW-E2E-062).
-            let mut session = prepare_session(&blueprint, Purpose::Spawn, host.clone())?;
-            let (program, args) = argv.split_first().expect("argv is non-empty");
-            let status = spawn_confined_child(&mut session, program, args)?;
-            tracing::warn!(
-                "--observe-anyway: ran enforced, but this host has no denial feed -- no proposal was written (FW-INV5: reported, not pretended)"
-            );
-            std::process::exit(exit_code(&status));
-        }
+    let feed = if let Ok(feed) = feed {
+        feed
+    } else {
+        // --observe-anyway: enforced run, loudly observation-free, no proposal (FW-E2E-062).
+        let mut session = prepare_session(&blueprint, Purpose::Spawn, host.clone())?;
+        let (program, args) = argv.split_first().expect("argv is non-empty");
+        let status = spawn_confined_child(&mut session, program, args)?;
+        tracing::warn!(
+            "--observe-anyway: ran enforced, but this host has no denial feed -- no proposal was written (FW-INV5: reported, not pretended)"
+        );
+        std::process::exit(exit_code(&status));
     };
     match feed {
         DenialFeed::MacosUnifiedLog => {

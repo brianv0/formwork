@@ -310,9 +310,7 @@ fn host_header_matches(value: &str, host: &CanonicalHost, port: u16) -> bool {
         return false;
     };
     p.unwrap_or(DEFAULT_HTTPS_PORT) == port
-        && formwork_blueprint::canonicalize_host(h)
-            .map(|c| &c == host)
-            .unwrap_or(false)
+        && formwork_blueprint::canonicalize_host(h).is_ok_and(|c| &c == host)
 }
 
 /// Present brokered credentials for a request to `host` (FW-CRED11): substitute the placeholder in
@@ -392,8 +390,7 @@ fn basic_carries(value: &str, placeholder: &str) -> bool {
     value
         .strip_prefix("Basic ")
         .and_then(|b64| BASE64.decode(b64.trim()).ok())
-        .map(|raw| String::from_utf8_lossy(&raw).contains(placeholder))
-        .unwrap_or(false)
+        .is_some_and(|raw| String::from_utf8_lossy(&raw).contains(placeholder))
 }
 
 /// Body framing of a message (FW-EGR11): exactly one of these, or refused.
@@ -446,8 +443,7 @@ fn response_framing(head: &ResponseHead, request_method: &str) -> Framing {
     }
     if head
         .header("transfer-encoding")
-        .map(|v| v.to_ascii_lowercase().contains("chunked"))
-        .unwrap_or(false)
+        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
     {
         return Framing::Chunked;
     }
@@ -543,9 +539,7 @@ pub(crate) async fn serve_inspected(
         }
     };
     let sni_ok = match tls.get_ref().1.server_name() {
-        Some(sni) => formwork_blueprint::canonicalize_host(sni)
-            .map(|c| c == host)
-            .unwrap_or(false),
+        Some(sni) => formwork_blueprint::canonicalize_host(sni).is_ok_and(|c| c == host),
         None => true,
     };
     let (read, mut write) = tokio::io::split(tls);
@@ -592,8 +586,7 @@ where
         let target = head.target.clone();
         if !head
             .header("host")
-            .map(|h| host_header_matches(h, &host, port))
-            .unwrap_or(false)
+            .is_some_and(|h| host_header_matches(h, &host, port))
         {
             shared.refuse(
                 "request",
@@ -726,8 +719,7 @@ where
         up_w.flush().await?;
         let client_close = head
             .header("connection")
-            .map(|v| v.eq_ignore_ascii_case("close"))
-            .unwrap_or(false);
+            .is_some_and(|v| v.eq_ignore_ascii_case("close"));
         // Response(s): 1xx interim responses are relayed until the final one.
         loop {
             let Some(resp) = up_r.response_head().await? else {
@@ -763,8 +755,7 @@ where
             let framing = response_framing(&resp, &head.method);
             let server_close = resp
                 .header("connection")
-                .map(|v| v.eq_ignore_ascii_case("close"))
-                .unwrap_or(false);
+                .is_some_and(|v| v.eq_ignore_ascii_case("close"));
             match framing {
                 Framing::Length(n) => up_r.copy_exact(n, &mut client_w, &mut scrub).await?,
                 Framing::Chunked => up_r.copy_chunked(&mut client_w, &mut scrub).await?,

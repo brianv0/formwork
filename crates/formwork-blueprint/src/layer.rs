@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn path_sets_union_across_layers() {
-        let base = layer_toml(r#"[fs]"#);
+        let base = layer_toml(r"[fs]");
         let a = layer_toml(
             r#"
             [fs]
@@ -251,8 +251,8 @@ mod tests {
 
     #[test]
     fn postures_are_last_set_wins_and_unset_inherits() {
-        let a = layer_toml(r#"net = { ports = [443] }"#);
-        let b = layer_toml(r#"[fs]"#); // sets nothing
+        let a = layer_toml(r"net = { ports = [443] }");
+        let b = layer_toml(r"[fs]"); // sets nothing
         let c = layer_toml(r#"net = "deny""#);
         assert_eq!(
             merge(&[a.clone(), b.clone()]).net,
@@ -365,7 +365,7 @@ mod tests {
                 r#"[fs]
                 reads = ["/b/**", "/a/**"]"#,
             ),
-            layer_toml(r#"net = { ports = [8080, 443] }"#),
+            layer_toml(r"net = { ports = [8080, 443] }"),
         ];
         assert_eq!(merge(&layers), merge(&layers));
         let json = serde_json::to_string(&merge(&layers)).unwrap();

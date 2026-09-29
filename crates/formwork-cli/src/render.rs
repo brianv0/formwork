@@ -80,11 +80,7 @@ pub fn explanation(e: &Explanation) -> String {
 pub fn egress_explanation(e: &crate::EgressExplanation) -> String {
     let mut out = format!("{}\n  host: {}:{} -- {}\n", e.url, e.host, e.port, e.grade);
     if let Some(rule) = &e.rule {
-        let origin = e
-            .source
-            .as_ref()
-            .map(source)
-            .unwrap_or_else(|| "built-in".into());
+        let origin = e.source.as_ref().map_or_else(|| "built-in".into(), source);
         out.push_str(&format!("  rule: {rule} ({origin})\n"));
     }
     for m in &e.methods {
@@ -114,7 +110,7 @@ pub fn net_table(net: &formwork_blueprint::NetPosture, rules: &[serde_json::Valu
             "net: direct port tier {p:?} -- any host on those ports, no Gateway\n"
         )),
         NetPosture::AllowHosts(_) => {
-            out.push_str("net: host rules -- all egress through the session Gateway\n")
+            out.push_str("net: host rules -- all egress through the session Gateway\n");
         }
     }
     for r in rules {

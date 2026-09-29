@@ -526,15 +526,12 @@ async fn read_frame<R: AsyncBufRead + Unpin>(
             if chunk.is_empty() {
                 return Ok(if buf.is_empty() { None } else { Some(buf) });
             }
-            match chunk.iter().position(|&b| b == b'\n') {
-                Some(nl) => {
-                    buf.extend_from_slice(&chunk[..nl]);
-                    (nl + 1, true)
-                }
-                None => {
-                    buf.extend_from_slice(chunk);
-                    (chunk.len(), false)
-                }
+            if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&chunk[..nl]);
+                (nl + 1, true)
+            } else {
+                buf.extend_from_slice(chunk);
+                (chunk.len(), false)
             }
         };
         reader.consume(consumed);
@@ -567,8 +564,7 @@ fn filter_list(raw: &[u8], kind: ListKind, policy: &McpPolicy) -> Option<String>
     items.retain(|item| {
         item.get(id_field)
             .and_then(Value::as_str)
-            .map(|n| vis.permits(n))
-            .unwrap_or(false)
+            .is_some_and(|n| vis.permits(n))
     });
     let hidden = before - items.len();
     if hidden > 0 {

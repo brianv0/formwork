@@ -660,7 +660,7 @@ pub fn accept(proposal_file: &Path, entries: &[String], all: bool, home: &str) -
     let picked = |number: usize, name: &str| -> bool {
         all || entries
             .iter()
-            .any(|sel| sel.parse::<usize>().map(|n| n == number).unwrap_or(false) || sel == name)
+            .any(|sel| sel.parse::<usize>().is_ok_and(|n| n == number) || sel == name)
     };
     // Entries are numbered paths first, then hosts, then channels, as listed above.
     fn pick<'a, T>(

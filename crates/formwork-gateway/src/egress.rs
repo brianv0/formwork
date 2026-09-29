@@ -189,10 +189,7 @@ impl EgressProxy {
     /// Whether the listener thread is still serving; a dead listener is a Formwork failure after
     /// spawn (FW-XR11).
     pub fn is_alive(&self) -> bool {
-        self.thread
-            .as_ref()
-            .map(|t| !t.is_finished())
-            .unwrap_or(false)
+        self.thread.as_ref().is_some_and(|t| !t.is_finished())
     }
 }
 
@@ -225,7 +222,7 @@ impl Shared {
         rule: Option<String>,
         explain: String,
     ) {
-        self.refuse_needing(kind, target, reason, rule, explain, None)
+        self.refuse_needing(kind, target, reason, rule, explain, None);
     }
 
     /// As [`Shared::refuse`], recording what the session needed (FW-DISC12).
@@ -278,10 +275,7 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         if let Some(registry) = &shared.config.admission.registry {
             // FW-EGR9: only connections the supervisor performed (and registered) are admitted;
             // a co-resident process that found the port is dropped before a byte is read.
-            let registered = registry
-                .lock()
-                .map(|mut r| r.remove(&peer.port()))
-                .unwrap_or(false);
+            let registered = registry.lock().is_ok_and(|mut r| r.remove(&peer.port()));
             if !registered {
                 shared.refuse(
                     "unregistered-connection",

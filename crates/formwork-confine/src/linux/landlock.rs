@@ -94,8 +94,7 @@ impl Hole {
             return path
                 .to_str()
                 .zip(self.base.to_str())
-                .map(|(p, b)| p.starts_with(b))
-                .unwrap_or(false);
+                .is_some_and(|(p, b)| p.starts_with(b));
         }
         if self.subtree {
             path.starts_with(&self.base)
@@ -108,11 +107,7 @@ impl Hole {
         if self.prefix {
             // The entries sit in the prefix's parent directory, so every ancestor of that
             // directory (and the directory itself) must be split.
-            return self
-                .base
-                .parent()
-                .map(|p| p.starts_with(dir))
-                .unwrap_or(false);
+            return self.base.parent().is_some_and(|p| p.starts_with(dir));
         }
         self.base != dir && self.base.starts_with(dir)
     }
@@ -141,7 +136,7 @@ fn expand(root: &Path, holes: &[Hole]) -> Vec<PathBuf> {
         // *through* a symlink still resolves to the real path, which is governed by whatever rule
         // covers that path (or denied), exactly as macOS checks the resolved path. A failed type
         // probe is treated as a symlink and skipped too (fail-closed).
-        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+        if entry.file_type().map_or(true, |t| t.is_symlink()) {
             continue;
         }
         let child = entry.path();

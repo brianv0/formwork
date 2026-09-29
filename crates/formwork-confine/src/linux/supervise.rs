@@ -811,12 +811,10 @@ fn bound_in_session(ino: u64, dev: u64) -> bool {
         let Some(path) = bound.get(sock) else {
             return false;
         };
-        std::fs::metadata(seen_from(pid, path))
-            .map(|m| {
-                use std::os::unix::fs::MetadataExt;
-                m.ino() == ino && m.dev() == dev
-            })
-            .unwrap_or(false)
+        std::fs::metadata(seen_from(pid, path)).is_ok_and(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.ino() == ino && m.dev() == dev
+        })
     })
 }
 

@@ -271,14 +271,6 @@ impl<'de> Deserialize<'de> for Capability {
 }
 
 impl FidelityReport {
-    /// The probe suite (FW-E2E-024) must confirm each.
-    pub fn enforced_capabilities(&self) -> impl Iterator<Item = (Capability, Backend)> + '_ {
-        self.per_capability.iter().filter_map(|(k, v)| match v {
-            Fidelity::Enforced { backend } => Some((*k, *backend)),
-            _ => None,
-        })
-    }
-
     /// True if net is never left silently open: enforced or partial, never bare-`Unenforceable`.
     /// The compiler upholds this by construction; the check lets `enforce()` assert it (FW-INV6).
     pub fn net_is_fail_closed(&self) -> bool {

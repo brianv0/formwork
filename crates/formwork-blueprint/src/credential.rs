@@ -323,15 +323,13 @@ pub fn resolve_brokers(
                     continue;
                 }
             };
-            let inspected = table
-                .map(|t| {
-                    t.rules.iter().any(|r| {
-                        r.is_inspected()
-                            && r.port_matches(crate::DEFAULT_HTTPS_PORT)
-                            && r.host.matches(&host)
-                    })
+            let inspected = table.is_some_and(|t| {
+                t.rules.iter().any(|r| {
+                    r.is_inspected()
+                        && r.port_matches(crate::DEFAULT_HTTPS_PORT)
+                        && r.host.matches(&host)
                 })
-                .unwrap_or(false);
+            });
             if !inspected {
                 errors.push(format!(
                     "{name} is brokered to {host}, which no inspected rule covers, so the Gateway \

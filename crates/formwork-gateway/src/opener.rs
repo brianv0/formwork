@@ -145,7 +145,7 @@ impl OpenerService {
             .name("formwork-opener".into())
             .spawn(move || {
                 let _finished = finished;
-                serve(stream, lifted, &host_opener, &sink)
+                serve(stream, lifted, &host_opener, &sink);
             })?;
         Ok(OpenerService {
             records,

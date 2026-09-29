@@ -357,8 +357,7 @@ fn not_exercised(reason: &str) {
 #[cfg(target_os = "linux")]
 fn on_path(tool: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
-        .unwrap_or(false)
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
 }
 
 #[cfg(target_os = "linux")]

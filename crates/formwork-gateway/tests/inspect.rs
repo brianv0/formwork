@@ -192,8 +192,7 @@ async fn request(tls: &mut tokio_rustls::client::TlsStream<TcpStream>, raw: &str
     loop {
         let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut chunk))
             .await
-            .map(|r| r.unwrap_or(0))
-            .unwrap_or(0);
+            .map_or(0, |r| r.unwrap_or(0));
         if n == 0 {
             break;
         }

@@ -285,25 +285,22 @@ mod linux {
         let yama_ok = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
-            .map(|scope| scope <= 1)
-            .unwrap_or(true);
+            .is_none_or(|scope| scope <= 1);
         getfd && yama_ok
     }
 
     fn is_socket(path: &Path) -> bool {
         use std::os::unix::fs::FileTypeExt;
-        std::fs::metadata(path)
-            .map(|m| m.file_type().is_socket())
-            .unwrap_or(false)
+        std::fs::metadata(path).is_ok_and(|m| m.file_type().is_socket())
     }
 
     /// `$XDG_RUNTIME_DIR`, falling back to `/run/user/<uid>` (a login session sets both; a CI
     /// job sets neither, and the fallback then does not exist).
     fn runtime_dir() -> Option<PathBuf> {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            // SAFETY: getuid is always successful and has no memory effects.
-            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
+            || PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })),
+            PathBuf::from,
+        );
         dir.is_dir().then_some(dir)
     }
 
@@ -376,8 +373,7 @@ mod linux {
             .lines()
             .find_map(|l| l.strip_prefix("CapEff:"))
             .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
-            .map(|eff| eff & MASK != 0)
-            .unwrap_or(true)
+            .is_none_or(|eff| eff & MASK != 0)
     }
 
     fn first_device(prefix: &str) -> Option<String> {
