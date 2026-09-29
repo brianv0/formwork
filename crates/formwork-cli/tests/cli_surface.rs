@@ -193,7 +193,7 @@ fn explain_backstop_denial_names_shape_and_lift() {
     let dir = Scratch::new("explain-backstop");
     std::fs::write(
         dir.path().join("bp.toml"),
-        "net = \"deny\"\n[fs]\nread-mode = \"closed\"\nreads = [\"/**\"]\nwrites = [\"/**\"]\n",
+        "net = \"deny\"\n[fs]\nread-mode = \"ambient-minus-subtract\"\nwrites = [\"/**\"]\n",
     )
     .unwrap();
     let out = formwork(

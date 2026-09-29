@@ -58,6 +58,9 @@ fn fw_e2e_026_dry_run_cross_platform_compile() {
         seccomp: false,
         seatbelt: false,
         os_version: "bare".into(),
+        user_namespaces: false,
+        connect_supervision: false,
+        facilities: Default::default(),
     };
     let bare_policy = compile(&rich_blueprint(), &bare);
     assert!(matches!(
@@ -180,6 +183,9 @@ fn fw_inv6_net_never_silently_open() {
             seccomp: true,
             seatbelt: false,
             os_version: "seccomp-only".into(),
+            user_namespaces: false,
+            connect_supervision: false,
+            facilities: Default::default(),
         },
         HostProfile {
             os: Os::Linux,
@@ -187,6 +193,9 @@ fn fw_inv6_net_never_silently_open() {
             seccomp: false,
             seatbelt: false,
             os_version: "bare".into(),
+            user_namespaces: false,
+            connect_supervision: false,
+            facilities: Default::default(),
         },
     ];
     for host in hosts {

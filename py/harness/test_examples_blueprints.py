@@ -11,18 +11,18 @@ BLUEPRINTS = REPO_ROOT / "examples" / "blueprints"
 
 
 @pytest.mark.fw_e2e("FW-E2E-026")
-def test_agent_session_blueprint_compiles_and_accounts_for_net(cli):
-    """The Axis-A confinement blueprint compiles, and its HTTPS-only egress is a real, accounted-for
-    posture — never silently open (FW-INV6)."""
-    result = cli("compile", "--blueprint", BLUEPRINTS / "agent-session.toml", "--report-only")
+def test_agent_blueprint_compiles_and_accounts_for_net(cli):
+    """The Axis-A Claude Code blueprint compiles, and its host-scoped egress is a real,
+    accounted-for posture on any host -- never silently open (FW-INV6)."""
+    result = cli("compile", "--blueprint", BLUEPRINTS / "claude-code.toml", "--report-only")
     assert result.code == 0, result.stderr
     report = json.loads(result.stdout)
     caps = report["per-capability"]
     assert "fs-read" in caps and "fs-write" in caps
-    # net = { ports = [443] } -> both the default-deny floor and the port tier are accounted for.
+    # Host rules -> both the default-deny floor and the host scope are accounted for.
     assert "net-default-deny" in caps
-    assert "net-port-tier" in caps
-    assert caps["net-default-deny"]["status"] in ("enforced", "partial", "unenforceable")
+    assert "net-host-scope" in caps
+    assert caps["net-host-scope"]["status"] in ("enforced", "partial", "unenforceable")
 
 
 @pytest.mark.fw_e2e("FW-E2E-026")
@@ -58,10 +58,15 @@ def test_rules_demo_compiles(cli):
 
 @pytest.mark.macos
 @pytest.mark.fw_e2e("FW-E2E-024")
-def test_agent_session_net_port_tier_enforced_on_macos(cli):
-    """On macOS the HTTPS egress tier is genuinely kernel-enforced, so the flagship 'confine the
-    agent, then skip the prompts' claim is backed, not aspirational."""
-    result = cli("compile", "--blueprint", BLUEPRINTS / "agent-session.toml", "--report-only")
+def test_agent_port_fallback_enforced_on_macos(cli):
+    """On macOS the port-tier fallback the examples document (the shared agent base plus
+    `--net ports:443`) is genuinely kernel-enforced, so the 'confine the agent, then skip the
+    prompts' claim is backed, not aspirational, even where host rules are not used."""
+    result = cli(
+        "compile", "--blueprint", BLUEPRINTS / "agent-base.toml",
+        "--net", "ports:443", "--allow-cred", "claude", "--report-only",
+    )
+    assert result.code == 0, result.stderr
     report = json.loads(result.stdout)
     assert report["per-capability"]["net-port-tier"]["status"] == "enforced"
     assert report["per-capability"]["fs-write"]["status"] == "enforced"

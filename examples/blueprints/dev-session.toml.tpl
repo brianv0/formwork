@@ -7,7 +7,7 @@
 # fold the child's cwd into the read grant (docs/spikes.md Spike 2), so the repo path must be named
 # explicitly — the recipe does that for you regardless of where you cloned.
 #
-# It is examples/blueprints/agent-session.toml widened to what a Rust build touches.
+# It is examples/blueprints/agent-base.toml plus the port tier, widened to what a Rust build touches.
 
 # crates.io + git-over-HTTPS (cargo fetch) and the model API. Port-scoped = any HTTPS host; the fs
 # wall, not an egress allowlist, is what stops exfiltration. (Once host-scoped egress lands, prefer

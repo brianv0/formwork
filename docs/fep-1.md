@@ -3,6 +3,11 @@
 **Formwork Enhancement Proposal 1 — deferred remainder.** Companion to `formwork.md`
 (design + end-to-end spec) and `constitution.md` (doctrine).
 
+> **FEP-5 gives this document its transport.** The `AllowHosts` posture below is spelled as host
+> rules in `rules` (`https:api.anthropic.com`), carried by the session Gateway and, on Linux, the
+> connect supervisor (`docs/fep-5.md` §3.1, §4). The requirements here keep their IDs; the
+> real-time violation stream ([FW-FID5](#fw-fid5)) stays deferred.
+
 The capability-model half of FEP-1 has **landed and been folded into `formwork.md`**:
 the environment axis ([FW-ENV1](../formwork.md#fw-env1)/2), execution-vector write-subtract ([FW-TRA7](../formwork.md#fw-tra7)), agent-state
 & local-secret coverage ([FW-TRA8](../formwork.md#fw-tra8)), any-depth `**/` patterns ([FW-CAP6](../formwork.md#fw-cap6)), sensitive-set
@@ -198,14 +203,9 @@ scrub — are now in `profiles/default.toml`):
 
 **Deliberate non-goals (scoped out, consistent with `formwork.md` §3).**
 
-- **TLS interception / MITM egress inspection.** srt offers an experimental
-  `tlsTerminate` for credential masking and body inspection. FEP-1 explicitly does
-  *not* add it — it means minting a CA into the child's trust stores, a large new
-  trust surface, and [FW-EGR5](#fw-egr5) instead reports the honest limit. Revisit only if a
-  concrete requirement demands request-body policy.
-- **Credential masking / host-side token injection.** srt's `mask` mode and Docker
-  Sandboxes' proxy-injected OAuth presuppose TLS termination and a secret-handling path
-  through the broker — out of scope here; the shipped [FW-ENV1](../formwork.md#fw-env1)/ENV2 deny, not mask.
+- **TLS interception and credential brokering** are specified by FEP-5 §3.2 as an opt-in
+  per-host grade; the CONNECT/SNI grade here remains the default for a plain host rule.
+  *(Amended by FEP-5.)*
 - **Windows.** Unchanged from `formwork.md` §11 — a later third backend, not this FEP.
 - **Resource-exhaustion DoS and kernel/LSM exploitation** — unchanged §3 out-of-scope.
 
@@ -214,6 +214,7 @@ scrub — are now in `profiles/default.toml`):
 - **Managed/lockdown layer.** Whether a non-weakenable managed default belongs in v1 or
   is deferred; it interacts with [FW-CAP2](../formwork.md#fw-cap2) (narrowing-only) cleanly but adds a policy
   precedence surface.
-- **Egress host-pattern grammar.** Exact wildcard/suffix semantics for `HostPattern`
-  (e.g. `*.example.com` vs `example.com`), fixed at the parse edge ([FW-EGR3](#fw-egr3)), before any
-  match.
+- **Egress host-pattern grammar.** *Closed by FEP-5 §4:* host rules in `rules` —
+  `https:host` (tunnel grade), `<methods>:host[/glob]` (inspected), `deny:host[/glob]` — where
+  `*.example.com` matches subdomains only and `example.com` the name alone, canonicalized at the
+  parse edge ([FW-EGR3](#fw-egr3)) before any match.

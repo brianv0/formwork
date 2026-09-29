@@ -14,7 +14,15 @@ formwork-blueprint = { workspace = true }
 formwork-compile = { workspace = true }
 formwork-confine = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "sync", "net"] }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+rustls-native-certs = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 formwork-detect = { workspace = true }
+# The inspection tests stand up a real TLS fixture upstream and a rustls client.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

@@ -41,6 +41,69 @@ pub fn spawn_confined(command: &mut Command, policy: &CompiledPolicy) -> Result<
     backend::spawn_confined(command, policy)
 }
 
+/// Let `fd` survive into `command`'s exec: `FD_CLOEXEC` is cleared in the child after the fork.
+/// The descriptor moves into the command, so an owned one stays open until the command is
+/// dropped; the caller keeps a raw one open until the spawn.
+#[cfg(unix)]
+pub fn inherit_fd<F>(command: &mut Command, fd: F)
+where
+    F: std::os::fd::AsRawFd + Send + Sync + 'static,
+{
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs post-fork and issues only fcntl(2) on a descriptor that is open in
+    // the parent until the spawn.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// The connect supervisor's configuration and handles (FW-EGR7); Linux only.
+#[cfg(target_os = "linux")]
+pub use backend::supervise::{Pending as PendingSupervisor, SupervisorConfig};
+
+/// As [`spawn_confined`], and when the policy routes egress through the connect supervisor
+/// (FW-EGR7), also prepares it: start the returned half after spawning, with the Gateway endpoint.
+/// `None` means the policy needs no supervisor (every macOS policy, and Linux without host rules).
+#[cfg(target_os = "linux")]
+pub fn spawn_confined_supervised(
+    command: &mut Command,
+    policy: &CompiledPolicy,
+) -> Result<Option<PendingSupervisor>, ConfineError> {
+    tracing::info!(
+        posture = "spawn",
+        backend = backend_label(policy),
+        "configuring confinement"
+    );
+    backend::spawn_confined_supervised(command, policy)
+}
+
+/// The isolation tier (FW-ISO10): `command` is `Command::new("/proc/self/exe")` with the
+/// workload's environment applied; it becomes the single-threaded stage that creates the
+/// namespaces, then confines and execs `argv`. Start the returned supervisor half after spawning.
+#[cfg(target_os = "linux")]
+pub fn spawn_isolated(
+    command: &mut Command,
+    argv: &[String],
+    policy: &CompiledPolicy,
+    private_tmp: Option<&std::path::Path>,
+) -> Result<Option<PendingSupervisor>, ConfineError> {
+    tracing::info!(
+        posture = "spawn",
+        backend = backend_label(policy),
+        "configuring confinement with the isolation tier"
+    );
+    backend::spawn_isolated(command, argv, policy, private_tmp)
+}
+
+/// The isolation stage's entry point; see [`spawn_isolated`]. Call first thing in `main`.
+#[cfg(target_os = "linux")]
+pub use backend::isolate::stage_if_requested as isolation_stage;
+
 /// Irreversible; confine-self posture (FW-ISO6).
 pub fn enforce_self(policy: &CompiledPolicy) -> Result<(), ConfineError> {
     tracing::info!(

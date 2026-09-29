@@ -1,0 +1,32 @@
+# opencode under host-scoped egress (FEP-5), with the Anthropic key brokered: the agent's
+# ANTHROPIC_API_KEY is a per-session placeholder, and the Gateway presents the real key to
+# api.anthropic.com only. opencode reads the session CA through the variables the Launcher sets
+# (verified with opencode 1.18). The run is refused before it starts if ANTHROPIC_API_KEY is unset.
+#
+# Another provider: swap its host into `rules` as an inspected rule and its type into
+# `allow-credentials` (OpenAI: "any:api.openai.com" and "broker:openai"). `formwork learn` proposes
+# the hosts a run needed.
+#
+# opencode keeps its sessions and caches under the XDG directories; create them once outside the
+# sandbox (`mkdir -p ~/.local/share/opencode ~/.local/state/opencode ~/.cache/opencode
+# ~/.config/opencode`). Deliberately refused: registry.npmjs.org (runtime package installs). On
+# Linux, opencode's walk up the tree for config files is refused at directories above a denied path
+# (Landlock can list neither; see docs/linux-backend.md); opencode carries on. Its runtime also
+# tries to open /sys/kernel/debug/tracing/trace_marker for writing, which only root may do: an
+# unprivileged `formwork learn` proposes it on Linux, and declining it changes nothing.
+#
+#   formwork explain --blueprint examples/blueprints/opencode.toml --hosts
+
+extends = ["agent-base.toml"]
+
+rules = [
+    "any:api.anthropic.com",
+    "https:models.dev",
+    "https:models.opencode.ai",
+    "https:opencode.ai",
+]
+allow-credentials = ["broker:anthropic"]
+channels = ["open-url"]
+
+[fs]
+writes = ["~/.local/share/opencode/**", "~/.local/state/opencode/**", "~/.cache/opencode/**", "~/.config/opencode/**"]

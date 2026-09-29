@@ -16,6 +16,12 @@ use formwork_blueprint::{
 /// The blueprint file every subcommand looks for when `--blueprint` is not given.
 pub const DEFAULT_BLUEPRINT_NAME: &str = "FORMWORK.toml";
 
+/// The second discovery location (FEP-5 D3): a blueprint inside `.formwork/`, so the file and its
+/// derived proposal/discovered layers sit in one directory. Write-protecting them then protects
+/// one directory instead of splitting the project root, where Landlock would lose the right to
+/// create files directly in the root.
+pub const DOTDIR_BLUEPRINT: &str = ".formwork/blueprint.toml";
+
 /// Profiles compiled into the binary, addressable as `extends = ["builtin:<name>"]` -- so a
 /// blueprint can layer on the shipped default without a repo checkout (the release-binary user
 /// has no `profiles/` directory to point at).
@@ -50,24 +56,31 @@ pub struct ResolvedBlueprint {
 /// a `FORMWORK.toml` discovered from the launch directory upward. `Ok(None)` means neither -- the
 /// caller decides whether that is an error (enforcing commands) or a degraded mode (`explain`
 /// with no blueprint still summarizes the host).
-pub fn resolve_blueprint(flag: Option<&Path>, cwd: &Path, home: &str) -> Option<ResolvedBlueprint> {
+pub fn resolve_blueprint(
+    flag: Option<&Path>,
+    cwd: &Path,
+    home: &str,
+) -> Result<Option<ResolvedBlueprint>> {
     if let Some(path) = flag {
         tracing::info!(blueprint = %path.display(), source = "flag", "blueprint resolved");
-        return Some(ResolvedBlueprint {
+        return Ok(Some(ResolvedBlueprint {
             path: path.to_path_buf(),
             source: BlueprintSource::Flag,
-        });
+        }));
     }
-    let found = find_default_blueprint(cwd, home)?;
+    let Some(found) = find_default_blueprint(cwd, home)? else {
+        return Ok(None);
+    };
     tracing::info!(
         blueprint = %found.display(),
         source = "auto-discovered",
-        "blueprint resolved (no --blueprint given; found {DEFAULT_BLUEPRINT_NAME})"
+        "blueprint resolved (no --blueprint given; found {})",
+        found.display()
     );
-    Some(ResolvedBlueprint {
+    Ok(Some(ResolvedBlueprint {
         path: found,
         source: BlueprintSource::Discovered,
-    })
+    }))
 }
 
 /// Walk from `cwd` upward looking for a `FORMWORK.toml`, stopping at `$HOME` (inclusive) so a
@@ -82,7 +95,7 @@ pub fn resolve_blueprint(flag: Option<&Path>, cwd: &Path, home: &str) -> Option<
 /// remains the explicit door for a file discovery will not trust. The `$HOME` boundary compares
 /// symlink-resolved paths, so a symlinked home (macOS `/var` vs `/private/var`) cannot let the
 /// walk escape above the real home directory.
-pub fn find_default_blueprint(cwd: &Path, home: &str) -> Option<PathBuf> {
+pub fn find_default_blueprint(cwd: &Path, home: &str) -> Result<Option<PathBuf>> {
     find_default_blueprint_trusting(cwd, home, &user_controls)
 }
 
@@ -93,7 +106,7 @@ fn find_default_blueprint_trusting(
     cwd: &Path,
     home: &str,
     trusted: &dyn Fn(&Path) -> bool,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>> {
     // Boundary comparisons happen in symlink-resolved coordinates; the returned candidate keeps
     // the caller's (as-given) coordinates, which the loader canonicalizes itself.
     let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
@@ -105,26 +118,48 @@ fn find_default_blueprint_trusting(
         if !trusted(dir) {
             break;
         }
-        let candidate = dir.join(DEFAULT_BLUEPRINT_NAME);
-        if candidate.is_file() {
+        let root_file = dir.join(DEFAULT_BLUEPRINT_NAME);
+        let dotdir_file = dir.join(DOTDIR_BLUEPRINT);
+        // `.formwork/` is one more directory level: it must be the user's too (FW-BP8).
+        let dotdir_ok = || dotdir_file.parent().map(trusted).unwrap_or(false);
+        let candidate = match (root_file.is_file(), dotdir_file.is_file()) {
+            (true, true) => bail!(
+                "both {} and {} exist; one project has one blueprint -- remove one, or pass \
+                 --blueprint to choose",
+                root_file.display(),
+                dotdir_file.display()
+            ),
+            (true, false) => Some(root_file),
+            (false, true) if dotdir_ok() => Some(dotdir_file),
+            (false, true) => {
+                tracing::warn!(
+                    candidate = %dotdir_file.display(),
+                    "ignoring a .formwork/ directory not owned by the invoking user (FW-BP8); \
+                     pass --blueprint to use its blueprint explicitly"
+                );
+                return Ok(None);
+            }
+            (false, false) => None,
+        };
+        if let Some(candidate) = candidate {
             if trusted(&candidate) {
-                return Some(candidate);
+                return Ok(Some(candidate));
             }
             // Fail-closed, not fail-open-through-a-foreign-file: the nearer suspicious file also
             // shadows anything above it -- silently skipping to a farther match would leave the
             // planted file looking effective.
             tracing::warn!(
                 candidate = %candidate.display(),
-                "ignoring a {DEFAULT_BLUEPRINT_NAME} not owned by the invoking user (FW-BP8); \
-                 pass --blueprint to use it explicitly"
+                "ignoring a blueprint not owned by the invoking user (FW-BP8); pass --blueprint \
+                 to use it explicitly"
             );
-            return None;
+            return Ok(None);
         }
         if resolve(dir) == home {
             break;
         }
     }
-    None
+    Ok(None)
 }
 
 /// Implicit policy may come only from territory the invoking user controls (FW-BP8): the path is
@@ -158,9 +193,34 @@ pub fn load_stack(
     sugar: BlueprintLayer,
     sigils: &Sigils,
 ) -> Result<Blueprint> {
-    let layers = load_layers(path, sets, sugar, sigils)?;
-    let plain: Vec<BlueprintLayer> = layers.into_iter().map(|(_, l)| l).collect();
-    validate(formwork_blueprint::merge(&plain))
+    load_stack_with_provenance(path, sets, sugar, sigils).map(|(blueprint, _)| blueprint)
+}
+
+/// FEP-5 D10: the ambient universe is a property of the read mode, never a row. Under `closed`
+/// (`mode = "unveil"`) a `/**` read row silently reopens everything the mode closed, so it is
+/// refused, naming the layer it came from.
+fn refuse_universe_row(layers: &[(RuleSource, BlueprintLayer)], merged: &Blueprint) -> Result<()> {
+    if merged.fs.read_mode != formwork_blueprint::ReadMode::Closed {
+        return Ok(());
+    }
+    let universe = PathPattern::parse("/**").expect("constant pattern");
+    for (source, layer) in layers {
+        let rows = layer
+            .fs
+            .reads
+            .iter()
+            .chain(layer.fs.writes.iter())
+            .chain(layer.fs.writes_no_create.iter());
+        if rows.clone().any(|p| *p == universe) {
+            let origin = describe_source(source);
+            bail!(
+                "a `/**` grant from {origin} reopens the whole filesystem under the closed read \
+                 mode (`mode = \"unveil\"`); the ambient universe is a read mode, not a rule -- \
+                 use `mode = \"subtractive\"`, or grant the directories the session needs"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Same stack as [`load_stack`], but each layer keeps the [`RuleSource`] it came from so `explain`
@@ -174,14 +234,21 @@ pub fn load_stack_with_provenance(
 ) -> Result<(Blueprint, Provenance)> {
     let layers = load_layers(path, sets, sugar, sigils)?;
     let (blueprint, provenance) = merge_with_provenance(&layers);
-    Ok((validate(blueprint)?, provenance))
+    refuse_universe_row(&layers, &blueprint)?;
+    validate_net(&layers, &blueprint)?;
+    Ok((validate(blueprint, sigils.home)?, provenance))
 }
 
 /// A typo'd credential type would silently stay blocked -- fail-closed but intent-hiding, the same
 /// trap as a typo'd gateway server name. Validate at the edge (parse, don't validate).
-fn validate(blueprint: Blueprint) -> Result<Blueprint> {
+fn validate(blueprint: Blueprint, home: &str) -> Result<Blueprint> {
     let catalog = formwork_blueprint::Catalog::builtin();
-    for t in &blueprint.allow_credentials {
+    for entry in &blueprint.allow_credentials {
+        // Inline bindings name credentials the Catalog does not know; `resolve_brokers` checks them.
+        let t = match entry {
+            formwork_blueprint::CredentialEntry::Inline(_) => continue,
+            other => other.name(),
+        };
         if !catalog.is_known_type(t) {
             let known: Vec<&str> = catalog
                 .type_names()
@@ -189,6 +256,23 @@ fn validate(blueprint: Blueprint) -> Result<Blueprint> {
                 .collect();
             bail!("unknown credential type {t:?} in allow-credentials (known: {known:?})");
         }
+    }
+    // FW-CRED12: every brokered credential resolves to hosts an inspected rule covers.
+    let resolved = catalog
+        .resolve(home)
+        .context("resolving the credential catalog")?;
+    if let Err(errors) = formwork_blueprint::resolve_brokers(
+        &blueprint.allow_credentials,
+        &resolved,
+        blueprint.net.host_table(),
+    ) {
+        bail!("allow-credentials:\n  {}", errors.join("\n  "));
+    }
+    for t in formwork_blueprint::doubly_named(&blueprint.allow_credentials) {
+        tracing::info!(
+            credential = %t,
+            "named both bare and `broker:`; brokered wins, so the credential stays out of the session (FW-BP12)"
+        );
     }
     Ok(blueprint)
 }
@@ -372,36 +456,128 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
         None => Vec::new(),
     };
     for raw in std::mem::take(&mut layer.rules) {
-        let (verb, path) = raw
+        let (verb, target) = raw
             .split_once(':')
-            .ok_or_else(|| anyhow!("rule {raw:?} is not \"<verb>:<path>\""))?;
-        let pat = PathPattern::parse(&sigils.expand(path.trim()))
-            .with_context(|| format!("rule {raw:?}"))?;
-        match verb.trim() {
-            "read" | "readonly" => layer.fs.reads.push(pat),
-            "readwrite" => layer.fs.writes.push(pat),
-            // The create/write split (FW-CAP9): `modify` grants write minus create, a distinct
-            // word from full `readwrite`/`writes` so the weaker grade never reads as full write.
-            "modify" => layer.fs.writes_no_create.push(pat),
-            "allow" => {
-                layer.fs.writes.push(pat.clone());
-                exec_paths.push(pat);
-            }
-            "readexec" => {
-                layer.fs.reads.push(pat.clone());
-                exec_paths.push(pat);
-            }
-            "exec" => exec_paths.push(pat),
-            "deny" => layer.fs.subtract.push(pat),
-            other => bail!(
-                "unknown rule verb {other:?} in {raw:?} (known: read, readonly, readwrite, modify, allow, readexec, exec, deny)"
-            ),
+            .ok_or_else(|| anyhow!("rule {raw:?} is not \"<verb>:<target>\""))?;
+        let target = target.trim();
+        let atoms: Vec<&str> = verb.split(',').map(str::trim).collect();
+        // The verb decides the axis (FW-BP15); `deny` belongs to both, and the target's shape --
+        // a path or a host -- decides it there (FW-BP13).
+        let http = atoms
+            .iter()
+            .all(|a| formwork_blueprint::HTTP_ATOMS.contains(a));
+        let host_deny = atoms == ["deny"] && formwork_blueprint::target_is_host(target);
+        if http || host_deny {
+            let rule = formwork_blueprint::HostRule::parse(verb, target)
+                .map_err(|e| anyhow!("rule {raw:?}: {e}"))?;
+            layer.hosts.push(rule);
+            continue;
+        }
+        let pat =
+            PathPattern::parse(&sigils.expand(target)).with_context(|| format!("rule {raw:?}"))?;
+        let fs = fs_atoms(&atoms).map_err(|e| anyhow!("rule {raw:?}: {e}"))?;
+        if fs.deny {
+            layer.fs.subtract.push(pat);
+            continue;
+        }
+        // `write` implies read and includes create; `modify` is write without create (FW-CAP9),
+        // subsumed when both are named.
+        if fs.write {
+            layer.fs.writes.push(pat.clone());
+        } else if fs.modify {
+            layer.fs.writes_no_create.push(pat.clone());
+        } else if fs.read {
+            layer.fs.reads.push(pat.clone());
+        }
+        if fs.exec {
+            exec_paths.push(pat);
         }
     }
     if !exec_paths.is_empty() {
         layer.exec = Some(ExecPosture::Allowlist(exec_paths));
     }
     Ok(())
+}
+
+/// The filesystem verb atoms of one rule (FW-BP15), with the landed compound verbs as aliases.
+#[derive(Default)]
+struct FsAtoms {
+    read: bool,
+    write: bool,
+    modify: bool,
+    exec: bool,
+    deny: bool,
+}
+
+fn fs_atoms(atoms: &[&str]) -> std::result::Result<FsAtoms, String> {
+    let mut out = FsAtoms::default();
+    for atom in atoms {
+        match *atom {
+            "read" | "readonly" => out.read = true,
+            "write" | "readwrite" => out.write = true,
+            "modify" => out.modify = true,
+            "exec" => out.exec = true,
+            "readexec" => {
+                out.read = true;
+                out.exec = true;
+            }
+            "allow" => {
+                out.write = true;
+                out.exec = true;
+            }
+            "deny" => out.deny = true,
+            other => {
+                return Err(format!(
+                    "unknown rule verb {other:?} (filesystem atoms: read, write, modify, exec, \
+                     deny, and the compounds readonly, readwrite, readexec, allow; HTTP atoms: {})",
+                    formwork_blueprint::HTTP_ATOMS.join(", ")
+                ))
+            }
+        }
+    }
+    if out.deny && atoms.len() > 1 {
+        return Err("`deny` cannot be combined with other atoms".to_string());
+    }
+    Ok(out)
+}
+
+/// FW-BP13/FW-EGR1: a port tier and host rules reach the network by different doors, so both in
+/// one blueprint is refused; FW-BP14: one host, one grade. Every conflict is named.
+fn validate_net(layers: &[(RuleSource, BlueprintLayer)], merged: &Blueprint) -> Result<()> {
+    let Some(table) = merged.net.host_table() else {
+        return Ok(());
+    };
+    if let Some((source, _)) = layers
+        .iter()
+        .rev()
+        .find(|(_, l)| matches!(l.net, Some(formwork_blueprint::NetPosture::Ports(_))))
+    {
+        let first = table
+            .rules
+            .first()
+            .map(|r| r.to_string())
+            .unwrap_or_default();
+        bail!(
+            "host rules (e.g. `{first}`) and a direct port tier (`net = {{ ports = [...] }}` in \
+             {}) cannot both apply: host rules route all egress through the Gateway, and the port \
+             tier would bypass it. Remove the port tier",
+            describe_source(source)
+        );
+    }
+    if let Err(errors) = formwork_blueprint::validate_host_rules(&table.rules) {
+        bail!("host rules conflict:\n  {}", errors.join("\n  "));
+    }
+    Ok(())
+}
+
+fn describe_source(source: &RuleSource) -> String {
+    match source {
+        RuleSource::BuiltIn => "the built-in baseline".to_string(),
+        RuleSource::Profile(p) => format!("profile {p}"),
+        RuleSource::File(p) => format!("blueprint {p}"),
+        RuleSource::Cli => "a CLI override".to_string(),
+        RuleSource::Discovered(p) => format!("discovered layer {p}"),
+    }
 }
 
 /// The CLI-edge path sigils, expanded before patterns reach the pure, absolute-only compiler:
@@ -500,7 +676,7 @@ fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer
     let mut value: toml::Value = toml::from_str(&text)
         .with_context(|| format!("parsing discovered layer {}", path.display()))?;
     sigils.expand_value(&mut value);
-    let layer: BlueprintLayer = value
+    let mut layer: BlueprintLayer = value
         .try_into()
         .with_context(|| format!("interpreting discovered layer {}", path.display()))?;
     if !layer.extends.is_empty() {
@@ -518,6 +694,55 @@ fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer
             );
         }
     }
+    // FW-DISC12: learned host rules and channel lifts, each attributable. Only host rules may
+    // sit in `rules` here -- a path rule would dodge the fs provenance check above.
+    for rule in &layer.rules {
+        let is_host = rule
+            .split_once(':')
+            .map(|(_, target)| formwork_blueprint::target_is_host(target))
+            .unwrap_or(false);
+        if !is_host {
+            bail!(
+                "discovered layer {} carries the rule {rule:?}, which is not a host rule; learned \
+                 paths belong in [fs] with provenance (FW-DISC6)",
+                path.display()
+            );
+        }
+        if !layer
+            .discovery
+            .provenance
+            .contains_key(&crate::learn::rule_key(rule))
+        {
+            bail!(
+                "discovered layer {} adds the host rule {rule:?} without provenance; refusing an \
+                 unattributable grant (FW-DISC6)",
+                path.display()
+            );
+        }
+    }
+    if let Some(channels) = &layer.channels {
+        if !channels.denied().is_empty() {
+            bail!(
+                "discovered layer {} denies channels; a learned layer only lifts",
+                path.display()
+            );
+        }
+        for channel in channels.allowed() {
+            if !layer
+                .discovery
+                .provenance
+                .contains_key(&crate::learn::channel_key(channel.name()))
+            {
+                bail!(
+                    "discovered layer {} lifts the channel {:?} without provenance; refusing an \
+                     unattributable lift (FW-DISC6)",
+                    path.display(),
+                    channel.name()
+                );
+            }
+        }
+    }
+    desugar_rules(&mut layer, sigils)?;
     Ok(layer)
 }
 
@@ -705,6 +930,74 @@ mod tests {
             layer.exec,
             Some(ExecPosture::Allowlist(vec![pp("/bin/ls"), pp("/bin/cat")]))
         );
+    }
+
+    #[test]
+    fn verb_atoms_compose_and_host_rules_desugar_by_target_shape() {
+        let sigils = Sigils::new("/home/x", "/work");
+        let mut layer = BlueprintLayer {
+            rules: vec![
+                "read,write:/a/**".into(),
+                "read,exec:/b/**".into(),
+                "write,modify:/c".into(),
+                "https:api.anthropic.com".into(),
+                "get,post:api.github.com/repos/acme/**".into(),
+                "deny:telemetry.example.com".into(),
+                "deny:~/.ssh".into(),
+            ],
+            ..Default::default()
+        };
+        desugar_rules(&mut layer, &sigils).unwrap();
+        assert_eq!(layer.fs.writes, vec![pp("/a/**"), pp("/c")]);
+        assert_eq!(layer.fs.reads, vec![pp("/b/**")]);
+        assert_eq!(layer.fs.subtract, vec![pp("/home/x/.ssh")]);
+        assert_eq!(layer.exec, Some(ExecPosture::Allowlist(vec![pp("/b/**")])));
+        let hosts: Vec<String> = layer.hosts.iter().map(|h| h.to_string()).collect();
+        assert_eq!(
+            hosts,
+            vec![
+                "https:api.anthropic.com",
+                "get,post:api.github.com/repos/acme/**",
+                "deny:telemetry.example.com"
+            ]
+        );
+        let mut bad = BlueprintLayer {
+            rules: vec!["read,deny:/x".into()],
+            ..Default::default()
+        };
+        assert!(desugar_rules(&mut bad, &sigils).is_err());
+    }
+
+    #[test]
+    fn host_rules_refuse_a_port_tier_and_a_second_grade() {
+        let dir = Scratch::new("host-rules");
+        std::fs::write(
+            dir.path().join("bp.toml"),
+            "net = { ports = [443] }\nrules = [\"https:api.anthropic.com\"]\n",
+        )
+        .unwrap();
+        let msg = format!(
+            "{:#}",
+            load(&dir.path().join("bp.toml"), "/home/x").unwrap_err()
+        );
+        assert!(msg.contains("port tier"), "{msg}");
+        std::fs::write(
+            dir.path().join("two.toml"),
+            "rules = [\"https:*.github.com\", \"post:api.github.com/x\"]\n",
+        )
+        .unwrap();
+        let msg = format!(
+            "{:#}",
+            load(&dir.path().join("two.toml"), "/home/x").unwrap_err()
+        );
+        assert!(msg.contains("two grades"), "{msg}");
+        std::fs::write(
+            dir.path().join("ok.toml"),
+            "rules = [\"https:api.anthropic.com\", \"get:api.github.com\"]\n",
+        )
+        .unwrap();
+        let bp = load(&dir.path().join("ok.toml"), "/home/x").unwrap();
+        assert_eq!(bp.net.host_table().unwrap().rules.len(), 2);
     }
 
     #[test]
@@ -1021,19 +1314,19 @@ mod tests {
         let home_str = home.to_str().unwrap();
 
         // Nothing anywhere: no discovery.
-        assert_eq!(find_default_blueprint(&project, home_str), None);
+        assert_eq!(find_default_blueprint(&project, home_str).unwrap(), None);
 
         // A file in a parent (still under $HOME) is found from a nested cwd.
         std::fs::write(home.join("work").join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
         assert_eq!(
-            find_default_blueprint(&project, home_str),
+            find_default_blueprint(&project, home_str).unwrap(),
             Some(home.join("work").join(DEFAULT_BLUEPRINT_NAME))
         );
 
         // The cwd's own file wins over a parent's.
         std::fs::write(project.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
         assert_eq!(
-            find_default_blueprint(&project, home_str),
+            find_default_blueprint(&project, home_str).unwrap(),
             Some(project.join(DEFAULT_BLUEPRINT_NAME))
         );
 
@@ -1042,16 +1335,65 @@ mod tests {
         std::fs::write(dir.path().join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
         std::fs::remove_file(project.join(DEFAULT_BLUEPRINT_NAME)).unwrap();
         std::fs::remove_file(home.join("work").join(DEFAULT_BLUEPRINT_NAME)).unwrap();
-        assert_eq!(find_default_blueprint(&project, home_str), None);
+        assert_eq!(find_default_blueprint(&project, home_str).unwrap(), None);
 
         // A cwd outside $HOME still walks its own ancestors (a project need not live under
         // home), just never as far as the filesystem root.
         let outside = dir.path().join("elsewhere");
         std::fs::create_dir_all(&outside).unwrap();
         assert_eq!(
-            find_default_blueprint(&outside, home_str),
+            find_default_blueprint(&outside, home_str).unwrap(),
             Some(dir.path().join(DEFAULT_BLUEPRINT_NAME))
         );
+    }
+
+    /// FEP-5 D3: `.formwork/blueprint.toml` is discovered like FORMWORK.toml, and a directory
+    /// holding both is a loud error rather than a silent pick.
+    #[test]
+    fn dotdir_blueprint_is_discovered_and_ambiguity_fails_loud() {
+        let dir = Scratch::new("discover-dotdir");
+        let home = dir.path().join("home");
+        let project = home.join("proj");
+        std::fs::create_dir_all(project.join(".formwork")).unwrap();
+        let home_str = home.to_str().unwrap();
+        let dotdir = project.join(DOTDIR_BLUEPRINT);
+        std::fs::write(&dotdir, "").unwrap();
+        assert_eq!(
+            find_default_blueprint(&project, home_str).unwrap(),
+            Some(dotdir.clone())
+        );
+        std::fs::write(project.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
+        let err = find_default_blueprint(&project, home_str).unwrap_err();
+        assert!(format!("{err}").contains("both"), "{err}");
+    }
+
+    /// FEP-5 D10: `/**` under the closed read mode is refused, naming the layer; the same row is
+    /// harmless under the ambient mode.
+    #[test]
+    fn universe_row_under_closed_mode_is_refused_naming_the_layer() {
+        let dir = Scratch::new("universe-row");
+        std::fs::write(
+            dir.path().join("base.toml"),
+            "[fs]\nread-mode = \"ambient-minus-subtract\"\nreads = [\"/**\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("bp.toml"),
+            "extends = [\"base.toml\"]\nmode = \"unveil\"\n",
+        )
+        .unwrap();
+        let err = load(&dir.path().join("bp.toml"), "/home/x").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("base.toml") && msg.contains("/**"), "{msg}");
+        assert!(load(&dir.path().join("base.toml"), "/home/x").is_ok());
+        // The builtin default no longer carries the row, so extending it in unveil mode is fine.
+        std::fs::write(
+            dir.path().join("strict.toml"),
+            "extends = [\"builtin:default\"]\nmode = \"unveil\"\n",
+        )
+        .unwrap();
+        let bp = load(&dir.path().join("strict.toml"), "/home/x").unwrap();
+        assert!(bp.fs.reads.is_empty(), "{:?}", bp.fs.reads);
     }
 
     /// FW-BP8: the walk ends at the first ancestor the invoking user does not control, BEFORE
@@ -1073,14 +1415,14 @@ mod tests {
 
         // The planted file sits in the untrusted ancestor: never consulted.
         assert_eq!(
-            find_default_blueprint_trusting(&project, home_str, &trusted),
+            find_default_blueprint_trusting(&project, home_str, &trusted).unwrap(),
             None
         );
 
         // The user's own launch directory still works below the same untrusted ancestor.
         std::fs::write(project.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
         assert_eq!(
-            find_default_blueprint_trusting(&project, home_str, &trusted),
+            find_default_blueprint_trusting(&project, home_str, &trusted).unwrap(),
             Some(project.join(DEFAULT_BLUEPRINT_NAME))
         );
     }
@@ -1102,7 +1444,7 @@ mod tests {
         let trusted = move |p: &Path| p != foreign;
 
         assert_eq!(
-            find_default_blueprint_trusting(&project, home_str, &trusted),
+            find_default_blueprint_trusting(&project, home_str, &trusted).unwrap(),
             None,
             "a refused candidate must not fall through to the file it shadows"
         );
@@ -1124,7 +1466,7 @@ mod tests {
         std::fs::write(dir.path().join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
 
         assert_eq!(
-            find_default_blueprint(&project, link_home.to_str().unwrap()),
+            find_default_blueprint(&project, link_home.to_str().unwrap()).unwrap(),
             None,
             "the walk escaped above a symlinked $HOME"
         );

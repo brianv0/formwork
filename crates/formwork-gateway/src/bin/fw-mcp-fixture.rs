@@ -22,10 +22,17 @@ fn emit(value: &Value) {
 }
 
 fn reply(id: &Option<Value>, result: Value) {
-    if let Some(id) = id {
-        if !id.is_null() {
+    match id {
+        Some(id) if !id.is_null() => {
             emit(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
         }
+        // An id-less call has no reply, so announce that it arrived: a gated call the gateway
+        // should have dropped then shows up at the agent (FW-ADV-016).
+        _ => emit(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"level": "info", "data": "fixture received an id-less call"}
+        })),
     }
 }
 

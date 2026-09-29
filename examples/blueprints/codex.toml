@@ -1,0 +1,23 @@
+# codex under host-scoped egress (FEP-5), signed in with ChatGPT: only the OpenAI API and its
+# sign-in hosts are reachable, through the session Gateway. `codex` keeps its own ~/.codex state
+# (create it once outside the sandbox: `mkdir -p ~/.codex`; the sandbox cannot create it in ~).
+# With an API key instead, use `codex-api-key.toml`: the key is brokered.
+#
+#   formwork explain --blueprint examples/blueprints/codex.toml --hosts
+#
+# Deliberately refused, and harmless to codex (observed with codex 0.157): ab.chatgpt.com
+# (analytics), github.com and api.github.com (release checks), files.openai.com.
+
+extends = ["agent-base.toml"]
+
+rules = [
+    "https:api.openai.com",
+    "https:chatgpt.com",
+    "https:auth.openai.com",
+]
+allow-credentials = ["codex"]
+# The ChatGPT login opens a browser.
+channels = ["open-url"]
+
+[fs]
+writes = ["~/.codex/**"]

@@ -2,23 +2,44 @@
 //! (`Blueprint::narrow`) can only shrink a grant, never widen it (FW-CAP2).
 
 mod catalog;
+mod channel;
+mod credential;
 mod discovery;
+mod egress;
 mod launcher;
 mod layer;
 mod narrow;
 mod path;
 mod provenance;
 
-pub use catalog::{Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP};
+pub use catalog::{
+    BrokerBlock, Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP, OS_KEYRING,
+};
+pub use channel::{
+    valid_channel_names, Channel, ChannelError, ChannelGroup, ChannelPolicy, IsolateMember,
+};
+pub use credential::{
+    doubly_named, exposed_types, resolve_brokers, BrokerPlan, BrokerScheme, CredentialEntry,
+    InlineBinding,
+};
 pub use discovery::{
-    reverse_compile, synthesize_blueprint, AccessRecord, Candidate, CandidateTag, DenialAccess,
-    DenialRecord, ProposalOutcome, WithheldEntry,
+    propose_channels, propose_host_rules, reverse_compile, synthesize_blueprint, AccessRecord,
+    Candidate, CandidateTag, DenialAccess, DenialRecord, EgressObservation, EgressProposal,
+    ProposalOutcome, WithheldEntry,
+};
+pub use egress::{
+    canonical_ip, canonicalize_host, canonicalize_request_path, is_restricted_ip, split_host_port,
+    split_url, target_is_host, validate_host_rules, CanonicalHost, ConnectDecision, Denial,
+    HostAccess, HostError, HostPattern, HostRule, HostTable, HttpMethod, PathGlob, RequestDecision,
+    DEFAULT_HTTPS_PORT, DEFAULT_HTTP_PORT, HTTP_ATOMS, METADATA_HOSTNAMES,
 };
 pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
 pub use narrow::intersect_grants;
-pub use path::{canonicalize_set, PathError, PathPattern};
-pub use provenance::{merge_with_provenance, Explanation, Provenance, RuleSource, Verdict};
+pub use path::{canonicalize_set, canonicalize_write_set, PathError, PathPattern};
+pub use provenance::{
+    merge_with_provenance, ChannelExplanation, Explanation, Provenance, RuleSource, Verdict,
+};
 
 use std::collections::BTreeMap;
 
@@ -38,15 +59,35 @@ pub struct Blueprint {
     pub env: EnvPosture,
     #[serde(default)]
     pub mcp: BTreeMap<String, McpPolicy>,
-    /// Credential types deliberately let through the catalog floor (FW-CRED5). The catalog itself
-    /// is compiled in; this is the only mechanism that lifts a typed entry -- path allows cannot.
+    /// Credential types deliberately let through the catalog floor (FW-CRED5), or brokered by the
+    /// Gateway (FW-BP12). The catalog itself is compiled in; this is the only mechanism that lifts a
+    /// typed entry -- path allows cannot. Floor computations read [`Blueprint::exposed_credentials`].
     #[serde(default)]
-    pub allow_credentials: Vec<String>,
+    pub allow_credentials: Vec<CredentialEntry>,
     #[serde(default)]
     pub discovery: DiscoveryBlueprint,
+    /// Host-service channels lifted from the baseline (FW-ISO13, FW-BP9). Default: none.
+    #[serde(default)]
+    pub channels: ChannelPolicy,
+    /// The opt-in isolation tier (FW-ISO10). Default: empty.
+    #[serde(default)]
+    pub isolate: Vec<IsolateMember>,
 }
 
 impl Blueprint {
+    /// The `allow-credentials` entries the Gateway brokers (FW-CRED11): every one but a plain
+    /// exposure.
+    pub fn brokered_credentials(&self) -> impl Iterator<Item = &CredentialEntry> {
+        self.allow_credentials
+            .iter()
+            .filter(|e| !matches!(e, CredentialEntry::Expose(_)))
+    }
+
+    /// The types whose floor is lifted (FW-CRED5): bare entries not also brokered.
+    pub fn exposed_credentials(&self) -> Vec<String> {
+        exposed_types(&self.allow_credentials)
+    }
+
     /// The floor-only Blueprint for a permissive recording: everything allowed, so the workload runs
     /// observably unconfined, except the credential floor. The floor is terminal, so the open `/**`
     /// write cannot reach a credential (FW-INV11) -- a recording can never touch one.
@@ -128,13 +169,27 @@ impl Mode {
 }
 
 /// `Deny` is the fail-closed default (FW-XR3); `Ports` allows direct TCP connect to a port set
-/// only where the platform can enforce it.
+/// only where the platform can enforce it; `AllowHosts` sends all egress through the Gateway, which
+/// admits only the host table's hosts (FW-EGR1). The three are mutually exclusive by construction.
+/// `AllowHosts` is authored only as host rules in `rules` (FW-BP13), never as a `net` value, so
+/// the variant is not deserialized from a blueprint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetPosture {
     #[default]
     Deny,
     Ports(Vec<u16>),
+    #[serde(skip_deserializing)]
+    AllowHosts(HostTable),
+}
+
+impl NetPosture {
+    pub fn host_table(&self) -> Option<&HostTable> {
+        match self {
+            NetPosture::AllowHosts(t) => Some(t),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -559,6 +614,8 @@ impl Blueprint {
             mcp: BTreeMap::new(),
             allow_credentials: Vec::new(),
             discovery: DiscoveryBlueprint::default(),
+            channels: ChannelPolicy::default(),
+            isolate: Vec::new(),
         }
     }
 
@@ -572,11 +629,14 @@ impl Blueprint {
         let mut allow_credentials = self.allow_credentials.clone();
         allow_credentials.sort();
         allow_credentials.dedup();
+        let mut isolate = self.isolate.clone();
+        isolate.sort();
+        isolate.dedup();
         Blueprint {
             fs: FsBlueprint {
                 read_mode: self.fs.read_mode,
                 reads: canonicalize_set(&self.fs.reads),
-                writes: canonicalize_set(&self.fs.writes),
+                writes: canonicalize_write_set(&self.fs.writes),
                 writes_no_create: canonicalize_set(&self.fs.writes_no_create),
                 subtract: canonicalize_set(&self.fs.subtract),
                 write_subtract: canonicalize_set(&self.fs.write_subtract),
@@ -589,6 +649,8 @@ impl Blueprint {
             discovery: DiscoveryBlueprint {
                 auto_widen: canonicalize_set(&self.discovery.auto_widen),
             },
+            channels: self.channels.clone(),
+            isolate,
         }
     }
 }
@@ -653,6 +715,7 @@ impl NetPosture {
                 }
             }
             NetPosture::Deny => NetPosture::Deny,
+            NetPosture::AllowHosts(t) => NetPosture::AllowHosts(HostTable::new(t.rules.clone())),
         }
     }
 }

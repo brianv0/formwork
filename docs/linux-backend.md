@@ -14,16 +14,23 @@ seccomp=unconfined --security-opt apparmor=unconfined` so only Formwork's sandbo
   `O_NOFOLLOW`), so granting or recursing a symlink *entry* would bind the rule to its target — a
   fail-open escape out of a split grant. Access *through* a symlink still resolves to the real path,
   governed by whatever rule covers it (or denied), matching macOS's resolved-path checks.
-- **`/proc/self` is granted in the child, not the parent.** It is a per-process symlink; a rule built
-  in the parent binds the *launcher's* `/proc/<pid>`. The child's own `/proc/self` is added post-fork
-  in `apply` (runtimes read `/proc/self/{maps,exe,status}` and would otherwise die under Closed mode).
+- **`/proc` and `/etc` are read essentials (FEP-5 D11).** A rule is bound to one inode at spawn, and
+  each descendant's `/proc/self` resolves to a different directory, so granting `/proc/self` in the
+  child left grandchildren (a shell's `node`, `cargo`, `go`) unable to read their own
+  `/proc/self/{maps,exe,status}`. `/proc` is granted read in every mode instead. Other processes'
+  `/proc/<pid>/environ` stays closed: `ptrace_may_access` decides it, and Landlock refuses a
+  confined process ptrace-class access outside its domain. A process holding `CAP_SYS_ADMIN` or
+  `CAP_PERFMON` (a root container) gets past that refusal; `detect` records those capabilities and
+  `CAP_SYS_PTRACE`, and the report says `Partial` then. `isolate = ["processes"]` closes it
+  regardless, with a fresh procfs.
 - **Net-deny is carried by seccomp, not Landlock.** Landlock net governs only TCP; carrying deny with
   it left UDP/raw open (an exfil channel). Deny now denies inet `socket(2)` creation at the family
-  level (TCP + UDP + raw), matching macOS `(deny network*)`. Landlock net carries the port tier, where
-  per-port TCP *allow* is required -- but even there seccomp still denies inet DGRAM/RAW `socket(2)`
-  (type masked to `SOCK_TYPE_MASK`, STREAM allowed), so the TCP-only Landlock grant cannot be
-  sidestepped with a UDP/raw socket. Direct DNS under the port tier goes through the gateway, not a
-  direct UDP:53 hole ([FW-ISO3](../formwork.md#fw-iso3)/[FW-INV3](../formwork.md#fw-inv3)/[FW-E2E-007](../formwork.md#fw-e2e-007)).
+  level (TCP + UDP + raw), matching macOS `(deny network*)`. Landlock net carries the port tier,
+  where per-port TCP *allow* is required -- but even there seccomp still denies inet DGRAM/RAW
+  `socket(2)` (type masked to `SOCK_TYPE_MASK`, STREAM allowed), so the TCP-only Landlock grant
+  cannot be sidestepped with a UDP/raw socket ([FW-ISO3](../formwork.md#fw-iso3),
+  [FW-INV3](../formwork.md#fw-inv3), [FW-ISO11](fep-5.md#fw-iso11)). Nothing inside the sandbox
+  resolves names under the port tier; host rules restore resolution through the Gateway.
 - **Abstract-UNIX-socket + signal scoping is enforced at ABI v6+** via the `Scope` handle — closing a
   pathless escape the fs rules cannot reach — matching the compiler's CrossDomainSocket = Partial.
 - **Device ioctls are *not* governed** (`IOCTL_DEV` excluded from `handled_fs`). Governing it denies
@@ -105,11 +112,10 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
 1. **Closed-read profiles need runtime essentials or nothing loads.** Granting only `/work/project`
    makes `ld.so`/libraries unreadable and every `execve` fails — the same class of failure the macOS
    spike hit (there it was a `dyld` SIGABRT). Linux essentials to add to the read set in Closed mode:
-   `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc/ld.so.cache`, `/etc/ld.so.preload`, and the safe
+   `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`, `/proc`, and the safe
    `/dev` nodes (`/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/random`, `/dev/tty`) — as literals,
    never a broad `/dev` (which would expose block devices, an out-of-band filesystem read). This
-   mirrors `MACOS_READ_ESSENTIALS` / `MACOS_READ_DEVICES`. `/proc/self` is *not* a parent-side
-   essential — it is per-process and must be granted in the child (see Hardening decisions above).
+   mirrors `MACOS_READ_ESSENTIALS` / `MACOS_READ_DEVICES`.
 2. **`subtract` can't be a deny rule** — it must be compiled into the *shape* of the grants. The
    expansion (bounded by the number of holes, not filesystem size):
 
@@ -131,6 +137,16 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
    subtrees. Consequence (state in the report): directories created under a broad root *after*
    enforcement are not covered — fail-closed, acceptable, and TOCTOU-safe because Landlock rules bind
    to the opened directory fds, not to path strings.
+
+   A second consequence: a split directory itself — every ancestor of a hole, typically `/`, `/home`
+   and `$HOME` — is traversable but not listable, so `ls /` and a tool's walk up the tree for config
+   files are refused, while every file beneath stays readable. The comparison is OpenBSD unveil:
+   `unveil("/", "r")` plus `unveil("~/.ssh", "")` lists `/` and `~` but hides `~/.ssh` entirely,
+   names included. Landlock cannot express both halves, because a listing right on `~` also applies
+   inside `~/.ssh`. Formwork keeps the half that never allows more than unveil would: ancestors stay
+   unlisted, and a denied directory's names stay hidden. (Under the closed read mode,
+   `mode = "unveil"`, the behavior matches unveil exactly: ancestors of a grant are traversable, not
+   listable.) Decided in FEP-5 review; `docs/fep-5-plan.md` §3.
 
 ## seccomp baseline (`seccompiler`) — and its hazards
 
@@ -163,6 +179,27 @@ rules.insert(libc::SYS_socket, vec![
 ]);
 // AF_UNIX / socketpair are absent from the list -> allowed (the injected-fd seam is untouched).
 ```
+
+### Connect supervision and the isolation tier (FEP-5)
+
+- **Supervised connect (`FW-EGR7`, `FW-ISO12`).** Under host rules a second seccomp filter returns
+  `SECCOMP_RET_USER_NOTIF` for `connect` and for `sendto` with a non-null destination (x32 numbers are
+  refused outright). The listener is handed to the `formwork` process over a socketpair; the
+  supervisor copies the `sockaddr` once, re-checks the notification id, takes the socket with
+  `pidfd_getfd` and performs the call itself, so a thread rewriting the address after the check
+  changes nothing (`FW-ADV-018`). Inet goes to the Gateway only; a pathname socket is admitted when a
+  literal write grant names it or a session process bound it, which is decided from `sock_diag` or,
+  on kernels without `CONFIG_UNIX_DIAG`, `/proc/net/unix`. Addressed `sendmsg`/`sendmmsg` on an
+  AF_UNIX datagram socket is not mediated (its destination sits in memory seccomp cannot read), and
+  the report says so. Requires 5.6+ (`pidfd_getfd`) and Yama `ptrace_scope` 0 or 1; `detect` probes
+  all three.
+- **The isolation tier (`FW-ISO10`).** User, PID, mount and UTS namespaces (plus IPC for `ipc`) are
+  created by the `formwork` binary re-executed as a single-threaded stage: the parent is
+  multi-threaded and cannot `unshare(CLONE_NEWUSER)`, and Landlock rules must be built after the
+  fresh `/proc` and the tmpfs over the session temp directory are mounted, which allocates. A
+  minimal PID-1 init reaps orphans and relays user-sent signals. The seccomp baseline installed
+  afterwards still denies `CLONE_NEWUSER` and the mount family. `detect` probes the whole tier,
+  `/proc` mount included, so Ubuntu 24.04's AppArmor restriction is refused before spawn.
 
 **Hazards (status after kernel validation):**
 

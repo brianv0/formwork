@@ -15,19 +15,19 @@ pub use policy::{
     MacosPolicy, SeccompPlan, SocketFamily,
 };
 pub use report::{
-    Backend, Capability, CredentialFidelity, CredentialReport, DenialSemantics, Fidelity,
-    FidelityReport,
+    Backend, Capability, ChannelReport, CredentialFidelity, CredentialReport, DenialSemantics,
+    Fidelity, FidelityReport, HostPresence,
 };
 
 use std::collections::BTreeMap;
 
 use formwork_blueprint::{
-    canonicalize_set, Blueprint, EnvPosture, ExecPosture, NetPosture, PathPattern, ReadMode,
-    ResolvedCatalog,
+    canonicalize_set, Blueprint, Channel, ChannelPolicy, EnvPosture, ExecPosture, IsolateMember,
+    NetPosture, PathPattern, ReadMode, ResolvedCatalog,
 };
 use formwork_detect::{HostProfile, Os};
 
-use linux::PortTier;
+use linux::{InetSeccompDeny, PortTier};
 
 /// The normalized intermediate both backends consume: canonicalized, with write grants folded into
 /// the read surface (writes imply reads). Operator denies (`subtract`) and the credential floor
@@ -50,6 +50,17 @@ pub struct CompileInput {
     pub floor_exempt: Vec<PathPattern>,
     pub net: NetPosture,
     pub exec: ExecPosture,
+    /// Host-service channels the blueprint lifts from the baseline (FW-ISO13).
+    pub channels: ChannelPolicy,
+    pub isolate: Vec<IsolateMember>,
+    /// The session Gateway's loopback port, known only when compiling for a spawn (FW-EGR8).
+    pub gateway_port: Option<u16>,
+    /// Pathname sockets granted by a literal write grant (FW-ISO12, FEP-5 §3.1.1).
+    pub unix_socket_grants: Vec<PathPattern>,
+    /// Whether any credential is brokered (FW-CRED11).
+    pub brokered: bool,
+    /// Whether the `os-keyring` type is lifted (FW-CRED13).
+    pub keyring_lifted: bool,
 }
 
 impl CompileInput {
@@ -58,28 +69,41 @@ impl CompileInput {
         reads.extend(blueprint.fs.writes.iter().cloned());
         // Write grants imply read; the no-create grant is a write grant too.
         reads.extend(blueprint.fs.writes_no_create.iter().cloned());
+        let exposed = blueprint.exposed_credentials();
         let floor_exempt: Vec<PathPattern> = catalog
             .types
             .iter()
-            .filter(|(name, _)| {
-                blueprint
-                    .allow_credentials
-                    .iter()
-                    .any(|a| a == name.as_str())
-            })
+            .filter(|(name, _)| exposed.iter().any(|a| a == name.as_str()))
             .flat_map(|(_, entry)| entry.paths.iter().cloned())
             .collect();
         CompileInput {
             read_mode: blueprint.fs.read_mode,
             effective_reads: canonicalize_set(&reads),
-            writes: canonicalize_set(&blueprint.fs.writes),
+            writes: formwork_blueprint::canonicalize_write_set(&blueprint.fs.writes),
             writes_no_create: canonicalize_set(&blueprint.fs.writes_no_create),
             subtract: canonicalize_set(&blueprint.fs.subtract),
             write_subtract: canonicalize_set(&blueprint.fs.write_subtract),
-            floor: canonicalize_set(&catalog.denied_paths(&blueprint.allow_credentials)),
+            floor: canonicalize_set(&catalog.denied_paths(&exposed)),
             floor_exempt: canonicalize_set(&floor_exempt),
             net: blueprint.net.clone(),
             exec: blueprint.exec.clone(),
+            channels: blueprint.channels.clone(),
+            isolate: blueprint.isolate.clone(),
+            gateway_port: None,
+            brokered: blueprint.brokered_credentials().next().is_some(),
+            keyring_lifted: exposed.iter().any(|t| t == formwork_blueprint::OS_KEYRING),
+            // A literal (non-subtree) write grant names one file; that is how a session grants a
+            // socket (`readwrite:$SSH_AUTH_SOCK`). Subtree grants never admit sockets, or a
+            // writable `/tmp/**` would admit the X11 socket beneath it.
+            unix_socket_grants: canonicalize_set(
+                &blueprint
+                    .fs
+                    .writes
+                    .iter()
+                    .filter(|p| !p.is_subtree() && !p.is_any_depth())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 }
@@ -92,28 +116,33 @@ pub fn compile(
     host: &HostProfile,
     catalog: &ResolvedCatalog,
 ) -> CompiledPolicy {
+    compile_for_session(blueprint, host, catalog, None)
+}
+
+/// [`compile`] for a session: `gateway_port` is the per-spawn Gateway listener the session's
+/// egress goes to (FW-EGR8/FW-EGR14), not blueprint content. A dry run compiles with none, and
+/// the macOS profile then allows no outbound endpoint at all (fail-closed). Still pure and
+/// deterministic in its inputs (FW-FID4).
+pub fn compile_for_session(
+    blueprint: &Blueprint,
+    host: &HostProfile,
+    catalog: &ResolvedCatalog,
+    gateway_port: Option<u16>,
+) -> CompiledPolicy {
     let blueprint = blueprint.canonicalize();
-    let input = CompileInput::from_blueprint(&blueprint, catalog);
+    let mut input = CompileInput::from_blueprint(&blueprint, catalog);
+    input.gateway_port = gateway_port;
 
     let mut per_capability: BTreeMap<Capability, Fidelity> = BTreeMap::new();
-    let mut semantics: BTreeMap<Capability, DenialSemantics> = BTreeMap::new();
+    let mut withheld: Vec<String> = Vec::new();
 
     let (confiner, direct_tcp_ports) = match host.os {
-        Os::MacOs => compile_macos(
-            &input,
-            host,
-            &blueprint,
-            &mut per_capability,
-            &mut semantics,
-        ),
-        Os::Linux => compile_linux(
-            &input,
-            host,
-            &blueprint,
-            &mut per_capability,
-            &mut semantics,
-        ),
+        Os::MacOs => compile_macos(&input, host, &mut per_capability),
+        Os::Linux => compile_linux(&input, host, &mut per_capability, &mut withheld),
     };
+    let supervised = supervised(&input, host);
+    egress_rows(&input, host, supervised, &mut per_capability);
+    let channels = baseline_rows(&input, host, supervised, &mut per_capability);
 
     // Filesystem invisibility is never provided; document it as an explicit, reported fact.
     per_capability.insert(
@@ -123,7 +152,6 @@ pub fn compile(
                 .to_string(),
         },
     );
-    semantics.insert(Capability::FsInvisibility, DenialSemantics::Deny);
 
     // Environment posture is applied at spawn by the CLI shell, independent of the OS confiner (like
     // MCP shading below). Passthrough asks for nothing, so it earns no row. Allowlist is exact
@@ -138,7 +166,6 @@ pub fn compile(
                     backend: Backend::Launcher,
                 },
             );
-            semantics.insert(Capability::EnvScrub, DenialSemantics::Hide);
         }
         EnvPosture::Scrub(_) => {
             per_capability.insert(
@@ -148,7 +175,6 @@ pub fn compile(
                     reason: "heuristic: drops secret-shaped names and values; a secret with neither a known marker name nor a recognized value shape (e.g. an inline credential in DATABASE_URL) is not caught -- pin it with an explicit deny or use an allowlist".to_string(),
                 },
             );
-            semantics.insert(Capability::EnvScrub, DenialSemantics::Hide);
         }
     }
 
@@ -160,19 +186,27 @@ pub fn compile(
                 backend: Backend::Gateway,
             },
         );
-        semantics.insert(Capability::McpShading, DenialSemantics::Hide);
     }
 
     let credentials = credential_report(catalog, &blueprint, host, &per_capability);
+    let semantics = per_capability
+        .keys()
+        .map(|&cap| (cap, cap.semantics()))
+        .collect();
+    withheld.sort();
+    withheld.dedup();
     let report = FidelityReport {
         host: host.clone(),
         per_capability,
         semantics,
         credentials,
+        withheld,
+        channels,
     };
     let gateway = GatewayPolicy {
         servers: blueprint.mcp.clone(),
         direct_tcp_ports,
+        egress: blueprint.net.host_table().cloned(),
     };
 
     CompiledPolicy {
@@ -217,8 +251,9 @@ fn credential_report(
     let env_fidelity = Fidelity::Enforced {
         backend: Backend::Launcher,
     };
+    let exposed = blueprint.exposed_credentials();
     let mut per_type = BTreeMap::new();
-    for (name, entry) in catalog.enforced_types(&blueprint.allow_credentials) {
+    for (name, entry) in catalog.enforced_types(&exposed) {
         per_type.insert(
             name.to_string(),
             CredentialFidelity {
@@ -227,13 +262,17 @@ fn credential_report(
             },
         );
     }
-    let backstop_lifted = blueprint
-        .allow_credentials
-        .iter()
-        .any(|a| a == formwork_blueprint::BACKSTOP);
+    let backstop_lifted = exposed.iter().any(|a| a == formwork_blueprint::BACKSTOP);
+    let mut brokered: Vec<String> = blueprint
+        .brokered_credentials()
+        .map(|e| e.name().to_string())
+        .collect();
+    brokered.sort();
+    brokered.dedup();
     CredentialReport {
         catalog_version: catalog.version,
-        allowed: blueprint.allow_credentials.clone(),
+        allowed: exposed,
+        brokered,
         per_type,
         backstop: (!backstop_lifted).then(|| path_fidelity_for(&catalog.backstop)),
         launcher_contingency: "env-var shading is applied by the launcher at spawn; it holds only \
@@ -246,89 +285,93 @@ fn credential_report(
 fn compile_macos(
     input: &CompileInput,
     host: &HostProfile,
-    blueprint: &Blueprint,
     caps: &mut BTreeMap<Capability, Fidelity>,
-    sem: &mut BTreeMap<Capability, DenialSemantics>,
 ) -> (ConfinerPolicy, Vec<u16>) {
     let sbpl = sbpl::render(input);
 
-    // Every macOS enforcement rides Seatbelt. When the host lacks it, report honestly rather than
-    // silently over-claim (FW-INV5/FW-XR1) -- mirroring the Linux `has_landlock=false` branch.
-    let has_seatbelt = host.seatbelt;
-    let fidelity = |reason: &str| -> Fidelity {
-        if has_seatbelt {
+    // Every macOS enforcement rides Seatbelt; a macOS host without it is reported, never claimed
+    // (FW-INV5/FW-XR1).
+    let seatbelt = |what: &str| -> Fidelity {
+        if host.seatbelt {
             Fidelity::Enforced {
                 backend: Backend::Seatbelt,
             }
         } else {
             Fidelity::Unenforceable {
-                reason: reason.to_string(),
+                reason: format!("Seatbelt unavailable on this host; {what} cannot be enforced"),
             }
         }
     };
-    let fs_net_reason = "Seatbelt unavailable on this host; filesystem/network scope cannot be \
-                         enforced";
-    caps.insert(Capability::FsRead, fidelity(fs_net_reason));
-    caps.insert(Capability::FsWrite, fidelity(fs_net_reason));
-    caps.insert(Capability::NetDefaultDeny, fidelity(fs_net_reason));
-    sem.insert(Capability::FsRead, DenialSemantics::Deny);
-    sem.insert(Capability::FsWrite, DenialSemantics::Deny);
-    sem.insert(Capability::NetDefaultDeny, DenialSemantics::Deny);
-
-    // Seatbelt path-gates UNIX sockets, so cross-domain socket control is clean here -- when present.
+    caps.insert(Capability::FsRead, seatbelt("filesystem read scope"));
+    caps.insert(Capability::FsWrite, seatbelt("filesystem write scope"));
+    caps.insert(Capability::NetDefaultDeny, seatbelt("network default-deny"));
+    // Seatbelt path-gates UNIX sockets under `(deny network*)`, so cross-domain socket control and
+    // pathname sockets are closed apart from granted literals.
     caps.insert(
         Capability::CrossDomainSocket,
-        fidelity(
-            "Seatbelt unavailable on this host; cross-domain socket control cannot be enforced",
-        ),
+        seatbelt("UNIX-socket control"),
     );
-    sem.insert(Capability::CrossDomainSocket, DenialSemantics::Deny);
+    caps.insert(
+        Capability::NetUnixSocket,
+        seatbelt("pathname-socket control"),
+    );
+    caps.insert(Capability::NetUdp, seatbelt("UDP/raw closure"));
+    if !input.write_subtract.is_empty() {
+        caps.insert(Capability::TamperVectors, seatbelt("the tamper-vector set"));
+    }
 
     let mut direct_ports = Vec::new();
-    if let NetPosture::Ports(ports) = &input.net {
-        caps.insert(
-            Capability::NetPortTier,
-            fidelity("Seatbelt unavailable on this host; direct port tier cannot be enforced"),
-        );
-        sem.insert(Capability::NetPortTier, DenialSemantics::Deny);
-        direct_ports = ports.clone();
+    match &input.net {
+        NetPosture::Ports(ports) => {
+            caps.insert(Capability::NetPortTier, seatbelt("the direct port tier"));
+            direct_ports = ports.clone();
+            // D8: the port tier re-allows the mDNSResponder literal, a name-resolution channel the
+            // report must list.
+            caps.insert(
+                Capability::NetResolver,
+                Fidelity::Partial {
+                    backend: Backend::Seatbelt,
+                    reason: format!(
+                        "the port tier allows the system resolver socket {} so names resolve; \
+                         every looked-up name reaches mDNSResponder outside the sandbox",
+                        sbpl::MACOS_RESOLVER_SOCKET
+                    ),
+                },
+            );
+        }
+        // FW-EGR12: under host rules the resolver literal is dropped and every lookup happens in
+        // the Gateway, which pins it (FW-ADV-008).
+        NetPosture::Deny | NetPosture::AllowHosts(_) => {
+            caps.insert(Capability::NetResolver, seatbelt("resolver closure"));
+        }
     }
     if let ExecPosture::Allowlist(_) = &input.exec {
-        caps.insert(
-            Capability::Exec,
-            fidelity("Seatbelt unavailable on this host; exec allowlist cannot be enforced"),
-        );
-        sem.insert(Capability::Exec, DenialSemantics::Deny);
+        caps.insert(Capability::Exec, seatbelt("the exec allow-list"));
     }
-    let _ = blueprint;
 
     (ConfinerPolicy::Macos(MacosPolicy { sbpl }), direct_ports)
 }
 
+/// Device-node prefixes behind the `camera` and `microphone` channels on Linux (FW-ISO13).
+const LINUX_CAMERA_DEVICES: &[&str] = &["/dev/media", "/dev/v4l", "/dev/video"];
+const LINUX_MICROPHONE_DEVICES: &[&str] = &["/dev/snd"];
+
 fn compile_linux(
     input: &CompileInput,
     host: &HostProfile,
-    _blueprint: &Blueprint,
     caps: &mut BTreeMap<Capability, Fidelity>,
-    sem: &mut BTreeMap<Capability, DenialSemantics>,
+    withheld: &mut Vec<String>,
 ) -> (ConfinerPolicy, Vec<u16>) {
     let abi = host.landlock_abi.unwrap_or(0);
     let has_landlock = abi >= 1;
+    let landlock = || Fidelity::Enforced {
+        backend: Backend::Landlock,
+    };
 
     // Filesystem read/write require Landlock. Report honestly if it is absent.
     if has_landlock {
-        caps.insert(
-            Capability::FsRead,
-            Fidelity::Enforced {
-                backend: Backend::Landlock,
-            },
-        );
-        caps.insert(
-            Capability::FsWrite,
-            Fidelity::Enforced {
-                backend: Backend::Landlock,
-            },
-        );
+        caps.insert(Capability::FsRead, landlock());
+        caps.insert(Capability::FsWrite, landlock());
     } else {
         let reason =
             "Landlock unavailable on this host; filesystem scope cannot be enforced".to_string();
@@ -340,39 +383,45 @@ fn compile_linux(
         );
         caps.insert(Capability::FsWrite, Fidelity::Unenforceable { reason });
     }
-    sem.insert(Capability::FsRead, DenialSemantics::Deny);
-    sem.insert(Capability::FsWrite, DenialSemantics::Deny);
 
     let (net_plan, inet_deny, tier) = linux::net_plan(host, &input.net);
-    // Net default-deny is seccomp-carried on every Linux path: an outright deny blocks the whole inet
-    // family, and the port tier still needs seccomp for the inet DGRAM/RAW deny (Landlock net governs
-    // TCP only). So a working seccomp filter is required to claim it Enforced -- Landlock alone would
-    // over-claim, leaving UDP/raw open (FW-ISO3/FW-INV3/FW-INV5).
-    let net_fidelity = if host.seccomp {
-        Fidelity::Enforced {
-            backend: Backend::Seccomp,
-        }
-    } else {
-        Fidelity::Unenforceable {
-            reason:
-                "neither Landlock net rules nor seccomp available; direct egress cannot be denied"
-                    .to_string(),
+    // Net default-deny is seccomp-carried on every Linux path: an outright deny blocks the inet
+    // family, and the port tier needs seccomp for the inet DGRAM/RAW deny (Landlock net governs TCP
+    // only). Without a working seccomp filter it is not claimed (FW-ISO11, FW-INV5).
+    let seccomp_or = |what: &str| -> Fidelity {
+        if host.seccomp {
+            Fidelity::Enforced {
+                backend: Backend::Seccomp,
+            }
+        } else {
+            Fidelity::Unenforceable {
+                reason: format!("seccomp unavailable on this host; {what} cannot be enforced"),
+            }
         }
     };
-    caps.insert(Capability::NetDefaultDeny, net_fidelity);
-    sem.insert(Capability::NetDefaultDeny, DenialSemantics::Deny);
+    caps.insert(
+        Capability::NetDefaultDeny,
+        seccomp_or("direct egress denial"),
+    );
+    caps.insert(Capability::NetUdp, seccomp_or("UDP/raw closure"));
+    // D8/FW-EGR12: UDP resolution is closed with the inet deny, but the pathname resolver sockets
+    // stay connect()-reachable without the supervisor, so resolution is not closed.
+    caps.insert(
+        Capability::NetResolver,
+        Fidelity::Partial {
+            backend: Backend::Seccomp,
+            reason: "UDP resolution is closed, but pathname resolver sockets (nscd, \
+                     systemd-resolved) are connect()-reachable; host rules route resolution \
+                     through the Gateway and close them"
+                .to_string(),
+        },
+    );
 
     let mut direct_ports = Vec::new();
     match tier {
         PortTier::NotRequested => {}
         PortTier::Enforced => {
-            caps.insert(
-                Capability::NetPortTier,
-                Fidelity::Enforced {
-                    backend: Backend::Landlock,
-                },
-            );
-            sem.insert(Capability::NetPortTier, DenialSemantics::Deny);
+            caps.insert(Capability::NetPortTier, landlock());
             if let NetPosture::Ports(ports) = &input.net {
                 direct_ports = ports.clone();
             }
@@ -387,7 +436,6 @@ fn compile_linux(
                     ),
                 },
             );
-            sem.insert(Capability::NetPortTier, DenialSemantics::Deny);
         }
     }
 
@@ -396,12 +444,7 @@ fn compile_linux(
         ExecPosture::Unrestricted => ExecPlan::Unrestricted,
         ExecPosture::Allowlist(paths) => {
             if has_landlock {
-                caps.insert(
-                    Capability::Exec,
-                    Fidelity::Enforced {
-                        backend: Backend::Landlock,
-                    },
-                );
+                caps.insert(Capability::Exec, landlock());
             } else {
                 caps.insert(
                     Capability::Exec,
@@ -411,32 +454,80 @@ fn compile_linux(
                     },
                 );
             }
-            sem.insert(Capability::Exec, DenialSemantics::Deny);
             ExecPlan::Allowlist {
                 paths: paths.clone(),
             }
         }
     };
 
-    // Cross-domain UNIX-socket scoping: coarse and recent (ABI v6). Partial where present, else a
-    // reported gap -- the fail-closed net posture still prevents remote egress (FW-ADV-006).
+    // D5: Landlock scoping (ABI 6) covers abstract sockets and signals, never pathname sockets.
+    let pathname_gap = "pathname UNIX-socket connect() is unmediated without host rules, which \
+                        reaches the session bus and systemd --user where a user session runs (a \
+                        path to run code outside the sandbox); the default scrub hides their \
+                        locator variables but does not close the sockets";
     if abi >= 6 {
         caps.insert(
             Capability::CrossDomainSocket,
             Fidelity::Partial {
                 backend: Backend::Landlock,
-                reason: "Landlock UNIX-socket scope is coarse: it blocks sockets created outside the domain, not per-path".to_string(),
+                reason: format!(
+                    "Landlock scope blocks abstract UNIX sockets and signals outside the domain; \
+                     {pathname_gap}"
+                ),
             },
         );
     } else {
         caps.insert(
             Capability::CrossDomainSocket,
             Fidelity::Unenforceable {
-                reason: "UNIX-socket scoping needs Landlock ABI v6; remote egress still denied by net posture".to_string(),
+                reason: format!(
+                    "abstract-socket and signal scoping needs Landlock ABI v6; {pathname_gap}"
+                ),
             },
         );
     }
-    sem.insert(Capability::CrossDomainSocket, DenialSemantics::Deny);
+    caps.insert(
+        Capability::NetUnixSocket,
+        Fidelity::Partial {
+            backend: Backend::Launcher,
+            reason: pathname_gap.to_string(),
+        },
+    );
+
+    // D1: any-depth write-subtract rows cannot be rooted Landlock rules; they are withheld as the
+    // floor's are and reported, never silently pretended (FW-INV5/6).
+    let (write_subtract, any_depth_ws): (Vec<PathPattern>, Vec<PathPattern>) = input
+        .write_subtract
+        .iter()
+        .cloned()
+        .partition(|p| !p.is_any_depth());
+    if !input.write_subtract.is_empty() {
+        let fidelity = if !has_landlock {
+            Fidelity::Unenforceable {
+                reason: "Landlock unavailable on this host".to_string(),
+            }
+        } else if any_depth_ws.is_empty() {
+            landlock()
+        } else {
+            Fidelity::Partial {
+                backend: Backend::Landlock,
+                reason: "any-depth (`**/`) rows cannot be rooted Landlock rules and are withheld \
+                         on Linux (see `withheld`); absolute rows are enforced"
+                    .to_string(),
+            }
+        };
+        caps.insert(Capability::TamperVectors, fidelity);
+    }
+    if has_landlock {
+        withheld.extend(any_depth_ws.iter().map(|p| format!("write-subtract {p}")));
+        withheld.extend(
+            input
+                .floor
+                .iter()
+                .filter(|p| p.is_any_depth())
+                .map(|p| format!("credential-floor {p}")),
+        );
+    }
 
     if !has_landlock && !host.seccomp {
         let confiner = ConfinerPolicy::Unavailable {
@@ -446,28 +537,455 @@ fn compile_linux(
         return (confiner, Vec::new());
     }
 
-    let seccomp = linux::seccomp_plan(inet_deny);
+    let supervise = matches!(net_plan, LinuxNetPlan::SupervisedConnect);
+    let seccomp = linux::seccomp_plan(inet_deny, supervise);
+    debug_assert!(
+        !matches!(inet_deny, InetSeccompDeny::DgramRawOnly) || seccomp.deny_inet_dgram_raw
+    );
     // The floor's absolute rows ride the subtract holes. Any-depth (`**/`) floor rows cannot be
-    // rooted Landlock rules (formwork-confine rejects them loud); they are withheld here and the
-    // credentials report marks the affected types Partial -- reported, never silently pretended
-    // (FW-INV5/6). No exemption plumbing exists on Linux because only any-depth rows can cross
-    // into an excluded type's scope.
+    // rooted Landlock rules (formwork-confine rejects them loud); they are withheld above and the
+    // credentials report marks the affected types Partial (FW-INV5/6).
     let mut subtract = input.subtract.clone();
     subtract.extend(input.floor.iter().filter(|p| !p.is_any_depth()).cloned());
+    // D10: the ambient universe is a property of the read mode, not an authored row. Landlock is
+    // allow-list only, so the ambient mode is rendered as a `/` read root expanded around the holes.
+    let mut reads = input.effective_reads.clone();
+    if input.read_mode == ReadMode::AmbientMinusSubtract {
+        reads.push(PathPattern::parse("/**").expect("constant pattern"));
+    }
+    let mut withhold_device_prefixes: Vec<String> = Vec::new();
+    if !input.channels.lifted(Channel::Camera) {
+        withhold_device_prefixes.extend(LINUX_CAMERA_DEVICES.iter().map(|s| s.to_string()));
+    }
+    if !input.channels.lifted(Channel::Microphone) {
+        withhold_device_prefixes.extend(LINUX_MICROPHONE_DEVICES.iter().map(|s| s.to_string()));
+    }
+    withhold_device_prefixes.sort();
     let policy = LinuxPolicy {
         landlock_abi_target: host.landlock_abi,
         read_mode: input.read_mode,
-        reads: input.effective_reads.clone(),
+        reads: canonicalize_set(&reads),
         writes: input.writes.clone(),
         writes_no_create: input.writes_no_create.clone(),
         subtract: canonicalize_set(&subtract),
-        write_subtract: input.write_subtract.clone(),
+        write_subtract: canonicalize_set(&write_subtract),
         exec: exec_plan,
         net: net_plan,
         seccomp,
         no_new_privs: true,
+        withhold_device_prefixes,
+        unix_socket_grants: canonicalize_set(&unix_socket_grants(input, host)),
+        isolate: input.isolate.clone(),
     };
     (ConfinerPolicy::Linux(Box::new(policy)), direct_ports)
+}
+
+/// The FEP-5 baseline rows shared by both backends: host-service channels (FW-ISO13), privileged
+/// interfaces (FW-ISO14), process-environment disclosure (FW-ISO16), the private temporary
+/// directory (FW-TRA10) and the isolation tier (FW-ISO10). Returns the per-channel detail.
+fn baseline_rows(
+    input: &CompileInput,
+    host: &HostProfile,
+    supervised: bool,
+    caps: &mut BTreeMap<Capability, Fidelity>,
+) -> BTreeMap<String, ChannelReport> {
+    let mut channels = BTreeMap::new();
+    let fs_enforced = caps
+        .get(&Capability::FsRead)
+        .map(Fidelity::is_enforced)
+        .unwrap_or(false);
+    let facilities = &host.facilities;
+    for channel in Channel::ALL {
+        let presence = channel_presence(host, channel);
+        let lifted = input.channels.lifted(channel);
+        channels.insert(
+            channel.name().to_string(),
+            ChannelReport {
+                lifted,
+                host: presence,
+            },
+        );
+        if lifted {
+            continue;
+        }
+        let fidelity = match host.os {
+            Os::MacOs => {
+                if host.seatbelt {
+                    Fidelity::Partial {
+                        backend: Backend::Seatbelt,
+                        reason: format!(
+                            "SBPL deny installed ({}); the service-name coverage is pending the \
+                             macOS characterization suite (FEP-5 §6.3)",
+                            sbpl::channel_mechanism(channel)
+                        ),
+                    }
+                } else {
+                    Fidelity::Unenforceable {
+                        reason: "Seatbelt unavailable on this host".to_string(),
+                    }
+                }
+            }
+            Os::Linux => linux_channel_fidelity(channel, fs_enforced, supervised, host),
+        };
+        let cap = Capability::Channel(channel);
+        caps.insert(cap, fidelity);
+    }
+
+    let privileged = match host.os {
+        Os::MacOs => Fidelity::Partial {
+            backend: Backend::Seatbelt,
+            reason: "mach-priv-host-port and mach-priv-task-port are denied; iokit-open is not \
+                     yet narrowed to an allowlist (pending characterization C8)"
+                .to_string(),
+        },
+        Os::Linux if host.seccomp => Fidelity::Enforced {
+            backend: Backend::Seccomp,
+        },
+        Os::Linux => Fidelity::Unenforceable {
+            reason: "seccomp unavailable on this host; the anti-shedding baseline cannot install"
+                .to_string(),
+        },
+    };
+    caps.insert(Capability::PrivilegedInterfaces, privileged);
+
+    let environment = match host.os {
+        Os::MacOs => Fidelity::Partial {
+            backend: Backend::Seatbelt,
+            reason: "the kern.procargs2 sysctl is denied, which hides other processes' \
+                     environments; pending characterization C5"
+                .to_string(),
+        },
+        Os::Linux if host.user_namespaces && input.isolate.contains(&IsolateMember::Processes) => {
+            // FW-ISO16: the fresh procfs lists only session processes.
+            Fidelity::Enforced {
+                backend: Backend::Namespaces,
+            }
+        }
+        // Landlock refuses a confined process ptrace-class access to any process outside its
+        // domain, which is the check `/proc/<pid>/environ` goes through (FW-ISO16).
+        Os::Linux if host.landlock_abi.is_some() && !facilities.ptrace_privileged => {
+            Fidelity::Enforced {
+                backend: Backend::Landlock,
+            }
+        }
+        Os::Linux if host.landlock_abi.is_some() => Fidelity::Partial {
+            backend: Backend::Landlock,
+            reason: format!(
+                "Landlock refuses ptrace-class access, /proc/<pid>/environ included, to processes \
+                 outside the session, but formwork runs with CAP_SYS_ADMIN, CAP_PERFMON or \
+                 CAP_SYS_PTRACE, which the confined process keeps and which can lift that \
+                 refusal{}; run formwork unprivileged, or isolate = [\"processes\"] closes it",
+                if facilities.pid_ns_nested {
+                    " (an outer PID namespace limits it to processes inside that namespace)"
+                } else {
+                    ""
+                }
+            ),
+        },
+        Os::Linux => Fidelity::Unenforceable {
+            reason: "Landlock unavailable on this host; same-uid processes' /proc/<pid>/environ \
+                     is readable; isolate = [\"processes\"] closes it"
+                .to_string(),
+        },
+    };
+    caps.insert(Capability::ProcessEnvironment, environment);
+
+    // FW-TRA10: the Launcher's per-session directory is private; `/tmp` stays shared when the
+    // blueprint grants it (the default profile does, so tools that hardcode `/tmp` keep working).
+    let tmp = std::path::Path::new("/tmp/x");
+    let private_tmp_tmp = std::path::Path::new("/private/tmp/x");
+    let shares_tmp = input
+        .writes
+        .iter()
+        .any(|p| p.matches_path(tmp) || p.matches_path(private_tmp_tmp));
+    let tmpfs = host.os == Os::Linux
+        && host.user_namespaces
+        && input.isolate.contains(&IsolateMember::Processes);
+    let private_tmp = if shares_tmp {
+        Fidelity::Partial {
+            backend: Backend::Launcher,
+            reason: if tmpfs {
+                "tmpfs form: TMPDIR/TMP/TEMP point at a tmpfs in the session's mount namespace, \
+                 but /tmp is shared by a blueprint write grant"
+            } else {
+                "directory form: TMPDIR/TMP/TEMP point at a per-session directory, but /tmp is \
+                 shared by a blueprint write grant"
+            }
+            .to_string(),
+        }
+    } else {
+        Fidelity::Enforced {
+            backend: Backend::Launcher,
+        }
+    };
+    caps.insert(Capability::PrivateTmp, private_tmp);
+
+    for member in &input.isolate {
+        let cap = match member {
+            IsolateMember::Processes => Capability::IsolateProcesses,
+            IsolateMember::Ipc => Capability::IsolateIpc,
+        };
+        let fidelity = match host.os {
+            Os::Linux if host.user_namespaces => Fidelity::Enforced {
+                backend: Backend::Namespaces,
+            },
+            Os::Linux => Fidelity::Unenforceable {
+                reason: "unprivileged user namespaces are unavailable on this host; `run` \
+                         refuses the member before spawn"
+                    .to_string(),
+            },
+            Os::MacOs => Fidelity::Partial {
+                backend: Backend::Seatbelt,
+                reason: match member {
+                    IsolateMember::Processes => {
+                        "process-info and signal are denied for processes outside the session's \
+                         children and process group; pending characterization C6"
+                    }
+                    IsolateMember::Ipc => "SysV IPC is denied; POSIX IPC names are global on macOS",
+                }
+                .to_string(),
+            },
+        };
+        caps.insert(cap, fidelity);
+    }
+    channels
+}
+
+/// Linux channel verdicts. The socket-shaped channels close only under supervised connect
+/// (FW-ISO12), which host rules turn on; the device-shaped ones close with the filesystem grant.
+fn linux_channel_fidelity(
+    channel: Channel,
+    fs_enforced: bool,
+    supervised: bool,
+    host: &HostProfile,
+) -> Fidelity {
+    // Under supervised connect every pathname and abstract connect() is decided outside the
+    // sandbox (FW-ISO12), so the socket-shaped channels are closed.
+    if supervised {
+        return match channel {
+            Channel::Camera | Channel::Microphone if !fs_enforced => Fidelity::Unenforceable {
+                reason: "Landlock unavailable on this host; device nodes cannot be withheld"
+                    .to_string(),
+            },
+            Channel::Camera => Fidelity::Enforced {
+                backend: Backend::Landlock,
+            },
+            _ => Fidelity::Enforced {
+                backend: Backend::Supervisor,
+            },
+        };
+    }
+    let unmediated = |what: &str| Fidelity::Partial {
+        backend: Backend::Launcher,
+        reason: format!(
+            "pathname connect() reaches {what} without host rules; the locator variables are \
+             stripped (FW-BP11), which hides the socket from well-behaved clients but does not \
+             close it"
+        ),
+    };
+    match channel {
+        Channel::RunOutside => unmediated("the session bus and the systemd --user socket"),
+        Channel::OpenUrl => unmediated("the session bus (the desktop portal)"),
+        Channel::Clipboard | Channel::Screen => {
+            if host.landlock_abi.unwrap_or(0) >= 6 {
+                unmediated("the X11/Wayland pathname socket")
+            } else {
+                unmediated("the X11/Wayland socket, abstract X11 included (Landlock ABI < 6)")
+            }
+        }
+        Channel::Camera if fs_enforced => Fidelity::Enforced {
+            backend: Backend::Landlock,
+        },
+        Channel::Microphone if fs_enforced => Fidelity::Partial {
+            backend: Backend::Landlock,
+            reason: "/dev/snd is withheld from every grant, but the audio server socket \
+                     (PulseAudio/PipeWire) is reachable by pathname connect() without host rules"
+                .to_string(),
+        },
+        Channel::Camera | Channel::Microphone => Fidelity::Unenforceable {
+            reason: "Landlock unavailable on this host; device nodes cannot be withheld"
+                .to_string(),
+        },
+    }
+}
+
+/// Whether the Linux `connect()` supervisor carries this session (FW-EGR7).
+fn supervised(input: &CompileInput, host: &HostProfile) -> bool {
+    matches!(input.net, NetPosture::AllowHosts(_)) && host.can_supervise_connect()
+}
+
+/// The sockets the Linux supervisor admits besides in-session ones (FW-ISO12): literal write
+/// grants, and the sockets behind lifted channels as `detect` found them (FW-FID10). `open-url`
+/// never lifts a host service (FW-ISO18).
+fn unix_socket_grants(input: &CompileInput, host: &HostProfile) -> Vec<PathPattern> {
+    let f = &host.facilities;
+    let mut paths: Vec<String> = Vec::new();
+    for channel in input.channels.lifted_channels() {
+        match channel {
+            Channel::RunOutside => {
+                paths.extend(f.session_bus.iter().cloned());
+                paths.extend(f.user_manager.iter().cloned());
+            }
+            Channel::Clipboard | Channel::Screen => paths.extend(f.display.iter().cloned()),
+            Channel::Microphone => paths.extend(f.audio.iter().cloned()),
+            Channel::OpenUrl | Channel::Camera => {}
+        }
+    }
+    // FW-CRED13: lifting `os-keyring` admits the keyring sockets and -- because the Secret Service
+    // lives on it -- the session bus (the coupling the report states).
+    if input.keyring_lifted {
+        paths.extend(f.keyring.iter().cloned());
+        paths.extend(f.session_bus.iter().cloned());
+    }
+    let mut grants = input.unix_socket_grants.clone();
+    grants.extend(paths.iter().filter_map(|p| PathPattern::parse(p).ok()));
+    grants
+}
+
+/// The host-scoped egress rows (FW-EGR1, FW-FID8): host scope, inspection, and -- under the
+/// supervisor -- the net rows the supervisor now carries.
+fn egress_rows(
+    input: &CompileInput,
+    host: &HostProfile,
+    supervised: bool,
+    caps: &mut BTreeMap<Capability, Fidelity>,
+) {
+    let NetPosture::AllowHosts(table) = &input.net else {
+        return;
+    };
+    let has_tunnel = table
+        .rules
+        .iter()
+        .any(|r| matches!(r.access, formwork_blueprint::HostAccess::Tunnel));
+    let has_inspected = table.rules.iter().any(|r| r.is_inspected());
+    let tunnel_gap = "tunnel-grade hosts (`https:`) are admitted by the CONNECT target and trust the client's SNI and Host; domain fronting is not caught (FW-EGR5)";
+    let unavailable = format!(
+        "connect supervision is unavailable on this host: it needs {}; egress fails closed and \
+         `run` refuses the host rules",
+        formwork_detect::CONNECT_SUPERVISION_NEEDS
+    );
+    match host.os {
+        Os::Linux if !supervised => {
+            caps.insert(
+                Capability::NetHostScope,
+                Fidelity::Unenforceable {
+                    reason: unavailable.to_string(),
+                },
+            );
+            return;
+        }
+        Os::Linux => {
+            caps.insert(
+                Capability::NetHostScope,
+                if has_tunnel {
+                    Fidelity::Partial {
+                        backend: Backend::Gateway,
+                        reason: tunnel_gap.to_string(),
+                    }
+                } else {
+                    Fidelity::Enforced {
+                        backend: Backend::Gateway,
+                    }
+                },
+            );
+            let supervisor = || Fidelity::Enforced {
+                backend: Backend::Supervisor,
+            };
+            caps.insert(Capability::NetDefaultDeny, supervisor());
+            caps.insert(Capability::NetResolver, supervisor());
+            let sendmsg_gap = "addressed sendmsg()/sendmmsg() on an AF_UNIX datagram socket is not mediated (its destination sits in memory seccomp cannot read); connect() and addressed sendto() are";
+            caps.insert(
+                Capability::NetUnixSocket,
+                Fidelity::Partial {
+                    backend: Backend::Supervisor,
+                    reason: sendmsg_gap.to_string(),
+                },
+            );
+            caps.insert(
+                Capability::CrossDomainSocket,
+                Fidelity::Partial {
+                    backend: Backend::Supervisor,
+                    reason: if host.landlock_abi.unwrap_or(0) >= 6 {
+                        format!("pathname and abstract connect() are supervised; {sendmsg_gap}")
+                    } else {
+                        format!(
+                            "pathname and abstract connect() are supervised; signals outside the \
+                              domain need Landlock ABI 6; {sendmsg_gap}"
+                        )
+                    },
+                },
+            );
+        }
+        Os::MacOs => {
+            let mut reason = "the egress listener admits the per-session proxy credential; the \
+                               peer-process check is pending characterization (C2), so a same-uid \
+                               process that reads the agent's environment could reach it"
+                .to_string();
+            if has_tunnel {
+                reason = format!("{reason}; {tunnel_gap}");
+            }
+            caps.insert(
+                Capability::NetHostScope,
+                if host.seatbelt {
+                    Fidelity::Partial {
+                        backend: Backend::Gateway,
+                        reason,
+                    }
+                } else {
+                    Fidelity::Unenforceable {
+                        reason: "Seatbelt unavailable on this host".to_string(),
+                    }
+                },
+            );
+        }
+    }
+    if has_inspected {
+        // Every request to an inspected host is decided per method and path; a client that does
+        // not trust the session CA fails its handshake and is refused -- fail-closed, not a bypass.
+        // The macOS limit (Security.framework clients ignore SSL_CERT_FILE) is a compatibility
+        // note the operator channel carries (FW-FID9), not a gap in what is enforced.
+        caps.insert(
+            Capability::NetInspection,
+            Fidelity::Enforced {
+                backend: Backend::Gateway,
+            },
+        );
+    }
+    if input.brokered {
+        caps.insert(
+            Capability::CredentialBroker,
+            Fidelity::Enforced {
+                backend: Backend::Gateway,
+            },
+        );
+    }
+}
+
+/// Whether this host runs the facility a channel reaches (FW-FID10).
+fn channel_presence(host: &HostProfile, channel: Channel) -> HostPresence {
+    let f = &host.facilities;
+    let via = match host.os {
+        Os::MacOs => {
+            if f.gui_session {
+                Some("GUI login session".to_string())
+            } else if channel == Channel::RunOutside {
+                Some("launchd".to_string())
+            } else {
+                None
+            }
+        }
+        Os::Linux => match channel {
+            Channel::RunOutside => f.session_bus.clone().or_else(|| f.user_manager.clone()),
+            Channel::OpenUrl => f.session_bus.clone(),
+            Channel::Clipboard | Channel::Screen => f.display.first().cloned(),
+            Channel::Camera => f.video_device.clone(),
+            Channel::Microphone => f.audio.clone(),
+        },
+    };
+    HostPresence {
+        present: via.is_some(),
+        via,
+    }
 }
 
 /// Serialize a compiled policy to canonical, compact JSON. Byte-identical for equal inputs
@@ -726,6 +1244,9 @@ mod tests {
             seccomp: false,
             seatbelt: false,
             os_version: "ancient".to_string(),
+            user_namespaces: false,
+            connect_supervision: false,
+            facilities: Default::default(),
         };
         let policy = compile(&sample_blueprint(), &host);
         assert!(matches!(
@@ -845,7 +1366,7 @@ mod tests {
     fn excluded_type_leaves_report_per_type_and_lists_allowed() {
         let catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
         let bp = Blueprint {
-            allow_credentials: vec!["aws".to_string()],
+            allow_credentials: vec!["aws".into()],
             ..Blueprint::empty()
         };
         let policy = super::compile(&bp, &HostProfile::synthetic_macos(), &catalog);

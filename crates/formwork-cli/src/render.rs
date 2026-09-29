@@ -3,8 +3,8 @@
 //! `explain --json` stay the machine door with stable JSON; everything here is prose for a person
 //! at a terminal, so wording favors "what can I do about it" over field names.
 
-use formwork_blueprint::{Explanation, RuleSource, Verdict};
-use formwork_compile::{Backend, Fidelity, FidelityReport};
+use formwork_blueprint::{ChannelExplanation, Explanation, RuleSource, Verdict};
+use formwork_compile::{Backend, Capability, Fidelity, FidelityReport};
 use formwork_detect::{HostProfile, Os};
 
 /// One line answering "will this machine enforce, and can `learn` observe?".
@@ -42,7 +42,7 @@ pub fn host_summary(profile: &HostProfile, strace_on_path: bool) -> String {
     }
 }
 
-fn source(s: &RuleSource) -> String {
+pub fn source(s: &RuleSource) -> String {
     match s {
         RuleSource::BuiltIn => "built-in".to_string(),
         RuleSource::Profile(name) => format!("profile {name}"),
@@ -61,15 +61,101 @@ fn verdict(v: &Verdict) -> String {
     }
 }
 
-/// One path's three verdicts, indented under the path.
+/// One path's three verdicts, indented under the path, plus what this host does differently.
 pub fn explanation(e: &Explanation) -> String {
-    format!(
+    let mut out = format!(
         "{}\n  read:  {}\n  write: {}\n  exec:  {}\n",
         e.path,
         verdict(&e.read),
         verdict(&e.write),
         verdict(&e.exec)
-    )
+    );
+    if let Some(note) = &e.host_note {
+        out.push_str(&format!("  on this host: {note}\n"));
+    }
+    out
+}
+
+/// One URL's egress verdict (FW-FID11).
+pub fn egress_explanation(e: &crate::EgressExplanation) -> String {
+    let mut out = format!("{}\n  host: {}:{} -- {}\n", e.url, e.host, e.port, e.grade);
+    if let Some(rule) = &e.rule {
+        let origin = e
+            .source
+            .as_ref()
+            .map(source)
+            .unwrap_or_else(|| "built-in".into());
+        out.push_str(&format!("  rule: {rule} ({origin})\n"));
+    }
+    for m in &e.methods {
+        out.push_str(&format!(
+            "  {:7} {}{}\n",
+            m.method,
+            if m.admitted { "admitted" } else { "refused" },
+            m.rule
+                .as_ref()
+                .map(|r| format!(" by {r}"))
+                .unwrap_or_default()
+        ));
+    }
+    if let Some(reason) = &e.reason {
+        out.push_str(&format!("  {reason}\n"));
+    }
+    out
+}
+
+/// The resolved host table (`explain --net`), one rule per line.
+pub fn net_table(net: &formwork_blueprint::NetPosture, rules: &[serde_json::Value]) -> String {
+    use formwork_blueprint::NetPosture;
+    let mut out = String::new();
+    match net {
+        NetPosture::Deny => out.push_str("net: deny -- no egress\n"),
+        NetPosture::Ports(p) => out.push_str(&format!(
+            "net: direct port tier {p:?} -- any host on those ports, no Gateway\n"
+        )),
+        NetPosture::AllowHosts(_) => {
+            out.push_str("net: host rules -- all egress through the session Gateway\n")
+        }
+    }
+    for r in rules {
+        let origin = r["layer"].as_str().unwrap_or("?");
+        out.push_str(&format!(
+            "  {:40} {:9} methods {:14} paths {:20} ({origin})\n",
+            r["rule"].as_str().unwrap_or(""),
+            r["grade"].as_str().unwrap_or(""),
+            r["methods"].as_str().unwrap_or(""),
+            r["paths"].as_str().unwrap_or(""),
+        ));
+    }
+    out
+}
+
+/// One channel's verdict (FW-FID11): lifted or denied, the deciding layer, this host's
+/// enforcement, and whether the facility behind it exists here (FW-FID10).
+pub fn channel_explanation(e: &ChannelExplanation, report: &FidelityReport) -> String {
+    let decided = format!("{} ({})", e.rule, source(&e.source));
+    let mut out = format!(
+        "{}\n  verdict: {} by {decided}\n",
+        e.channel,
+        if e.lifted { "lifted" } else { "denied" }
+    );
+    let cap = formwork_blueprint::Channel::from_name(&e.channel).map(Capability::Channel);
+    if let Some(f) = cap.and_then(|c| report.per_capability.get(&c)) {
+        out.push_str(&format!("  enforcement: {}\n", fidelity(f)));
+    }
+    if let Some(detail) = report.channels.get(&e.channel) {
+        match &detail.host.via {
+            Some(via) => out.push_str(&format!("  host: reachable on this host ({via})\n")),
+            None => out.push_str("  host: not present on this host\n"),
+        }
+    }
+    if e.channel == "clipboard" {
+        out.push_str(
+            "  note: terminal paste is done by the terminal, outside the sandbox; only \
+             programmatic clipboard access (pbpaste, wl-paste, image paste) needs this channel\n",
+        );
+    }
+    out
 }
 
 /// The remedy line under a credential-floor denial: the `allow-credentials` entry that lifts it.
@@ -99,6 +185,8 @@ fn backend(b: Backend) -> &'static str {
         Backend::Seatbelt => "seatbelt",
         Backend::Gateway => "gateway",
         Backend::Launcher => "launcher",
+        Backend::Supervisor => "supervisor",
+        Backend::Namespaces => "namespaces",
         Backend::None => "none",
     }
 }
@@ -130,6 +218,36 @@ pub fn report_summary(report: &FidelityReport) -> String {
             fidelity(f),
             width = width
         ));
+    }
+    let lifted: Vec<&str> = report
+        .channels
+        .iter()
+        .filter(|(_, c)| c.lifted)
+        .map(|(n, _)| n.as_str())
+        .collect();
+    let present: Vec<String> = report
+        .channels
+        .iter()
+        .filter_map(|(n, c)| c.host.via.as_ref().map(|v| format!("{n} ({v})")))
+        .collect();
+    out.push_str(&format!(
+        "channels: lifted: {}; reachable on this host: {}\n",
+        if lifted.is_empty() {
+            "(none)".to_string()
+        } else {
+            lifted.join(", ")
+        },
+        if present.is_empty() {
+            "(none)".to_string()
+        } else {
+            present.join(", ")
+        }
+    ));
+    if !report.withheld.is_empty() {
+        out.push_str("withheld on this host (the backend cannot install these rules):\n");
+        for w in &report.withheld {
+            out.push_str(&format!("  {w}\n"));
+        }
     }
     let creds = &report.credentials;
     let path_types = creds.per_type.values().filter(|f| f.path.is_some()).count();
@@ -196,6 +314,7 @@ mod tests {
             },
             write: Verdict::Hidden,
             exec: Verdict::Ambient,
+            host_note: None,
         };
         let text = explanation(&e);
         assert!(
