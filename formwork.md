@@ -99,10 +99,14 @@ write-subtract(path-pattern)  # write-deny but keep readable: tamper vectors (FW
 exec(path-pattern)            # OPTIONAL: execute only these binaries (off by default)
 net: Deny                     # default: no direct egress at all
    | Ports([u16])             # optional: allow direct TCP connect to these ports
+   | AllowHosts(host rules)   # host rules in `rules`: all egress through the Gateway (FEP-5 §4)
+channels: {allow, deny}       # host-service channels lifted from the baseline (FW-BP9)
+isolate: [member]             # opt-in process isolation: processes, ipc (FW-ISO10)
 env: Passthrough              # default: inherit the launcher's environment
    | Allowlist([name])        # only the named vars survive
    | Scrub({allow, deny})     # drop secret-shaped vars by name/value, minus an allowlist (FW-ENV1/2)
-allow-credentials: [type]     # lift named credential-catalog types — the ONLY un-deny (FW-CRED5)
+allow-credentials: [type]     # lift named credential-catalog types (FW-CRED5); `broker:<type>`
+                              # keeps the floor and has the Gateway present it (FW-BP12)
 discovery.auto-widen: [path]  # zone in which a learning run may self-grant (FW-DISC4)
 mcp(server): {                # per-MCP-server visibility policy
     tools:     Allow([...]) | AllowAll | Deny,
@@ -130,7 +134,7 @@ Five further points pin the vocabulary above down so it is unambiguous to the co
 - **MCP identifiers match exactly or by anchored pattern, with a terminal deny ([FW-GW9](#fw-gw9)).** Each axis is an **allow** scope minus a terminal **deny** list. A list entry is either an exact identifier or an anchored regex written `/…/` — compiled as `\A(?:…)\z`, so it matches the whole identifier (`/get_.*/` covers `get_issue`, not the substring hit `forget_me`). `permits(id)` holds iff the allow scope admits `id` and no deny pattern matches it, so a deny always wins over any allow — the same deny-terminal bias as the fs model ([FW-CAP8](#fw-cap8)), here over protocol names rather than paths. Authoring is one shape on every axis: the keyword `"allow-all"`/`"deny"`, `{ allow = [...] }`, `{ allow = [...], deny = [...] }`, or a deny-only `{ deny = [...] }` (omitting `allow` means "all", an explicit `allow = []` means "none", and an empty `{}` is a loud error). Unlike the fs axis this is a *userspace* string match in the privileged gateway, not a kernel path rule, so a general regex here is sound where a general fs glob is not ([FW-BP4](#fw-bp4)): a mismatch shades one protocol frame, never silently unroots a kernel deny. A `/…/` that will not compile fails loud at parse ([FW-INV6](#fw-inv6)).
 - **Grant paths must be representable.** Grant, write, and `subtract` paths are canonicalized against the real filesystem at enforce time (symlink and firmlink resolution) so kernel path-matching lines up. A resolved path that cannot be faithfully rendered into the backend's policy language — e.g. a non-UTF-8 byte path — makes enforcement **fail loud**, never emit a lossy rule that might silently not match. A `subtract` hole that failed to match would be a silent fail-open of the sensitive set, which [FW-INV6](#fw-inv6) forbids. Patterns are absolute, an any-depth basename form (`**/.env`) that matches a trailing component at any depth, or the prefix-anchored refinement (`<prefix>/**/<suffix>`) that matches only below an absolute prefix ([FW-CAP6](#fw-cap6)); no `..` traversal exists, and all forms canonicalize deterministically ([FW-FID4](#fw-fid4)).
 - **Path sigils are a closed set, expanded at the CLI edge.** `~` → `$HOME` and `$CWD` → the launch directory, expanded *before* patterns reach the compiler, so a grant can be written relative to the project it runs in ([FW-BP5](#fw-bp5)). Fixed tokens only — never general `$VAR` interpolation, since the environment is exactly what the launcher strips ([FW-CRED2](#fw-cred2)). An unresolvable sigil fails loud, never silently widening ([FW-INV6](#fw-inv6)).
-- **Layers merge in a fixed order, and deny beats allow.** Baseline (the fail-closed empty Blueprint plus the credential-catalog floor) → `extends` chain (depth-first, bases before deriveds) → the file → CLI overrides ([FW-BP2](#fw-bp2)). Postures are last-set-wins; path sets merge additively; at any layer and any precedence, deny/subtract wins over allow — the only un-deny anywhere is the typed credential exclude ([FW-BP4](#fw-bp4), [FW-CRED5](#fw-cred5)).
+- **Layers merge in a fixed order, and deny beats allow.** Baseline (the fail-closed empty Blueprint plus the credential-catalog floor) → `extends` chain (depth-first, bases before deriveds) → the file → `--set` fragments → the discovered layer → CLI sugar flags ([FW-BP2](#fw-bp2)). Postures are last-set-wins; path sets merge additively; at any layer and any precedence, deny/subtract wins over allow — the only un-denies anywhere are the typed credential exclude ([FW-BP4](#fw-bp4), [FW-CRED5](#fw-cred5)) and a `channels` lift of the FEP-5 channel baseline ([FW-BP9](docs/fep-5.md#fw-bp9)).
 - **Environment is a capability, applied at spawn.** The `env` posture ([FW-ENV1](#fw-env1)) governs what environment the confined child receives — passthrough, an allowlist of names, or a scrub of secret-shaped vars. The launcher, not the confiner, builds the child's environment: the credential-catalog strip partitions first ([FW-CRED4](#fw-cred4)), then the posture filters what remains; the `FidelityReport` carries the verdict like any other capability. The default profile's scrub ([FW-ENV2](#fw-env2)) is heuristic, so it is reported Partial, never a silent over-claim.
 
 ## 5. Requirements
@@ -155,7 +159,7 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 
 | Req | Requirement |
 |---|---|
-| <a id="fw-cap1"></a>**FW-CAP1** Enumerable vocabulary | The blueprint is a finite enumeration of read/write/subtract/exec/net/env/mcp — the fs write grade admits a create/write split ([FW-CAP9](#fw-cap9)). No mechanism accepts natural language and produces a grant. It is authored as typed fields or, equivalently, as flat verb rules ([FW-BP6](#fw-bp6)). |
+| <a id="fw-cap1"></a>**FW-CAP1** Enumerable vocabulary | The blueprint is a finite enumeration of read/write/subtract/exec/net (ports or host rules)/env/mcp/channels/isolate — the fs write grade admits a create/write split ([FW-CAP9](#fw-cap9)). No mechanism accepts natural language and produces a grant. It is authored as typed fields or, equivalently, as flat verb rules ([FW-BP6](#fw-bp6)). |
 | <a id="fw-cap2"></a>**FW-CAP2** Monotonic narrowing | A session may narrow its own grant but never widen it. A child's grant is a subset of its parent's. |
 | <a id="fw-cap3"></a>**FW-CAP3** Subtractive default profile | The default profile is broad-read over the ambient environment minus a configured sensitive set, not minimal-from-empty. *(Realized concretely by FEP-2's compiled-in credential catalog + backstop, applied as a floor under every blueprint — [FW-CRED4](#fw-cred4).)* |
 | <a id="fw-cap4"></a>**FW-CAP4** Invisibility for MCP, denial for fs | Ungranted MCP tools/resources/prompts are absent from listings and non-invocable. Ungranted filesystem paths may return EACCES rather than ENOENT. |
@@ -188,7 +192,7 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 | <a id="fw-gw3"></a>**FW-GW3** Full-surface policy | Policy covers resources (list/read/templates), prompts (list/get), `list_changed` re-filtering, and server→client sampling/elicitation. |
 | <a id="fw-gw4"></a>**FW-GW4** Single door | Shading is binding because the confiner removes every alternative path to the backend. |
 | <a id="fw-gw5"></a>**FW-GW5** Backend confinement | stdio backends the gateway spawns are themselves confined by the confiner to their own grant. |
-| <a id="fw-gw6"></a>**FW-GW6** fd minting | The gateway supplies connection fds to the agent (pre-opened at spawn or minted on demand via `SCM_RIGHTS`); the agent never performs an in-sandbox `connect()`. |
+| <a id="fw-gw6"></a>**FW-GW6** fd minting | The gateway supplies connection fds to the agent (pre-opened at spawn or minted on demand via `SCM_RIGHTS`), or, under host rules on Linux, the connect supervisor performs the agent's `connect()` on its behalf ([FW-EGR7](docs/fep-5.md#fw-egr7)); the agent never completes a `connect()` itself. |
 | <a id="fw-gw7"></a>**FW-GW7** Least-privilege gateway | The gateway holds host network only to allowlisted MCP endpoints, and its own filesystem access is scoped to what brokering requires — its policy input and the stdio backends it spawns — not the host at large. |
 | <a id="fw-gw8"></a>**FW-GW8** Transparent passthrough | For *granted* items, the gateway is protocol-transparent: no semantic mangling, so agents behave as if talking to the backend directly. |
 | <a id="fw-gw9"></a>**FW-GW9** Pattern-matched shading | Each shaded axis (tools/prompts by `name`, resources/templates by `uri`/`uriTemplate`, [design §4](#fw-cap4)) carries an **allow** scope and a terminal **deny** list. Entries are exact identifiers or anchored regex written `/…/`, matched against the *whole* identifier (`\A(?:…)\z`), so an allow pattern cannot admit a substring nor a deny over-reach onto an unrelated name. `permits(name)` holds iff the allow scope admits it and no deny matches — deny is terminal, the MCP-surface form of the deny-terminal fs model ([FW-CAP8](#fw-cap8)/[FW-BP4](#fw-bp4)) applied to protocol identities. This is a *userspace* string match in the privileged gateway, never a kernel path boundary, so it does not reopen the "no general glob" fs doctrine ([FW-BP4](#fw-bp4)); the `regex` engine matches in guaranteed linear time, so a hostile blueprint pattern cannot wedge the gateway. A `/…/` that will not compile, and an ambiguous empty policy table, fail loud at parse ([FW-INV6](#fw-inv6)) rather than degrading to a silent deny-all or allow-all; pattern sets canonicalize deterministically ([FW-FID4](#fw-fid4)) and refusals stay oracle-free ([FW-ADV-004](#fw-adv-004)) since a deny-hidden name refuses exactly as a nonexistent one does. |
@@ -398,7 +402,7 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-041"></a>**FW-E2E-041: Rename regression.** *(Retired with the `--spec` compat alias. This was a transitional regression guard for the spec → Blueprint rename — never tied to a numbered requirement — and its number stays retired now that the alias is gone. Byte-deterministic compile is covered by [FW-E2E-026](#fw-e2e-026)/027.)*
 
-<a id="fw-e2e-042"></a>**FW-E2E-042: Override precedence.** A path allowed in the file is denied by a CLI `--subtract` layered over it; a deny and an allow at equal precedence resolve to deny. Pass: merge follows baseline → extends → file → CLI ([FW-BP2](#fw-bp2)), postures last-set-wins, path sets additive, with deny-beats-allow at ties. Fail: any ordering or tie deviation.
+<a id="fw-e2e-042"></a>**FW-E2E-042: Override precedence.** A path allowed in the file is denied by a CLI `--subtract` layered over it; a deny and an allow at equal precedence resolve to deny. Pass: merge follows baseline → extends → file → `--set` → discovered layer → CLI sugar flags ([FW-BP2](#fw-bp2)), postures last-set-wins, path sets additive, with deny-beats-allow at ties. Fail: any ordering or tie deviation.
 
 <a id="fw-e2e-043"></a>**FW-E2E-043: CLI/file parity.** The same grant authored in the file and expressed via CLI flag produce identical compiled policy. Pass: byte-identical policy from both surfaces. Fail: divergence.
 
@@ -505,12 +509,12 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 
 - Filesystem read/write scope: `file-read*` / `file-write*` with path filters. Clean.
 - Exec restriction: `process-exec*` path filters. Optional.
-- Net default-deny and host/port filtering: `network*` deny with `network-outbound` allowances. Seatbelt can filter by remote host/port and can gate UNIX-socket endpoints by path (the mechanism Chromium's macOS sandbox relies on) — so cross-domain socket control is cleaner here than on Linux.
+- Net default-deny and host/port filtering: `network*` deny with `network-outbound` allowances. Seatbelt can filter by remote port, with the host limited to `*` or `localhost` (FEP-5 C1), and can gate UNIX-socket endpoints by path (the mechanism Chromium's macOS sandbox relies on) — so cross-domain socket control is cleaner here than on Linux.
 - Descendant inheritance: the profile applies to the process and its children.
 - Channel baseline (FEP-5): `appleevent-send`, `lsopen`, the pasteboard, screen capture, camera and audio services, and `mach-priv-host-port`/`mach-priv-task-port` are denied; `kern.procargs2` is denied so other processes' environments stay hidden ([FW-ISO13](docs/fep-5.md#fw-iso13), [FW-ISO14](docs/fep-5.md#fw-iso14), [FW-ISO16](docs/fep-5.md#fw-iso16)). Service-name coverage is pending the macOS characterization suite (FEP-5 §6.3).
 - Host-scoped egress (FEP-5): the profile allows TCP only to the session Gateway's loopback port, which requires a per-session proxy credential.
 
-**Both.** The injected-fd transport behaves identically, since it is an inherited descriptor, not a mediated `connect()`. This is why [FW-XR6](#fw-xr6)/[FW-XR7](#fw-xr7) hold across platforms rather than diverging on socket semantics.
+**Both.** The MCP seam is an inherited descriptor on both, so it behaves identically. Host-scoped egress differs by mechanism: a supervised `connect()` on Linux, a credentialed loopback endpoint on macOS (FEP-5 §3.6). [FW-XR6](#fw-xr6)/[FW-XR7](#fw-xr7) hold across platforms either way: the agent never completes a connection of its own.
 
 **Fidelity summary (typical modern host).**
 
@@ -519,7 +523,10 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | fs read/write scope | Enforced | Enforced |
 | net default-deny | Enforced | Enforced |
 | net host allowlist (host rules, FEP-5) | Enforced (connect supervisor + Gateway; tunnel grade trusts SNI/Host) | Partial (Gateway; endpoint credential, peer-PID check pending) |
-| TLS inspection and brokering (FEP-5) | Enforced (Gateway, env-trust clients) | Partial (Security.framework clients refuse the session CA) |
+| TLS inspection (FEP-5) | Enforced (Gateway; a client that refuses the session CA fails closed) | Enforced (Gateway; Security.framework clients refuse the session CA) |
+| credential brokering (FEP-5) | Enforced; Partial where other processes' environments are readable | Partial (environment disclosure pending characterization) |
+| pathname UNIX sockets under host rules (FEP-5) | Partial (connect and addressed sendto supervised; addressed sendmsg unmediated) | Enforced (literal grants) |
+| privileged interfaces (FEP-5) | Enforced (seccomp) | Partial (`mach-priv*` denied; IOKit allowlist pending) |
 | UDP / raw sockets | Enforced (seccomp, every posture) | Enforced (Seatbelt) |
 | name resolution under the port tier | none (UDP closed, no Gateway) | mDNSResponder literal (reported, D8) |
 | host-service channels (FEP-5) | Enforced under host rules; else Partial (locators stripped) | Partial (SBPL denies; characterization pending) |
@@ -545,10 +552,10 @@ FidelityReport says `Partial` until the macOS characterization suite (FEP-5 §6.
 | Property | Linux | macOS | Why |
 |---|---|---|---|
 | Violation latency | synchronous per `connect()` | post-hoc (unified log) | Seatbelt has no notification channel |
-| Egress endpoint authentication | by construction | credential + peer-PID check | SBPL cannot scope `localhost` to a session |
+| Egress endpoint authentication | by construction | per-session credential (peer-PID check not built) | SBPL cannot scope `localhost` to a session |
 | TLS inspection clients | all env-trust clients | excludes Security.framework clients | no per-process trust on macOS |
 | Keychain lift granularity | per bus name (Secret Service as a whole) | whole keychain channel | Seatbelt gates `securityd` as one service |
-| `os-keyring` lift | `Partial` (shares the session bus with `run-outside`) | `Enforced` (own mach service) | D-Bus routes by bus name inside the socket |
+| `os-keyring` lift | `Partial` (shares the session bus with `run-outside`) | `Enforced` (own mach service; the deny is withheld until characterized) | D-Bus routes by bus name inside the socket |
 | Other processes' environment | `Enforced` unprivileged; `Partial` with `CAP_SYS_ADMIN`/`CAP_PERFMON`/`CAP_SYS_PTRACE` | `Enforced` (sysctl deny) | Landlock's ptrace refusal yields to those capabilities |
 | Any-depth `**/` rows | `Partial` | `Enforced` | Landlock cannot root them |
 | `stat` on denied paths | `Partial` | `Enforced` | kernel mechanism |
@@ -556,13 +563,13 @@ FidelityReport says `Partial` until the macOS characterization suite (FEP-5 §6.
 | Private tmp | directory form by default; tmpfs under `isolate` | directory form | no mount namespace on macOS |
 | Name resolution under `Ports` | none (UDP closed; no Gateway) | mDNSResponder literal | reported (D8); host rules restore it through the Gateway on both |
 | ENOENT invisibility | not provided | not provided | §3 non-goal |
-| Enforcement API | stable kernel ABI | `sandbox_init` (deprecated, still shipped) | §9 |
+| Enforcement API | stable kernel ABI | `sandbox_init` (deprecated, still shipped) | FEP-5 §9 |
 
 ## 10. Requirements ↔ tests traceability
 
 FEP-5's requirements (`FW-EGR7`–15, `FW-CRED10`–15, `FW-TRA9`–10, `FW-ISO10`–18, `FW-BP9`–15,
-`FW-FID8`–11, `FW-DISC12`, `FW-XR10`–11, `FW-INV13`–14) are defined in `docs/fep-5.md` and traced to
-their tests in `docs/fep-5-plan.md`. The rows below that FEP-5 amended carry its tests too.
+`FW-FID8`–11, `FW-DISC12`, `FW-XR10`–11, `FW-INV13`–14) are defined in `docs/fep-5.md`; their tests
+are mapped to files in `docs/fep-5-plan.md` §4, and a requirement-to-test map is owed (§5 there). The rows below that FEP-5 amended carry its tests too.
 
 | Requirement | Primary tests | Also covered by |
 |---|---|---|
@@ -650,7 +657,7 @@ their tests in `docs/fep-5-plan.md`. The rows below that FEP-5 amended carry its
 
 **Exec restriction in v1.** [FW-ISO4](#fw-iso4) is off by default and nearly free to implement. Whether it ships enabled-optional in v1 or is deferred is a scope call; confining fs + net already contains most of what a rogue exec could do.
 
-**fd-minting default.** *Closed by FEP-5.* On Linux connections are minted on demand through the connect supervisor ([FW-EGR7](docs/fep-5.md#fw-egr7)); on macOS the session reaches a static, credentialed Gateway endpoint.
+**fd-minting default.** *Closed by FEP-5.* On Linux the connect supervisor performs each connection on the agent's behalf (`pidfd_getfd`) ([FW-EGR7](docs/fep-5.md#fw-egr7)); on macOS the session reaches a static, credentialed Gateway endpoint.
 
 **Credential brokering.** *Closed by FEP-5 §3.2.* Excluding a type ([FW-CRED5](#fw-cred5)) exposes the file/var to the agent; `broker:<type>` instead keeps the floor and has the Gateway present the credential on inspected hosts, with a per-session placeholder in the agent's environment ([FW-CRED11](docs/fep-5.md#fw-cred11)–[FW-CRED14](docs/fep-5.md#fw-cred14), [FW-INV13](docs/fep-5.md#fw-inv13)). *(The older sensitive-set-discovery question — auto-detect vs configure the subtracted set — was resolved by the typed catalog + backstop, §5.9, deny-the-superset by default, and observe-then-widen discovery, §5.10.)*
 
@@ -675,8 +682,10 @@ Kernel-mechanism-first, honesty-first, reuse-validated-early:
 7. **Degraded-host honesty and optional tiers** ([FW-E2E-009](#fw-e2e-009), 025, ADV-006), confirming Formwork reports rather than pretends when a kernel cannot enforce a requested capability.
 8. **Capability-model hardening** (FEP-1): the env axis ([FW-ENV1](#fw-env1)/2), execution-vector write-subtract ([FW-TRA7](#fw-tra7)), sensitive-set metadata denial ([FW-CAP7](#fw-cap7)), any-depth patterns ([FW-CAP6](#fw-cap6)), extended sensitive set ([FW-TRA8](#fw-tra8)), and the anti-escalation guarantee ([FW-XR8](#fw-xr8)) — landed and compiled/enforced on both backends. The fs additions are real-Seatbelt verified ([FW-E2E-037](#fw-e2e-037)..039); the env axis (a CLI-shell spawn transform, not a kernel capability) by unit tests plus the FidelityReport. Host-scoped egress (FW-EGR) and the violation stream ([FW-FID5](docs/fep-1.md#fw-fid5)) remain deferred in `docs/fep-1.md`.
 
-9. **Blueprints, the credential catalog, and discovery** (FEP-2): the layered Blueprint model with `extends`, a CLI override surface, and path sigils ([FW-BP1](#fw-bp1)–5), the typed credential catalog enforced across the confiner and the launcher arm with per-type report labels and per-platform honesty ([FW-CRED1](#fw-cred1)–9), and observe-then-widen discovery bounded by the catalog floor ([FW-DISC1](#fw-disc1)–6; [FW-INV7](#fw-inv7)–10) — landed and folded into this document (§2, §4, §5.8–5.10, §6, §7.7–7.10), verified on real Seatbelt + the unified-log denial feed ([FW-E2E-041](#fw-e2e-041)..055, [FW-ADV-012](#fw-adv-012)..015). On Linux the catalog's path arm rides whatever carries fs enforcement, with any-depth floor rows reported Partial per [FW-CRED9](#fw-cred9). Credential brokering remains deferred (§11).
+9. **Blueprints, the credential catalog, and discovery** (FEP-2): the layered Blueprint model with `extends`, a CLI override surface, and path sigils ([FW-BP1](#fw-bp1)–5), the typed credential catalog enforced across the confiner and the launcher arm with per-type report labels and per-platform honesty ([FW-CRED1](#fw-cred1)–9), and observe-then-widen discovery bounded by the catalog floor ([FW-DISC1](#fw-disc1)–6; [FW-INV7](#fw-inv7)–10) — landed and folded into this document (§2, §4, §5.8–5.10, §6, §7.7–7.10), verified on real Seatbelt + the unified-log denial feed ([FW-E2E-041](#fw-e2e-041)..055, [FW-ADV-012](#fw-adv-012)..015). On Linux the catalog's path arm rides whatever carries fs enforcement, with any-depth floor rows reported Partial per [FW-CRED9](#fw-cred9). Credential brokering landed with FEP-5 (item 11).
 
 10. **Filesystem capability rules** (FEP-3): a flat verb-rule grammar and a `mode` posture over the existing model ([FW-BP6](#fw-bp6)/[FW-BP7](#fw-bp7)), the three-layer deny-terminal evaluation named as a first-class property ([FW-CAP8](#fw-cap8), [FW-INV11](#fw-inv11)), the create/write split ([FW-CAP9](#fw-cap9)), exec-as-a-verb with cross-backend parity ([FW-ISO9](#fw-iso9)/[FW-XR6](#fw-xr6)), and rule provenance + `formwork explain` ([FW-FID6](#fw-fid6)) — landed and folded into this document (§4, §5.2–5.3, §5.6, §5.8, §6, §7.7, §9, §10), with a Seatbelt paired allow/deny probe for the split ([FW-E2E-056](#fw-e2e-056)..058, [FW-E2E-061](#fw-e2e-061)) and a dry-run explain probe ([FW-E2E-059](#fw-e2e-059)). FEP-3 landed in full; one proposed extra, per-deny mechanism labels, was dropped (on macOS every deny is uniformly LSM-enforced so the label carries no information, and its Linux-only disclosures reference machinery not built).
+
+11. **Host-scoped egress, brokering, channels and isolation** (FEP-5): host rules in `rules` with a tunnel and an inspected grade, the Linux connect supervisor and the macOS credentialed endpoint ([FW-EGR7](docs/fep-5.md#fw-egr7)–15), TLS inspection and credential brokering ([FW-CRED10](docs/fep-5.md#fw-cred10)–15), the host-service channel and privileged-interface baselines, environment disclosure and the opt-in `isolate` tier ([FW-ISO10](docs/fep-5.md#fw-iso10)–18), a private temporary directory ([FW-TRA9](docs/fep-5.md#fw-tra9)–10), and `explain`/`learn` for hosts and channels — landed, defined in `docs/fep-5.md` with the build recorded in `docs/fep-5-plan.md`. Owed: the macOS characterization suite, which keeps every macOS channel, isolation and environment verdict `Partial` until it runs.
 
 If steps 1–4 pass, Formwork is a transparent, reusable filesystem confiner that behaves the same on both platforms and tells the truth about itself. If steps 5–7 pass, it is a complete agent sandbox: one privileged broker, everything else in a mould, egress forced through a policy gateway, and every claim backed by a mechanism or reported as a gap.

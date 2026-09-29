@@ -27,7 +27,10 @@ boundary (§6.5).
 `SCM_RIGHTS`. The supervisor copies the `sockaddr` once with `process_vm_readv`, re-checks the
 notification id, takes the target's socket with `pidfd_getfd`, and performs the operation itself.
 Inet destinations go to the Gateway only, and the source port is registered so the Gateway admits
-only supervisor-made connections (`FW-EGR9`). Pathname sockets are admitted when granted or bound
+only supervisor-made connections from `127.0.0.1` (`FW-EGR9`); a port whose connect definitely
+failed is unregistered. The seccomp baseline denies any send carrying `MSG_FASTOPEN` under the
+port tier and host rules, since a TCP Fast Open send connects without `connect()` and would pass
+both Landlock's `ConnectTcp` hook and the supervisor. Pathname sockets are admitted when granted or bound
 by a session process: UNIX socket diagnostics when the kernel has them, else `/proc/net/unix`
 resolved from the binder's root. The supervisor resolves paths through `/proc/<pid>/root`, so it
 works across the isolation tier's mount namespace.
@@ -35,7 +38,8 @@ works across the isolation tier's mount namespace.
 **Gateway egress listener.** An HTTP proxy on `127.0.0.1:0` in its own thread and runtime, gated by
 a per-session `Proxy-Authorization` credential. CONNECT tunnels and plain-HTTP absolute form are
 served; the target is canonicalized (`FW-EGR3`), resolved once and pinned, and restricted addresses
-are refused unless a rule names them (`FW-EGR4`). Every refusal is one operator line with the
+are refused unless a rule names them by IP literal (`FW-EGR4`). Plain HTTP forwards the canonical
+path it decided and exactly the framed body, then closes. Every refusal is one operator line with the
 `explain` invocation that reproduces it (`FW-FID9`), and carries what the session needed for
 `learn`.
 
@@ -48,8 +52,11 @@ write-protected in every read mode, and exported through `SSL_CERT_FILE`, `NODE_
 `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO` and `PIP_CERT`. A brokered credential's
 secret is read from the launching environment; the confined environment carries
 `fwcred-<type>-<nonce>` in the same variable; the Gateway substitutes it or sets the scheme's header
-on bound hosts, refuses it on any other host and over plain HTTP, and scrubs the secret from
-responses (`FW-INV13`). A brokered credential with no value refuses the run before spawn.
+on bound hosts, refuses it on any other host and over plain HTTP, asks a bound host for an
+uncompressed response, and scrubs the secret and each `basic` binding's encoded form from
+responses (`FW-INV13`). A brokered credential with no value refuses the run before spawn. Because
+the secret arrives in `formwork`'s own environment, `credential-broker` is `Partial` wherever
+`process-environment` is not `Enforced`.
 
 **Isolation tier (Linux).** `formwork` cannot `unshare(CLONE_NEWUSER)` itself (it is
 multi-threaded), and a `pre_exec` closure cannot fork a PID-1 init or build Landlock rules after
@@ -82,16 +89,58 @@ here rather than silently deviated.
   `https:api.anthropic.com` with `broker:anthropic`, which `FW-CRED12` itself refuses: the Gateway
   cannot present a credential on a tunnel it cannot see into. The README and the examples use the
   inspected grade. *Resolved: `any:` kept, and the §3.2 sketch in `fep-5.md` amended to match.*
-- **Sockets are granted by a literal write grant.** §3.1 says "granted by `allow`". `allow` also
+- **Sockets are granted by a literal write grant.** §3.1 said "granted by `allow`". `allow` also
   turns on the exec allowlist, so granting a socket through it would restrict exec as a side
   effect. A literal write grant on the socket path admits it (`FW-ISO12`); the compiler keeps
-  literal write grants under a granted subtree for exactly this.
+  literal write grants under a granted subtree for exactly this. *Resolved: §3.1.1, `FW-EGR8`,
+  `FW-ISO12` and `FW-E2E-076` amended.*
+- **The supervisor performs the call on the target's socket.** §3.1 described
+  `SECCOMP_IOCTL_NOTIF_ADDFD` injection of a socket the supervisor opened. The build takes a
+  duplicate of the target's own socket with `pidfd_getfd` and connects or sends on it, so the
+  target's socket options survive; that needs Linux 5.6 and Yama `ptrace_scope` 0 or 1, which
+  `detect` checks and `run` refuses host rules without. An addressed `sendmsg`/`sendmmsg` keeps its
+  destination behind a pointer seccomp cannot read, so it is not mediated, and `net-unix-socket`
+  says `Partial`. *Resolved: §3.1 and `FW-EGR7` amended.*
+- **D3 keeps the root whole on macOS only.** Landlock cannot grant a directory whole while denying
+  a path beneath it, so on Linux every directory above the protected blueprint is split, and the
+  `.formwork/` layout splits the project root just as `FORMWORK.toml` does. `run` says so in both
+  layouts and names what avoids it (new files in a subdirectory, or a blueprint outside the grant
+  passed with `--blueprint`). *Resolved: the D3 row amended; §9's per-user state directory and
+  `Make*` rights remain the alternatives.*
+- **Brokered secrets are read once.** `FW-CRED15` stated a refresh interval from the Catalog. The
+  only source built is the launching environment, which cannot change mid-session, so the Gateway
+  reads it once at session start and the Catalog carries no interval. *Resolved: §3.2 and
+  `FW-CRED15` amended; a file or service source would bring the interval back.*
+- **The Catalog's `services` locations are descriptive.** The Linux keyring sockets the supervisor
+  admits for `os-keyring` come from `detect` (`HostFacilities.keyring`), not from the Catalog entry,
+  since only `detect` knows which exist on the host.
+- **Run-time paths are disclosed by `run`.** §3.5 had `compile` and `explain` name the Gateway
+  listener, the CA path and the temp directory; those exist only for a run, and `compile` stays
+  pure, so `run` names them on the operator channel and `explain` names the blueprint source
+  (`fd:N` for a descriptor). *Resolved: §3.5 and `FW-E2E-089` amended.*
+- **The channel report is two maps.** §3.5 described one `{ verdict, reason, host }` object per
+  channel. The verdict is the `per_capability` entry every capability uses, and presence is the
+  report's `channels` map. *Resolved: §3.5 amended.*
+- **`explain --hosts` prints one rule per line**, since a host may carry several rules (methods on
+  different paths, a deny); each line names its broker binding and marks port 80 cleartext.
+  *Resolved: §3.5 and `FW-FID11` amended.*
+- **`FW-XR10` names `run`.** `learn` prints its proposal pointer on stdout, which FEP-4 landed as
+  its result and its tests read. *Resolved: `FW-XR10` narrowed.*
+- **The platform-verifier caveat is printed for every brokered run on macOS**, not per type: the
+  Catalog does not know each type's typical client. `net-inspection` stays `Enforced`, since a
+  client that refuses the session CA fails closed. *Resolved: §3.2 amended.*
+- **The macOS default denies shipped before their gate.** §1.1 ships a new default deny only after
+  the toolchain gate (`FW-E2E-020`..023) and the agent-example gate pass on macOS; neither has run
+  there. The channel, `kern.procargs2` and `mach-priv*` denies are in the default profile, and each
+  is reported `Partial` until the characterization suite runs. The `securityd` and `iokit-open`
+  denies, the ones most likely to break a toolchain, are withheld.
 - **Loopback is restricted by name.** `localhost` and loopback literals are restricted destinations
   like private ranges, unless a rule names them explicitly. The tests' fixture resolver maps test
   names to loopback upstreams; the production resolver never does.
 - **No `hyper`.** HTTP/1.1 framing is hand-written in `inspect.rs` (content-length or chunked,
-  never both, strict header parsing). The dependency list is `rustls`, `tokio-rustls`, `rcgen` and
-  `rustls-native-certs`, all confined to `formwork-gateway`.
+  never both, strict header parsing). The dependency list is `rustls`, `tokio-rustls`, `rcgen`,
+  `rustls-native-certs` and `base64`, all confined to `formwork-gateway`. *Resolved: §4
+  Dependencies amended.*
 - **The opener transport is one-way.** A shell script cannot hold a request-reply exchange on a
   socket shared by every process in the session without interleaving replies, so the shim cannot
   hear the Gateway's verdict. *Resolved: the shim mirrors it.* The Launcher writes the shim knowing
@@ -152,7 +201,7 @@ here rather than silently deviated.
 
 | ID | Where | Runs on |
 |---|---|---|
-| `FW-E2E-075` | `formwork-confine/tests/linux_supervise.rs`, `formwork-cli/tests/fep5_run.rs` | Linux |
+| `FW-E2E-075` | `formwork-confine/tests/linux_supervise.rs` (TCP Fast Open included), `formwork-cli/tests/fep5_run.rs` | Linux |
 | `FW-E2E-076` | `formwork-confine/tests/linux_supervise.rs` | Linux |
 | `FW-E2E-077` | `formwork-gateway/tests/inspect.rs` | both |
 | `FW-E2E-078` | `formwork-gateway/tests/inspect.rs` (Gateway half), `fep5_run.rs` (session half) | both / Linux |
@@ -180,8 +229,23 @@ instead of skipping. The README quickstart is read verbatim from `README.md` and
   `FW-E2E-080` (isolation tier), `FW-E2E-081` (channels), `FW-E2E-091` (loopback callback),
   `FW-ADV-019` (endpoint theft). Until they run, every macOS channel, isolation and
   environment-disclosure verdict stays `Partial`, and the macOS cells marked `Enforced` in §3.6 are
-  targets. Several `fep5_run.rs` tests are Linux-only for the same reason: they have not been
-  observed on Seatbelt, and a test that has never run on its platform is a claim.
+  targets. The macOS halves of `FW-E2E-075`, 076, 078 (session), 083, 084, 085, 087, 088, 089
+  (`confstr`), 090 and `FW-ADV-020` are owed for the same reason: they have not been observed on
+  Seatbelt, and a test that has never run on its platform is a claim. `FW-E2E-020`..023 (the
+  toolchain gate) are owed on macOS too.
+- **macOS mechanisms not built:** the egress peer-PID check (`FW-EGR9`), the `iokit-open`
+  allowlist (`FW-ISO14`, C8), the `securityd` deny behind `os-keyring`, and the `claude` type's
+  keychain location (`FW-CRED13`, C9).
+- **Test branches not yet exercised.** `FW-E2E-082` covers the `gdbus` route; the fixture service
+  standing in for `systemd --user`, the X11-shaped socket and the "a lift opens nothing else" check
+  are owed. `FW-E2E-085` proposes `open-url` from the opener; the clipboard proposal from a
+  supervisor-refused display socket is owed. `FW-E2E-088` checks the locator variables and the
+  parse error; its runtime clipboard and URL probes and the downstream `deny` layer are owed.
+  `FW-E2E-089` does not yet read the CA bundle from a grandchild, `FW-E2E-090` runs without host
+  rules, `FW-ADV-020` covers the opener route only, `FW-E2E-084` runs each agent's `--version` (the
+  Claude Code login flow with a fixture opener is owed), and `FW-E2E-079` chooses its branch from
+  `detect` rather than pinning it per runner. The second half of `FW-E2E-086` is recorded above.
+- **A requirement-to-test map** for the FEP-5 requirements (this record maps tests to files only).
 - **macOS channel proposals in `learn`.** The unified-log feed yields path denials; mapping Seatbelt
   service denials (pasteboard, AppleEvents) onto channels is not built. Opener and Gateway
   refusals are proposed on macOS, since the spawn is in-process there.

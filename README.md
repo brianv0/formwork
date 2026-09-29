@@ -67,7 +67,8 @@ The sandbox holds for the whole process tree — a `git` or `python` the agent s
 walls. Denials surface as ordinary `EACCES`/`EPERM`, credentials stay unreadable even under broad
 read grants, and a deny always beats an allow, from any layer. Host services that could act for
 the agent outside the sandbox — the clipboard, opening URLs, the session bus, AppleEvents — are
-closed unless the blueprint lifts them with `channels`.
+closed unless the blueprint lifts them with `channels`. On Linux their sockets close under host
+rules; with the port tier they are only hidden, and `formwork explain` says so.
 
 To reach named hosts only, write host rules instead of the port tier. Every connection then goes
 through a Gateway that Formwork runs outside the sandbox, and an API key can be *brokered*: the
@@ -101,8 +102,8 @@ and wiring for Claude Code, codex, and opencode.
 |---|---|---|
 | Filesystem read/write walls (`run`, `gateway`) | ✅ Seatbelt | ✅ Landlock + seccomp (kernel 5.13+) |
 | Default-deny network, port tier | ✅ | ✅ (best on kernel 6.7+) |
-| Host-scoped egress through the Gateway, TLS inspection, credential brokering | ✅ | ✅ (kernel 5.6+, Yama `ptrace_scope` 0 or 1) |
-| Host-service channels closed by default (`channels`) | ✅ | ✅ (sockets closed under host rules; hidden otherwise) |
+| Host-scoped egress through the Gateway, TLS inspection, credential brokering | partial (the Gateway endpoint is credential-gated; clients such as `gh` that verify through Security.framework refuse the session CA) | ✅ (kernel 5.6+, Yama `ptrace_scope` 0 or 1) |
+| Host-service channels closed by default (`channels`) | partial (sandbox denies; coverage being verified) | ✅ under host rules; partial otherwise |
 | Process isolation (`isolate = ["processes", "ipc"]`) | partial (sandbox filters) | ✅ where unprivileged user namespaces are allowed |
 | Exec allow-lists | ✅ | ✅ |
 | MCP gateway shading | ✅ | ✅ |

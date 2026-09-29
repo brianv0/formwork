@@ -16,12 +16,11 @@ Seatbelt and Landlock ([FW-E2E-036](../formwork.md#fw-e2e-036)..039; see `formwo
 defaults gained the matching entries (`.env`/agent-state/`~/.docker` subtracts, the
 tamper-vector write-subtract set, and the default secret-shaped env scrub).
 
-What remains here are the **two deferred subsystems** — the FEP items that need new
-*runtime* machinery rather than pure compile-side work, and so are genuinely
-multi-session:
+What remained here were the **two deferred subsystems** — the FEP items that need new
+*runtime* machinery rather than pure compile-side work:
 
-- **Part A — host-scoped egress ([FW-EGR1](#fw-egr1)–6):** needs the gateway **forward proxy** (a new
-  subsystem + dependency, gated by the constitution's Growth doctrine).
+- **Part A — host-scoped egress ([FW-EGR1](#fw-egr1)–6):** landed with FEP-5, which built the
+  Gateway forward proxy and its transport.
 - **FW-FID5 — real-time violation stream:** needs a structured violation event path (on
   macOS, a unified-log tap is one option).
 
@@ -33,8 +32,8 @@ New requirement/test IDs continue the `formwork.md` scheme: egress uses [FW-E2E-
 As Formwork closes the read side (the credential deny-list, `.env`, tamper vectors, and
 env scrub are now shipping), the exfiltration frontier moves to the network layer — and
 that is the weakest part of our own design: TCP-port granularity only, no domain
-allowlist, no working forward proxy. `examples/blueprints/agent-session.toml` documents
-this itself — `:443` means "any HTTPS host." Every competitor's *residual* security rests
+allowlist, no working forward proxy. The port-scoped agent example documented this itself — `:443`
+meant "any HTTPS host" (FEP-5 retired it for host-scoped blueprints). Every competitor's *residual* security rests
 on the network layer, and every one has been bypassed there or via agent-driven
 self-escape (CVE-2025-66479, the srt SOCKS5 null-byte bypass, Codex CVE-2025-59532, Gemini
 GHSA-wpqr-6v78-jr5g, Cursor CVE-2026-50548); their post-mortems are the test plan below.
@@ -59,9 +58,9 @@ against the exact bypasses that hit everyone else.
 | <a id="fw-egr1"></a>**FW-EGR1** Host-scoped egress | The net axis becomes a three-way enum — `Deny \| Ports([u16]) \| AllowHosts([HostPattern])` — adding a host-allowlist posture mediated by the gateway (the confiner stays default-deny; kernels can't express hosts). Under `AllowHosts`, a confined process reaches an allowlisted host through the gateway fd and nothing else. | **Concepts amendment** — extends the net axis (`formwork.md` §4). Reuses the [FW-GW7](../formwork.md#fw-gw7) forward proxy; no new door ([FW-XR7](../formwork.md#fw-xr7)). |
 | <a id="fw-egr2"></a>**FW-EGR2** Empty means deny | An empty, absent, or unparseable host allowlist compiles to **full deny**, never allow-all, and the report says so. Directly mirrors CVE-2025-66479, where srt's "block everything" list disabled the proxy and allowed everything. | Fits (compiler + [FW-INV6](../formwork.md#fw-inv6)). A regression guard, not a new axis. |
 | <a id="fw-egr3"></a>**FW-EGR3** Hostname canonicalization before match | Host patterns and requested hosts are canonicalized before comparison: reject or neutralize embedded NUL, percent-encoding, CRLF, leading/trailing dots, IDN/Unicode confusables, and IPv6 zone-IDs. Mirrors the srt SOCKS5 `attacker\x00.google.com` bypass and the IPv6-zone-ID hardening now in srt's `domain-pattern.ts`. | Fits (parse-don't-validate at the gateway edge; Boundaries). |
-| <a id="fw-egr4"></a>**FW-EGR4** SSRF / metadata default-block | Under the gateway-mediated `AllowHosts` posture, egress to cloud-metadata endpoints (`169.254.169.254`, `fd00:ec2::254`, `metadata.google.internal`) and RFC-1918 / link-local / ULA ranges is denied unless a host pattern names them explicitly (mirrors Cursor's anti-SSRF default). The `Ports` posture is a *direct* kernel `connect()` the gateway never sees and the kernel cannot filter by IP, so it cannot carry this block; its report states plainly that it reaches any host on the port, metadata included. That asymmetry is deliberate — it is the concrete reason the shipped examples should move off `ports=[443]` to `AllowHosts` (defaults §4). | Fits (compiler default + gateway enforcement; honest `Ports` report per [FW-XR1](../formwork.md#fw-xr1)). |
+| <a id="fw-egr4"></a>**FW-EGR4** SSRF / metadata default-block | Under the gateway-mediated `AllowHosts` posture, egress to cloud-metadata endpoints (`169.254.169.254`, `fd00:ec2::254`, `metadata.google.internal`) and RFC-1918 / link-local / ULA ranges and loopback are denied unless a host rule names the IP literal explicitly; a name that resolves into those ranges is refused even when named (mirrors Cursor's anti-SSRF default; FEP-5 §4). The `Ports` posture is a *direct* kernel `connect()` the gateway never sees and the kernel cannot filter by IP, so it cannot carry this block; its report states plainly that it reaches any host on the port, metadata included. That asymmetry is deliberate — it is the concrete reason the shipped examples should move off `ports=[443]` to `AllowHosts` (defaults §4). | Fits (compiler default + gateway enforcement; honest `Ports` report per [FW-XR1](../formwork.md#fw-xr1)). |
 | <a id="fw-egr5"></a>**FW-EGR5** Honest allowlist fidelity | Host-scoped egress is reported `Partial` with a stated reason: without TLS interception (which FEP-1 does **not** add — see Non-goals), the allowlist trusts the client-supplied SNI/Host, so domain-fronting and SNI/Host mismatch are not caught. The report never claims `Enforced` for a guarantee MITM would be required to make. Mirrors srt's own acknowledged limitation. | Fits ([FW-FID1](../formwork.md#fw-fid1) / [FW-XR1](../formwork.md#fw-xr1)). |
-| <a id="fw-egr6"></a>**FW-EGR6** No unauthenticated egress door | The gateway exposes no network-reachable, unauthenticated control surface. Egress mediation is the injected fd ([FW-XR7](../formwork.md#fw-xr7)); any proxy port the gateway opens toward its *own* upstreams is not reachable from the confined process nor from co-resident host processes acting as a confused deputy. This is why we need no per-session proxy token where srt does — the fd seam already closes that surface, and this requirement keeps it closed. | Fits (invariant-shaped; codifies an existing strength). |
+| <a id="fw-egr6"></a>**FW-EGR6** No unauthenticated egress door | The gateway exposes no network-reachable, unauthenticated control surface. Egress reaches the gateway only through the session's transport ([FW-XR7](../formwork.md#fw-xr7)): on Linux, connections the connect supervisor registered; on macOS, a listener gated by a per-session credential (FEP-5 [FW-EGR9](fep-5.md#fw-egr9)). Any proxy port the gateway opens toward its *own* upstreams is not reachable from the confined process nor from co-resident host processes acting as a confused deputy. | Fits (invariant-shaped; codifies an existing strength). |
 
 **Resolved — the three net postures are mutually exclusive by construction.** `net`
 becomes a single enum, `Deny | Ports([u16]) | AllowHosts([HostPattern])`, so "a host
@@ -179,8 +178,9 @@ shipped — `.env`/agent-state/`~/.docker` subtracts, tamper write-subtract, the
 scrub — are now in `profiles/default.toml`):
 
 - **The `Ports` posture cannot filter by IP, so the shipped example reaches cloud
-  metadata.** `default.toml` is `net = "deny"` (good), but `agent-session.toml` uses
-  `net = { ports = [443] }` — a direct kernel `connect()` that silently reaches
+  metadata.** `default.toml` is `net = "deny"` (good), but the port-scoped agent example
+  (`agent-session.toml`, since retired by FEP-5) used `net = { ports = [443] }` — a direct kernel
+  `connect()` that silently reaches
   `169.254.169.254`. The kernel cannot IP-filter a direct port grant ([FW-EGR4](#fw-egr4)), so the
   fix is a **migration of the example to `AllowHosts`** ([FW-EGR1](#fw-egr1)) naming the real
   model-API hosts — which routes egress through the gateway, where the metadata/RFC-1918

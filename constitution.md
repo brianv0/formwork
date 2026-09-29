@@ -117,11 +117,12 @@ compatibility discipline concentrate here.
   authored ones ([FW-DISC6](formwork.md#fw-disc6)).
 - **broker** = the Gateway presenting a credential it holds, never disclosing its bytes ·
   **placeholder** = the per-session stand-in for a brokered env var · **inspect** = TLS termination
-  at the Gateway for a host rule that needs request-level policy · **supervise** = the Gateway
-  receiving a confined `connect()` through seccomp user notification and minting the connection
-  itself · **channel** = a host service that can act outside the sandbox on a confined process's
-  behalf, named by a portable enum value · **characterize** = a CI test that records how a platform
-  mechanism behaves, run before a requirement relying on it is anchored.
+  at the Gateway for a host rule that needs request-level policy · **supervise** = the connect
+  supervisor, outside the sandbox, receiving a confined `connect()` through seccomp user
+  notification and performing it itself · **channel** = a host service that can act outside the
+  sandbox on a confined process's behalf, named by a portable enum value · **characterize** = a CI
+  test that records how a platform mechanism behaves; until it runs, a requirement relying on it is
+  reported `Partial` on that platform.
 - **Confiner** (hard OS layer), **Gateway** (soft MCP layer), and **Seam**
   (transport) are three distinct things and are never blurred. **Formwork** is
   the whole system.

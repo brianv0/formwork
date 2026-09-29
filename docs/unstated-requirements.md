@@ -10,10 +10,9 @@ and whether it deserves minting as a real `FW-*` requirement.
 [FW-BP8](../formwork.md#fw-bp8) (with [FW-E2E-070](../formwork.md#fw-e2e-070)), and
 [FW-DISC11](../formwork.md#fw-disc11); items 2, 3, 4, 7, and 9 landed as the marked constitution
 amendments (Errors doctrine, Requirements & identifiers, Testing, Growth, Precedence & Conflicts —
-with the deprecations register in [`STATUS.md`](STATUS.md)); item 8 was already doctrine. Items 10
-(CI-matrix rule — mint when release automation is next touched) and 12 (exit-code contract — mint
-when an embedder needs it) remain deliberately unminted, per their own entries. The per-item prose
-below is kept as the design record.
+with the deprecations register in [`STATUS.md`](STATUS.md)); item 8 was already doctrine. Item 12
+(exit-code contract) is minted as [FW-XR10](fep-5.md#fw-xr10)/[FW-XR11](fep-5.md#fw-xr11), and item
+10 (CI-matrix rule) is applied by FEP-5 §6.2. The per-item prose below is kept as the design record.
 
 ## 1. Surface parity: a subcommand that cannot deliver on a platform refuses before consuming work
 
@@ -183,6 +182,6 @@ for a signal death) and [FW-XR11](fep-5.md#fw-xr11) (a Formwork failure after th
 
 Recommended next actions, smallest first: the constitution sentences (items 3, 7, 9), the FID
 disclosure requirement (item 5), the BP trust-scope requirement (item 6), the XR fail-fast
-generalization (item 1), then the CI-matrix rule (item 10) when release automation is next
-touched. Each is a human-reviewed mint per the constitution; this document is input to that
-review, not a substitute for it.
+generalization (item 1), then the CI-matrix rule (item 10), since applied by FEP-5 §6.2. Each is a
+human-reviewed mint per the constitution; this document is input to that review, not a substitute
+for it.
