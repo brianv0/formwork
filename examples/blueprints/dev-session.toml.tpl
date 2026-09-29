@@ -10,10 +10,12 @@
 # It is examples/blueprints/agent-base.toml plus the port tier, widened to what a Rust build touches.
 
 # crates.io + git-over-HTTPS (cargo fetch) and the model API. Port-scoped = any HTTPS host; the fs
-# wall, not an egress allowlist, is what stops exfiltration. (Once host-scoped egress lands, prefer
-# naming crates.io + the model host so egress is host-scoped and the SSRF/metadata block applies.)
-# DNS still resolves: on macOS it goes through the system resolver (mDNSResponder), not a socket the
-# confined process opens, so :443 egress is enough for cargo to reach the network.
+# wall, not an egress allowlist, is what stops exfiltration. On macOS names resolve through the
+# system resolver (mDNSResponder), so :443 is enough for cargo. On Linux the port tier resolves no
+# names at all (UDP is closed and no Gateway runs), so cargo cannot fetch: replace this line with
+# host rules, which resolve through the Gateway and apply the metadata block, e.g.
+#   rules = ["https:index.crates.io", "https:static.crates.io", "https:github.com",
+#            "https:api.anthropic.com"]
 net = { ports = [443] }
 exec = "unrestricted"
 # Scrub secret-shaped env vars but keep the model auth the dev agent needs.
@@ -24,8 +26,8 @@ env = { scrub = { allow = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] } }
 allow-credentials = ["anthropic", "claude"]
 
 [fs]
+# Ambient reads (rustc, ~/.rustup toolchains, system libs), read-only, minus the credential floor.
 read-mode = "ambient-minus-subtract"
-reads = ["/**"]                      # ambient: rustc, ~/.rustup toolchains, system libs — read-only
 
 # Writable working set: the repo (edits + target/ output persist) and the cargo caches a
 # fetch/build writes. Everything else stays read-only.
@@ -55,4 +57,6 @@ write-subtract = [
     "**/.mcp.json",
     "**/.vscode/**",
     "**/.idea/**",
+    "**/.claude/settings.json",
+    "**/.claude/settings.local.json",
 ]

@@ -13,19 +13,27 @@ exec = "unrestricted"
 env = { scrub = {} }
 
 [fs]
+# The ambient universe is the read mode, not a row (FEP-5 D10), so `--mode unveil` can close it.
 read-mode = "ambient-minus-subtract"
-reads = ["/**"]
 writes = ["~/project/**", "/tmp/**", "/private/tmp/**", "/var/tmp/**"]
 # Credential locations are NOT listed here: the compiled-in catalog floor denies them all under
 # every blueprint, minus exactly each agent's `allow-credentials`.
 subtract = []
 
 # Tamper vectors: write-denied but readable, so the agent can't plant a git hook / .mcp.json / IDE
-# task that later runs unsandboxed, yet git and tooling still read them.
+# task / shell rc / Claude Code hook that later runs unsandboxed, yet git and tooling still read
+# them. The same set as builtin:default.
 write-subtract = [
     "**/.git/hooks/**",
     "**/.git/config",
     "**/.mcp.json",
     "**/.vscode/**",
     "**/.idea/**",
+    "**/.claude/settings.json",
+    "**/.claude/settings.local.json",
+    "**/.bashrc",
+    "**/.zshrc",
+    "**/.zshenv",
+    "**/.bash_profile",
+    "**/.profile",
 ]

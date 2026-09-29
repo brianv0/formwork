@@ -6,7 +6,8 @@
 #
 # Login: `claude` opens a browser for the OAuth flow. `desktop` lifts `open-url` (the URL is handed
 # to your browser outside the session, http(s) only) and the clipboard. The callback listener on
-# localhost is allowed under every posture.
+# localhost is allowed under every posture. The channel baseline keeps the rest closed (screen,
+# camera, microphone, and running commands outside the session); lift one by name if needed.
 #
 # With an API key instead of the login, use `claude-code-api-key.toml`: the key is brokered, so the
 # agent never holds it.

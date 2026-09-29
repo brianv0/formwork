@@ -16,7 +16,9 @@ rules = [
     "https:auth.openai.com",
 ]
 allow-credentials = ["codex"]
-# The ChatGPT login opens a browser.
+# The ChatGPT login opens a browser: `open-url` hands the URL to your browser outside the session.
+# The channel baseline keeps the rest closed (clipboard, screen, camera, microphone, and running
+# commands outside the session); lift one by name here if a workflow needs it.
 channels = ["open-url"]
 
 [fs]

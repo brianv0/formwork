@@ -18,8 +18,10 @@ formwork run --blueprint ./examples/blueprints/opencode.toml -- opencode run --a
 ```
 
 The blueprint grants writes to `~/project` + scratch, subtracts credentials/keychains/browser profiles,
-and reaches only the model providers it names, through the session Gateway. Add a `https:` rule
-per provider you use, or let `formwork learn` propose them. Narrow `writes` to your repo.
+and reaches only the model providers it names, through the session Gateway. A provider whose key is
+brokered needs an inspected rule (`any:api.openai.com` beside `broker:openai`); a host the agent
+only fetches from takes a `https:` rule. `formwork learn` proposes the hosts a run needed. Narrow
+`writes` to your repo.
 
 ## Axis B — route MCP servers through the gateway
 

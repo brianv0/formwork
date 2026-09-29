@@ -67,20 +67,31 @@ examples/
 
 ## Two ways to author the same policy
 
-The blueprints above use the nested `[fs]` table. The same filesystem grants can be written as a
-flat list of **verb rules** — one `"<verb>:<path>"` string per rule — which is the *same vocabulary*
-on a `--rule` flag and a file line, so a policy reads the same however you author it. See
+`agent-base.toml` writes its filesystem grants in the nested `[fs]` table; the agent blueprints
+add host rules in `rules`. The same filesystem grants can be written as a flat list of **verb
+rules** — one `"<verb>:<target>"` string per rule — which is the *same vocabulary* on a `--rule`
+flag and a file line, so a policy reads the same however you author it. See
 `blueprints/rules-demo.toml` and `formwork.md` (§4, §5) for the full grammar.
 
 | Verb | Grants | Nested-`[fs]` equivalent |
 |---|---|---|
 | `read` / `readonly` | read | `reads` |
-| `readwrite` | read + write + create | `writes` |
+| `write` / `readwrite` | read + write + create | `writes` |
 | `modify` | read + modify, **no create** | `writes-no-create` |
-| `allow` | read + write + create + exec | `writes` + `exec` allow-list |
-| `readexec` | read + execute | `reads` + `exec` allow-list |
 | `exec` | execute only | `exec` allow-list |
+| `readexec` | read + execute | `reads` + `exec` allow-list |
+| `allow` | read + write + create + exec | `writes` + `exec` allow-list |
 | `deny` | nothing (terminal) | `subtract` |
+
+Atoms combine with commas (`read,exec:` is `readexec:`), and verbs are case-insensitive. A target
+that is a host rather than a path makes the rule a host rule:
+
+| Verb | Grants |
+|---|---|
+| `https:host[:port]` | a tunnel to the host (TLS unterminated; the request is opaque) |
+| `get,post,…:host[:port][/glob]` | the named HTTP methods on matching paths; the Gateway inspects the host |
+| `any:host[:port][/glob]` | every method on matching paths, inspected |
+| `deny:host[/glob]` | nothing (terminal); a path needs an inspected rule for the host |
 
 `--mode unveil` (empty universe) or `--mode subtractive` (ambient minus the credential floor)
 is a friendlier spelling of `[fs] read-mode`. `deny` is terminal — no allow overrides it — and the
@@ -141,7 +152,8 @@ formwork explain --blueprint examples/blueprints/claude-code.toml --hosts
 # Under an inspected rule, clients must trust the session CA. Most read SSL_CERT_FILE and friends,
 # which the Launcher sets; uv needs UV_NATIVE_TLS=1 to read them:
 UV_NATIVE_TLS=1 formwork run --blueprint examples/blueprints/agent-base.toml --rule "get:pypi.org" \
-  --rule "get:files.pythonhosted.org" -- uv sync
+  --rule "get:files.pythonhosted.org" --rule 'readwrite:$CWD/**' --rule 'readwrite:~/.cache/uv/**' \
+  -- uv sync
 
 # Ask why one path is granted or denied — the deciding rule and the layer it came from:
 formwork explain --blueprint examples/blueprints/rules-demo.toml '$CWD/.env'
