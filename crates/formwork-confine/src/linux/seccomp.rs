@@ -3,8 +3,9 @@
 //! escalation/confinement-shedding syscalls, and -- to carry net default-deny -- inet `socket(2)`
 //! creation, return `EPERM`. Net-deny has two shapes: an outright deny blocks the whole inet family
 //! (TCP + UDP + raw), while the port tier denies only inet DGRAM/RAW and lets STREAM through so the
-//! Landlock per-port TCP rules can govern it (FW-ISO3/FW-INV3). Built in the parent; `apply()` runs in
-//! the forked child after `NO_NEW_PRIVS`.
+//! Landlock per-port TCP rules can govern it (FW-ISO3/FW-INV3), denying only the TCP Fast Open sends
+//! that would connect around them. Built in the parent; `apply()` runs in the forked child after
+//! `NO_NEW_PRIVS`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -52,6 +53,22 @@ pub fn build(plan: &SeccompPlan) -> Result<BpfProgram, ConfineError> {
             for sock_type in [libc::SOCK_DGRAM as u64, libc::SOCK_RAW as u64] {
                 socket_rules.push(inet_socket_type_rule(domain, sock_type)?);
             }
+        }
+    }
+    // TCP Fast Open connects inside sendto/sendmsg/sendmmsg, never through connect(2), so neither
+    // the Landlock `ConnectTcp` hook nor the connect supervisor sees it. The flag is a plain
+    // argument (arg3 of sendto/sendmmsg, arg2 of sendmsg), so it is denied here outright.
+    if plan.deny_fastopen {
+        let fastopen = libc::MSG_FASTOPEN as u64;
+        for (nr, flags_arg) in [
+            (libc::SYS_sendto, 3),
+            (libc::SYS_sendmsg, 2),
+            (libc::SYS_sendmmsg, 3),
+        ] {
+            rules
+                .entry(nr)
+                .or_default()
+                .push(masked_flag_rule(flags_arg, fastopen)?);
         }
     }
     if !socket_rules.is_empty() {

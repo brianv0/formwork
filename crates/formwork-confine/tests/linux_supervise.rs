@@ -26,6 +26,15 @@ fn supervision_available() -> bool {
     host.connect_supervision && host.seccomp && host.landlock_abi.is_some()
 }
 
+/// Skip with a reason locally; in CI (`FW_REQUIRE_EXERCISED=1`) a test that could not exercise its
+/// mechanism fails instead (FEP-5 §6.1).
+fn not_exercised(reason: &str) {
+    if std::env::var("FW_REQUIRE_EXERCISED").as_deref() == Ok("1") {
+        panic!("not exercised: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
 /// A listener that counts the connections it accepts.
 struct Counting {
     addr: SocketAddr,
@@ -141,7 +150,7 @@ fn cmd(p: &Path, args: &[&str]) -> Command {
 #[test]
 fn fw_e2e_075_gateway_is_the_sole_egress_path() {
     if !supervision_available() {
-        eprintln!("skipping: connect supervision unavailable on this host");
+        not_exercised("connect supervision unavailable on this host");
         return;
     }
     let work = Scratch::new("075");
@@ -190,8 +199,30 @@ fn fw_e2e_075_gateway_is_the_sole_egress_path() {
         cmd(&probe("udp"), &[]),
     );
     assert_eq!(udp, 7, "UDP stays closed under host rules (FW-ISO11)");
+    // A TCP Fast Open send connects inside sendmsg, never calling connect(); the control run shows
+    // the route is live on this host before the confined run shows it closed.
+    let control = cmd(&probe("connect"), &[&other.addr.to_string(), "fastopen"])
+        .status()
+        .unwrap()
+        .code();
     std::thread::sleep(std::time::Duration::from_millis(100));
-    assert_eq!(other.count(), 0, "nothing reached the other listener");
+    let before = other.count();
+    if control == Some(0) {
+        let fastopen = run(
+            &pol,
+            gateway.addr,
+            registry.clone(),
+            cmd(&probe("connect"), &[&other.addr.to_string(), "fastopen"]),
+        );
+        assert_eq!(
+            fastopen, 7,
+            "a Fast Open send cannot connect around the supervisor"
+        );
+    } else {
+        not_exercised("TCP Fast Open is disabled on this host (net.ipv4.tcp_fastopen)");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(other.count(), before, "nothing reached the other listener");
     assert!(gateway.count() >= 1);
 }
 
@@ -201,7 +232,7 @@ fn fw_e2e_075_gateway_is_the_sole_egress_path() {
 #[test]
 fn fw_e2e_076_pathname_sockets_are_mediated() {
     if !supervision_available() {
-        eprintln!("skipping: connect supervision unavailable on this host");
+        not_exercised("connect supervision unavailable on this host");
         return;
     }
     let work = Scratch::new("076");
@@ -288,7 +319,7 @@ fn fw_e2e_076_pathname_sockets_are_mediated() {
 #[test]
 fn fw_adv_018_supervisor_race_cannot_redirect() {
     if !supervision_available() {
-        eprintln!("skipping: connect supervision unavailable on this host");
+        not_exercised("connect supervision unavailable on this host");
         return;
     }
     let work = Scratch::new("018");

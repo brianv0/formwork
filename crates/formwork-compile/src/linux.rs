@@ -87,6 +87,7 @@ pub fn seccomp_plan(inet_deny: InetSeccompDeny, supervise_connect: bool) -> Secc
         deny_syscalls,
         deny_socket_families,
         deny_inet_dgram_raw,
+        deny_fastopen: deny_inet_dgram_raw,
         supervise_connect,
         restrict_userns: true,
         set_no_new_privs: true,
@@ -191,6 +192,10 @@ mod tests {
         // STREAM survives for Landlock), while packet + non-route netlink stay blocked.
         let plan = seccomp_plan(InetSeccompDeny::DgramRawOnly, false);
         assert!(plan.deny_inet_dgram_raw, "UDP/raw must be denied");
+        assert!(
+            plan.deny_fastopen,
+            "a Fast Open send would connect around Landlock"
+        );
         assert!(
             !plan.deny_socket_families.contains(&SocketFamily::Inet)
                 && !plan.deny_socket_families.contains(&SocketFamily::Inet6),

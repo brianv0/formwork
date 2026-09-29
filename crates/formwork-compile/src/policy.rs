@@ -117,6 +117,11 @@ pub struct SeccompPlan {
     /// `SOCK_NONBLOCK`/`SOCK_CLOEXEC` cannot evade it) while allowing STREAM (FW-ISO11).
     #[serde(default)]
     pub deny_inet_dgram_raw: bool,
+    /// Deny `sendto`/`sendmsg`/`sendmmsg` carrying `MSG_FASTOPEN`: a TCP Fast Open send connects
+    /// without `connect(2)`, so it would pass both Landlock's `ConnectTcp` hook and the supervisor.
+    /// Set wherever inet STREAM sockets survive (the port tier and host rules).
+    #[serde(default)]
+    pub deny_fastopen: bool,
     /// Deliver `connect()` and addressed `sendto()` to the supervisor via seccomp user
     /// notification (FW-EGR7). The confiner refuses to spawn without a supervisor when set.
     #[serde(default)]

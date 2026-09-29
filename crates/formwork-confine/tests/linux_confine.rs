@@ -358,6 +358,24 @@ fn port_tier_tcp_selective_under_landlock() {
         7,
         "a non-granted TCP port must be denied by Landlock at connect() (exit 7)"
     );
+
+    // TCP Fast Open connects inside sendmsg, where Landlock's ConnectTcp hook never looks; the
+    // seccomp baseline denies the flag instead. The control run proves the route live first.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let target = listener.local_addr().unwrap().to_string();
+    let mut control = Command::new(&probe);
+    control.args([target.as_str(), "fastopen"]);
+    if control.status().unwrap().code() == Some(0) {
+        let mut fastopen = Command::new(&probe);
+        fastopen.args([target.as_str(), "fastopen"]);
+        assert_eq!(
+            run(&policy, fastopen),
+            7,
+            "a Fast Open send to a non-granted port must be denied (exit 7)"
+        );
+    } else {
+        eprintln!("skipping the Fast Open arm: TCP Fast Open is disabled on this host");
+    }
 }
 
 /// FW-TRA2 (Linux): the sandbox is transparent -- a shell that forks and execs a child runs clean
