@@ -1,68 +1,71 @@
-//! The Gateway's egress listener (FW-EGR1, FEP-5 §3.1): the one network door of a host-scoped
-//! session. An HTTP proxy on a loopback port that admits only registered connections (the Linux
-//! supervisor registers each one it performs, FW-EGR9) carrying the per-session credential, and
-//! forwards only what the host table admits:
+//! The egress engine (FW-EGR1, FEP-5 §3.1, FEP-6): the one network door of a host-scoped
+//! session, an HTTP proxy on a loopback port inside the Gateway. It admits only registered
+//! connections (the Linux supervisor registers each one it performs, FW-EGR9) carrying the
+//! per-session credential, and serves each through one pipeline (FEP-6 §4.2):
 //!
-//! - `CONNECT host:port` to a tunnel-grade host splices bytes to the upstream (FW-EGR5: the request
-//!   stays opaque);
-//! - an absolute-form plain-HTTP request is checked by method and canonical path when its host is
-//!   inspected, or by host when it is tunnel-grade, then forwarded once with `Connection: close`;
-//! - an inspected host over TLS is terminated by the inspection layer (FW-EGR10).
+//! 1. the proxy request head, read within **head-timeout** and **head-limit**: `CONNECT host:port`,
+//!    or an absolute-form `http://` request for a plain-HTTP rule;
+//! 2. the authority, parsed into the one host type rules parse into (FW-EGR3);
+//! 3. the host decision -- not listed, denied, tunnel or inspected;
+//! 4. the destination: one resolution, every address classified, only admitted addresses dialed
+//!    (FW-EGR17-19);
+//! 5. the grade: a tunnel forwards TLS after its ClientHello's server name matches the CONNECT host
+//!    (FW-EGR16); an inspected host is terminated and each request decided (`inspect`).
 //!
-//! Names resolve once, here, and the address connected to is the address checked: a name that
-//! resolves into a restricted range is refused however it is allowlisted (FW-EGR4, FW-ADV-008).
-//! Every refusal is a structured violation record on the operator channel naming the rule and the
-//! `explain` invocation that reproduces it (FW-FID5, FW-FID9), while the client gets a generic 403
-//! (FW-CRED7).
+//! Every refusal is one violation record with a reason from a closed set (FW-FID12) and one
+//! operator line naming the rule and the `explain` invocation that reproduces it (FW-FID9), while
+//! the client gets a generic refusal (FW-CRED7). Every admitted tunnel and request is a grant
+//! record (FW-FID13).
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use formwork_blueprint::{
-    canonicalize_host, canonicalize_request_path, is_restricted_ip, split_host_port, split_url,
-    CanonicalHost, ConnectDecision, Denial, HostTable, HttpMethod, DEFAULT_HTTPS_PORT,
+    admit_addresses, canonicalize_host, split_host_port, CanonicalHost, ConnectDecision,
+    EgressObservation, HostRule, HostTable, LocalAddresses, Naming, RefusalReason,
+    DEFAULT_HTTPS_PORT, DEFAULT_HTTP_PORT,
 };
+use formwork_compile::Capability;
 
-use crate::inspect::{
-    basic_value, render_request, request_framing, Broker, Buffered, Inspection, Scrubber,
-};
+use crate::http::{parse_head, parse_response_head, respond, BoxIo, Buffered, HeadError};
+use crate::inspect::{basic_value, Broker, Inspection, Pool};
+use crate::upstream::{ProxyEndpoint, UpstreamProxy};
 use crate::GatewayError;
 
-/// Bound on a message head, so a peer that never ends its headers cannot make the Gateway buffer
-/// without limit (a stability bound, like `MAX_FRAME_BYTES`).
-pub(crate) const MAX_HEAD_BYTES: usize = 64 * 1024;
+/// **hello-limit** (FEP-6 §4.9): the buffered ClientHello.
+const HELLO_LIMIT: usize = 16 * 1024;
+/// **hello-timeout**: from the `200` reply to a complete ClientHello.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Records kept for an embedder or test to read back; older ones are dropped.
+const MAX_KEPT_RECORDS: usize = 1024;
 /// The reproduction for a refusal that names no destination.
 const EXPLAIN_HOSTS: &str = "formwork explain --hosts";
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Violation records kept for an embedder or test to read back; older ones are dropped.
-const MAX_KEPT_VIOLATIONS: usize = 1024;
 
-/// How the Gateway resolves names. `System` is the host resolver. `Fixture` maps names to
-/// addresses with no DNS at all -- the controlled input the egress tests drive the real Gateway
-/// with (FEP-1 test harness); it is reachable only through this library API, never the CLI.
+/// How the Gateway resolves names. `System` is the host resolver (`getaddrinfo`, so `/etc/hosts`,
+/// NSS and split-horizon DNS behave as they do for the operator). `Fixture` maps names to addresses
+/// with no DNS at all -- the controlled input the egress tests drive the real Gateway with (FEP-1
+/// test harness); it is reachable only through this library API, never the CLI.
 #[derive(Clone, Debug)]
 pub enum Resolver {
     System,
-    Fixture {
-        map: BTreeMap<String, Vec<IpAddr>>,
-        /// Fixture upstreams listen on loopback; a fixture's loopback answers are therefore not a
-        /// rebinding. Private, link-local and metadata answers are still refused.
-        loopback_upstreams: bool,
-    },
+    Fixture(BTreeMap<String, Vec<IpAddr>>),
 }
 
 /// Who may use the listener (FW-EGR9).
 #[derive(Clone, Debug)]
 pub struct Admission {
-    /// The per-session credential every request carries (`Proxy-Authorization: Basic`).
+    /// The per-session credential every proxy request carries (`Proxy-Authorization: Basic`).
     pub credential: String,
     /// Linux: source ports the supervisor registered for connections it performed. A connection
-    /// from an unregistered port is refused before a byte is read. `None` on macOS, where the
+    /// from an unregistered port is closed before a byte is read. `None` on macOS, where the
     /// credential is the admission (FW-EGR9's residual, reported `Partial`).
     pub registry: Option<Arc<Mutex<HashSet<u16>>>>,
 }
@@ -72,65 +75,169 @@ pub struct EgressConfig {
     pub table: HostTable,
     pub resolver: Resolver,
     pub admission: Admission,
-    /// The session CA and upstream trust, when any host is inspected (FW-EGR10/EGR13).
+    /// The session CA and upstream trust; present whenever a host is inspected (FW-EGR13).
     pub inspection: Option<Inspection>,
     /// Brokered credentials (FW-CRED11).
     pub brokers: Vec<Broker>,
+    /// Every address on the host's interfaces, enumerated at session start (FW-EGR19).
+    pub host_addresses: Vec<IpAddr>,
+    /// The operator's upstream proxy, from `formwork run`'s own environment (FW-EGR26).
+    pub upstream_proxy: Option<UpstreamProxy>,
 }
 
-/// One refusal (FW-FID5): what was refused, why, the deciding rule, and the reproduction.
+/// One refusal (FW-FID5, FW-FID12): the capability refused, one reason from the closed set, what
+/// the request was when known, and the deciding rule. It never carries a header value, a body or a
+/// query string, which can hold secrets.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Violation {
-    pub kind: &'static str,
-    pub target: String,
-    pub reason: String,
-    pub rule: Option<String>,
-    pub explain: String,
-    /// What the session needed, when the refusal was a policy decision `learn` can propose a rule
-    /// for (FW-DISC12). Absent for protocol refusals (malformed, smuggling-shaped, mismatched).
+    pub capability: Capability,
+    pub reason: RefusalReason,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub need: Option<formwork_blueprint::EgressObservation>,
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// The canonical path, without its query (FW-EGR11).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// Operator-channel prose.
+    pub detail: String,
+    pub explain: String,
+    /// Milliseconds since the Unix epoch.
+    pub timestamp: u64,
+    /// What the session needed, when `learn` can propose a rule for it or must itemize why not
+    /// (FW-DISC12).
+    #[serde(skip)]
+    pub need: Option<EgressObservation>,
 }
 
-/// A refused destination, as `learn` sees it.
-pub(crate) fn need(
-    host: &CanonicalHost,
-    port: u16,
-    request: Option<(&str, &str)>,
-) -> Option<formwork_blueprint::EgressObservation> {
-    Some(formwork_blueprint::EgressObservation {
-        host: host.to_string(),
-        port,
-        method: request.map(|(m, _)| m.to_string()),
-        path: request.map(|(_, p)| p.to_string()),
-    })
+/// One admitted tunnel or inspected request (FW-FID13), under the same exclusions as a violation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Grant {
+    pub host: String,
+    pub port: u16,
+    /// `tunnel` or `inspected`.
+    pub grade: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub duration_ms: u64,
+}
+
+/// A refusal on its way to a record: the engine's typed error for a connection or request it will
+/// not forward. Boxed, since it travels in every `Result` of the pipeline.
+#[derive(Clone, Debug)]
+pub(crate) struct Refusal(Box<RefusalParts>);
+
+#[derive(Clone, Debug)]
+struct RefusalParts {
+    reason: RefusalReason,
+    capability: Capability,
+    detail: String,
+    host: Option<(CanonicalHost, u16)>,
+    request: Option<(String, String)>,
+    rule: Option<String>,
+    plain: bool,
+}
+
+impl Refusal {
+    pub(crate) fn new(reason: RefusalReason, detail: impl Into<String>) -> Refusal {
+        use RefusalReason as R;
+        let capability = match reason {
+            R::HostNotListed
+            | R::HostDenied
+            | R::Resolution
+            | R::AddressClass
+            | R::NotTls
+            | R::SniMismatch
+            | R::Malformed
+            | R::Limit => Capability::NetHostScope,
+            R::Alpn | R::HostMismatch | R::Method | R::Path | R::UpstreamTls => {
+                Capability::NetInspection
+            }
+            R::Placeholder | R::Reflection => Capability::CredentialBroker,
+        };
+        Refusal(Box::new(RefusalParts {
+            reason,
+            capability,
+            detail: detail.into(),
+            host: None,
+            request: None,
+            rule: None,
+            plain: false,
+        }))
+    }
+
+    pub(crate) fn at(mut self, host: &CanonicalHost, port: u16) -> Refusal {
+        self.0.host = Some((host.clone(), port));
+        self
+    }
+
+    pub(crate) fn request(mut self, method: &str, path: &str) -> Refusal {
+        self.0.request = Some((method.to_string(), path.to_string()));
+        self
+    }
+
+    pub(crate) fn rule(mut self, rule: Option<&HostRule>) -> Refusal {
+        self.0.rule = rule.map(|r| r.to_string());
+        self
+    }
+
+    pub(crate) fn plain(mut self, plain: bool) -> Refusal {
+        self.0.plain = plain;
+        self
+    }
+
+    pub(crate) fn capability(mut self, capability: Capability) -> Refusal {
+        self.0.capability = capability;
+        self
+    }
+
+    pub(crate) fn reason(&self) -> RefusalReason {
+        self.0.reason
+    }
 }
 
 /// A running egress listener. Dropping it stops the listener and joins its thread.
 pub struct EgressProxy {
     addr: SocketAddr,
     credential: String,
-    violations: Arc<Mutex<VecDeque<Violation>>>,
+    shared: Arc<Shared>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl EgressProxy {
     /// Bind `127.0.0.1:0` and serve on a dedicated thread with its own runtime, so the caller (the
-    /// synchronous CLI) stays free of tokio (constitution Layers).
+    /// synchronous CLI) stays free of tokio (constitution Layers). A listener that cannot bind is
+    /// an error, never a session without its door.
     pub fn start(config: EgressConfig) -> Result<EgressProxy, GatewayError> {
         let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         std_listener.set_nonblocking(true)?;
         let addr = std_listener.local_addr()?;
-        let violations = Arc::new(Mutex::new(VecDeque::new()));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let credential = config.admission.credential.clone();
         let shared = Arc::new(Shared {
             expected_auth: basic_value("fw", &credential),
-            secrets: Scrubber::secrets_of(&config.brokers),
+            local: LocalAddresses {
+                gateway: vec![addr],
+                host: config.host_addresses.clone(),
+            },
             config,
-            violations: violations.clone(),
+            pool: Pool::default(),
+            records: Mutex::new(Records::default()),
         });
+        let serving = shared.clone();
         let thread = std::thread::Builder::new()
             .name("formwork-egress".into())
             .spawn(move || {
@@ -155,15 +262,22 @@ impl EgressProxy {
                     };
                     tokio::select! {
                         _ = rx => {}
-                        _ = accept_loop(listener, shared) => {}
+                        _ = accept_loop(listener, serving) => {}
                     }
                 });
             })?;
         tracing::info!(listener = %addr, "gateway egress listener started (FW-EGR14)");
+        if let Some(proxy) = &shared.config.upstream_proxy {
+            tracing::info!(
+                upstream = %proxy.describe(),
+                "egress leaves through the operator's upstream proxy, which resolves the names it \
+                 carries: address classification for those hosts is Partial (FW-EGR26)"
+            );
+        }
         Ok(EgressProxy {
             addr,
             credential,
-            violations,
+            shared,
             shutdown: Some(tx),
             thread: Some(thread),
         })
@@ -173,16 +287,35 @@ impl EgressProxy {
         self.addr
     }
 
-    /// The value for `HTTP(S)_PROXY` in the confined child.
+    /// The value for the proxy variables in the confined child.
     pub fn proxy_url(&self) -> String {
         format!("http://fw:{}@{}", self.credential, self.addr)
     }
 
     /// The refusals recorded so far, oldest first.
     pub fn violations(&self) -> Vec<Violation> {
-        self.violations
+        self.shared
+            .records
             .lock()
-            .map(|v| v.iter().cloned().collect())
+            .map(|r| r.violations.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The admitted tunnels and requests recorded so far, oldest first (FW-FID13).
+    pub fn grants(&self) -> Vec<Grant> {
+        self.shared
+            .records
+            .lock()
+            .map(|r| r.grants.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Inspected hosts whose clients rejected the session CA, which only a `tunnel:` rule serves.
+    pub fn ca_rejections(&self) -> Vec<(CanonicalHost, u16)> {
+        self.shared
+            .records
+            .lock()
+            .map(|r| r.ca_rejections.clone())
             .unwrap_or_default()
     }
 
@@ -207,62 +340,136 @@ impl Drop for EgressProxy {
     }
 }
 
+#[derive(Default)]
+struct Records {
+    violations: VecDeque<Violation>,
+    grants: VecDeque<Grant>,
+    ca_rejections: Vec<(CanonicalHost, u16)>,
+}
+
+fn keep<T>(list: &mut VecDeque<T>, item: T) {
+    if list.len() >= MAX_KEPT_RECORDS {
+        list.pop_front();
+    }
+    list.push_back(item);
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub(crate) struct Shared {
     pub(crate) config: EgressConfig,
-    /// The `Proxy-Authorization` value every admitted request carries (FW-EGR9).
+    /// The `Proxy-Authorization` value every admitted proxy request carries (FW-EGR9).
     expected_auth: String,
-    /// The brokered secrets response scrubbers mask (FW-INV13).
-    pub(crate) secrets: Arc<[Vec<u8>]>,
-    violations: Arc<Mutex<VecDeque<Violation>>>,
+    /// The listener endpoint and the host's addresses, for classification (FW-EGR18/EGR19).
+    pub(crate) local: LocalAddresses,
+    pub(crate) pool: Pool,
+    records: Mutex<Records>,
 }
 
 impl Shared {
-    pub(crate) fn refuse(
-        &self,
-        kind: &'static str,
-        target: &str,
-        reason: &str,
-        rule: Option<String>,
-        explain: String,
-    ) {
-        self.refuse_needing(kind, target, reason, rule, explain, None)
-    }
-
-    /// As [`Shared::refuse`], recording what the session needed (FW-DISC12).
-    pub(crate) fn refuse_needing(
-        &self,
-        kind: &'static str,
-        target: &str,
-        reason: &str,
-        rule: Option<String>,
-        explain: String,
-        need: Option<formwork_blueprint::EgressObservation>,
-    ) {
+    /// Record a refusal and emit its operator line (FW-FID9); the confined client sees only a
+    /// generic refusal.
+    pub(crate) fn refuse(&self, r: Refusal) {
+        use RefusalReason as R;
+        let r = *r.0;
+        let scheme = if r.plain { "http" } else { "https" };
+        let explain = match &r.host {
+            Some((host, port)) => explain_hint(
+                scheme,
+                host,
+                *port,
+                r.request.as_ref().map(|(_, p)| p.as_str()).unwrap_or(""),
+            ),
+            None => EXPLAIN_HOSTS.to_string(),
+        };
+        let need = match (&r.host, r.reason) {
+            (
+                Some((host, port)),
+                R::HostNotListed | R::HostDenied | R::AddressClass | R::Method | R::Path,
+            ) => Some(EgressObservation {
+                host: host.to_string(),
+                port: *port,
+                reason: r.reason,
+                method: r.request.as_ref().map(|(m, _)| m.clone()),
+                path: r.request.as_ref().map(|(_, p)| p.clone()),
+            }),
+            _ => None,
+        };
+        let target = match (&r.host, &r.request) {
+            (Some((h, p)), Some((m, path))) => format!("{m} {h}:{p}{path}"),
+            (Some((h, p)), None) => format!("{h}:{p}"),
+            (None, _) => "(no destination)".to_string(),
+        };
+        tracing::warn!(
+            reason = r.reason.as_str(),
+            capability = r.capability.as_key(),
+            rule = r.rule.as_deref().unwrap_or("(no rule admits it)"),
+            explain = %explain,
+            "formwork: egress refused ({}) {target}: {}",
+            r.reason,
+            r.detail
+        );
         let v = Violation {
-            kind,
-            target: target.to_string(),
-            reason: reason.to_string(),
-            rule,
+            capability: r.capability,
+            reason: r.reason,
+            host: r.host.as_ref().map(|(h, _)| h.to_string()),
+            port: r.host.as_ref().map(|(_, p)| *p),
+            method: r.request.as_ref().map(|(m, _)| m.clone()),
+            path: r.request.map(|(_, p)| p),
+            rule: r.rule,
+            detail: r.detail,
             explain,
+            timestamp: now_ms(),
             need,
         };
-        // FW-FID9: one operator-channel line naming what was refused, the deciding rule, and the
-        // reproduction; the confined client sees only a generic refusal.
-        tracing::warn!(
-            violation = kind,
-            target = %v.target,
-            rule = v.rule.as_deref().unwrap_or("(no rule admits it)"),
-            reproduce = %v.explain,
-            "formwork: refused {kind} {} -- {}",
-            v.target,
-            v.reason
-        );
-        if let Ok(mut all) = self.violations.lock() {
-            if all.len() >= MAX_KEPT_VIOLATIONS {
-                all.pop_front();
-            }
-            all.push_back(v);
+        if let Ok(mut records) = self.records.lock() {
+            keep(&mut records.violations, v);
         }
+    }
+
+    pub(crate) fn grant(&self, g: Grant) {
+        tracing::debug!(
+            host = %g.host,
+            port = g.port,
+            grade = g.grade,
+            method = g.method.as_deref().unwrap_or("-"),
+            path = g.path.as_deref().unwrap_or("-"),
+            status = g.status.unwrap_or(0),
+            bytes_up = g.bytes_up,
+            bytes_down = g.bytes_down,
+            duration_ms = g.duration_ms,
+            "egress granted (FW-FID13)"
+        );
+        if let Ok(mut records) = self.records.lock() {
+            keep(&mut records.grants, g);
+        }
+    }
+
+    pub(crate) fn note_ca_rejection(&self, host: &CanonicalHost, port: u16) {
+        if let Ok(mut records) = self.records.lock() {
+            if !records.ca_rejections.contains(&(host.clone(), port)) {
+                records.ca_rejections.push((host.clone(), port));
+            }
+        }
+    }
+}
+
+pub(crate) fn explain_hint(scheme: &str, host: &CanonicalHost, port: u16, path: &str) -> String {
+    let default = if scheme == "https" {
+        DEFAULT_HTTPS_PORT
+    } else {
+        DEFAULT_HTTP_PORT
+    };
+    let path = if path.is_empty() { "/" } else { path };
+    if port == default {
+        format!("formwork explain {scheme}://{host}{path}")
+    } else {
+        format!("formwork explain {scheme}://{host}:{port}{path}")
     }
 }
 
@@ -276,23 +483,22 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             }
         };
         if let Some(registry) = &shared.config.admission.registry {
-            // FW-EGR9: only connections the supervisor performed (and registered) are admitted;
-            // a co-resident process that found the port is dropped before a byte is read.
+            // FW-EGR9: only connections the supervisor performed (and registered) are admitted; a
+            // co-resident process that found the port is dropped before a byte is read.
             let registered = registry
                 .lock()
                 .map(|mut r| r.remove(&peer.port()))
                 .unwrap_or(false);
             if !registered {
-                shared.refuse(
-                    "unregistered-connection",
-                    &peer.to_string(),
-                    "the connection was not made through the session's supervisor",
-                    None,
-                    EXPLAIN_HOSTS.into(),
+                tracing::warn!(
+                    peer = %peer,
+                    "formwork: the egress listener closed a connection the session's supervisor \
+                     did not make (FW-EGR9)"
                 );
                 continue;
             }
         }
+        let _ = stream.set_nodelay(true);
         let shared = shared.clone();
         tokio::spawn(async move {
             if let Err(e) = serve(stream, shared).await {
@@ -300,130 +506,6 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             }
         });
     }
-}
-
-/// A parsed request head.
-pub(crate) struct Head {
-    pub(crate) method: String,
-    pub(crate) target: String,
-    pub(crate) headers: Vec<(String, String)>,
-}
-
-/// A parsed response head.
-pub(crate) struct ResponseHead {
-    pub(crate) version: String,
-    pub(crate) status: u16,
-    pub(crate) reason: String,
-    pub(crate) headers: Vec<(String, String)>,
-}
-
-fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
-}
-
-impl Head {
-    pub(crate) fn header(&self, name: &str) -> Option<&str> {
-        find_header(&self.headers, name)
-    }
-}
-
-impl ResponseHead {
-    pub(crate) fn header(&self, name: &str) -> Option<&str> {
-        find_header(&self.headers, name)
-    }
-}
-
-/// Split a head into its start line and strictly parsed headers: CRLF line endings, no obsolete
-/// line folding, no NUL, one `name: value` per line with a token name. Anything else is refused
-/// rather than guessed at (FW-EGR11's spirit at the head).
-fn parse_lines(raw: &[u8]) -> Option<(&str, Vec<(String, String)>)> {
-    let text = std::str::from_utf8(raw).ok()?;
-    if text.contains('\0') {
-        return None;
-    }
-    let mut lines = text.split("\r\n");
-    let start = lines.next()?;
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with(' ')
-            || line.starts_with('\t')
-            || line.contains('\n')
-            || line.contains('\r')
-        {
-            return None;
-        }
-        let (name, value) = line.split_once(':')?;
-        if name.is_empty() || name.contains(' ') {
-            return None;
-        }
-        headers.push((name.to_string(), value.trim().to_string()));
-    }
-    Some((start, headers))
-}
-
-fn http_version(v: &str) -> bool {
-    v == "HTTP/1.1" || v == "HTTP/1.0"
-}
-
-/// A request head: `METHOD target HTTP/1.x`, then headers.
-pub(crate) fn parse_head(raw: &[u8]) -> Option<Head> {
-    let (start, headers) = parse_lines(raw)?;
-    let mut parts = start.split(' ');
-    let method = parts.next()?.to_string();
-    let target = parts.next()?.to_string();
-    let version = parts.next()?;
-    if parts.next().is_some() || !http_version(version) {
-        return None;
-    }
-    Some(Head {
-        method,
-        target,
-        headers,
-    })
-}
-
-/// A response head: `HTTP/1.x <3-digit status> [reason]`, then headers.
-pub(crate) fn parse_response_head(raw: &[u8]) -> Option<ResponseHead> {
-    let (start, headers) = parse_lines(raw)?;
-    let mut parts = start.splitn(3, ' ');
-    let version = parts.next()?;
-    let status = parts.next()?;
-    let reason = parts.next().unwrap_or("").to_string();
-    if !http_version(version) || status.len() != 3 || !status.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(ResponseHead {
-        version: version.to_string(),
-        status: status.parse().ok()?,
-        reason,
-        headers,
-    })
-}
-
-/// A Gateway-originated response, then close. A 403 carries the one generic refusal body the
-/// confined client ever sees (FW-CRED7).
-pub(crate) async fn respond<W: AsyncWrite + Unpin>(
-    stream: &mut W,
-    status: &str,
-    extra: &str,
-) -> std::io::Result<()> {
-    let body = if status.starts_with("403") {
-        "denied by formwork policy\n"
-    } else {
-        ""
-    };
-    let msg = format!(
-        "HTTP/1.1 {status}\r\n{extra}Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(msg.as_bytes()).await?;
-    stream.shutdown().await
 }
 
 /// Compare without an early exit on the first differing byte.
@@ -435,332 +517,491 @@ fn same_secret(a: &str, b: &str) -> bool {
             == 0
 }
 
-pub(crate) fn explain_hint(scheme: &str, host: &CanonicalHost, port: u16, path: &str) -> String {
-    let default = if scheme == "https" {
-        DEFAULT_HTTPS_PORT
-    } else {
-        formwork_blueprint::DEFAULT_HTTP_PORT
-    };
-    if port == default {
-        format!("formwork explain {scheme}://{host}{path}")
-    } else {
-        format!("formwork explain {scheme}://{host}:{port}{path}")
-    }
-}
-
-async fn serve(stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
+/// The front door (FEP-6 §4.2 stages 1-2): the only stage that knows how the connection arrived.
+async fn serve(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     let mut client = Buffered::new(stream, Vec::new());
-    let Some(head) = client.head().await? else {
-        return Ok(());
+    let head = match client
+        .raw_head(Some(crate::http::HEAD_TIMEOUT))
+        .await
+        .and_then(|raw| parse_head(&raw))
+    {
+        Ok(head) => head,
+        Err(HeadError::Closed | HeadError::Idle) => return Ok(()),
+        Err(HeadError::Io(e)) => return Err(e),
+        Err(HeadError::Limit(why)) => {
+            shared.refuse(Refusal::new(RefusalReason::Limit, why));
+            return respond(&mut client.s, "400 Bad Request", "", true).await;
+        }
+        Err(HeadError::Malformed(why)) => {
+            shared.refuse(Refusal::new(RefusalReason::Malformed, why));
+            return respond(&mut client.s, "400 Bad Request", "", true).await;
+        }
     };
-    let (mut stream, leftover) = (client.s, client.buf);
     let presented = head.header("Proxy-Authorization").unwrap_or("");
     if !same_secret(presented, &shared.expected_auth) {
         return respond(
-            &mut stream,
+            &mut client.s,
             "407 Proxy Authentication Required",
             "Proxy-Authenticate: Basic realm=\"formwork\"\r\n",
+            true,
         )
         .await;
     }
     if head.method == "CONNECT" {
-        serve_connect(stream, head, leftover, shared).await
+        serve_connect(client, head.target, shared).await
     } else {
-        serve_plain(stream, head, leftover, shared).await
+        crate::inspect::serve_plain(client, head, shared).await
     }
 }
 
-/// Resolve and pin (FW-EGR4, FW-ADV-008): the first address that is not restricted -- unless the
-/// host is an IP literal a rule names, which is the explicit naming EGR4 requires.
-pub(crate) async fn resolve(
+/// Stages 2-6 for `CONNECT host:port`.
+async fn serve_connect(
+    mut client: Buffered<TcpStream>,
+    target: String,
+    shared: Arc<Shared>,
+) -> io::Result<()> {
+    let authority = split_host_port(&target)
+        .map_err(|e| e.to_string())
+        .and_then(|(h, p)| {
+            let port = p.ok_or("a CONNECT authority without a port")?;
+            let host = canonicalize_host(h).map_err(|e| e.to_string())?;
+            Ok((host, port))
+        });
+    let (host, port) = match authority {
+        Ok(a) => a,
+        Err(why) => {
+            shared.refuse(Refusal::new(
+                RefusalReason::Malformed,
+                format!("the CONNECT authority {target:?}: {why}"),
+            ));
+            return respond(&mut client.s, "400 Bad Request", "", true).await;
+        }
+    };
+    let inspect = match shared.config.table.decide_connect(&host, port) {
+        ConnectDecision::Tunnel(_) => false,
+        ConnectDecision::Inspect => true,
+        ConnectDecision::Deny(d) => {
+            shared.refuse(
+                Refusal::new(d.reason, d.detail)
+                    .at(&host, port)
+                    .rule(d.rule),
+            );
+            return respond(&mut client.s, "403 Forbidden", "", true).await;
+        }
+    };
+    let dest = match destination(&shared, &host, port, true).await {
+        Ok(d) => d,
+        Err(r) => {
+            shared.refuse(r.at(&host, port));
+            return respond(&mut client.s, "403 Forbidden", "", true).await;
+        }
+    };
+    client
+        .s
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+    if inspect {
+        crate::inspect::serve_inspected(client, dest, shared).await
+    } else {
+        tunnel(client, dest, shared).await
+    }
+}
+
+/// The tunnel grade (FW-EGR16): the ClientHello's server name must be the CONNECT host before a
+/// byte goes upstream; then bytes are copied until either side closes.
+async fn tunnel(
+    mut client: Buffered<TcpStream>,
+    dest: Destination,
+    shared: Arc<Shared>,
+) -> io::Result<()> {
+    let started = Instant::now();
+    let (host, port) = (dest.host.clone(), dest.port);
+    let hello = match read_client_hello(&mut client).await {
+        Ok(h) => h,
+        Err(r) => {
+            shared.refuse(r.at(&host, port));
+            return Ok(());
+        }
+    };
+    if let Err(r) = check_server_name(&hello, &host) {
+        shared.refuse(r.at(&host, port));
+        return Ok(());
+    }
+    let mut upstream = match dial(&dest, true).await {
+        Ok(u) => u,
+        Err(why) => {
+            tracing::info!(host = %host, port, %why, "egress upstream unavailable");
+            return Ok(());
+        }
+    };
+    upstream.write_all(&hello.raw).await?;
+    let (up, down) = tokio::io::copy_bidirectional(&mut client.s, &mut upstream)
+        .await
+        .unwrap_or((0, 0));
+    shared.grant(Grant {
+        host: host.to_string(),
+        port,
+        grade: "tunnel",
+        method: None,
+        path: None,
+        status: None,
+        bytes_up: up + hello.raw.len() as u64,
+        bytes_down: down,
+        duration_ms: started.elapsed().as_millis() as u64,
+    });
+    Ok(())
+}
+
+/// A complete ClientHello, parsed, and every byte read to get it, which is replayed to whichever
+/// side terminates the TLS session.
+pub(crate) struct Hello {
+    pub(crate) sni: Option<String>,
+    pub(crate) alpn: Option<Vec<Vec<u8>>>,
+    pub(crate) raw: Vec<u8>,
+}
+
+/// Buffer one complete TLS ClientHello within **hello-limit** and **hello-timeout** and parse it
+/// with rustls's own acceptor, which is then dropped (FEP-6 §4.3). A first byte other than a TLS
+/// handshake record is `not-tls`.
+pub(crate) async fn read_client_hello<S: AsyncRead + Unpin>(
+    client: &mut Buffered<S>,
+) -> Result<Hello, Refusal> {
+    let deadline = tokio::time::Instant::now() + HELLO_TIMEOUT;
+    loop {
+        if let Some(&first) = client.buf.first() {
+            if first != 0x16 {
+                return Err(Refusal::new(
+                    RefusalReason::NotTls,
+                    "the first byte after CONNECT is not a TLS handshake record",
+                ));
+            }
+            let mut acceptor = rustls::server::Acceptor::default();
+            let mut rd: &[u8] = &client.buf;
+            while !rd.is_empty() {
+                match acceptor.read_tls(&mut rd) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            match acceptor.accept() {
+                Ok(Some(accepted)) => {
+                    let ch = accepted.client_hello();
+                    let sni = ch.server_name().map(str::to_string);
+                    let alpn = ch
+                        .alpn()
+                        .map(|protocols| protocols.map(<[u8]>::to_vec).collect());
+                    return Ok(Hello {
+                        sni,
+                        alpn,
+                        raw: std::mem::take(&mut client.buf),
+                    });
+                }
+                Ok(None) => {}
+                Err((e, _)) => {
+                    return Err(Refusal::new(
+                        RefusalReason::Malformed,
+                        format!("the ClientHello does not parse: {e}"),
+                    ))
+                }
+            }
+        }
+        if client.buf.len() > HELLO_LIMIT {
+            return Err(Refusal::new(
+                RefusalReason::Limit,
+                "a ClientHello larger than hello-limit",
+            ));
+        }
+        match tokio::time::timeout_at(deadline, client.fill()).await {
+            Err(_) => {
+                return Err(Refusal::new(
+                    RefusalReason::Limit,
+                    "no complete ClientHello within hello-timeout",
+                ))
+            }
+            Ok(Ok(0)) | Ok(Err(_)) => {
+                return Err(Refusal::new(
+                    RefusalReason::Malformed,
+                    "the client closed before a complete ClientHello",
+                ))
+            }
+            Ok(Ok(_)) => {}
+        }
+    }
+}
+
+/// The server name must be the CONNECT host after the same canonicalization; only a connection to
+/// an IP literal may omit it (FW-EGR10, FW-EGR16).
+pub(crate) fn check_server_name(hello: &Hello, host: &CanonicalHost) -> Result<(), Refusal> {
+    match &hello.sni {
+        None if matches!(host, CanonicalHost::Ip(_)) => Ok(()),
+        None => Err(Refusal::new(
+            RefusalReason::SniMismatch,
+            "the ClientHello names no server, which only a connection to an IP literal may omit",
+        )),
+        Some(sni) if canonicalize_host(sni).is_ok_and(|n| &n == host) => Ok(()),
+        Some(sni) => Err(Refusal::new(
+            RefusalReason::SniMismatch,
+            format!(
+                "the ClientHello names {sni:?}, not the CONNECT host {host}; a client using \
+                 Encrypted Client Hello sends its provider's outer name, the likely cause if it \
+                 enables ECH"
+            ),
+        )),
+    }
+}
+
+/// Where an admitted connection may go: the admitted addresses of one resolution, in answer order
+/// (FW-EGR17), or the operator's upstream proxy, which resolves the name itself (FW-EGR26).
+#[derive(Clone, Debug)]
+pub(crate) struct Destination {
+    pub(crate) host: CanonicalHost,
+    pub(crate) port: u16,
+    route: Route,
+}
+
+#[derive(Clone, Debug)]
+enum Route {
+    Direct(Vec<SocketAddr>),
+    Proxied(ProxyEndpoint),
+}
+
+impl Destination {
+    pub(crate) fn proxy(&self) -> Option<&ProxyEndpoint> {
+        match &self.route {
+            Route::Proxied(p) => Some(p),
+            Route::Direct(_) => None,
+        }
+    }
+}
+
+/// Resolve once and classify every address (FW-EGR17-19). A name the upstream proxy carries is not
+/// resolved here; an IP literal is classified either way.
+pub(crate) async fn destination(
     shared: &Shared,
     host: &CanonicalHost,
     port: u16,
-) -> Result<SocketAddr, String> {
-    if host.is_restricted() && !shared.config.table.names_explicitly(host) {
-        return Err(match host {
-            CanonicalHost::Ip(ip) => format!(
-                "{ip} is a restricted address (metadata, private, loopback or link-local) and no \
-                 rule names it (FW-EGR4)"
-            ),
-            CanonicalHost::Name(name) => {
-                format!("{name} is a metadata service and no rule names it (FW-EGR4)")
-            }
-        });
-    }
-    match host {
-        CanonicalHost::Ip(ip) => Ok(SocketAddr::new(*ip, port)),
-        CanonicalHost::Name(name) => {
-            let (candidates, loopback_ok): (Vec<IpAddr>, bool) = match &shared.config.resolver {
-                Resolver::Fixture {
-                    map,
-                    loopback_upstreams,
-                } => (
-                    map.get(name).cloned().unwrap_or_default(),
-                    *loopback_upstreams,
+    tls: bool,
+) -> Result<Destination, Refusal> {
+    let naming = shared
+        .config
+        .table
+        .naming(host, port)
+        .unwrap_or(Naming::Wildcard);
+    let proxy = shared
+        .config
+        .upstream_proxy
+        .as_ref()
+        .and_then(|p| p.endpoint_for(host, tls))
+        .cloned();
+    let answer = match (host, &proxy) {
+        (CanonicalHost::Ip(ip), _) => vec![*ip],
+        (CanonicalHost::Name(_), Some(p)) => {
+            return Ok(Destination {
+                host: host.clone(),
+                port,
+                route: Route::Proxied(p.clone()),
+            })
+        }
+        (CanonicalHost::Name(name), None) => resolve(shared, name, port).await?,
+    };
+    let admitted =
+        admit_addresses(&answer, port, naming, &shared.local).map_err(|(ip, class)| {
+            let by = match naming {
+                Naming::Wildcard => "a wildcard rule",
+                Naming::Exact => "an exact-name rule",
+                Naming::IpLiteral => "an IP-literal rule",
+            };
+            let detail = match class {
+                formwork_blueprint::AddressClass::GatewayEndpoint => format!(
+                    "{host} reaches {ip}:{port}, the Gateway's own listener, which no rule admits \
+                 (FW-EGR18)"
                 ),
-                Resolver::System => (
-                    tokio::net::lookup_host((name.as_str(), port))
-                        .await
-                        .map_err(|e| format!("{name} did not resolve: {e}"))?
-                        .map(|a| a.ip())
-                        .collect(),
-                    false,
+                _ => format!(
+                    "{host} resolves to {ip}, a {class} address, which {by} does not admit \
+                 (FW-EGR19); a mixed or rebound answer is refused whole (FW-EGR17)"
                 ),
             };
-            if candidates.is_empty() {
-                return Err(format!("{name} did not resolve"));
+            Refusal::new(RefusalReason::AddressClass, detail)
+        })?;
+    Ok(Destination {
+        host: host.clone(),
+        port,
+        route: match proxy {
+            Some(p) => Route::Proxied(p),
+            None => Route::Direct(admitted),
+        },
+    })
+}
+
+async fn resolve(shared: &Shared, name: &str, port: u16) -> Result<Vec<IpAddr>, Refusal> {
+    let answer: Vec<IpAddr> = match &shared.config.resolver {
+        Resolver::Fixture(map) => map.get(name).cloned().unwrap_or_default(),
+        Resolver::System => {
+            match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((name, port))).await
+            {
+                Ok(Ok(addrs)) => addrs.map(|a| a.ip()).collect(),
+                Ok(Err(e)) => {
+                    return Err(Refusal::new(
+                        RefusalReason::Resolution,
+                        format!("{name} did not resolve: {e}"),
+                    ))
+                }
+                Err(_) => {
+                    return Err(Refusal::new(
+                        RefusalReason::Resolution,
+                        format!("{name} did not resolve within {RESOLVE_TIMEOUT:?}"),
+                    ))
+                }
             }
-            candidates
-                .into_iter()
-                .map(formwork_blueprint::canonical_ip)
-                .find(|ip| !is_restricted_ip(*ip) || (loopback_ok && ip.is_loopback()))
-                .map(|ip| SocketAddr::new(ip, port))
-                .ok_or_else(|| {
-                    format!(
-                        "{name} resolves only to restricted addresses; a name never admits a \
-                         restricted address (FW-EGR4, DNS rebinding)"
-                    )
-                })
+        }
+    };
+    if answer.is_empty() {
+        return Err(Refusal::new(
+            RefusalReason::Resolution,
+            format!("{name} did not resolve"),
+        ));
+    }
+    Ok(answer)
+}
+
+/// Open a connection to a destination: the first reachable admitted address, or the upstream
+/// proxy. `tls` asks the proxy for a tunnel (`CONNECT`); a plain-HTTP request instead goes to the
+/// proxy in absolute form.
+pub(crate) async fn dial(dest: &Destination, tls: bool) -> Result<BoxIo, String> {
+    match &dest.route {
+        Route::Direct(addrs) => {
+            let mut last = String::from("no admitted address");
+            for addr in addrs {
+                match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await
+                {
+                    Ok(Ok(s)) => {
+                        let _ = s.set_nodelay(true);
+                        return Ok(Box::new(s));
+                    }
+                    Ok(Err(e)) => last = format!("{addr}: {e}"),
+                    Err(_) => last = format!("{addr}: timed out"),
+                }
+            }
+            Err(last)
+        }
+        Route::Proxied(proxy) => {
+            let tcp = match tokio::time::timeout(
+                UPSTREAM_CONNECT_TIMEOUT,
+                TcpStream::connect((proxy.host.as_str(), proxy.port)),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(format!("upstream proxy {}: {e}", proxy.describe())),
+                Err(_) => return Err(format!("upstream proxy {}: timed out", proxy.describe())),
+            };
+            let _ = tcp.set_nodelay(true);
+            if !tls {
+                return Ok(Box::new(tcp));
+            }
+            let authority = format!("{}:{}", dest.host, dest.port);
+            let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+            if let Some(auth) = &proxy.authorization {
+                request.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
+            }
+            request.push_str("\r\n");
+            let mut conn = Buffered::new(tcp, Vec::new());
+            conn.s
+                .write_all(request.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            let head = conn
+                .raw_head(Some(UPSTREAM_CONNECT_TIMEOUT))
+                .await
+                .and_then(|raw| parse_response_head(&raw))
+                .map_err(|e| format!("upstream proxy {}: {e:?}", proxy.describe()))?;
+            if !(200..300).contains(&head.status) {
+                return Err(format!(
+                    "upstream proxy {} answered CONNECT {authority} with {}",
+                    proxy.describe(),
+                    head.status
+                ));
+            }
+            Ok(Box::new(Prefixed {
+                prefix: conn.buf,
+                inner: conn.s,
+            }))
         }
     }
 }
 
-pub(crate) async fn connect_upstream(addr: SocketAddr) -> Result<TcpStream, String> {
-    match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(format!("upstream {addr} refused: {e}")),
-        Err(_) => Err(format!("upstream {addr} timed out")),
+/// Bytes already read from a stream, replayed ahead of it: a ClientHello the engine buffered, or
+/// what an upstream proxy sent past its `200`.
+pub(crate) struct Prefixed<S> {
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if !self.prefix.is_empty() {
+            let n = self.prefix.len().min(buf.remaining());
+            let rest = self.prefix.split_off(n);
+            let head = std::mem::replace(&mut self.prefix, rest);
+            buf.put_slice(&head);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
-async fn serve_connect(
-    mut stream: TcpStream,
-    head: Head,
-    leftover: Vec<u8>,
-    shared: Arc<Shared>,
-) -> std::io::Result<()> {
-    let target = head.target.as_str();
-    let Ok((raw_host, port)) = split_host_port(target) else {
-        shared.refuse(
-            "connect",
-            target,
-            "malformed CONNECT target",
-            None,
-            EXPLAIN_HOSTS.into(),
-        );
-        return respond(&mut stream, "400 Bad Request", "").await;
-    };
-    let port = port.unwrap_or(DEFAULT_HTTPS_PORT);
-    let host = match canonicalize_host(raw_host) {
-        Ok(h) => h,
-        Err(e) => {
-            shared.refuse(
-                "connect",
-                target,
-                &e.to_string(),
-                None,
-                EXPLAIN_HOSTS.into(),
-            );
-            return respond(&mut stream, "403 Forbidden", "").await;
-        }
-    };
-    let hint = explain_hint("https", &host, port, "");
-    match shared.config.table.decide_connect(&host, port) {
-        ConnectDecision::Tunnel(_) => {}
-        ConnectDecision::Inspect => {
-            return crate::inspect::serve_inspected(stream, host, port, leftover, shared.clone())
-                .await;
-        }
-        ConnectDecision::Deny(Denial { reason, rule }) => {
-            shared.refuse_needing(
-                "connect",
-                &format!("{host}:{port}"),
-                &reason,
-                rule.map(|r| r.to_string()),
-                hint,
-                need(&host, port, None),
-            );
-            return respond(&mut stream, "403 Forbidden", "").await;
-        }
+impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
     }
-    let addr = match resolve(&shared, &host, port).await {
-        Ok(a) => a,
-        Err(reason) => {
-            shared.refuse_needing(
-                "connect",
-                &format!("{host}:{port}"),
-                &reason,
-                None,
-                hint,
-                need(&host, port, None),
-            );
-            return respond(&mut stream, "403 Forbidden", "").await;
-        }
-    };
-    let mut upstream = match connect_upstream(addr).await {
-        Ok(u) => u,
-        Err(reason) => {
-            tracing::info!(target = %format!("{host}:{port}"), %reason, "egress upstream unavailable");
-            return respond(&mut stream, "502 Bad Gateway", "").await;
-        }
-    };
-    tracing::info!(host = %host, port, upstream = %addr, "egress tunnel opened");
-    stream
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
-    if !leftover.is_empty() {
-        upstream.write_all(&leftover).await?;
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
     }
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
-    Ok(())
-}
-
-/// A plain-HTTP request in absolute form (`GET http://host/path HTTP/1.1`): decided by host, and by
-/// method and canonical path when the host is inspected, then forwarded once.
-async fn serve_plain(
-    mut stream: TcpStream,
-    head: Head,
-    leftover: Vec<u8>,
-    shared: Arc<Shared>,
-) -> std::io::Result<()> {
-    let parsed = head
-        .target
-        .starts_with("http://")
-        .then(|| split_url(&head.target).ok())
-        .flatten();
-    let Some((raw_host, port, raw_path)) = parsed else {
-        shared.refuse(
-            "request",
-            &head.target,
-            "only CONNECT and absolute-form http:// requests reach the Gateway",
-            None,
-            EXPLAIN_HOSTS.into(),
-        );
-        return respond(&mut stream, "400 Bad Request", "").await;
-    };
-    let host = match canonicalize_host(raw_host) {
-        Ok(h) => h,
-        Err(e) => {
-            shared.refuse(
-                "request",
-                raw_host,
-                &e.to_string(),
-                None,
-                EXPLAIN_HOSTS.into(),
-            );
-            return respond(&mut stream, "403 Forbidden", "").await;
-        }
-    };
-    let path = match canonicalize_request_path(raw_path) {
-        Ok(p) => p,
-        Err(reason) => {
-            shared.refuse(
-                "request",
-                &format!("{host}{raw_path}"),
-                &reason,
-                None,
-                EXPLAIN_HOSTS.into(),
-            );
-            return respond(&mut stream, "403 Forbidden", "").await;
-        }
-    };
-    if let Err(reason) = request_framing(&head) {
-        shared.refuse(
-            "request",
-            &format!("{host}{path}"),
-            &format!("request smuggling shape: {reason} (FW-EGR11)"),
-            None,
-            EXPLAIN_HOSTS.into(),
-        );
-        return respond(&mut stream, "403 Forbidden", "").await;
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
-    let hint = explain_hint("http", &host, port, &path);
-    // A brokered credential is never presented over plain HTTP, and its placeholder never leaves
-    // unencrypted (FW-CRED11).
-    if let Some(b) = shared
-        .config
-        .brokers
-        .iter()
-        .find(|b| head.headers.iter().any(|(_, v)| v.contains(&b.placeholder)))
-    {
-        shared.refuse(
-            "request",
-            &format!("{} {host}:{port}{path}", head.method),
-            &format!("the {} placeholder was sent over plain HTTP", b.name),
-            None,
-            hint,
-        );
-        return respond(&mut stream, "403 Forbidden", "").await;
-    }
-    let method = HttpMethod::from_token(&head.method);
-    if let Err(Denial { reason, rule }) = shared.config.table.decide(&host, port, method, &path) {
-        shared.refuse_needing(
-            "request",
-            &format!("{} {host}:{port}{path}", head.method),
-            &reason,
-            rule.map(|r| r.to_string()),
-            hint,
-            need(&host, port, Some((&head.method, &path))),
-        );
-        return respond(&mut stream, "403 Forbidden", "").await;
-    }
-    let addr = match resolve(&shared, &host, port).await {
-        Ok(a) => a,
-        Err(reason) => {
-            shared.refuse_needing(
-                "request",
-                &format!("{host}:{port}"),
-                &reason,
-                None,
-                hint,
-                need(&host, port, None),
-            );
-            return respond(&mut stream, "403 Forbidden", "").await;
-        }
-    };
-    let mut upstream = match connect_upstream(addr).await {
-        Ok(u) => u,
-        Err(_) => return respond(&mut stream, "502 Bad Gateway", "").await,
-    };
-    // Origin-form request line; the proxy credential and hop-by-hop headers stay here.
-    let hop = [
-        "proxy-authorization",
-        "proxy-connection",
-        "connection",
-        "keep-alive",
-    ];
-    let mut headers: Vec<(String, String)> = head
-        .headers
-        .iter()
-        .filter(|(name, _)| !hop.contains(&name.to_ascii_lowercase().as_str()))
-        .cloned()
-        .collect();
-    headers.push(("Connection".into(), "close".into()));
-    upstream
-        .write_all(&render_request(&head, raw_path, &headers))
-        .await?;
-    if !leftover.is_empty() {
-        upstream.write_all(&leftover).await?;
-    }
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_client_hello_is_read_whole_and_refused_when_it_is_not_tls() {
+        let mut plain = Buffered::new(&b"GET / HTTP/1.1\r\n\r\n"[..], Vec::new());
+        let err = read_client_hello(&mut plain).await.err().unwrap();
+        assert_eq!(err.reason(), RefusalReason::NotTls);
+        let mut truncated = Buffered::new(&[0x16u8, 3, 1, 0, 200, 1][..], Vec::new());
+        let err = read_client_hello(&mut truncated).await.err().unwrap();
+        assert_eq!(err.reason(), RefusalReason::Malformed);
+    }
+
     #[test]
-    fn heads_parse_strictly() {
-        let h = parse_head(b"CONNECT a.test:443 HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap();
-        assert_eq!(h.method, "CONNECT");
-        assert_eq!(h.header("host"), Some("a.test"));
-        assert!(parse_head(b"GET / HTTP/1.1\r\n folded\r\n\r\n").is_none());
-        assert!(parse_head(b"GET / HTTP/2\r\n\r\n").is_none());
-        assert!(parse_head(b"GET  / HTTP/1.1\r\n\r\n").is_none());
-        let r = parse_response_head(b"HTTP/1.1 404 Not Found\r\nA: b\r\n\r\n").unwrap();
-        assert_eq!((r.status, r.reason.as_str()), (404, "Not Found"));
-        assert!(parse_response_head(b"HTTP/1.1 20 X\r\n\r\n").is_none());
+    fn server_names_are_compared_canonically() {
+        let hello = |sni: Option<&str>| Hello {
+            sni: sni.map(str::to_string),
+            alpn: None,
+            raw: Vec::new(),
+        };
+        let api = CanonicalHost::Name("api.test".into());
+        assert!(check_server_name(&hello(Some("API.test")), &api).is_ok());
+        assert!(check_server_name(&hello(Some("other.test")), &api).is_err());
+        assert!(check_server_name(&hello(None), &api).is_err());
+        let ip = CanonicalHost::Ip("127.0.0.1".parse().unwrap());
+        assert!(check_server_name(&hello(None), &ip).is_ok());
     }
 }

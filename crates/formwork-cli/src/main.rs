@@ -750,8 +750,8 @@ fn explain_url(
         formwork_blueprint::split_url(url).map_err(|e| anyhow!("explain: {e}"))?;
     let host =
         formwork_blueprint::canonicalize_host(raw_host).map_err(|e| anyhow!("{url}: {e}"))?;
-    let path = formwork_blueprint::canonicalize_request_path(raw_path)
-        .map_err(|e| anyhow!("{url}: {e}"))?;
+    let path =
+        formwork_blueprint::CanonicalPath::parse(raw_path).map_err(|e| anyhow!("{url}: {e}"))?;
     let empty = formwork_blueprint::HostTable::default();
     let table = blueprint.net.host_table().unwrap_or(&empty);
     let source_of = |rule: Option<&formwork_blueprint::HostRule>| {
@@ -783,7 +783,8 @@ fn explain_url(
             out.source = source_of(Some(rule));
             out.rule = Some(rule.to_string());
             out.reason = Some(
-                "admitted at CONNECT by host and port; the request itself is opaque (FW-EGR5)"
+                "forwarded after the ClientHello's server name matches the host (FW-EGR16); the \
+                 request itself is opaque (FW-EGR5)"
                     .to_string(),
             );
         }
@@ -801,10 +802,14 @@ fn explain_url(
                 });
             }
         }
-        ConnectDecision::Deny(Denial { reason, rule }) => {
+        ConnectDecision::Deny(Denial {
+            reason,
+            detail,
+            rule,
+        }) => {
             out.source = source_of(rule);
             out.rule = rule.map(|r| r.to_string());
-            out.reason = Some(reason);
+            out.reason = Some(format!("{reason}: {detail}"));
         }
     }
     Ok(out)
@@ -814,6 +819,31 @@ fn explain_url(
 fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
     let resolved = args.resolve()?;
     let (blueprint, provenance) = args.load_with_provenance(&resolved.path, &home())?;
+    let upstream = upstream_proxy()?;
+    // FW-EGR26: a name the upstream proxy carries is resolved there, so its addresses are not
+    // classified here.
+    let classification = |host: &formwork_blueprint::HostPattern, tls: bool| {
+        let name = match host {
+            formwork_blueprint::HostPattern::Exact(n)
+            | formwork_blueprint::HostPattern::Wildcard(n) => {
+                formwork_blueprint::CanonicalHost::Name(n.clone())
+            }
+            formwork_blueprint::HostPattern::Ip(_) => {
+                return serde_json::json!({ "verdict": "enforced" })
+            }
+        };
+        match upstream.as_ref().and_then(|u| u.endpoint_for(&name, tls)) {
+            Some(proxy) => serde_json::json!({
+                "verdict": "partial",
+                "reason": format!(
+                    "egress to {host} goes through the upstream proxy {}, which resolves the name; \
+                     its addresses are not classified here (FW-EGR26)",
+                    proxy.describe()
+                ),
+            }),
+            None => serde_json::json!({ "verdict": "enforced" }),
+        }
+    };
     let rules: Vec<serde_json::Value> = blueprint
         .net
         .host_table()
@@ -838,6 +868,7 @@ fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
                         .unwrap_or_else(|| "(all)".into()),
                 ),
             };
+            let tls = r.port != Some(formwork_blueprint::DEFAULT_HTTP_PORT);
             serde_json::json!({
                 "rule": r.to_string(),
                 "host": r.host.to_string(),
@@ -846,13 +877,19 @@ fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
                 "methods": methods,
                 "paths": path,
                 "broker": serde_json::Value::Null,
+                "classification": classification(&r.host, tls),
                 "source": provenance.host_rule_source(r),
                 "layer": provenance.host_rule_source(r).map(render::source),
             })
         })
         .collect();
     if json {
-        let mut value = serde_json::json!({ "net": blueprint.net, "hosts": rules });
+        let mut value = serde_json::json!({
+            "net": blueprint.net,
+            "hosts": rules,
+            "upstream-trust": formwork_gateway::native_roots_source(),
+            "upstream-proxy": upstream.as_ref().map(|u| u.describe()),
+        });
         attach_blueprint_info(&mut value, &resolved);
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
@@ -1238,8 +1275,15 @@ fn prepare_inspection(
     let plans =
         formwork_blueprint::resolve_brokers(&blueprint.allow_credentials, catalog, Some(table))
             .map_err(|errors| anyhow!("allow-credentials:\n  {}", errors.join("\n  ")))?;
-    let ca = formwork_gateway::SessionCa::generate().context("generating the session CA")?;
+    // FW-EGR25: the CA may certify exactly the hosts the blueprint inspects.
+    let ca = formwork_gateway::SessionCa::generate(&table.inspected_hosts())
+        .context("generating the session CA")?;
     let roots = formwork_gateway::native_roots();
+    tracing::info!(
+        source = %formwork_gateway::native_roots_source(),
+        roots = roots.len(),
+        "upstream trust store (FW-EGR24)"
+    );
     let trust_dir = tmp.sibling("trust")?;
     let file = trust_dir.join("ca-bundle.pem");
     write_launcher_file(&file, ca.trust_bundle(&roots).as_bytes(), 0o400)?;
@@ -1251,6 +1295,11 @@ fn prepare_inspection(
         .collect();
     tracing::info!(bundle = %file, "inspection trust bundle");
 
+    if !plans.is_empty() {
+        // FW-CRED16: this process's environment already holds the credentials it will broker.
+        formwork_confine::deny_inspection_of_self()
+            .context("protecting the brokered credentials")?;
+    }
     let mut brokers = Vec::new();
     for plan in plans {
         let Some((var, secret)) = plan.env_sources.iter().find_map(|v| {
@@ -1267,7 +1316,12 @@ fn prepare_inspection(
                 plan.name
             );
         };
-        let placeholder = format!("fwcred-{}-{}", plan.name, session_nonce()?);
+        let placeholder = format!(
+            "{}{}-{}",
+            formwork_gateway::PLACEHOLDER_PREFIX,
+            plan.name,
+            session_nonce()?
+        );
         tracing::info!(credential = %plan.name, var = %var, "brokered; the session holds a placeholder");
         env.push((var.clone(), placeholder.clone()));
         brokers.push(formwork_gateway::Broker {
@@ -1319,6 +1373,14 @@ fn start_egress(
     }
     let registry = (host.os == formwork_detect::Os::Linux)
         .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())));
+    let host_addresses = formwork_detect::interface_addresses().unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            "enumerating the host's interface addresses failed; the other address classes still \
+             apply (FW-EGR19)"
+        );
+        Vec::new()
+    });
     let proxy = formwork_gateway::EgressProxy::start(formwork_gateway::EgressConfig {
         table: table.clone(),
         resolver: formwork_gateway::Resolver::System,
@@ -1328,6 +1390,8 @@ fn start_egress(
         },
         inspection,
         brokers,
+        host_addresses,
+        upstream_proxy: upstream_proxy()?,
     })
     .context("starting the Gateway egress listener")?;
     for rule in &table.rules {
@@ -1336,8 +1400,28 @@ fn start_egress(
     Ok(Some(Egress { proxy, registry }))
 }
 
-/// Variables the Launcher sets after the posture ran (FW-TRA10, FEP-5 §3.1): the session temp
-/// directory and, under host rules, the proxy that reaches the Gateway.
+/// FW-EGR26: the operator's upstream proxy, read from `formwork run`'s own environment -- never
+/// the session's, which the Launcher points at the Gateway. The lowercase spelling wins, as curl
+/// reads it.
+fn upstream_proxy() -> Result<Option<formwork_gateway::UpstreamProxy>> {
+    let var = |lower: &str, upper: &str| {
+        std::env::var(lower)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var(upper).ok())
+    };
+    formwork_gateway::UpstreamProxy::from_values(
+        var("https_proxy", "HTTPS_PROXY").as_deref(),
+        var("http_proxy", "HTTP_PROXY").as_deref(),
+        var("no_proxy", "NO_PROXY").as_deref(),
+    )
+    .map_err(|e| anyhow!("{e}"))
+}
+
+/// Variables the Launcher sets after the posture ran (FW-TRA10, FEP-5 §3.1, FEP-6 §4.11): the
+/// session temp directory and, under host rules, the proxy that reaches the Gateway, in both
+/// spellings (curl reads `http_proxy` only in lowercase), an empty `no_proxy`, and Node's opt-in
+/// to the proxy variables.
 fn session_env(session: &Session) -> Vec<(String, String)> {
     let tmp = session.tmp_dir.path.display().to_string();
     let mut vars: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
@@ -1365,6 +1449,7 @@ fn session_env(session: &Session) -> Vec<(String, String)> {
         for var in ["NO_PROXY", "no_proxy"] {
             vars.push((var.to_string(), String::new()));
         }
+        vars.push(("NODE_USE_ENV_PROXY".to_string(), "1".to_string()));
     }
     vars.extend(session.egress_env.iter().cloned());
     if let Some(opener) = &session.opener {
@@ -1598,6 +1683,18 @@ fn session_observations(session: &Session) -> learn::SessionObservations {
             .violations()
             .into_iter()
             .filter_map(|v| v.need)
+            .collect();
+        obs.tunnel_candidates = egress
+            .proxy
+            .ca_rejections()
+            .into_iter()
+            .map(|(host, port)| {
+                if port == formwork_blueprint::DEFAULT_HTTPS_PORT {
+                    format!("tunnel:{host}")
+                } else {
+                    format!("tunnel:{host}:{port}")
+                }
+            })
             .collect();
     }
     if let Some(service) = session.opener.as_ref().and_then(|o| o.service.as_ref()) {

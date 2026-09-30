@@ -858,7 +858,7 @@ fn egress_rows(
         .iter()
         .any(|r| matches!(r.access, formwork_blueprint::HostAccess::Tunnel));
     let has_inspected = table.rules.iter().any(|r| r.is_inspected());
-    let tunnel_gap = "tunnel-grade hosts (`https:`) are admitted by the CONNECT target and trust the client's SNI and Host; domain fronting is not caught (FW-EGR5)";
+    let tunnel_gap = "`tunnel:` hosts are forwarded once the ClientHello's server name matches the CONNECT host (FW-EGR16), but the request inside is opaque: a CDN serving many names from one address can be fronted (FW-EGR5)";
     let unavailable = format!(
         "connect supervision is unavailable on this host: it needs {}; egress fails closed and \
          `run` refuses the host rules",
@@ -952,10 +952,26 @@ fn egress_rows(
         );
     }
     if input.brokered {
+        // FW-CRED17: the reflection guard scans for the credential's wire encodings in responses
+        // it can read, which is why it refuses any content coding but identity; an upstream that
+        // echoes the credential transformed (escaped, re-encoded, split across WebSocket frames)
+        // is not recognized. FW-CRED16's macOS mechanism awaits characterization.
+        let mut reason = "responses to brokered requests must be identity-coded (any other \
+                          content coding is refused), and one that carries the credential or its \
+                          scheme value is ended; an echo transformed some other way (escaped, \
+                          re-encoded, split across WebSocket frames) is not recognized"
+            .to_string();
+        if host.os == Os::MacOs {
+            reason.push_str(
+                "; the Gateway denies debugger attachment to itself (PT_DENY_ATTACH), pending \
+                 characterization",
+            );
+        }
         caps.insert(
             Capability::CredentialBroker,
-            Fidelity::Enforced {
+            Fidelity::Partial {
                 backend: Backend::Gateway,
+                reason,
             },
         );
     }

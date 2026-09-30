@@ -20,13 +20,16 @@ use formwork_compile::CompiledPolicy;
 
 pub mod ca;
 pub mod egress;
+mod http;
 mod inspect;
 pub mod opener;
+mod upstream;
 
-pub use ca::{native_roots, SessionCa};
-pub use egress::{Admission, EgressConfig, EgressProxy, Resolver, Violation};
-pub use inspect::{Broker, Inspection};
+pub use ca::{native_roots, native_roots_source, SessionCa};
+pub use egress::{Admission, EgressConfig, EgressProxy, Grant, Resolver, Violation};
+pub use inspect::{Broker, Inspection, PLACEHOLDER_PREFIX};
 pub use opener::{OpenRecord, OpenerService};
+pub use upstream::{ProxyEndpoint, UpstreamProxy};
 
 // Bounds a single frame so a peer that never sends a newline can't make the gateway buffer without
 // limit; overflow closes the connection. A stability bound (design §3), not a DoS-resistance claim --

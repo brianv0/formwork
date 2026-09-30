@@ -18,7 +18,7 @@ formwork run --blueprint ./examples/blueprints/opencode.toml -- opencode run --a
 ```
 
 The blueprint grants writes to `~/project` + scratch, subtracts credentials/keychains/browser profiles,
-and reaches only the model providers it names, through the session Gateway. Add a `https:` rule
+and reaches only the model providers it names, through the session Gateway. Add an `allow:` rule
 per provider you use, or let `formwork learn` propose them. Narrow `writes` to your repo.
 
 ## Axis B — route MCP servers through the gateway

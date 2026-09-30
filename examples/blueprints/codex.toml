@@ -11,9 +11,9 @@
 extends = ["agent-base.toml"]
 
 rules = [
-    "https:api.openai.com",
-    "https:chatgpt.com",
-    "https:auth.openai.com",
+    "allow:api.openai.com",
+    "allow:chatgpt.com",
+    "allow:auth.openai.com",
 ]
 allow-credentials = ["codex"]
 # The ChatGPT login opens a browser.

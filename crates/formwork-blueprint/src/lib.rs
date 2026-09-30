@@ -28,10 +28,11 @@ pub use discovery::{
     ProposalOutcome, WithheldEntry,
 };
 pub use egress::{
-    canonical_ip, canonicalize_host, canonicalize_request_path, is_restricted_ip, split_host_port,
-    split_url, target_is_host, validate_host_rules, CanonicalHost, ConnectDecision, Denial,
-    HostAccess, HostError, HostPattern, HostRule, HostTable, HttpMethod, PathGlob, RequestDecision,
-    DEFAULT_HTTPS_PORT, DEFAULT_HTTP_PORT, HTTP_ATOMS, METADATA_HOSTNAMES,
+    admit_addresses, canonical_ip, canonicalize_host, classify, is_restricted_ip, split_host_port,
+    split_url, target_is_host, validate_host_rules, AddressClass, CanonicalHost, CanonicalPath,
+    ConnectDecision, Denial, HostAccess, HostError, HostPattern, HostRule, HostTable, HttpMethod,
+    LocalAddresses, Naming, PathGlob, RefusalReason, RequestDecision, DEFAULT_HTTPS_PORT,
+    DEFAULT_HTTP_PORT, HTTP_ATOMS, METADATA_HOSTNAMES,
 };
 pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};

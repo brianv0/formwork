@@ -62,6 +62,28 @@ where
     }
 }
 
+/// FW-CRED16: while this process holds brokered credentials, no same-uid process may read its
+/// memory or environment. Linux: not dumpable, so `/proc/<pid>/mem`, `environ` and `ptrace` need
+/// `CAP_SYS_PTRACE` whatever Yama and Landlock decide; `execve` resets the flag, so a spawned
+/// workload is unaffected. macOS: debugger attachment denied. Call before the workload is spawned.
+pub fn deny_inspection_of_self() -> Result<(), ConfineError> {
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl(PR_SET_DUMPABLE) takes integer arguments and touches no memory of ours.
+    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    #[cfg(target_os = "macos")]
+    // SAFETY: ptrace(PT_DENY_ATTACH) on the calling process takes no pointers it dereferences.
+    let rc = unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let rc = -1;
+    if rc != 0 {
+        return Err(ConfineError::MechanismFailed(format!(
+            "denying inspection of the Gateway's memory (FW-CRED16): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
 /// The connect supervisor's configuration and handles (FW-EGR7); Linux only.
 #[cfg(target_os = "linux")]
 pub use backend::supervise::{Pending as PendingSupervisor, SupervisorConfig};

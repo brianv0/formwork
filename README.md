@@ -75,7 +75,7 @@ agent holds a placeholder, and the Gateway presents the real key to that host al
 
 ```toml
 extends = ["builtin:default"]
-rules = ["readwrite:$CWD/**", "any:api.anthropic.com"]   # this host only, through the Gateway
+rules = ["readwrite:$CWD/**", "allow:api.anthropic.com"] # this host only, through the Gateway
 allow-credentials = ["broker:anthropic"]                 # the agent sees a placeholder, never the key
 ```
 

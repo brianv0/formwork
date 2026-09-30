@@ -237,6 +237,8 @@ dependencies = [
  "formwork-detect",
  "formwork-gateway",
  "libc",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

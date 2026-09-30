@@ -610,7 +610,7 @@ mod tests {
     fn host_rules_allow_only_the_gateway_endpoint_and_drop_the_resolver() {
         let mut i = input();
         i.net = NetPosture::AllowHosts(formwork_blueprint::HostTable::new(vec![
-            serde_json::from_str("\"https:api.anthropic.com\"").unwrap(),
+            serde_json::from_str("\"allow:api.anthropic.com\"").unwrap(),
         ]));
         i.gateway_port = Some(41234);
         let s = render(&i);

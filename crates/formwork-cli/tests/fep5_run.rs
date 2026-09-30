@@ -33,6 +33,18 @@ struct Output {
 fn formwork(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_formwork"));
     cmd.args(args).current_dir(dir).env("HOME", dir);
+    // An operator's upstream proxy would carry the Gateway's egress (FW-EGR26); these fixtures are
+    // on loopback, reached directly.
+    for var in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        cmd.env_remove(var);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -405,7 +417,7 @@ fn fw_e2e_075_run_routes_egress_through_the_gateway() {
     std::fs::write(
         dir.path().join("FORMWORK.toml"),
         format!(
-            "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:{port}\"]\n"
+            "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"allow:127.0.0.1:{port}\"]\n"
         ),
     )
     .unwrap();
@@ -521,7 +533,7 @@ fn fw_e2e_082_session_bus_is_closed_until_run_outside_is_lifted() {
     assert!(control.status.success(), "control: the bus is live");
 
     let base =
-        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:9\"]\n";
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"allow:127.0.0.1:9\"]\n";
     std::fs::write(dir.path().join("FORMWORK.toml"), base).unwrap();
     let env = [("DBUS_SESSION_BUS_ADDRESS", address.as_str())];
     let mut args = vec!["run", "--"];
@@ -591,6 +603,27 @@ env"#;
         "secret disclosed: {}",
         out.stdout
     );
+    // FEP-6 §4.11: both spellings of the proxy variables, an empty no_proxy, and Node's opt-in.
+    for line in [
+        "http_proxy=http://fw:",
+        "https_proxy=http://fw:",
+        "HTTP_PROXY=http://fw:",
+        "HTTPS_PROXY=http://fw:",
+        "NODE_USE_ENV_PROXY=1",
+    ] {
+        assert!(
+            out.stdout.lines().any(|l| l.starts_with(line)),
+            "{line}: {}",
+            out.stdout
+        );
+    }
+    for line in ["no_proxy=", "NO_PROXY="] {
+        assert!(
+            out.stdout.lines().any(|l| l == line),
+            "{line}: {}",
+            out.stdout
+        );
+    }
     assert!(
         !out.stdout.contains("catalog-file-bytes"),
         "a brokered type keeps its floor: {}",
@@ -634,7 +667,7 @@ fn a_brokered_credential_without_a_value_is_refused_before_spawn() {
 fn brokering_to_a_tunneled_host_is_refused_at_load() {
     let dir = Scratch::new("broker-tunnel");
     let bp = "extends = [\"builtin:default\"]\n\
-              rules = [\"readwrite:$CWD/**\", \"https:api.anthropic.com\"]\n\
+              rules = [\"readwrite:$CWD/**\", \"tunnel:api.anthropic.com\"]\n\
               allow-credentials = [\"broker:anthropic\"]\n";
     std::fs::write(dir.path().join("FORMWORK.toml"), bp).unwrap();
     let out = formwork(dir.path(), &["explain", "--json"], &[]);
@@ -744,7 +777,7 @@ fn isolation_tier_keeps_supervised_egress() {
         dir.path().join("FORMWORK.toml"),
         format!(
             "extends = [\"builtin:default\"]\n\
-             rules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:{port}\"]\n\
+             rules = [\"readwrite:$CWD/**\", \"allow:127.0.0.1:{port}\"]\n\
              isolate = [\"processes\"]\n"
         ),
     )
@@ -889,7 +922,7 @@ fn fw_adv_020_the_opener_does_not_exfiltrate_when_not_lifted() {
     assert_eq!(out.stdout, "xdg-open=1\n", "the caller hears a refusal");
 }
 
-/// FW-E2E-085 (Linux): a learning run under host rules proposes `https:blocked.test` from the
+/// FW-E2E-085 (Linux): a learning run under host rules proposes `allow:blocked.test` from the
 /// Gateway's refusal and `open-url` from the opener's, withholds the metadata address with an
 /// operator line, and the accepted entries apply from the next run (FW-DISC12).
 #[cfg(target_os = "linux")]
@@ -902,7 +935,7 @@ fn fw_e2e_085_discovery_of_hosts_and_channels() {
     }
     std::fs::write(
         dir.path().join("FORMWORK.toml"),
-        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:9\"]\n",
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"allow:127.0.0.1:9\"]\n",
     )
     .unwrap();
     let learned = formwork(
@@ -929,7 +962,7 @@ fn fw_e2e_085_discovery_of_hosts_and_channels() {
     );
     let list = formwork(dir.path(), &["learn", "--list"], &[]);
     assert!(
-        list.stdout.contains("\"https:blocked.test:80\""),
+        list.stdout.contains("\"allow:blocked.test:80\""),
         "{}",
         list.stdout
     );
@@ -940,7 +973,7 @@ fn fw_e2e_085_discovery_of_hosts_and_channels() {
     assert_eq!(accepted.code, 0, "{}", accepted.stderr);
     let hosts = formwork(dir.path(), &["explain", "--hosts"], &[]);
     assert!(
-        hosts.stdout.contains("https:blocked.test:80") && hosts.stdout.contains("discovered layer"),
+        hosts.stdout.contains("allow:blocked.test:80") && hosts.stdout.contains("discovered layer"),
         "{}",
         hosts.stdout
     );
@@ -960,7 +993,7 @@ fn a_discovered_layer_without_provenance_for_hosts_or_channels_is_refused() {
     .unwrap();
     let discovered = dir.path().join("FORMWORK.toml.discovered.toml");
     for forged in [
-        "rules = [\"https:evil.test\"]\n",
+        "rules = [\"allow:evil.test\"]\n",
         "rules = [\"readwrite:/etc/**\"]\n",
         "channels = [\"run-outside\"]\n",
     ] {
@@ -1066,7 +1099,7 @@ fn fw_e2e_084_agent_examples_under_the_baseline() {
                 let pattern = c.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
                 let read = c.get("access").and_then(|a| a.as_str()) == Some("read");
                 // The launch directory is also `$HOME` here, itself an ancestor of the floor.
-                !(read && launch.starts_with(pattern)) && !host_imposed.contains(&pattern)
+                !(host_imposed.contains(&pattern) || (read && launch.starts_with(pattern)))
             })
             .map(|c| c.to_string())
             .collect();
@@ -1141,7 +1174,7 @@ fn fw_e2e_087_host_session_detection() {
     }
     let with_bus = explain(&[]);
     let supervised = supervision_host(dir.path());
-    let under_rules = explain(&["--set", "rules = [\"https:127.0.0.1:9\"]"]);
+    let under_rules = explain(&["--set", "rules = [\"allow:127.0.0.1:9\"]"]);
     let _ = daemon.kill();
     let _ = daemon.wait();
     let channel = &with_bus["report"]["channels"]["run-outside"]["host"];
@@ -1181,5 +1214,261 @@ fn fw_e2e_087_host_session_detection() {
         assert_eq!(clipboard["present"], true, "{clipboard}");
     } else {
         not_exercised("Xvfb unavailable");
+    }
+}
+
+/// A TLS upstream on `127.0.0.1` with a self-signed certificate for that address, answering
+/// `ok:<path>` to every request; its certificate is also its own root, written as PEM for the
+/// operator's `SSL_CERT_FILE` (FEP-6 §7.1: the Gateway's upstream trust comes from its own
+/// environment).
+#[cfg(target_os = "linux")]
+fn tls_fixture(dir: &Path) -> (u16, PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let root = dir.join("fixture-root.pem");
+    std::fs::write(&root, cert.pem()).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
+                ),
+            )
+            .unwrap(),
+    );
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = requests.clone();
+    std::thread::spawn(move || {
+        for tcp in listener.incoming().flatten() {
+            let config = config.clone();
+            let count = count.clone();
+            std::thread::spawn(move || {
+                let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let Ok(conn) = rustls::ServerConnection::new(config) else {
+                    return;
+                };
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = String::from_utf8_lossy(&buf);
+                let path = head.split(' ').nth(1).unwrap_or("/").to_string();
+                let body = format!("ok:{path}\n");
+                let _ = write!(
+                    tls,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tls.flush();
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            });
+        }
+    });
+    (port, root, requests)
+}
+
+/// FW-E2E-098 (Linux, the run-level rows 1, 8 and 9 of FEP-6 S1): under `allow:` a client that
+/// trusts the session bundle reaches the upstream through inspection -- the leaf is minted for an
+/// IP literal and name-constrained to it (FW-EGR25), and the Gateway verifies the upstream against
+/// the operator's `SSL_CERT_FILE` (FW-EGR24). A client that ignores the bundle fails its handshake
+/// and the operator line names the `tunnel:` rule; under that rule the same client gets through.
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_e2e_098_inspected_https_through_run() {
+    let dir = Scratch::new("inspect-run");
+    if !supervision_host(dir.path()) || !on_path("curl") {
+        not_exercised("connect supervision or curl unavailable");
+        return;
+    }
+    let (port, root, requests) = tls_fixture(dir.path());
+    let root_env = root.to_str().unwrap();
+    let url = format!("https://127.0.0.1:{port}/ok");
+    let blueprint = |rule: &str| {
+        format!("extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"{rule}\"]\n")
+    };
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        blueprint(&format!("allow:127.0.0.1:{port}")),
+    )
+    .unwrap();
+    let inspected = formwork(
+        dir.path(),
+        &["run", "--", "curl", "-sS", "-m", "10", &url],
+        &[("SSL_CERT_FILE", root_env)],
+    );
+    assert_eq!(inspected.code, 0, "{}", inspected.stderr);
+    assert_eq!(inspected.stdout, "ok:/ok\n");
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let rejecting = formwork(
+        dir.path(),
+        &[
+            "run", "--", "curl", "-sS", "-m", "10", "--cacert", root_env, &url,
+        ],
+        &[("SSL_CERT_FILE", root_env)],
+    );
+    assert_eq!(rejecting.code, 60, "{}", rejecting.stderr);
+    assert!(
+        rejecting
+            .stderr
+            .contains(&format!("tunnel:127.0.0.1:{port}")),
+        "the operator line names the tunnel rule (FW-FID9): {}",
+        rejecting.stderr
+    );
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        blueprint(&format!("tunnel:127.0.0.1:{port}")),
+    )
+    .unwrap();
+    let tunneled = formwork(
+        dir.path(),
+        &[
+            "run", "--", "curl", "-sS", "-m", "10", "--cacert", root_env, &url,
+        ],
+        &[],
+    );
+    assert_eq!(tunneled.code, 0, "{}", tunneled.stderr);
+    assert_eq!(tunneled.stdout, "ok:/ok\n");
+}
+
+/// FW-CRED16 (Linux): while it brokers a credential, the `formwork` process is not dumpable, so
+/// its `/proc` entries belong to root and a same-uid process cannot read its environment.
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_cred16_the_gateway_is_not_dumpable_while_it_brokers() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = Scratch::new("custody");
+    if !supervision_host(dir.path()) {
+        not_exercised("connect supervision unavailable");
+        return;
+    }
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        not_exercised("running as root, which owns every /proc entry either way");
+        return;
+    }
+    std::fs::write(dir.path().join("FORMWORK.toml"), BROKERED).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_formwork"))
+        .args(["run", "--", "/bin/sh", "-c", "sleep 2"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("ANTHROPIC_API_KEY", "sk-custody-fixture")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let environ = PathBuf::from(format!("/proc/{}/environ", child.id()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut owner = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(m) = std::fs::metadata(&environ) {
+            if m.uid() == 0 {
+                owner = Some(0);
+                break;
+            }
+            owner = Some(m.uid());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let read = std::fs::read(&environ);
+    let _ = child.wait();
+    assert_eq!(
+        owner,
+        Some(0),
+        "the Gateway's /proc entries stayed the user's"
+    );
+    assert!(
+        read.is_err(),
+        "a same-uid process read the Gateway's environment"
+    );
+}
+
+/// FW-E2E-104 (FEP-6 S8): blueprints the compiler refuses, each naming the lines at fault, and the
+/// near misses it accepts.
+#[test]
+fn fw_e2e_104_blueprints_the_compiler_refuses() {
+    let dir = Scratch::new("s8");
+    let cases: &[(&str, bool, &[&str])] = &[
+        (
+            "rules = [\"tunnel:api.github.com\", \"get:api.github.com/repos/**\"]",
+            false,
+            &["tunnel:api.github.com", "get:api.github.com/repos/**"],
+        ),
+        (
+            "rules = [\"tunnel:github.com\"]\nallow-credentials = [\"broker:github\"]",
+            false,
+            &["allow:github.com", "allow:api.github.com"],
+        ),
+        (
+            "rules = [\"get:status.corp.internal:80/**\"]\nallow-credentials = [{ name = \"status\", env = \"STATUS_TOKEN\", hosts = [\"status.corp.internal\"], scheme = \"bearer\" }]",
+            false,
+            &["get:status.corp.internal:80"],
+        ),
+        (
+            "net = { ports = [443] }\nrules = [\"allow:api.anthropic.com\"]",
+            false,
+            &["port tier"],
+        ),
+        (
+            "rules = [\"tunnel:api.github.com\", \"deny:api.github.com/repos/acme/secret/**\"]",
+            false,
+            &["not inspected"],
+        ),
+        ("rules = [\"allow:*\"]", false, &["a host target is"]),
+        (
+            "rules = [\"tunnel:api.anthropic.com/v1/**\"]",
+            false,
+            &["allow:api.anthropic.com/v1/**"],
+        ),
+        ("rules = [\"allow:build/**\"]", false, &["no dot"]),
+        (
+            "rules = [\"tunnel:internal.corp.example:8443\", \"allow:internal.corp.example\"]",
+            true,
+            &[],
+        ),
+        ("rules = [\"deny:telemetry.example.com\"]", true, &[]),
+    ];
+    for (i, (lines, compiles, named)) in cases.iter().enumerate() {
+        let file = dir.path().join(format!("s8-{i}.toml"));
+        std::fs::write(&file, format!("{lines}\n")).unwrap();
+        let out = formwork(
+            dir.path(),
+            &[
+                "compile",
+                "--report-only",
+                "--blueprint",
+                file.to_str().unwrap(),
+            ],
+            &[],
+        );
+        assert_eq!(out.code == 0, *compiles, "{lines}: {}", out.stderr);
+        for n in *named {
+            assert!(
+                out.stderr.contains(n),
+                "{lines}: expected {n:?} in {}",
+                out.stderr
+            );
+        }
     }
 }

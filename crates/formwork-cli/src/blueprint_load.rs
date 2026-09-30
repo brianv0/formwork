@@ -451,7 +451,7 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
     let mut exec_paths: Vec<PathPattern> = match layer.exec.take() {
         Some(ExecPosture::Allowlist(p)) => p,
         Some(ExecPosture::Unrestricted) => {
-            bail!("exec verbs (`exec`/`readexec`/`allow`) conflict with an explicit `exec = unrestricted` in the same layer");
+            bail!("exec verbs (`exec`/`readexec`) conflict with an explicit `exec = unrestricted` in the same layer");
         }
         None => Vec::new(),
     };
@@ -461,13 +461,24 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
             .ok_or_else(|| anyhow!("rule {raw:?} is not \"<verb>:<target>\""))?;
         let target = target.trim();
         let atoms: Vec<&str> = verb.split(',').map(str::trim).collect();
-        // The verb decides the axis (FW-BP15); `deny` belongs to both, and the target's shape --
-        // a path or a host -- decides it there (FW-BP13).
-        let http = atoms
+        // The verb decides the axis (FW-BP15); `allow` and `deny` belong to both, and the
+        // target's shape -- a path or a host -- decides it there (FW-BP13, FW-BP16).
+        let egress_only = atoms
             .iter()
             .all(|a| formwork_blueprint::HTTP_ATOMS.contains(a));
-        let host_deny = atoms == ["deny"] && formwork_blueprint::target_is_host(target);
-        if http || host_deny {
+        let both_axes = atoms == ["allow"] || atoms == ["deny"];
+        let host_target = formwork_blueprint::target_is_host(target);
+        if egress_only && !host_target {
+            bail!("rule {raw:?}: `{verb}` is an egress verb and takes a host target, not a path");
+        }
+        if host_target && !egress_only && !both_axes {
+            bail!(
+                "rule {raw:?}: `{verb}` is not an egress verb (egress atoms: {}; on both axes: \
+                 allow, deny); a path target starts with /, ~ or $CWD",
+                formwork_blueprint::HTTP_ATOMS.join(", ")
+            );
+        }
+        if egress_only || (both_axes && host_target) {
             let rule = formwork_blueprint::HostRule::parse(verb, target)
                 .map_err(|e| anyhow!("rule {raw:?}: {e}"))?;
             layer.hosts.push(rule);
@@ -521,15 +532,15 @@ fn fs_atoms(atoms: &[&str]) -> std::result::Result<FsAtoms, String> {
                 out.read = true;
                 out.exec = true;
             }
-            "allow" => {
-                out.write = true;
-                out.exec = true;
-            }
+            // `allow` is the ordinary full grant on each axis: read, write and create here, with
+            // execute spelled `exec` (FW-ISO9, FEP-6 §9 j).
+            "allow" => out.write = true,
             "deny" => out.deny = true,
             other => {
                 return Err(format!(
                     "unknown rule verb {other:?} (filesystem atoms: read, write, modify, exec, \
-                     deny, and the compounds readonly, readwrite, readexec, allow; HTTP atoms: {})",
+                     and the compounds readonly, readwrite, readexec; on both axes: allow, deny; \
+                     egress atoms: {})",
                     formwork_blueprint::HTTP_ATOMS.join(", ")
                 ))
             }
@@ -940,15 +951,22 @@ mod tests {
                 "read,write:/a/**".into(),
                 "read,exec:/b/**".into(),
                 "write,modify:/c".into(),
-                "https:api.anthropic.com".into(),
+                "tunnel:api.anthropic.com".into(),
                 "get,post:api.github.com/repos/acme/**".into(),
+                "allow:registry.npmjs.org".into(),
                 "deny:telemetry.example.com".into(),
                 "deny:~/.ssh".into(),
+                "allow:$CWD/out/**".into(),
             ],
             ..Default::default()
         };
         desugar_rules(&mut layer, &sigils).unwrap();
-        assert_eq!(layer.fs.writes, vec![pp("/a/**"), pp("/c")]);
+        // `allow` is the full grant on each axis, decided by the target's shape (FW-BP16): read,
+        // write and create on a path, with execute spelled `exec`.
+        assert_eq!(
+            layer.fs.writes,
+            vec![pp("/a/**"), pp("/c"), pp("/work/out/**")]
+        );
         assert_eq!(layer.fs.reads, vec![pp("/b/**")]);
         assert_eq!(layer.fs.subtract, vec![pp("/home/x/.ssh")]);
         assert_eq!(layer.exec, Some(ExecPosture::Allowlist(vec![pp("/b/**")])));
@@ -956,16 +974,27 @@ mod tests {
         assert_eq!(
             hosts,
             vec![
-                "https:api.anthropic.com",
+                "tunnel:api.anthropic.com",
                 "get,post:api.github.com/repos/acme/**",
+                "allow:registry.npmjs.org",
                 "deny:telemetry.example.com"
             ]
         );
-        let mut bad = BlueprintLayer {
-            rules: vec!["read,deny:/x".into()],
-            ..Default::default()
-        };
-        assert!(desugar_rules(&mut bad, &sigils).is_err());
+        for bad in [
+            "read,deny:/x",
+            // FEP-6 §9 (j): the FEP-5 verbs are not aliases.
+            "https:api.anthropic.com",
+            "any:api.github.com",
+            // FW-BP16: a relative path typed by mistake is not a host named `build`.
+            "allow:build/**",
+            "get:/etc/passwd",
+        ] {
+            let mut layer = BlueprintLayer {
+                rules: vec![bad.into()],
+                ..Default::default()
+            };
+            assert!(desugar_rules(&mut layer, &sigils).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -973,7 +1002,7 @@ mod tests {
         let dir = Scratch::new("host-rules");
         std::fs::write(
             dir.path().join("bp.toml"),
-            "net = { ports = [443] }\nrules = [\"https:api.anthropic.com\"]\n",
+            "net = { ports = [443] }\nrules = [\"allow:api.anthropic.com\"]\n",
         )
         .unwrap();
         let msg = format!(
@@ -983,7 +1012,7 @@ mod tests {
         assert!(msg.contains("port tier"), "{msg}");
         std::fs::write(
             dir.path().join("two.toml"),
-            "rules = [\"https:*.github.com\", \"post:api.github.com/x\"]\n",
+            "rules = [\"tunnel:*.github.com\", \"post:api.github.com/x\"]\n",
         )
         .unwrap();
         let msg = format!(
@@ -993,7 +1022,7 @@ mod tests {
         assert!(msg.contains("two grades"), "{msg}");
         std::fs::write(
             dir.path().join("ok.toml"),
-            "rules = [\"https:api.anthropic.com\", \"get:api.github.com\"]\n",
+            "rules = [\"tunnel:api.anthropic.com\", \"get:api.github.com\"]\n",
         )
         .unwrap();
         let bp = load(&dir.path().join("ok.toml"), "/home/x").unwrap();

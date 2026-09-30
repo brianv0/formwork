@@ -57,7 +57,7 @@ pub struct ProposalFile {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RuleProposal {
-    /// A host rule in `rules` syntax (`https:host`, `post:host/path`).
+    /// A host rule in `rules` syntax (`allow:host`, `post:host/path`).
     pub rule: String,
     pub run_id: String,
 }
@@ -82,6 +82,11 @@ pub struct SessionObservations {
     /// `(what, why)` withheld before proposal, for the operator channel.
     #[serde(default)]
     pub withheld: Vec<(String, String)>,
+    /// `tunnel:` rules for hosts whose clients rejected the session CA. Never proposed: the host
+    /// already has an inspected rule, and a tunnel would drop its request checks and brokering,
+    /// so the operator swaps the rule by hand (FEP-6 §9 j).
+    #[serde(default)]
+    pub tunnel_candidates: Vec<String>,
 }
 
 /// The environment variable naming the descriptor the Linux learning shim reports on.
@@ -357,6 +362,14 @@ pub fn conclude_learning_run(
     let egress = propose_host_rules(&observations.egress, blueprint.net.host_table());
     for (target, why) in egress.withheld.iter().chain(observations.withheld.iter()) {
         tracing::info!(target = %target, "learning: withheld, not proposed (FW-DISC12): {why}");
+    }
+    for rule in &observations.tunnel_candidates {
+        tracing::warn!(
+            rule = %rule,
+            "learning: a client rejected the session CA; to serve it, replace the host's \
+             inspected rule with `{rule}`, which drops its method, path and Host checks and its \
+             brokering (not proposed: the grade drop is an authoring decision)"
+        );
     }
     let observed_channels: Vec<Channel> = observations
         .channels
