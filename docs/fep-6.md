@@ -11,9 +11,10 @@ how it resolves and pins destinations, how it mints certificates, how it present
 credentials, what it refuses to forward, and what it is built from. This FEP specifies that program,
 the **egress engine**, and records the research behind the build decision.
 
-**Status: nothing in this document mutates the landed spec, the constitution, or FEP-5.** Draft
-identifiers are inline code, as in FEP-5, and start above the highest drafted number: FEP-5 drafted
-up to `FW-EGR15`, `FW-CRED15`, `FW-FID11`, `FW-BP15`, `FW-INV14`, `FW-E2E-091` and `FW-ADV-020`;
+**Status: nothing in this document mutates the landed spec or the constitution.** Two of its FEP-5
+amendments are applied on this branch (§9 g, j); the rest wait for adoption. Draft identifiers are
+inline code, as in FEP-5, and start above the highest drafted number: FEP-5 drafted up to
+`FW-EGR15`, `FW-CRED15`, `FW-FID11`, `FW-BP15`, `FW-INV14`, `FW-E2E-091` and `FW-ADV-020`;
 FEP-4 drafted `FW-INV12` and `FW-DISC7`–`FW-DISC10`. This FEP starts at `FW-EGR16`, `FW-CRED16`,
 `FW-FID12`, `FW-BP16`, `FW-INV15`, `FW-E2E-092` and `FW-ADV-021`. Changes to FEP-5 or FEP-1 drafts
 are listed in §9. §7.2 walks through ten concrete configurations, from a model-API-only agent to a
@@ -1293,7 +1294,7 @@ Conditional on FEP-5's transport landing and on the **(characterize)** marks abo
 
 ## 9. Proposed amendments (apply on landing)
 
-None of these are applied yet except (g).
+None of these are applied yet except (g) and (j), which are applied to FEP-5 on this branch.
 
 **(a) FEP-5 `FW-CRED11`.** Replace "refusing with a violation record where the placeholder is
 carried toward any other host" with "refusing with a violation record where the placeholder appears
