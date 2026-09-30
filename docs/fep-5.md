@@ -956,7 +956,7 @@ revision under `read-mode = "closed"`, and the findings below cite them by role.
   `github` instead. Lifting `os-keyring` on macOS exposes every non-prompting item, which makes
   brokering `github` on the same Mac largely redundant. Closed-mode fs grants are platform-shaped
   (half of the team's file); D11 widens the essentials, and portable fs groups are the recommended
-  FEP-6 (§9). `/proc/**` under `closed` on Linux reopens G8 and is reported `Partial`.
+  FEP-7 (§9). `/proc/**` under `closed` on Linux reopens G8 and is reported `Partial`.
 - **Interaction with PR #28's `**/.claude/**` write-subtract.** Under that profile Claude Code
   cannot write `~/.claude`, and `allow-credentials = ["claude"]` does not lift an operator
   write-subtract. The options are to narrow the row to the executable parts of that tree
@@ -1007,7 +1007,7 @@ revision under `read-mode = "closed"`, and the findings below cite them by role.
   (`/opt/homebrew`, `/System`, `~/Library/Caches` beside `/lib64`, `~/.cache`). One or two exact
   schema groups that expand per backend the way `desktop` does (`caches`, `toolchain`) would make
   unveil mode the reasonable default on a laptop. The same move this FEP makes for channels, and the
-  recommended FEP-6.
+  recommended FEP-7 (FEP-6 took the egress engine).
 - **`any:` as the all-methods verb.** Whether `https:` with a path should imply inspection instead,
   which would drop `any:`; kept because it keeps the grade visible in the verb.
 
