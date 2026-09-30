@@ -8,7 +8,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::layer::{merge, BlueprintLayer};
-use crate::{Blueprint, ExecPosture, PathPattern, ReadMode};
+use crate::{Blueprint, Channel, ExecPosture, PathPattern, ReadMode};
 
 /// Where an effective rule came from (FW-FID6).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -38,6 +38,12 @@ pub struct Provenance {
     /// The winning exec allow-list (empty when exec is unrestricted). Exec is a last-set-wins
     /// posture, not a union of path sets, so a later layer's allow-list replaces an earlier one.
     exec: Vec<(PathPattern, RuleSource)>,
+    /// Channel allow and deny entries, each with the layer that wrote it (FW-FID11), groups
+    /// already expanded.
+    channel_allow: Vec<(Channel, RuleSource)>,
+    channel_deny: Vec<(Channel, RuleSource)>,
+    /// Host rules with the layer that wrote each (FW-FID11 `explain --net`).
+    hosts: Vec<(crate::HostRule, RuleSource)>,
 }
 
 /// Like [`merge`], but also records, per fs/exec pattern, the layer it came from. The returned
@@ -62,8 +68,27 @@ pub fn merge_with_provenance(layers: &[(RuleSource, BlueprintLayer)]) -> (Bluepr
             Some(ExecPosture::Unrestricted) => p.exec.clear(),
             None => {}
         }
+        p.hosts
+            .extend(layer.hosts.iter().map(|h| (h.clone(), src.clone())));
+        if let Some(channels) = &layer.channels {
+            p.channel_allow
+                .extend(channels.allowed().iter().map(|c| (*c, src.clone())));
+            p.channel_deny
+                .extend(channels.denied().iter().map(|c| (*c, src.clone())));
+        }
     }
     (blueprint, p)
+}
+
+/// A channel's verdict (FW-FID11): lifted or denied, and the layer that decides it.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ChannelExplanation {
+    pub channel: String,
+    pub lifted: bool,
+    /// The entry that decides the verdict: a terminal `deny`, the first `allow`, or the baseline.
+    pub rule: String,
+    pub source: RuleSource,
 }
 
 /// A read, write, or exec verdict for a path (FW-FID6), naming the winning rule and its origin.
@@ -89,6 +114,10 @@ pub struct Explanation {
     pub read: Verdict,
     pub write: Verdict,
     pub exec: Verdict,
+    /// What this host enforces where it differs from the model verdict above (FEP-5 D2): a row
+    /// the backend cannot install is withheld, so the verdict is the blueprint's, not the kernel's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_note: Option<String>,
 }
 
 impl Provenance {
@@ -168,6 +197,52 @@ impl Provenance {
             read,
             write,
             exec,
+            host_note: None,
+        }
+    }
+
+    /// The layer that wrote a host rule (FW-FID11).
+    pub fn host_rule_source(&self, rule: &crate::HostRule) -> Option<&RuleSource> {
+        self.hosts.iter().find(|(r, _)| r == rule).map(|(_, s)| s)
+    }
+
+    /// Whether a denying write-subtract row for `path` exists only in any-depth form -- the rows
+    /// Landlock cannot root (D1/D2).
+    pub fn write_subtract_only_any_depth(&self, path: &Path) -> bool {
+        let hits: Vec<&PathPattern> = self
+            .write_subtract
+            .iter()
+            .map(|(p, _)| p)
+            .filter(|p| p.matches_path(path))
+            .collect();
+        !hits.is_empty() && hits.iter().all(|p| p.is_any_depth())
+    }
+
+    /// Explain one channel (FW-FID11): a deny from any layer is terminal (FW-BP10), otherwise
+    /// the first layer that allows it lifts it, otherwise the built-in baseline denies it.
+    pub fn explain_channel(&self, channel: Channel) -> ChannelExplanation {
+        let name = channel.name().to_string();
+        if let Some((_, src)) = self.channel_deny.iter().find(|(c, _)| *c == channel) {
+            return ChannelExplanation {
+                channel: name.clone(),
+                lifted: false,
+                rule: format!("channels deny {name}"),
+                source: src.clone(),
+            };
+        }
+        if let Some((_, src)) = self.channel_allow.iter().find(|(c, _)| *c == channel) {
+            return ChannelExplanation {
+                channel: name.clone(),
+                lifted: true,
+                rule: format!("channels allow {name}"),
+                source: src.clone(),
+            };
+        }
+        ChannelExplanation {
+            channel: name,
+            lifted: false,
+            rule: "channel baseline".to_string(),
+            source: RuleSource::BuiltIn,
         }
     }
 }

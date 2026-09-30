@@ -6,7 +6,7 @@
 //! variable is absent, not empty -- the child and its whole descendant tree can never inherit it
 //! (FW-INV7) and cannot distinguish it from never-set (FW-INV9).
 
-use crate::{EnvPosture, ResolvedCatalog};
+use crate::{ChannelPolicy, EnvPosture, ResolvedCatalog};
 
 /// The launcher's decision, with the operator-channel itemization (FW-CRED7). Names only, never
 /// values -- secrets never hit logs.
@@ -17,6 +17,8 @@ pub struct EnvConstruction {
     pub stripped: Vec<(String, String)>,
     /// Names the posture itself dropped (FW-ENV1/2 telemetry, unchanged semantics).
     pub posture_dropped: Vec<String>,
+    /// Locator variables of channels that stay denied (FW-BP11), stripped whatever the posture.
+    pub locator_stripped: Vec<String>,
 }
 
 /// Build the confined child's environment. The catalog strip is the floor, so it partitions
@@ -30,6 +32,7 @@ pub fn construct_env(
     posture: &EnvPosture,
     catalog: &ResolvedCatalog,
     allow: &[String],
+    channels: &ChannelPolicy,
     vars: Vec<(String, String)>,
 ) -> EnvConstruction {
     let mut strip: Vec<(String, String)> = Vec::new();
@@ -79,6 +82,33 @@ pub fn construct_env(
         other => other.clone(),
     };
 
+    // FW-BP11 / D5: a denied channel's locator variables are stripped (hiding the socket from
+    // well-behaved clients); a lifted channel re-admits them, or its client cannot find the socket
+    // and the lift is a silent no-op. An explicit Allowlist posture stays exact either way.
+    let (mut admitted, mut locators) = channels.locator_vars();
+    // The OS keyring is reached over the session bus on Linux (Secret Service), so exposing it
+    // admits the bus address -- the Catalog entry's services carry the socket grant.
+    if allow.iter().any(|t| t == crate::OS_KEYRING) {
+        for bus in crate::Channel::RunOutside.locator_vars() {
+            locators.retain(|v| v != bus);
+            if !admitted.contains(bus) {
+                admitted.push(bus);
+            }
+        }
+    }
+    let (locator_pairs, remainder): (Vec<_>, Vec<_>) = remainder
+        .into_iter()
+        .partition(|(name, _)| locators.contains(&name.as_str()));
+    let mut locator_stripped: Vec<String> = locator_pairs.into_iter().map(|(n, _)| n).collect();
+    locator_stripped.sort();
+    let effective = match effective {
+        EnvPosture::Scrub(mut scrub) => {
+            scrub.allow.extend(admitted.iter().map(|v| v.to_string()));
+            EnvPosture::Scrub(scrub)
+        }
+        other => other,
+    };
+
     let posture_dropped = effective.dropped_names(&remainder);
     let kept = effective.apply(remainder);
 
@@ -86,6 +116,7 @@ pub fn construct_env(
         kept,
         stripped,
         posture_dropped,
+        locator_stripped,
     }
 }
 
@@ -103,6 +134,37 @@ mod tests {
 
     fn catalog() -> ResolvedCatalog {
         ResolvedCatalog::builtin_for_home("/home/x").unwrap()
+    }
+
+    fn construct_env(
+        posture: &EnvPosture,
+        catalog: &ResolvedCatalog,
+        allow: &[String],
+        vars: Vec<(String, String)>,
+    ) -> EnvConstruction {
+        super::construct_env(posture, catalog, allow, &ChannelPolicy::default(), vars)
+    }
+
+    #[test]
+    fn denied_channel_locators_are_stripped_and_a_lift_readmits_them() {
+        let env = vars(&[
+            ("DISPLAY", ":0"),
+            ("WAYLAND_DISPLAY", "wayland-0"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1/bus"),
+            ("PATH", "/usr/bin"),
+        ]);
+        let out = construct_env(&EnvPosture::Passthrough, &catalog(), &[], env.clone());
+        let kept: Vec<&str> = out.kept.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kept, vec!["PATH"]);
+        assert_eq!(
+            out.locator_stripped,
+            vec!["DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY"]
+        );
+        let desktop = ChannelPolicy::allow([crate::Channel::Clipboard, crate::Channel::OpenUrl]);
+        let out = super::construct_env(&EnvPosture::Passthrough, &catalog(), &[], &desktop, env);
+        let kept: Vec<&str> = out.kept.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(kept.contains(&"DISPLAY") && kept.contains(&"WAYLAND_DISPLAY"));
+        assert!(!kept.contains(&"DBUS_SESSION_BUS_ADDRESS"));
     }
 
     #[test]

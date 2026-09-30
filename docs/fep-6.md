@@ -11,21 +11,39 @@ how it resolves and pins destinations, how it mints certificates, how it present
 credentials, what it refuses to forward, and what it is built from. This FEP specifies that program,
 the **egress engine**, and records the research behind the build decision.
 
-**Status: nothing in this document mutates the landed spec or the constitution.** Two of its FEP-5
-amendments are applied on this branch (§9 g, j); the rest wait for adoption. Draft identifiers are
-inline code, as in FEP-5, and start above the highest drafted number: FEP-5 drafted up to
+**Status: nothing in this document mutates the landed spec or the constitution.** Of its §9
+amendments only (g) is applied. Draft identifiers are inline code, as in FEP-5, and start above the
+highest drafted or landed number: FEP-5 drafted, and has since anchored, up to
 `FW-EGR15`, `FW-CRED15`, `FW-FID11`, `FW-BP15`, `FW-INV14`, `FW-E2E-091` and `FW-ADV-020`;
 FEP-4 drafted `FW-INV12` and `FW-DISC7`–`FW-DISC10`. This FEP starts at `FW-EGR16`, `FW-CRED16`,
 `FW-FID12`, `FW-BP16`, `FW-INV15`, `FW-E2E-092` and `FW-ADV-021`. Changes to FEP-5 or FEP-1 drafts
 are listed in §9. §7.2 walks through ten concrete configurations, from a model-API-only agent to a
 corporate proxy, each with a test form the harness runs as written.
 
+**Written against the FEP-5 proposal; reconciliation owed.** FEP-5 landed while this FEP was
+drafted (Phases 0–4; `docs/fep-5-plan.md` records how). The known differences:
+
+- The engine exists: `crates/formwork-gateway/src/egress.rs`, `inspect.rs` and `ca.rs`, on `rustls`
+  with `ring`, `rcgen` 0.13 and `rustls-native-certs`. HTTP/1.1 framing (content length and chunked)
+  is written by hand, without `hyper` (`docs/fep-5-plan.md` §3). §3's comparison of options still
+  holds; §5's dependency table and toolchain note describe the composition this FEP recommended, not
+  the landed one, which adds no `hyper` and needs no MSRV change.
+- Host rules landed with `https:` and `any:` (`crates/formwork-blueprint/src/egress.rs`), and the
+  shipped agent examples use `https:` rules (`examples/blueprints/claude-code.toml`). §9 (j) is
+  therefore a code change on adoption, not a text edit.
+- Landed FEP-5 restricts loopback destinations by name (`docs/fep-5-plan.md` §3), a different rule
+  from `FW-EGR19`.
+
+The next step is a requirement-by-requirement comparison of §6 with the landed engine. Until it is
+done, §4 and §6 describe the target design, not the state of `main`.
+
 **The question that opened this FEP.** Omnigent does not use Envoy, Squid or mitmproxy. Its egress
 proxy is about 2,900 lines of its own Python (asyncio, the standard-library `ssl` module, and
 `cryptography` for certificates) under `omnigent/inner/egress/`. The proxy is present in the
 repository's first public commit (2026-06-13), and no commit message in its 4,165-commit history
 names another proxy. Formwork can build the equivalent in Rust on `hyper`, `rustls` and `rcgen`,
-adding 34 crates to the release binary (§3). OpenAI's Codex (`codex-rs/network-proxy`) and Coder's
+adding 34 crates to the release binary (§3); FEP-5's landing built one on the same TLS stack without
+`hyper`. OpenAI's Codex (`codex-rs/network-proxy`) and Coder's
 httpjail are shipped Rust egress proxies on the same building blocks (§2.2). Every protocol parser
 and state machine in the proposed engine is Rust; the cryptographic primitives come from `ring`,
 which is Rust with C and assembly cores (§3.3).
@@ -34,7 +52,8 @@ which is Rust with C and assembly cores (§3.3).
 
 ## 1. Problem
 
-FEP-5 Phases 2 and 3 need an engine behind the egress listener. Four inputs fix its shape.
+FEP-5 Phases 2 and 3 needed an engine behind the egress listener (for what landed, see the
+reconciliation note above). Four inputs fix its shape.
 
 - **The policy surface is mostly settled.** FEP-5 §4 fixes the host-rule grammar (`FW-BP13`), one
   grade per host (`FW-BP14`), brokering (`FW-BP12`, `FW-CRED11`) and the report keys. This FEP adds
@@ -725,7 +744,7 @@ unless marked "outside", and is checked after the process tree exits.
 **Configuration.**
 
 ```toml
-# examples/blueprints/agent-session.toml after FEP-5 and this FEP
+# examples/blueprints/claude-code.toml reduced to the model API, in this FEP's verbs
 extends = ["builtin:default"]
 rules = [
   "readwrite:$CWD/**",
@@ -1294,7 +1313,8 @@ Conditional on FEP-5's transport landing and on the **(characterize)** marks abo
 
 ## 9. Proposed amendments (apply on landing)
 
-None of these are applied yet except (g) and (j), which are applied to FEP-5 on this branch.
+None of these are applied yet except (g). FEP-5 has landed, so an amendment to one of its drafts is
+now a change to landed text and, where that text is implemented, to code.
 
 **(a) FEP-5 `FW-CRED11`.** Replace "refusing with a violation record where the placeholder is
 carried toward any other host" with "refusing with a violation record where the placeholder appears
@@ -1369,6 +1389,12 @@ the default.** Replace the host-rule atoms `any` and `https` with `allow` and `t
   FEP-1's port-scoped fd (§11).
 - **Vocabulary.** Add to FEP-5 §7 (i)'s block: **tunnel** = a host grant the Gateway forwards
   without terminating TLS, checking the host and the server name but not the contents.
+- **Adoption.** FEP-5 landed with `https:` and `any:` in the parser
+  (`crates/formwork-blueprint/src/egress.rs`), the `learn` proposals (`discovery.rs`), the compiler
+  messages (`credential.rs`), the shipped examples and their tests. Adopting (j) changes each of
+  them, and changes the shipped examples' hosts from tunnel to inspected, so their clients must trust
+  the session CA. The old spellings stay as aliases, recorded in the `docs/STATUS.md` deprecations
+  register with removal at the first tagged release (constitution Precedence & Conflicts).
 
 ---
 

@@ -1,18 +1,21 @@
-# FEP-5 (proposal): host-scoped egress, credential brokering, host-service channels, and process isolation on both backends
+# FEP-5 (landed): host-scoped egress, credential brokering, host-service channels, and process isolation on both backends
 
-**Formwork Enhancement Proposal 5 — proposal, not landed.** Companion to `formwork.md` (design +
-end-to-end spec), `constitution.md` (doctrine), and `docs/fep-1.md` (host-scoped egress, which this
-FEP gives a transport). Motivated by `docs/omnigent-integration-eval.md`.
+**Formwork Enhancement Proposal 5 — landed, macOS characterization owed.** Companion to
+`formwork.md` (design + end-to-end spec), `constitution.md` (doctrine), and `docs/fep-1.md`
+(host-scoped egress, which this FEP gives a transport). Motivated by
+`docs/omnigent-integration-eval.md`.
 
-**Status: nothing in this document mutates the landed spec or the constitution yet.** Per the
-constitution (Requirements & identifiers; Precedence & Conflicts), a draft lives in its FEP until
-adoption, and the landed docs stay stable. The amendments in §7 are written as apply-on-landing
-blocks for review. New identifiers are draft numbering, written as inline code so the requirements
-canary skips them, and start above the highest landed or drafted number: `FW-E2E-074` and
-`FW-ADV-015` landed; `FW-INV12` and `FW-DISC7`–`FW-DISC10` drafted or reserved by FEP-4; `FW-EGR6`
-and `FW-FID5` drafted by FEP-1. Three open PRs touch this FEP's ground and are accounted for in §2
-and §8: #28 (spec-conformance fixes), #29 (UDP/raw closure under the port tier), #30 (adversarial
-and invariant coverage).
+**Status.** Phases 0–4 are implemented on both backends, with the opener shim and host and channel
+discovery; `docs/fep-5-plan.md` records how, every departure from the text below, and what is
+still owed. The requirements stay defined here, anchored, and code cites them bare; the §7
+amendments are applied to `formwork.md`, `docs/fep-1.md`, `docs/unstated-requirements.md` and
+`constitution.md`. What remains is the macOS characterization suite (§6.3) and the macOS-only
+tests that depend on it; until it runs, the report keeps every macOS verdict it would settle at
+`Partial`. The draft-numbering note below is kept as the record of how the numbers were chosen:
+`FW-E2E-074` and `FW-ADV-015` were the highest landed; `FW-INV12` and `FW-DISC7`–`FW-DISC10` were
+drafted or reserved by FEP-4; `FW-EGR6` and `FW-FID5` were drafted by FEP-1. Three PRs touched this
+FEP's ground and are accounted for in §2 and §8: #28 (spec-conformance fixes), #29 (UDP/raw
+closure under the port tier), #30 (adversarial and invariant coverage).
 
 **Platform stance.** Each gap is closed on both backends, or the report states the difference
 (§3.6). Blueprint vocabulary is portable: no field value is a platform name, and the same blueprint
@@ -74,8 +77,8 @@ backends.
   and the agent-example gate (`FW-E2E-084`); a deny that fails either moves to the `strict` profile
   and the default reports it `Partial`.
 - **Growth.** No new subcommand and no new CLI flag. Two new blueprint fields (`channels`,
-  `isolate`) and two extended ones (`rules`, `allow-credentials`), each justified in §4. Inspection
-  is the default for a host rule; a tunnel that skips it is opt-in per host (FEP-6 §9 j).
+  `isolate`) and two extended ones (`rules`, `allow-credentials`), each justified in §4. TLS
+  termination is opt-in per host.
 
 ---
 
@@ -182,13 +185,14 @@ of `formwork.md` §11, which the Catalog is now shaped to answer.
 
 #### Inspected hosts
 
-Every host rule except `tunnel:` is *inspected* (§4). For such a host the Gateway terminates TLS
-with a leaf certificate minted for the SNI; checks that the SNI, the `Host` header and the CONNECT
-target agree; canonicalizes the request (`FW-EGR11`) and matches it against the rule; and sends the
-request upstream with the host trust store. A `tunnel:` rule keeps FEP-1's CONNECT/SNI grade, which
-is `Partial` per [FW-EGR5](fep-1.md#fw-egr5), for clients that cannot trust the session CA.
-Omnigent's matcher does not canonicalize (`/repos/acme/../other/x` matches `/repos/acme/**` there,
-verified against `omnigent/inner/egress/rules.py`); `FW-ADV-017` pins that case.
+A host rule that names HTTP methods, or that a brokered credential is bound to, is *inspected*. For
+such a host the Gateway terminates TLS with a leaf certificate minted for the SNI; checks that the
+SNI, the `Host` header and the CONNECT target agree; canonicalizes the request (`FW-EGR11`) and
+matches it against the rule; and sends the request upstream with the host trust store. Plain host
+rules (`https:`) keep FEP-1's CONNECT/SNI grade, which is `Partial` per
+[FW-EGR5](fep-1.md#fw-egr5). Omnigent's matcher does not canonicalize (`/repos/acme/../other/x`
+matches `/repos/acme/**` there, verified against `omnigent/inner/egress/rules.py`); `FW-ADV-017`
+pins that case.
 
 #### CA and client trust
 
@@ -239,7 +243,7 @@ credential header, the Gateway adds one; this is what makes `git push` work with
 helper, since git sends no `Authorization` on its own. A placeholder sent to any other host is
 refused with a violation record. A brokered credential requires an inspected rule for each bound
 host; a blueprint that brokers a type without one fails at compile, and the message names the line
-to add (`allow:api.github.com`).
+to add (`any:api.github.com/**`).
 
 Claude Code prefers an API key over its OAuth login when `ANTHROPIC_API_KEY` is set, so a brokered
 placeholder switches its auth mode; the Claude Code example brokers `anthropic` only in its API-key
@@ -250,7 +254,7 @@ The README-layer shape of the feature:
 
 ```toml
 extends = ["builtin:default"]
-rules = ["readwrite:$CWD/**", "allow:api.anthropic.com"]   # this host only, inspected by the gateway
+rules = ["readwrite:$CWD/**", "any:api.anthropic.com"]     # this host only, inspected by the gateway
 allow-credentials = ["broker:anthropic"]                   # the agent sees a placeholder, never the key
 ```
 
@@ -260,14 +264,17 @@ allow-credentials = ["broker:anthropic"]                   # the agent sees a pl
 
 Environment disclosure is a credential-disclosure path, so it is not part of the opt-in tier. On
 macOS the default profile denies `sysctl-read` of `kern.procargs2` **(characterize)**, which returns
-the full environment of same-uid processes. On Linux a confined process reads a same-uid sibling's
-`/proc/<pid>/environ` today (verified); access is decided by `ptrace_may_access`, which Landlock does
-not govern, and a Landlock deny cannot be written for "every pid but the caller's" because a rule is
-bound to one inode at spawn while each descendant's `/proc/self` resolves to a different directory.
-The Linux verdicts are `Partial` in the default profile, with the residual named; `Enforced` under
-`isolate = ["processes"]`, where the fresh `procfs` lists only session processes; and `Enforced` when
-stacked under an outer PID namespace, which `detect` recognizes from a multi-field `NSpid` in
-`/proc/self/status` and records in the HostProfile.
+the full environment of same-uid processes. On Linux, access to `/proc/<pid>/environ` is decided
+by `ptrace_may_access`, and Landlock hooks that check: a confined process is refused ptrace-class
+access to any process outside its domain. A process holding `CAP_SYS_ADMIN` or `CAP_PERFMON` gets
+past the refusal, so a root container reads a same-uid sibling's environment while an ordinary user
+does not (both verified; the first observation, from a root container, was recorded as "readable"
+and is corrected here). The Linux verdicts are `Enforced` by Landlock for an unprivileged run;
+`Partial` when `detect` finds `CAP_SYS_ADMIN`, `CAP_PERFMON` or `CAP_SYS_PTRACE` in the effective
+set, with the residual named; `Unenforceable` without Landlock; and `Enforced` under
+`isolate = ["processes"]`, where the fresh `procfs` lists only session processes. An outer PID
+namespace, which `detect` recognizes from a multi-field `NSpid` in `/proc/self/status`, narrows the
+residual and is named in it.
 
 #### Default-on: a private temporary directory (`FW-TRA10`)
 
@@ -324,8 +331,9 @@ channel is a credential store.
 On Linux the portal, `systemd --user` and the Secret Service share one socket, `$XDG_RUNTIME_DIR/bus`;
 a `connect()` supervisor sees one `sun_path` and cannot tell `OpenURI` from `StartTransientUnit`, so
 lifting the socket for URLs would lift code execution. The channel therefore uses the
-single-privileged-broker pattern: the Launcher places a Formwork-owned `xdg-open` / `open` shim
-first in `PATH` and in `BROWSER`; the shim sends the URL over the Seam; the Gateway accepts
+single-privileged-broker pattern: in every spawned session the Launcher places a Formwork-owned
+`xdg-open` / `open` shim first in `PATH` and in `BROWSER`; the shim sends the URL over the Seam; the
+Gateway refuses it unless `open-url` is lifted, and otherwise accepts
 `http` and `https` URLs only, refuses `file:`, `javascript:` and custom schemes, records the URL on
 the operator channel, and opens it with the host opener outside the sandbox. No host service is
 lifted on either platform, closed mode needs no grant, and `learn` proposes the channel from the
@@ -402,11 +410,10 @@ explainable with the tools the operator already uses and discoverable through `l
   extended, no new subcommand): a value with `scheme://` is a URL and gives the host-rule verdict,
   the method and path match, the grade and the deciding rule; a member of the channel enum or a group
   name gives the channel verdict, its lift, and host reachability; anything else is a path, and a
-  socket path gives the supervised-connect verdict. `explain --net` prints the resolved host table,
+  socket path gives the supervised-connect verdict. `explain --hosts` prints the resolved host table,
   one host per line with its grade, methods, paths, broker binding and deciding layer.
 - **`learn`** proposes hosts and channels (`FW-DISC12`). Gateway egress violations reverse-compile
-  into host rules (`allow:<host>`, `tunnel:<host>` for a host whose clients rejected the session CA,
-  or `<methods>:<host>/<path>` when the host already has method rules); channel
+  into host rules (`https:<host>`, or `<methods>:<host>/<path>` when the host is inspected); channel
   denials into `channels` entries, from supervisor violations on Linux and from unified-log
   `mach-lookup`/`lsopen`/`appleevent-send` denials on macOS, mapped back to the portable name. A host
   a wildcard already tunnels is proposed at the tunnel grade, never as a method rule that would fail
@@ -456,7 +463,7 @@ explainable with the tools the operator already uses and discoverable through `l
 | TLS inspection clients | all env-trust clients | excludes Security.framework clients | no per-process trust on macOS |
 | Keychain lift granularity | per bus name (Secret Service as a whole) | whole keychain channel | Seatbelt gates `securityd` as one service |
 | `os-keyring` lift | `Partial` (shares the session bus with `run-outside`) | `Enforced` (own mach service) | D-Bus routes by bus name inside the socket |
-| Other processes' environment | `Partial` without `isolate` | `Enforced` (sysctl deny) | `ptrace_may_access` is outside Landlock |
+| Other processes' environment | `Enforced` unprivileged; `Partial` with `CAP_SYS_ADMIN`/`CAP_PERFMON`/`CAP_SYS_PTRACE` | `Enforced` (sysctl deny) | Landlock's ptrace refusal yields to those capabilities |
 | Any-depth `**/` rows | `Partial` | `Enforced` | Landlock cannot root them |
 | `stat` on denied paths | `Partial` | `Enforced` | kernel mechanism |
 | `isolate` members | `Enforced` where user namespaces exist | `Partial` or `Enforced` per characterization | no namespaces on macOS |
@@ -475,10 +482,10 @@ for paths, so there is one mini-language:
 ```toml
 rules = [
   "readwrite:$CWD/**",                           # fs rule (landed)
-  "allow:api.anthropic.com",                     # every method, any path, inspected
-  "get,post,patch:api.github.com/repos/acme/**", # HTTP methods: inspected, path-scoped
+  "https:api.anthropic.com",                     # plain host grant: tunnel grade, not inspected
+  "get,post,patch:api.github.com/repos/acme/**", # HTTP methods: inspected grade, path-scoped
   "get:*.npmjs.org/**",                          # wildcard host
-  "tunnel:internal.corp:8443",                   # explicit port; forwarded, not inspected
+  "https:internal.corp:8443",                    # explicit port
   "deny:telemetry.example.com",                  # terminal, as for paths
 ]
 ```
@@ -487,33 +494,27 @@ The verb position is a comma-separated list of atoms on both axes, and the verb 
 fs atoms are `read`, `write` (create included, per Vocabulary), `modify` and `exec`; `read,write:` is
 `readwrite:` and `read,exec:` is `readexec:`, and the landed compound spellings stay as aliases.
 `write` alone still implies read ([FW-TRA3](../formwork.md#fw-tra3)). The HTTP atoms are `get`,
-`post`, `put`, `patch`, `delete`, `head` and `options`. `allow` admits every method and, like `deny`,
-applies to both axes, meaning the ordinary full grant on each: read, write and create on the fs axis
-(with `exec` separate), every request, inspected, on the egress axis (with `tunnel` separate).
-`tunnel` is the host-only verb. One grammar covers every rule: `<atom>[,<atom>…]:<target>`, where
-the target is a path pattern when it begins with `/`, `~` or `$`, and otherwise
-`host[:port][/path-glob]`, whose host must contain a dot, be `localhost`, or be an IP literal
-(FEP-6 `FW-BP16`). Any host rule sets the net posture to FEP-1's
+`post`, `put`, `patch`, `delete`, `head`, `options` and `any`; `https` is the host-only verb; `deny`
+applies to both axes. One grammar covers every rule: `<atom>[,<atom>…]:<target>`, where the target
+is a path pattern or `host[:port][/path-glob]`. Any host rule sets the net posture to FEP-1's
 `AllowHosts`; combining host rules with `net = { ports = [...] }` is a compile error, as FEP-1
 requires. The target grammar, pinned because an embedder must translate into it:
 
 - **host**: an exact DNS name, or `*.example.com` for one or more labels under `example.com` (the
   apex is not included). IP literals are accepted and, for private ranges, are the explicit naming
   [FW-EGR4](fep-1.md#fw-egr4) requires.
-- **port**: `host:port`, default 443; an inspected rule on port 80 is proxied unencrypted and
-  reported so; a `tunnel:` rule carries TLS only (FEP-6 `FW-EGR16`).
+- **port**: `host:port`, default 443; port 80 is proxied unencrypted and reported so.
 - **path**: optional after the host, a glob over the canonicalized path without query: `*` matches
-  one segment, `**` any depth, `?` one character; absent means `/**`; a `tunnel:` rule takes no
-  path. Omnigent's `"GET,POST host/path"` rules translate by moving the space to a colon, and
-  `"* host/**"` becomes `allow:host`.
+  one segment, `**` any depth, `?` one character; absent means `/**`. Omnigent's `"GET,POST host/path"`
+  rules translate by moving the space to a colon.
 
-Every host and port resolves to exactly one grade, *inspected* (`allow:` and method verbs, the
-default) or *tunnel* (`tunnel:`), and nothing changes a host's grade without a line in the file:
+Every host resolves to exactly one grade, *tunnel* (`https:`) or *inspected* (method verbs), and
+nothing changes a host's grade without a line in the file:
 
-- Two rules at the same grade for one host and port union.
-- A `tunnel:` rule and an inspected rule that both match a host and port, directly or through a
-  wildcard, are a compile error naming both lines; otherwise the tunnel would admit everything and
-  the path rule would be decoration.
+- Two rules at the same grade for one host union.
+- A plain rule and a method rule that both match a host, directly or through a wildcard, are a
+  compile error naming both lines; otherwise the plain rule would admit everything and the path rule
+  would be decoration.
 - `deny:host` is terminal. `deny:host/path` needs the inspected grade; on a tunnel host it is a
   compile error, never a silent no-op.
 - `broker:<type>` requires an inspected rule for each bound host; the error names the line to add.
@@ -523,13 +524,12 @@ The verb also names the layer that enforces it, and the report follows:
 | Rule form | Layer | Enforced by | Verdict |
 |---|---|---|---|
 | `net = { ports = [443] }` | L4 | kernel (Landlock `ConnectTcp` / Seatbelt) | `Enforced`; any host on the port; UDP/raw denied (PR #29); no name resolution on Linux |
-| `tunnel:host[:port]` | L4 target + TLS SNI | Gateway at CONNECT, unterminated | `Partial` ([FW-EGR5](fep-1.md#fw-egr5)): trusts client SNI/Host; request opaque |
-| `allow:` or `<methods>:host[/glob]` | L7 | Gateway, TLS terminated | `Enforced` for env-trust clients; platform-verifier clients refused (§3.2) |
+| `https:host[:port]` | L4 target + TLS SNI | Gateway at CONNECT, unterminated | `Partial` ([FW-EGR5](fep-1.md#fw-egr5)): trusts client SNI/Host; request opaque |
+| `<methods>:host[/glob]` | L7 | Gateway, TLS terminated | `Enforced` for env-trust clients; platform-verifier clients refused (§3.2) |
 
-`tunnel:` is the most a rule can say without terminating TLS: where the connection goes and the name
-the client claims. Method or path is L7 and needs the certificate. Inspection is the default, so the
-plainest rule (`allow:`) carries the strongest check, and the weaker grade is spelled by its own
-verb.
+`https:` is the most a rule can say without terminating TLS: where the connection goes and the name
+the client claims. Method or path is L7 and needs the certificate, which is why inspection is spelled
+by the verb rather than inferred from a path.
 
 **`allow-credentials` (extended).** Entries are a bare Catalog type (expose), `broker:<type>`, or
 an inline binding table `{ name, env, hosts, scheme }` for a credential the Catalog does not know.
@@ -546,8 +546,10 @@ valid names (`deny_unknown_fields` discipline).
 (mach names on macOS; bus names and sockets on Linux), the `os-keyring` type, and the `claude` type's
 macOS keychain location. Embedded data, so a catalog version bump.
 
-**CLI.** No new subcommand and no new flag. `explain` accepts URLs, channel and group names, and
-socket paths positionally, and `--net` prints the resolved host table. Two Launcher-provided files
+**CLI.** No new subcommand, and one new flag: `explain --hosts` prints the resolved host table.
+(`--net` was the first choice, but it is already the net-posture override every blueprint-taking
+subcommand shares.) `explain` accepts URLs, channel and group names, and socket paths
+positionally. Two Launcher-provided files
 appear at run time, the opener shim and the CA bundle, both under `FW-TRA9`.
 
 **Profiles.** `builtin:default` only. It loses its explicit `reads = ["/**"]` row (D10) and gains
@@ -574,51 +576,51 @@ ID; discussion and rationale live in §3.
 
 | Req | Requirement |
 |---|---|
-| `FW-EGR7` Supervised connect (Linux) | Under the host-allowlist posture on Linux, the Confiner shall deliver every `connect()` on AF_INET, AF_INET6 and AF_UNIX sockets, and every addressed `sendto`/`sendmsg` on an AF_UNIX datagram socket, to a supervisor outside the sandbox, which shall perform any allowed operation itself and install the result in the target. |
-| `FW-EGR8` Sole egress endpoint (macOS) | Under the host-allowlist posture on macOS, the compiled profile shall permit outbound network only to `localhost:<P>` for the session's Gateway listener and to pathname sockets granted by `allow`. |
-| `FW-EGR9` Registered egress | The Gateway egress listener shall accept a connection only if its source endpoint was registered by the supervisor (Linux), or if it presents the session credential and its peer PID belongs to the session (macOS). |
-| `FW-EGR10` Inspected host rule | For an inspected host, the Gateway shall terminate TLS, verify that the SNI, the `Host` header and the CONNECT target agree, and admit a request only if its method and canonicalized path match a rule for that host. |
-| `FW-EGR11` Request canonicalization | Before matching, the Gateway shall remove dot-segments and decode percent-encoded unreserved characters, and shall reject a request carrying an encoded `/`, a NUL, a backslash in the path, or both `Content-Length` and `Transfer-Encoding`. |
-| `FW-EGR12` Resolver closure | Under the host-allowlist posture, the Confiner shall deny every local name-resolution path: UDP and the resolver sockets on Linux, and the mDNSResponder literal on macOS. |
-| `FW-EGR13` Ephemeral CA | The Gateway shall generate the inspection CA in memory per session and shall not write the CA private key to any file nor expose it to any confined process. |
-| `FW-EGR14` Gateway hosting | `formwork run` in the spawn posture shall host the Gateway whenever the blueprint carries a host rule. |
-| `FW-EGR15` Loopback listen (macOS) | Under every net posture, the macOS profile shall permit `network-bind` and `network-inbound` on `localhost:*`. |
-| `FW-CRED10` Brokered floor | For each brokered credential, the Launcher and the Confiner shall strip and deny its locations exactly as for an unlisted type ([FW-CRED4](../formwork.md#fw-cred4)). |
-| `FW-CRED11` Credential presentation | The Gateway shall present a brokered credential only on requests to its bound hosts, using the scheme bound to that host: substituting where the request carries the session placeholder, adding the header where the request carries no credential, and refusing with a violation record where the placeholder is carried toward any other host. |
-| `FW-CRED12` Broker host closure | The compiler shall reject a blueprint that brokers a credential without an inspected rule for each of its bound hosts, naming the rule to add. |
-| `FW-CRED13` Service-located credentials | The Catalog shall express credential locations that are services (macOS mach names; Linux bus names and sockets), ship the `os-keyring` type floor-denied by default, and map the `claude` type's macOS location to the keychain. |
-| `FW-CRED14` Placeholder timing | When a brokered type has an env var, the Launcher shall set it to the per-session placeholder after the Catalog strip and the environment scrub have run. |
-| `FW-CRED15` Credential custody | The Gateway shall hold each brokered credential outside the sandbox, reading its source at session start and again at the interval the Catalog entry states. |
-| `FW-TRA9` Launcher-owned paths | Paths the Launcher creates for a session (the session scratch holding the CA bundle, the private temporary directory, the opener shim directory) shall be granted in every read mode, read-only except the temporary directory, and named in the resolved-input disclosure ([FW-FID7](../formwork.md#fw-fid7)). |
-| `FW-TRA10` Private temporary directory | The Launcher shall create a per-session temporary directory and set `TMPDIR`, `TMP` and `TEMP` to it in the confined environment. |
-| `FW-ISO10` Isolation tier | When a blueprint requests `isolate`, the Confiner shall apply each member (`processes`, `ipc`) with the §3.3 mechanism for the platform. |
-| `FW-ISO11` Datagram and raw closure (Linux) | Under every net posture, the Confiner shall deny AF_INET and AF_INET6 `SOCK_DGRAM` and `SOCK_RAW` socket creation (PR #29 for `Deny` and `Ports`; extended here to the host-allowlist posture). |
-| `FW-ISO12` Pathname socket mediation (Linux) | Under supervised connect, the supervisor shall refuse a `connect()` or addressed send to a pathname AF_UNIX socket unless the socket is granted by `allow` or was bound by a process in the session. |
-| `FW-ISO13` Channel baseline | In every blueprint, the Confiner shall deny each channel in the shipped baseline set that is not lifted by `channels` or by a typed credential exclusion, using the mechanism listed for its platform. |
-| `FW-ISO14` Privileged-interface baseline (macOS) | The macOS profile shall deny `mach-priv-host-port`, `mach-priv-task-port`, and `iokit-open` outside the shipped IOKit allowlist. |
-| `FW-ISO16` Process-environment disclosure | The Confiner shall deny a confined process reading the environment of any process outside the session where the platform provides a mechanism (macOS `kern.procargs2` deny; Linux PID namespace under `isolate`). |
-| `FW-ISO17` Opener shim | When `open-url` is lifted, the Launcher shall place a Formwork-owned opener first in `PATH` and in `BROWSER`. |
-| `FW-ISO18` Brokered URL open | The Gateway shall accept from the opener shim `http` and `https` URLs only, record each on the operator channel, and open it with the host opener outside the session. |
-| `FW-BP9` Channel policy shape | The Blueprint shall express channel lifts as an `allow` scope and a `deny` list over the closed channel enum and the fixed groups `desktop` (`clipboard`, `open-url`) and `media` (`screen`, `camera`, `microphone`), with groups expanded at the parse edge. |
-| `FW-BP10` Channel layering | Across layers, channel `allow` scopes shall union, `deny` entries shall be terminal, and the `"deny"` keyword shall mean an empty `allow` scope. |
-| `FW-BP11` Locator variables | The Launcher shall re-admit the environment variables by which a lifted channel's platform clients locate it. |
-| `FW-BP12` Credential entry forms | `allow-credentials` shall accept a bare Catalog type, `broker:<type>`, or an inline binding `{ name, env, hosts, scheme }`; a type present in both bare and `broker:` forms shall resolve to `broker`. |
-| `FW-BP13` Host-rule grammar | `rules` shall accept host rules of the form `<atoms>:host[:port][/glob]` with the §4 grammar, where the atoms are HTTP methods, `allow`, `tunnel` or `deny`; any host rule shall set the net posture to host-allowlist, and a host rule together with a port tier shall be a compile error. |
-| `FW-BP14` One host, one grade | The compiler shall reject a blueprint in which a tunnel rule and an inspected rule both match one host and port, or in which a path-scoped `deny` names a host that has no inspected rule, naming the conflicting lines. |
-| `FW-BP15` Verb atoms | The verb position of a rule shall be a comma-separated list of atoms; for the fs axis the atoms shall be `read`, `write`, `modify` and `exec`, with the landed compound verbs accepted as aliases of the same meaning. |
-| `FW-FID8` Per-backend report lines | The FidelityReport shall carry, each under the stable JSON key §3.5 names, per-backend verdicts for host scoping, inspection, UDP, pathname sockets, resolver closure, brokering, each `isolate` member, private tmp, each channel, privileged interfaces and process-environment disclosure, and a `withheld` list naming every rule the backend could not install. |
-| `FW-FID9` Self-explaining refusals | For each Gateway refusal, supervised-connect denial, opener-shim refusal and TLS `unknown_ca` rejection of the session CA, Formwork shall emit on the operator channel, within the run, one line naming what was refused, the deciding rule, and the `explain` invocation that reproduces the verdict, while the confined process receives only a generic refusal ([FW-CRED7](../formwork.md#fw-cred7)). |
-| `FW-FID10` Host-session detection | `detect` shall probe for the host facilities that make each channel reachable (session bus, user manager, display server, keyring service; GUI session on macOS) and for PID-namespace nesting, and record them in the HostProfile. |
-| `FW-FID11` Explain for hosts and channels | `explain` shall accept a URL, a channel or group name, or a socket path as a positional argument and print the verdict, the deciding rule and layer, the grade for a host, and host reachability for a channel; `explain --net` shall print every effective host once with its grade, methods, paths, broker binding and deciding layer. |
-| `FW-DISC12` Host and channel discovery | `learn` shall reverse-compile Gateway egress violations and channel denials into proposal entries (host rules, `channels`) on both backends, at the grade an existing rule for the host already has, and shall withhold and itemize metadata and private-IP destinations and credential-typed channels ([FW-DISC3](../formwork.md#fw-disc3)). |
-| `FW-XR10` Wrapper transparency | Wrapper subcommands shall exit with the workload's status and write nothing of their own to stdout. |
-| `FW-XR11` Failure attribution | A Formwork failure after the workload is spawned shall exit `125` and emit one `formwork:`-prefixed line on stderr attributing the failure to Formwork. |
+| <a id="fw-egr7"></a>**FW-EGR7** Supervised connect (Linux) | Under the host-allowlist posture on Linux, the Confiner shall deliver every `connect()` on AF_INET, AF_INET6 and AF_UNIX sockets, and every addressed `sendto`/`sendmsg` on an AF_UNIX datagram socket, to a supervisor outside the sandbox, which shall perform any allowed operation itself and install the result in the target. |
+| <a id="fw-egr8"></a>**FW-EGR8** Sole egress endpoint (macOS) | Under the host-allowlist posture on macOS, the compiled profile shall permit outbound network only to `localhost:<P>` for the session's Gateway listener and to pathname sockets granted by `allow`. |
+| <a id="fw-egr9"></a>**FW-EGR9** Registered egress | The Gateway egress listener shall accept a connection only if its source endpoint was registered by the supervisor (Linux), or if it presents the session credential and its peer PID belongs to the session (macOS). |
+| <a id="fw-egr10"></a>**FW-EGR10** Inspected host rule | For an inspected host, the Gateway shall terminate TLS, verify that the SNI, the `Host` header and the CONNECT target agree, and admit a request only if its method and canonicalized path match a rule for that host. |
+| <a id="fw-egr11"></a>**FW-EGR11** Request canonicalization | Before matching, the Gateway shall remove dot-segments and decode percent-encoded unreserved characters, and shall reject a request carrying an encoded `/`, a NUL, a backslash in the path, or both `Content-Length` and `Transfer-Encoding`. |
+| <a id="fw-egr12"></a>**FW-EGR12** Resolver closure | Under the host-allowlist posture, the Confiner shall deny every local name-resolution path: UDP and the resolver sockets on Linux, and the mDNSResponder literal on macOS. |
+| <a id="fw-egr13"></a>**FW-EGR13** Ephemeral CA | The Gateway shall generate the inspection CA in memory per session and shall not write the CA private key to any file nor expose it to any confined process. |
+| <a id="fw-egr14"></a>**FW-EGR14** Gateway hosting | `formwork run` in the spawn posture shall host the Gateway whenever the blueprint carries a host rule. |
+| <a id="fw-egr15"></a>**FW-EGR15** Loopback listen (macOS) | Under every net posture, the macOS profile shall permit `network-bind` and `network-inbound` on `localhost:*`. |
+| <a id="fw-cred10"></a>**FW-CRED10** Brokered floor | For each brokered credential, the Launcher and the Confiner shall strip and deny its locations exactly as for an unlisted type ([FW-CRED4](../formwork.md#fw-cred4)). |
+| <a id="fw-cred11"></a>**FW-CRED11** Credential presentation | The Gateway shall present a brokered credential only on requests to its bound hosts, using the scheme bound to that host: substituting where the request carries the session placeholder, adding the header where the request carries no credential, and refusing with a violation record where the placeholder is carried toward any other host. |
+| <a id="fw-cred12"></a>**FW-CRED12** Broker host closure | The compiler shall reject a blueprint that brokers a credential without an inspected rule for each of its bound hosts, naming the rule to add. |
+| <a id="fw-cred13"></a>**FW-CRED13** Service-located credentials | The Catalog shall express credential locations that are services (macOS mach names; Linux bus names and sockets), ship the `os-keyring` type floor-denied by default, and map the `claude` type's macOS location to the keychain. |
+| <a id="fw-cred14"></a>**FW-CRED14** Placeholder timing | When a brokered type has an env var, the Launcher shall set it to the per-session placeholder after the Catalog strip and the environment scrub have run. |
+| <a id="fw-cred15"></a>**FW-CRED15** Credential custody | The Gateway shall hold each brokered credential outside the sandbox, reading its source at session start and again at the interval the Catalog entry states. |
+| <a id="fw-tra9"></a>**FW-TRA9** Launcher-owned paths | Paths the Launcher creates for a session (the session scratch holding the CA bundle, the private temporary directory, the opener shim directory) shall be granted in every read mode, read-only except the temporary directory, and named in the resolved-input disclosure ([FW-FID7](../formwork.md#fw-fid7)). |
+| <a id="fw-tra10"></a>**FW-TRA10** Private temporary directory | The Launcher shall create a per-session temporary directory and set `TMPDIR`, `TMP` and `TEMP` to it in the confined environment. |
+| <a id="fw-iso10"></a>**FW-ISO10** Isolation tier | When a blueprint requests `isolate`, the Confiner shall apply each member (`processes`, `ipc`) with the §3.3 mechanism for the platform. |
+| <a id="fw-iso11"></a>**FW-ISO11** Datagram and raw closure (Linux) | Under every net posture, the Confiner shall deny AF_INET and AF_INET6 `SOCK_DGRAM` and `SOCK_RAW` socket creation (PR #29 for `Deny` and `Ports`; extended here to the host-allowlist posture). |
+| <a id="fw-iso12"></a>**FW-ISO12** Pathname socket mediation (Linux) | Under supervised connect, the supervisor shall refuse a `connect()` or addressed send to a pathname AF_UNIX socket unless the socket is granted by `allow` or was bound by a process in the session. |
+| <a id="fw-iso13"></a>**FW-ISO13** Channel baseline | In every blueprint, the Confiner shall deny each channel in the shipped baseline set that is not lifted by `channels` or by a typed credential exclusion, using the mechanism listed for its platform. |
+| <a id="fw-iso14"></a>**FW-ISO14** Privileged-interface baseline (macOS) | The macOS profile shall deny `mach-priv-host-port`, `mach-priv-task-port`, and `iokit-open` outside the shipped IOKit allowlist. |
+| <a id="fw-iso16"></a>**FW-ISO16** Process-environment disclosure | The Confiner shall deny a confined process reading the environment of any process outside the session where the platform provides a mechanism (macOS `kern.procargs2` deny; Linux PID namespace under `isolate`). |
+| <a id="fw-iso17"></a>**FW-ISO17** Opener shim | In every spawned session, the Launcher shall place a Formwork-owned opener first in `PATH` and in `BROWSER`; it hands each URL to the Gateway, which opens it only when `open-url` is lifted and otherwise records a refusal. |
+| <a id="fw-iso18"></a>**FW-ISO18** Brokered URL open | The Gateway shall accept from the opener shim `http` and `https` URLs only, record each on the operator channel, and open it with the host opener outside the session. |
+| <a id="fw-bp9"></a>**FW-BP9** Channel policy shape | The Blueprint shall express channel lifts as an `allow` scope and a `deny` list over the closed channel enum and the fixed groups `desktop` (`clipboard`, `open-url`) and `media` (`screen`, `camera`, `microphone`), with groups expanded at the parse edge. |
+| <a id="fw-bp10"></a>**FW-BP10** Channel layering | Across layers, channel `allow` scopes shall union, `deny` entries shall be terminal, and the `"deny"` keyword shall mean an empty `allow` scope. |
+| <a id="fw-bp11"></a>**FW-BP11** Locator variables | The Launcher shall re-admit the environment variables by which a lifted channel's platform clients locate it. |
+| <a id="fw-bp12"></a>**FW-BP12** Credential entry forms | `allow-credentials` shall accept a bare Catalog type, `broker:<type>`, or an inline binding `{ name, env, hosts, scheme }`; a type present in both bare and `broker:` forms shall resolve to `broker`. |
+| <a id="fw-bp13"></a>**FW-BP13** Host-rule grammar | `rules` shall accept host rules of the form `<atoms>:host[:port][/glob]` with the §4 grammar, where the atoms are HTTP methods, `any`, `https` or `deny`; any host rule shall set the net posture to host-allowlist, and a host rule together with a port tier shall be a compile error. |
+| <a id="fw-bp14"></a>**FW-BP14** One host, one grade | The compiler shall reject a blueprint in which a tunnel rule and an inspected rule both match one host, or in which a path-scoped `deny` names a host that has no inspected rule, naming the conflicting lines. |
+| <a id="fw-bp15"></a>**FW-BP15** Verb atoms | The verb position of a rule shall be a comma-separated list of atoms; for the fs axis the atoms shall be `read`, `write`, `modify` and `exec`, with the landed compound verbs accepted as aliases of the same meaning. |
+| <a id="fw-fid8"></a>**FW-FID8** Per-backend report lines | The FidelityReport shall carry, each under the stable JSON key §3.5 names, per-backend verdicts for host scoping, inspection, UDP, pathname sockets, resolver closure, brokering, each `isolate` member, private tmp, each channel, privileged interfaces and process-environment disclosure, and a `withheld` list naming every rule the backend could not install. |
+| <a id="fw-fid9"></a>**FW-FID9** Self-explaining refusals | For each Gateway refusal, supervised-connect denial, opener-shim refusal and TLS `unknown_ca` rejection of the session CA, Formwork shall emit on the operator channel, within the run, one line naming what was refused, the deciding rule, and the `explain` invocation that reproduces the verdict, while the confined process receives only a generic refusal ([FW-CRED7](../formwork.md#fw-cred7)). |
+| <a id="fw-fid10"></a>**FW-FID10** Host-session detection | `detect` shall probe for the host facilities that make each channel reachable (session bus, user manager, display server, keyring service; GUI session on macOS) and for PID-namespace nesting, and record them in the HostProfile. |
+| <a id="fw-fid11"></a>**FW-FID11** Explain for hosts and channels | `explain` shall accept a URL, a channel or group name, or a socket path as a positional argument and print the verdict, the deciding rule and layer, the grade for a host, and host reachability for a channel; `explain --hosts` shall print every effective host once with its grade, methods, paths, broker binding and deciding layer. |
+| <a id="fw-disc12"></a>**FW-DISC12** Host and channel discovery | `learn` shall reverse-compile Gateway egress violations and channel denials into proposal entries (host rules, `channels`) on both backends, at the grade an existing rule for the host already has, and shall withhold and itemize metadata and private-IP destinations and credential-typed channels ([FW-DISC3](../formwork.md#fw-disc3)). |
+| <a id="fw-xr10"></a>**FW-XR10** Wrapper transparency | Wrapper subcommands shall exit with the workload's status and write nothing of their own to stdout. |
+| <a id="fw-xr11"></a>**FW-XR11** Failure attribution | A Formwork failure after the workload is spawned shall exit `125` and emit one `formwork:`-prefixed line on stderr attributing the failure to Formwork. |
 
 Invariants:
 
-- `FW-INV13` **Broker non-disclosure.** A brokered credential's bytes do not appear in a confined
+- <a id="fw-inv13"></a>**FW-INV13 — Broker non-disclosure.** A brokered credential's bytes do not appear in a confined
   process's environment, in a file or service it can read, or in any Gateway response to it.
-- `FW-INV14` **No out-of-sandbox execution.** A confined process cannot, through any channel its
+- <a id="fw-inv14"></a>**FW-INV14 — No out-of-sandbox execution.** A confined process cannot, through any channel its
   blueprint has not lifted, cause a process outside its session to execute a command, open a URL, or
   perform network egress.
 
@@ -697,101 +699,101 @@ settled by one of them.
 
 Each test is written as Pass/Fail. Draft numbers continue above `FW-E2E-074` and `FW-ADV-015`.
 
-- `FW-E2E-075` **Sole egress path (both).** Under `rules = ["tunnel:allowed.test"]`, a request through
+- <a id="fw-e2e-075"></a>**FW-E2E-075: Sole egress path (both).** Under `rules = ["https:allowed.test"]`, a request through
   `HTTP_PROXY` reaches the fixture; a direct `connect()` to the fixture, a direct `connect()` to
   `169.254.169.254`, an unregistered (Linux) or uncredentialed (macOS) connection to the listener, a
   UDP send, and `getaddrinfo("blocked.test")` are each attempted. Pass: the proxied request succeeds
   and each direct attempt is denied with a violation record. Fail: any direct attempt succeeds.
-- `FW-E2E-076` **Pathname socket (both).** Three sockets, each with an unconfined control: one bound
+- <a id="fw-e2e-076"></a>**FW-E2E-076: Pathname socket (both).** Three sockets, each with an unconfined control: one bound
   by an out-of-session fixture, one granted by `allow`, one bound in-session. Pass: the first is
   refused and the other two connect. Fail: the first connects, or a granted one is refused.
-- `FW-E2E-077` **Inspected path scope (both).** Under `post:allowed.test/repos/acme/**`. Pass:
+- <a id="fw-e2e-077"></a>**FW-E2E-077: Inspected path scope (both).** Under `post:allowed.test/repos/acme/**`. Pass:
   `POST /repos/acme/x` passes; `POST /repos/other/x` and `GET /repos/acme/x` are refused with a
   generic 403 and an operator-channel line naming the rule. Fail: either refused request reaches the
   fixture, or the 403 body names the rule.
-- `FW-E2E-078` **Brokered header (both).** Under `allow-credentials = ["broker:anthropic"]` bound to
+- <a id="fw-e2e-078"></a>**FW-E2E-078: Brokered header (both).** Under `allow-credentials = ["broker:anthropic"]` bound to
   `allowed.test`. Pass: the fixture receives the credential in `x-api-key`; the confined `env` shows
   the placeholder; the Catalog file is unreadable; the placeholder sent to `other.test` is refused;
   the credential bytes appear on no confined-readable surface the test can enumerate (`FW-INV13`).
   Fail: any of these does not hold.
-- `FW-E2E-079` **Isolation tier (Linux, both runners).** With `isolate = ["processes"]`. Pass on
+- <a id="fw-e2e-079"></a>**FW-E2E-079: Isolation tier (Linux, both runners).** With `isolate = ["processes"]`. Pass on
   `ubuntu-22.04`: `/proc` lists only session PIDs, `$TMPDIR` is a tmpfs, `kill` of a host PID fails.
   Pass on `ubuntu-24.04`: the run is refused before spawn and the message names AppArmor, the
   `sysctl` remedy, bwrap, and dropping the member. Fail: the tier is applied partially on either.
-- `FW-E2E-080` **Isolation tier (macOS).** With the same request. Pass: `kill` and `proc_pidinfo` on
+- <a id="fw-e2e-080"></a>**FW-E2E-080: Isolation tier (macOS).** With the same request. Pass: `kill` and `proc_pidinfo` on
   an unconfined control sibling fail, and the report's `processes` verdict matches what `ps` shows.
   Fail: a host process is signalable or the report and `ps` disagree.
-- `FW-E2E-081` **Channels (macOS).** Under the default profile, `open -g -n fixture.app`,
+- <a id="fw-e2e-081"></a>**FW-E2E-081: Channels (macOS).** Under the default profile, `open -g -n fixture.app`,
   `launchctl submit` of a marker job, an AppleEvent to the fixture app, `pbcopy`/`pbpaste` of a nonce,
   and `security find-generic-password` against a test item in a test keychain are each attempted.
   Pass: each is denied with a sandbox deny record and no marker appears; with
   `channels = ["clipboard"]` only the clipboard probe succeeds; with
   `allow-credentials = ["os-keyring"]` only the keychain probe succeeds. Fail: a marker appears, or a
   lift opens more than its channel.
-- `FW-E2E-082` **Channels (Linux).** Against a session `dbus-daemon` and the fixture service under
+- <a id="fw-e2e-082"></a>**FW-E2E-082: Channels (Linux).** Against a session `dbus-daemon` and the fixture service under
   supervised connect: `gdbus call --session`, the fixture's "run this" request, and a connection to a
   fixture X11-shaped socket. Pass: each is denied with a violation record, and each succeeds under its
   matching lift. Fail: a denial is missing or a lift opens an unrelated socket.
-- `FW-E2E-083` **Environment disclosure (both).** An unconfined sibling carries `FW_CANARY=<nonce>`;
+- <a id="fw-e2e-083"></a>**FW-E2E-083: Environment disclosure (both).** An unconfined sibling carries `FW_CANARY=<nonce>`;
   the control (`ps -E` on macOS, `/proc/<pid>/environ` on Linux) shows it. Pass on macOS: the confined
   run under the default profile does not show it. Pass on Linux: the default profile shows it and
   the report says `Partial` with the residual ([FW-E2E-025](../formwork.md#fw-e2e-025) pattern);
   under `isolate = ["processes"]` on `ubuntu-22.04` it is not shown and the report says `Enforced`.
   Fail: the report and the observation disagree.
-- `FW-E2E-084` **Agent examples under the baseline (both).** Each shipped `examples/` blueprint runs
+- <a id="fw-e2e-084"></a>**FW-E2E-084: Agent examples under the baseline (both).** Each shipped `examples/` blueprint runs
   its agent's non-interactive smoke command with the baseline on; the Claude Code login flow runs
   with the fixture opener standing in for the browser. Pass: zero denials outside the lift set the
   example documents. Fail: any other denial, including a write to `~/.claude` under the default
   profile.
-- `FW-E2E-085` **Discovery of hosts and channels (both).** `learn` runs a millisecond workload that
+- <a id="fw-e2e-085"></a>**FW-E2E-085: Discovery of hosts and channels (both).** `learn` runs a millisecond workload that
   requests `blocked.test` through the proxy and touches the clipboard, and a second that requests
-  `169.254.169.254`. Pass: `allow:blocked.test` and `channels = ["clipboard"]` are proposed; the
+  `169.254.169.254`. Pass: `https:blocked.test` and `channels = ["clipboard"]` are proposed; the
   metadata address produces a withheld line. Fail: the metadata address is proposed, or a proposal is
   missing.
-- `FW-E2E-086` **Exit codes (both).** A workload exiting 3; then a run whose Gateway is killed
+- <a id="fw-e2e-086"></a>**FW-E2E-086: Exit codes (both).** A workload exiting 3; then a run whose Gateway is killed
   mid-session. Pass: the first makes `run` exit 3 with nothing of its own on stdout; the second exits
   125 with the attribution line on stderr and stdout untouched. Fail: stdout carries a Formwork line,
   or the code differs.
-- `FW-E2E-087` **Host-session detection (both).** Pass on a bare Linux runner: `detect` reports each
+- <a id="fw-e2e-087"></a>**FW-E2E-087: Host-session detection (both).** Pass on a bare Linux runner: `detect` reports each
   channel `not present on this host`. Pass with the §6.1 fixture session: `detect` names the bus,
   user-manager and display sockets, `run` prints the matching `Partial` line, and the same run under
   supervised connect prints `Enforced`. Pass on macOS: `detect` reports the GUI-session verdict and
   the channel lines match `FW-E2E-081`. Fail: a present facility is reported absent or the reverse.
-- `FW-E2E-088` **Channel groups (both).** Under `channels = ["desktop"]`. Pass: the clipboard and
+- <a id="fw-e2e-088"></a>**FW-E2E-088: Channel groups (both).** Under `channels = ["desktop"]`. Pass: the clipboard and
   URL-open probes succeed; `screen` and `run-outside` are denied; on Linux `DISPLAY` and
   `WAYLAND_DISPLAY` are present in the confined environment and `DBUS_SESSION_BUS_ADDRESS` is not;
   with a downstream `channels = { deny = ["desktop"] }` both probes are denied and `explain desktop`
   names the denying layer; a base `channels = "deny"` with a downstream `channels = ["clipboard"]`
   admits the clipboard; `channels = { allow = ["desk"] }` fails at parse listing the valid names.
   Fail: any branch differs.
-- `FW-E2E-089` **Launcher-owned paths under `closed` (both).** A blueprint with `mode = "unveil"`
+- <a id="fw-e2e-089"></a>**FW-E2E-089: Launcher-owned paths under `closed` (both).** A blueprint with `mode = "unveil"`
   and only `readwrite:$CWD/**`. Pass: `$TMPDIR` is set inside the session and writable, and on macOS
   `confstr(_CS_DARWIN_USER_TEMP_DIR)` resolves beneath it; a grandchild reads the session CA bundle,
   `/proc/self/status` and `/etc/hosts`; `explain` names the tmp directory and the CA path. Fail: any
   read is denied or a path is undisclosed.
-- `FW-E2E-090` **Brokered `open-url` (both).** Under `channels = ["open-url"]`. Pass: the confined
+- <a id="fw-e2e-090"></a>**FW-E2E-090: Brokered `open-url` (both).** Under `channels = ["open-url"]`. Pass: the confined
   `xdg-open`/`open` of an `https://` URL causes the fixture opener on the host to receive it and the
   operator channel records it; a `file:` URL is refused with a violation record; `lsopen` (macOS) and
   the session bus (Linux) stay denied throughout. Fail: the `file:` URL is opened, or a host service
   is reachable.
-- `FW-E2E-091` **Loopback callback (macOS).** A confined process binds `localhost:<ephemeral>` and
+- <a id="fw-e2e-091"></a>**FW-E2E-091: Loopback callback (macOS).** A confined process binds `localhost:<ephemeral>` and
   an unconfined control process connects and sends a nonce, under `net = "deny"`, `ports` and a host
   rule. Pass: the confined process receives the nonce under each posture. Fail: the bind or the
   accept is denied.
-- `FW-ADV-016` **Gateway frame bypass (D6).** A batch array, a non-JSON frame, and an id-less
+- <a id="fw-adv-016"></a>**FW-ADV-016: Gateway frame bypass (D6).** A batch array, a non-JSON frame, and an id-less
   `tools/call` for a shaded tool. Pass: none reaches the backend. Fail: any does.
-- `FW-ADV-017` **Path traversal against an inspected rule.** Against `post:allowed.test/repos/acme/**`:
+- <a id="fw-adv-017"></a>**FW-ADV-017: Path traversal against an inspected rule.** Against `post:allowed.test/repos/acme/**`:
   `/repos/acme/../other/x`, `/repos/acme/%2e%2e/other/x`, `/repos/acme%2F..%2Fother/x`, and a
   request carrying both `Content-Length` and `Transfer-Encoding`. Pass: each is refused or
   canonicalizes outside the scope. Fail: any reaches `/repos/other`.
-- `FW-ADV-018` **Supervisor race (Linux).** A second thread rewrites the `sockaddr` while `connect()`
+- <a id="fw-adv-018"></a>**FW-ADV-018: Supervisor race (Linux).** A second thread rewrites the `sockaddr` while `connect()`
   is pending. Pass: the connection lands only where the supervisor's copy was allowed. Fail: it lands
   at the rewritten address.
-- `FW-ADV-019` **Endpoint theft (macOS).** An unconfined same-uid process holding `P` and the
+- <a id="fw-adv-019"></a>**FW-ADV-019: Endpoint theft (macOS).** An unconfined same-uid process holding `P` and the
   credential connects to the listener. Pass: the peer check refuses it; or, if C2 found the peer check
   unreliable, the report is `Partial` and names this residual. Fail: the connection is admitted while
   the report says `Enforced`.
-- `FW-ADV-020` **Exfiltration through a host service (both).** Under `rules = ["allow:allowed.test"]`
+- <a id="fw-adv-020"></a>**FW-ADV-020: Exfiltration through a host service (both).** Under `rules = ["https:allowed.test"]`
   the agent tries to send a nonce to the `blocked.test` fixture through the opener with a URL
   argument, an AppleEvent, the Linux fixture service running `curl`, and a clipboard hand-off to an
   unconfined reader. Pass: the nonce never reaches the fixture, checked after the process tree exits.
@@ -813,10 +815,10 @@ Each phase lands independently, and the report is honest at every boundary.
 
 ---
 
-## 7. Proposed amendments to the landed docs (apply on landing)
+## 7. Amendments to the landed docs
 
-None of these are applied yet. On adoption they fold into the landed documents and the draft IDs
-gain anchors.
+Applied on landing: each block below is now in the named document, and the IDs are anchored in this
+one.
 
 **(a) `formwork.md` [FW-XR7](../formwork.md#fw-xr7).** Current: "The agent reaches the gateway via
 an inherited fd. Formwork never depends on an in-sandbox `connect()` nor on the filesystem sandbox
@@ -862,8 +864,8 @@ build-vs-buy" to the optional netns path.
 **(g) `docs/fep-1.md`.** In Non-goals, replace the TLS-interception and credential-masking bullets
 with:
 
-> - **TLS interception and credential brokering** are specified by FEP-5 §3.2, with inspection as
->   the default grade for a host rule; the CONNECT/SNI grade here remains available as `tunnel:`.
+> - **TLS interception and credential brokering** are specified by FEP-5 §3.2 as an opt-in
+>   per-host grade; the CONNECT/SNI grade here remains the default for a plain host rule.
 
 Spell `AllowHosts` as host rules in `rules` (FEP-5 §4), and close the open host-pattern question with
 the §4 grammar.
@@ -875,9 +877,7 @@ applied by §6.2.
 
 > - **broker** = the Gateway presenting a credential it holds, never disclosing its bytes ·
 >   **placeholder** = the per-session stand-in for a brokered env var · **inspect** = TLS termination
->   at the Gateway for every host rule except `tunnel:` · **tunnel** = a host grant the Gateway
->   forwards without terminating TLS, checking the host and the server name but not the contents ·
->   **supervise** = the Gateway
+>   at the Gateway for a host rule that needs request-level policy · **supervise** = the Gateway
 >   receiving a confined `connect()` through seccomp user notification and minting the connection
 >   itself · **channel** = a host service that can act outside the sandbox on a confined process's
 >   behalf, named by a portable enum value · **characterize** = a CI test that records how a platform
@@ -895,8 +895,8 @@ revision under `read-mode = "closed"`, and the findings below cite them by role.
 - **Host rules live in `rules`, not in a `net.hosts` table.** A `{ host, methods, paths }` table was
   a second grammar beside the verb rules and reached TOML's nesting limit at the first path-scoped
   rule. The verb form is one grammar, and Omnigent's egress strings translate into it directly.
-- **One host, one grade; no inference.** A host matched by both a tunnel and a method rule would let
-  the tunnel admit everything. A brokered credential silently promoting its host to inspected
+- **One host, one grade; no inference.** A host matched by both a plain and a method rule would let
+  the plain rule admit everything. A brokered credential silently promoting its host to inspected
   hid a grade change from the file. Both are compile errors now (`FW-BP14`, `FW-CRED12`).
 - **Brokering is a grade on `allow-credentials`, not a second list.** A separate `broker-credentials`
   list with a parse error at its intersection was asked to be one list by three of the four operators;
@@ -944,9 +944,11 @@ revision under `read-mode = "closed"`, and the findings below cite them by role.
 - **Report lines have stable JSON keys, and host probing lives in `detect`.** The embedder could not
   gate on prose, and a filesystem probe in the compiler broke its purity
   ([FW-CAP5](../formwork.md#fw-cap5)).
-- **Environment disclosure is `Partial` on Linux without the tier.** An earlier claim that Landlock
-  blocked `/proc/<pid>/environ` was checked and found false (D9); the honest verdict is stated rather
-  than the mechanism invented.
+- **Environment disclosure on Linux follows the process's capabilities.** An earlier claim that
+  Landlock blocked `/proc/<pid>/environ` was checked in a root container and found false (D9). CI
+  on ordinary runners then showed it true: Landlock refuses ptrace-class access outside the domain,
+  and only `CAP_SYS_ADMIN` or `CAP_PERFMON` gets past it. The verdict is `Enforced` for an
+  unprivileged run and `Partial`, with the capability named, otherwise.
 - **`.formwork/` in the project for D3.** A per-user state directory would keep the root unsplit but
   make learned grants machine-local; the team workflow commits them.
 - **Accepted limitations.** Brokering a credential whose client verifies through Security.framework
@@ -960,7 +962,9 @@ revision under `read-mode = "closed"`, and the findings below cite them by role.
   write-subtract. The options are to narrow the row to the executable parts of that tree
   (`**/.claude/settings.json`, `**/.claude/hooks/**`) or to make the typed exclusion lift the
   matching write-subtract rows. This FEP recommends the first, since a typed exclusion that lifts
-  tamper protection widens what "exclude" means; the decision belongs with PR #28.
+  tamper protection widens what "exclude" means; the decision belongs with PR #28. *Resolved: PR
+  #28 landed the first, narrowing the row to `**/.claude/settings.json` and
+  `**/.claude/settings.local.json`.*
 
 ---
 
@@ -1004,8 +1008,8 @@ revision under `read-mode = "closed"`, and the findings below cite them by role.
   schema groups that expand per backend the way `desktop` does (`caches`, `toolchain`) would make
   unveil mode the reasonable default on a laptop. The same move this FEP makes for channels, and the
   recommended FEP-7 (FEP-6 took the egress engine).
-- **`any:` as the all-methods verb.** Closed by FEP-6 §9 (j): `allow:` admits every method,
-  inspected, and `tunnel:` replaces `https:` as the uninspected grade.
+- **`any:` as the all-methods verb.** Whether `https:` with a path should imply inspection instead,
+  which would drop `any:`; kept because it keeps the grade visible in the verb.
 
 ---
 
@@ -1023,7 +1027,7 @@ Conditional on the characterization suite confirming the **(characterize)** mark
 | Pathname AF_UNIX | unreachable (not mounted) | denied | mediated (supervisor) | Enforced (literals) |
 | Host-service channels | closed | partly (mach open) | closed under supervised connect, else `Partial` | closed; keychain lift is whole-channel |
 | Privileged interfaces | seccomp | not granted | seccomp | denied, IOKit allowlist |
-| Other processes' environment | hidden | open **(characterize)** | `Partial` by default; `Enforced` under `isolate` | blocked, default-on |
+| Other processes' environment | hidden | open **(characterize)** | `Enforced` unprivileged (Landlock); `Partial` with ptrace-class capabilities; `Enforced` under `isolate` | blocked, default-on |
 | Process visibility / IPC | namespaces | self-only signal/info | opt-in, namespaces | opt-in, filters |
 | Runs without user namespaces | no | n/a | yes, except `isolate` | n/a |
 | `explain` / `learn` for egress and channels | no | no | yes | yes |

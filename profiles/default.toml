@@ -21,15 +21,11 @@ env = { scrub = {} }
 
 # Reads: broadly allowed over the ambient environment, minus the compiled-in credential floor. On macOS this
 # is native `(allow default)` + deny holes; on Linux it is an enumerate-and-grant expansion at
-# enforce time (Landlock is allow-list only). See the plan §3.2.
+# enforce time (Landlock is allow-list only). See the plan §3.2. The ambient universe is a property
+# of `read-mode`, not a row: there is no `/**` read grant here, so a blueprint that extends this
+# profile and switches to `mode = "unveil"` gets a closed universe (FEP-5 D10).
 [fs]
 read-mode = "ambient-minus-subtract"
-
-# Reads still list the ambient roots explicitly: on Linux they seed the expansion, and they
-# document intent on both platforms.
-reads = [
-    "/**",
-]
 
 # Writable working set (FW-TRA5): the project and scratch areas. Callers should replace the project
 # path with their own. Everything else is read-only.

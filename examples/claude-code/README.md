@@ -9,20 +9,26 @@ egress become OS-enforced boundaries on the `claude` process and everything it s
 the prompts is no longer what's protecting you.
 
 ```sh
-formwork run --blueprint ./examples/blueprints/agent-session.toml -- \
+formwork run --blueprint ./examples/blueprints/claude-code.toml -- \
     claude --dangerously-skip-permissions
 ```
 
 `./sandbox-agent.sh` runs exactly this (and prints the enforced-capability report first). The blueprint
-grants writes to `~/project` + scratch, subtracts your credential/keychain/browser paths, and allows
-only HTTPS egress so the model API still works. Narrow `writes` to your actual repo before using it.
+grants writes to `~/project` + scratch and Claude's own `~/.claude`, subtracts your
+credential/keychain/browser paths, and reaches only the Anthropic hosts it names, through the session
+Gateway. The login flow opens your browser through the `open-url` channel. Narrow `writes` to your
+actual repo before using it. With an API key, use `claude-code-api-key.toml` instead: the key is
+brokered, so Claude sees a placeholder and the Gateway presents the real key to
+`api.anthropic.com` only.
 
 Notes:
 - `--dangerously-skip-permissions` refuses to run as **root**. `formwork run` doesn't elevate, so
   you stay an ordinary user behind the kernel wall — which is the isolated environment the flag is
   meant for.
-- Egress is port-scoped (`net = { ports = [443] }` = any HTTPS host), not host-scoped. The fs
-  sandbox — not an egress allowlist — is what stops secrets being read to exfiltrate.
+- Egress is host-scoped: a host the blueprint does not name is refused, and `formwork learn`
+  proposes the rule a run needed. On a Linux host without connect supervision, host rules are
+  refused before the run starts. Fall back to the port tier there (any HTTPS host):
+  `formwork run --blueprint ./examples/blueprints/agent-base.toml --net ports:443 --allow-cred claude --rule "readwrite:~/.claude/**" -- claude`.
 
 ## Axis B — stage an MCP config that routes servers through the gateway
 
@@ -78,7 +84,7 @@ Run Claude confined **and** route its MCP servers through the gateway — Axis A
 Axis B walls each tool server:
 
 ```sh
-formwork run --blueprint ./examples/blueprints/agent-session.toml -- \
+formwork run --blueprint ./examples/blueprints/claude-code.toml -- \
     claude --dangerously-skip-permissions \
            --strict-mcp-config --mcp-config ./examples/claude-code/mcp.json
 ```

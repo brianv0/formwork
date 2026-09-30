@@ -190,17 +190,24 @@ fn landlock_symlink_in_grant_does_not_escape() {
         return;
     }
     let fx = Fixture::new("symlink");
-    // A hole forces `root` to be split into its entries; a symlink to /etc rides among them.
-    std::os::unix::fs::symlink("/etc", fx.root.join("etclink")).unwrap();
+    // An ungranted target outside the fixture (`/etc` is a closed-mode essential since D11).
+    let outside = std::env::temp_dir().join(format!("fw-linux-symtarget-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir_all(&outside).unwrap();
+    let outside = fs::canonicalize(&outside).unwrap();
+    fs::write(outside.join("private.txt"), b"out of scope\n").unwrap();
+    // A hole forces `root` to be split into its entries; a symlink to the target rides among them.
+    std::os::unix::fs::symlink(&outside, fx.root.join("outlink")).unwrap();
     let policy = closed_policy(
         vec![pp(&fx.root)],
         vec![],
         vec![pp(&fx.root.join("secret"))],
     );
+    let escaped = run(&policy, cat(&fx.root.join("outlink/private.txt")));
+    let _ = fs::remove_dir_all(&outside);
     assert_ne!(
-        run(&policy, cat(&fx.root.join("etclink/hostname"))),
-        0,
-        "reading /etc through an in-grant symlink must be denied (no escape)"
+        escaped, 0,
+        "reading an ungranted directory through an in-grant symlink must be denied (no escape)"
     );
     assert_eq!(
         run(&policy, cat(&fx.granted_file())),
@@ -279,8 +286,8 @@ fn net_default_deny_blocks_udp() {
     );
 }
 
-/// FW-INV3 / FW-E2E-007 (Linux): under the direct TCP port tier, direct UDP/raw egress is denied --
-/// there is no direct-DNS hole. Landlock net governs TCP only, so the port tier pairs its per-port
+/// FW-INV3 / FW-E2E-007 / FW-ISO11 (Linux): under the direct TCP port tier, direct UDP/raw egress
+/// is denied -- there is no direct-DNS hole. Landlock net governs TCP only, so the port tier pairs its per-port
 /// TCP allow with a seccomp filter that denies inet DGRAM/RAW `socket(2)`; resolution then goes
 /// through the gateway, matching the egress-through-the-gateway model. This holds regardless of the
 /// reported tier fidelity, so the assertion is unconditional (both halves fail UDP closed):

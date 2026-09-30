@@ -315,6 +315,22 @@ impl<'de> Deserialize<'de> for PathPattern {
 }
 
 /// Idempotent and order-independent. O(n^2); scope sets are small.
+/// As [`canonicalize_set`], but a literal (single-file) absolute pattern survives even when a
+/// subtree covers it. Write grants use this: a literal write grant is also how a session grants a
+/// pathname socket (FW-ISO12), which a covering subtree grant deliberately does not do.
+pub fn canonicalize_write_set(patterns: &[PathPattern]) -> Vec<PathPattern> {
+    let mut out = canonicalize_set(patterns);
+    out.extend(
+        patterns
+            .iter()
+            .filter(|p| !p.is_subtree() && !p.is_any_depth())
+            .cloned(),
+    );
+    out.sort();
+    out.dedup();
+    out
+}
+
 pub fn canonicalize_set(patterns: &[PathPattern]) -> Vec<PathPattern> {
     let mut sorted = patterns.to_vec();
     sorted.sort();

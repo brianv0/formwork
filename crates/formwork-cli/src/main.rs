@@ -154,7 +154,13 @@ enum Cmd {
         /// Machine-readable JSON instead of the human rendering.
         #[arg(long)]
         json: bool,
-        /// Paths to explain. Sigils `~`/`$CWD` expand as in a grant; a bare relative path
+        /// Print the resolved host table: one host rule per line with its grade, methods, paths,
+        /// and the layer that wrote it (FW-FID11). (`--net` is the net-posture override every
+        /// blueprint-taking subcommand already accepts.)
+        #[arg(long)]
+        hosts: bool,
+        /// Paths to explain; a `scheme://` URL explains egress to it, and a channel or group name
+        /// (`clipboard`, `desktop`) explains that channel. Sigils `~`/`$CWD` expand as in a grant; a bare relative path
         /// resolves against the current directory, so `explain ./credentials` just works.
         paths: Vec<String>,
     },
@@ -219,11 +225,11 @@ impl BlueprintArgs {
     /// caller (`explain` with no path) that degrades to a host-only summary instead of erroring.
     fn try_resolve(&self) -> Result<Option<ResolvedBlueprint>> {
         let cwd = cwd()?;
-        Ok(blueprint_load::resolve_blueprint(
+        blueprint_load::resolve_blueprint(
             self.blueprint.as_deref(),
             std::path::Path::new(&cwd),
             &home(),
-        ))
+        )
     }
 
     /// Whether any override flag was given -- overrides without a base blueprint are an error,
@@ -329,8 +335,15 @@ impl BlueprintArgs {
             exec: None,
             env: None,
             mcp: Default::default(),
-            allow_credentials: self.allow_cred.clone(),
+            allow_credentials: self
+                .allow_cred
+                .iter()
+                .map(|c| formwork_blueprint::CredentialEntry::parse(c))
+                .collect(),
             discovery: Default::default(),
+            channels: None,
+            isolate: Vec::new(),
+            hosts: Vec::new(),
         })
     }
 }
@@ -431,6 +444,13 @@ fn init_telemetry() {
 }
 
 fn main() -> Result<()> {
+    // The isolation stage (FW-ISO10) is this binary re-executed by `run` before any thread starts;
+    // in every other process this returns `None` at once.
+    #[cfg(target_os = "linux")]
+    if let Some(code) = formwork_confine::isolation_stage() {
+        std::process::exit(code);
+    }
+    take_learning_report_fd();
     init_telemetry();
     let cli = parse_cli();
     let cmd = match &cli.command {
@@ -467,14 +487,7 @@ fn main() -> Result<()> {
             blueprint,
             confine_self,
             argv,
-        } => {
-            let posture = if confine_self {
-                Posture::Self_
-            } else {
-                Posture::Spawn
-            };
-            run(blueprint, argv, posture)?
-        }
+        } => run(blueprint, argv, confine_self)?,
         Cmd::Learn {
             blueprint,
             list,
@@ -539,8 +552,9 @@ fn main() -> Result<()> {
         Cmd::Explain {
             blueprint,
             json,
+            hosts,
             paths,
-        } => explain(blueprint, paths, json)?,
+        } => explain(blueprint, paths, json, hosts)?,
     }
     Ok(())
 }
@@ -579,7 +593,10 @@ fn attach_blueprint_info(value: &mut serde_json::Value, resolved: &ResolvedBluep
 /// policy-input write-protection) are not applied -- explain reflects the blueprint, not a run.
 /// With no path, summarizes the session instead: host capabilities plus the merged blueprint's
 /// fidelity report (host-only when no blueprint exists) -- the human door `detect`'s JSON never was.
-fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
+fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> Result<()> {
+    if hosts {
+        return explain_net(&args, json);
+    }
     if paths.is_empty() {
         return explain_summary(&args, json);
     }
@@ -590,10 +607,32 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
     let sigils = blueprint_load::Sigils::new(&home, &cwd);
     let catalog =
         ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
+    let host = detect();
+    // Channel verdicts come from the compiled report so the enforcement line is this host's.
+    let report = compile(&blueprint, &host, &catalog).report;
+    let landlock_withholds = host.os == formwork_detect::Os::Linux && host.landlock_abi.is_some();
     // Shape rides beside the verdict, not into the JSON: only the human door prints the lift hint,
     // the machine shape stays stable (FW-CRED7).
     let mut rows = Vec::new();
-    for path in &paths {
+    let mut channel_rows = Vec::new();
+    let mut url_rows = Vec::new();
+    for arg in &paths {
+        if arg.contains("://") {
+            url_rows.push(explain_url(&blueprint, &provenance, arg)?);
+            continue;
+        }
+        // Typed by shape (FW-FID11): a channel or group name is a channel, anything else a path.
+        if let Some(channel) = formwork_blueprint::Channel::from_name(arg) {
+            channel_rows.push(provenance.explain_channel(channel));
+            continue;
+        }
+        if let Some(group) = formwork_blueprint::ChannelGroup::from_name(arg) {
+            for channel in group.members() {
+                channel_rows.push(provenance.explain_channel(*channel));
+            }
+            continue;
+        }
+        let path = arg;
         // A bare relative path resolves against cwd here: blueprint rules stay absolute/sigil to be
         // location-independent, but `explain` is a live diagnostic, not a stored grant.
         let expanded = sigils.expand(path);
@@ -607,7 +646,7 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
         };
         let target =
             PathPattern::parse(&expanded).with_context(|| format!("explaining {path:?}"))?;
-        let floor = catalog.floor_type_of(&blueprint.allow_credentials, &target);
+        let floor = catalog.floor_type_of(&blueprint.exposed_credentials(), &target);
         let shape = floor
             .as_deref()
             .filter(|t| *t == formwork_blueprint::BACKSTOP)
@@ -618,12 +657,39 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
                     .find(|p| p.matches_path(target.base()))
                     .map(|p| p.to_string())
             });
-        let explanation = provenance.explain(&blueprint, target.base(), floor.clone());
+        let mut explanation = provenance.explain(&blueprint, target.base(), floor.clone());
+        // D2: on Linux a floor or tamper row that exists only in any-depth form is withheld, so
+        // the model verdict above is not what this kernel enforces.
+        if landlock_withholds {
+            let absolute_floor_hit = catalog
+                .denied_paths(&blueprint.exposed_credentials())
+                .iter()
+                .any(|p| !p.is_any_depth() && p.matches_path(target.base()));
+            if floor.is_some() && !absolute_floor_hit {
+                explanation.host_note = Some(
+                    "withheld on this host -- Landlock cannot root the any-depth floor row, so \
+                     this path is not denied by the kernel here (see `withheld` in the report)"
+                        .to_string(),
+                );
+            } else if provenance.write_subtract_only_any_depth(target.base()) {
+                explanation.host_note = Some(
+                    "write denial withheld on this host -- Landlock cannot root the any-depth \
+                     write-subtract row, so writes here are not denied by the kernel"
+                        .to_string(),
+                );
+            }
+        }
         rows.push((explanation, floor, shape));
     }
     if json {
         let explanations: Vec<_> = rows.iter().map(|(e, _, _)| e).collect();
         let mut value = serde_json::json!({ "explanations": explanations });
+        if !channel_rows.is_empty() {
+            value["channels"] = serde_json::to_value(&channel_rows)?;
+        }
+        if !url_rows.is_empty() {
+            value["egress"] = serde_json::to_value(&url_rows)?;
+        }
         attach_blueprint_info(&mut value, &resolved);
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
@@ -638,7 +704,165 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool) -> Result<()> {
                 print!("{}", render::floor_remedy(floor_type, shape.as_deref()));
             }
         }
+        for channel in &channel_rows {
+            print!("{}", render::channel_explanation(channel, &report));
+        }
+        for url in &url_rows {
+            print!("{}", render::egress_explanation(url));
+        }
     }
+    Ok(())
+}
+
+/// One URL's egress verdict (FW-FID11): the host's grade, which methods the path admits, the
+/// deciding rule and the layer that wrote it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct EgressExplanation {
+    pub url: String,
+    pub host: String,
+    pub port: u16,
+    /// `tunnel`, `inspected`, or `denied`.
+    pub grade: &'static str,
+    /// Per HTTP method on an inspected host: admitted or not, and the deciding rule.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<MethodVerdict>,
+    pub rule: Option<String>,
+    pub source: Option<formwork_blueprint::RuleSource>,
+    pub reason: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct MethodVerdict {
+    pub method: String,
+    pub admitted: bool,
+    pub rule: Option<String>,
+}
+
+fn explain_url(
+    blueprint: &Blueprint,
+    provenance: &formwork_blueprint::Provenance,
+    url: &str,
+) -> Result<EgressExplanation> {
+    use formwork_blueprint::{ConnectDecision, Denial, HttpMethod, RequestDecision};
+    let (raw_host, port, raw_path) =
+        formwork_blueprint::split_url(url).map_err(|e| anyhow!("explain: {e}"))?;
+    let host =
+        formwork_blueprint::canonicalize_host(raw_host).map_err(|e| anyhow!("{url}: {e}"))?;
+    let path = formwork_blueprint::canonicalize_request_path(raw_path)
+        .map_err(|e| anyhow!("{url}: {e}"))?;
+    let empty = formwork_blueprint::HostTable::default();
+    let table = blueprint.net.host_table().unwrap_or(&empty);
+    let source_of = |rule: Option<&formwork_blueprint::HostRule>| {
+        rule.and_then(|r| provenance.host_rule_source(r).cloned())
+    };
+    let mut out = EgressExplanation {
+        url: url.to_string(),
+        host: host.to_string(),
+        port,
+        grade: "denied",
+        methods: Vec::new(),
+        rule: None,
+        source: None,
+        reason: None,
+    };
+    if blueprint.net.host_table().is_none() {
+        out.reason = Some(match &blueprint.net {
+            formwork_blueprint::NetPosture::Ports(p) => format!(
+                "the net posture is a direct port tier ({p:?}): any host on those ports, no \
+                 Gateway, no host scoping"
+            ),
+            _ => "the net posture is deny: no egress at all".to_string(),
+        });
+        return Ok(out);
+    }
+    match table.decide_connect(&host, port) {
+        ConnectDecision::Tunnel(rule) => {
+            out.grade = "tunnel";
+            out.source = source_of(Some(rule));
+            out.rule = Some(rule.to_string());
+            out.reason = Some(
+                "admitted at CONNECT by host and port; the request itself is opaque (FW-EGR5)"
+                    .to_string(),
+            );
+        }
+        ConnectDecision::Inspect => {
+            out.grade = "inspected";
+            for m in HttpMethod::ALL {
+                let (admitted, rule) = match table.decide_request(&host, port, Some(m), &path) {
+                    RequestDecision::Allow(rule) => (true, Some(rule)),
+                    RequestDecision::Deny(Denial { rule, .. }) => (false, rule),
+                };
+                out.methods.push(MethodVerdict {
+                    method: m.atom().to_ascii_uppercase(),
+                    admitted,
+                    rule: rule.map(|r| r.to_string()),
+                });
+            }
+        }
+        ConnectDecision::Deny(Denial { reason, rule }) => {
+            out.source = source_of(rule);
+            out.rule = rule.map(|r| r.to_string());
+            out.reason = Some(reason);
+        }
+    }
+    Ok(out)
+}
+
+/// `explain --hosts` (FW-FID11): every host rule once, with its grade and the layer that wrote it.
+fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
+    let resolved = args.resolve()?;
+    let (blueprint, provenance) = args.load_with_provenance(&resolved.path, &home())?;
+    let rules: Vec<serde_json::Value> = blueprint
+        .net
+        .host_table()
+        .map(|t| t.rules.clone())
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let (grade, methods, path) = match &r.access {
+                formwork_blueprint::HostAccess::Tunnel => {
+                    ("tunnel", "(opaque)".to_string(), "(opaque)".to_string())
+                }
+                formwork_blueprint::HostAccess::Inspected { methods, path } => (
+                    "inspected",
+                    formwork_blueprint::HttpMethod::atoms(methods),
+                    path.as_str().to_string(),
+                ),
+                formwork_blueprint::HostAccess::Deny { path } => (
+                    "deny",
+                    "-".to_string(),
+                    path.as_ref()
+                        .map(|p| p.as_str().to_string())
+                        .unwrap_or_else(|| "(all)".into()),
+                ),
+            };
+            serde_json::json!({
+                "rule": r.to_string(),
+                "host": r.host.to_string(),
+                "port": r.port,
+                "grade": grade,
+                "methods": methods,
+                "paths": path,
+                "broker": serde_json::Value::Null,
+                "source": provenance.host_rule_source(r),
+                "layer": provenance.host_rule_source(r).map(render::source),
+            })
+        })
+        .collect();
+    if json {
+        let mut value = serde_json::json!({ "net": blueprint.net, "hosts": rules });
+        attach_blueprint_info(&mut value, &resolved);
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    println!(
+        "blueprint: {} ({})",
+        resolved.path.display(),
+        resolved.source.as_str()
+    );
+    print!("{}", render::net_table(&blueprint.net, &rules));
     Ok(())
 }
 
@@ -697,11 +921,6 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-enum Posture {
-    Spawn,
-    Self_,
-}
-
 /// `exit_code=1`, never Rust's `Some(1)`; a signal death is named, not `None`.
 fn log_exit(what: &'static str, status: &std::process::ExitStatus) {
     match status.code() {
@@ -723,11 +942,186 @@ struct Session {
     /// The resolved blueprint file this session was built from (flag or discovered FORMWORK.toml);
     /// `learn` derives the proposal/discovered-layer paths from it.
     blueprint_path: PathBuf,
+    /// The per-session temporary directory (FW-TRA10), removed when the spawned child exits.
+    tmp_dir: SessionTmp,
+    /// The Gateway egress listener, when the blueprint carries host rules (FW-EGR14).
+    egress: Option<Egress>,
+    /// Variables the Launcher sets for inspection and brokering: the trust-bundle variables
+    /// (FW-EGR13) and each brokered credential's placeholder (FW-CRED14).
+    egress_env: Vec<(String, String)>,
+    /// The opener shim and its socket (FW-ISO17), in the spawn posture.
+    opener: Option<OpenerSetup>,
+    /// The host this session was compiled for; `learn` maps refused sockets to channels by it.
+    host: HostProfile,
+    /// Pathname sockets the connect supervisor refused (FW-DISC12).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    refused_sockets: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
 }
 
-fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
+/// A host-scoped session's egress door: the in-process Gateway listener and, on Linux, the port
+/// registry the connect supervisor fills (FW-EGR9).
+struct Egress {
+    proxy: formwork_gateway::EgressProxy,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    registry: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>>,
+}
+
+/// What a session is prepared for: which postures can carry host-scoped egress differs (FEP-5
+/// §3.1 -- only the spawn posture leaves a process outside the sandbox to host the Gateway).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Spawn,
+    ConfineSelf,
+    GatewayBackend,
+}
+
+/// A per-session secret from the kernel's CSPRNG, hex-encoded.
+fn session_nonce() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 24];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("reading /dev/urandom for the session credential")?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The Launcher-owned per-session temporary directory (FW-TRA9/FW-TRA10). Created 0700 beneath the
+/// host temp root (`$TMPDIR` on macOS is the per-user `DARWIN_USER_TEMP_DIR`), granted read-write
+/// in every read mode, and exported as `TMPDIR`/`TMP`/`TEMP` to the confined child.
+struct SessionTmp {
+    path: PathBuf,
+    /// Launcher-owned read-only directories beside `path` (FW-TRA9): the inspection trust bundle
+    /// and the opener shim. Siblings, never inside `path`: the session may write its temp
+    /// directory, and a writable bundle or shim would let it trust a CA or run code of its own.
+    siblings: Vec<PathBuf>,
+}
+
+impl SessionTmp {
+    fn create() -> Result<SessionTmp> {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path = root.join(format!(
+            "formwork-session-{}-{nanos:08x}",
+            std::process::id()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .with_context(|| format!("creating the session temp directory {}", path.display()))?;
+        let path = std::fs::canonicalize(&path).context("resolving the session temp directory")?;
+        Ok(SessionTmp {
+            path,
+            siblings: Vec::new(),
+        })
+    }
+
+    /// A fresh 0700 sibling directory `<path>-<suffix>`, removed with the session.
+    fn sibling(&mut self, suffix: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(format!("-{suffix}"));
+        let dir = PathBuf::from(name);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("creating the session directory {}", dir.display()))?;
+        self.siblings.push(dir.clone());
+        Ok(dir)
+    }
+
+    fn remove(&self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+        for dir in &self.siblings {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Write a Launcher-owned file, created fresh with `mode`.
+fn write_launcher_file(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    std::io::Write::write_all(&mut f, bytes).with_context(|| format!("writing {}", path.display()))
+}
+
+/// FW-TRA9: grant a Launcher-owned directory readable (and, for the shim, executable under an
+/// exec allowlist) in every read mode, and write-protect it: it sits under the host temp root,
+/// which a profile commonly grants writable.
+fn grant_launcher_dir(
+    blueprint: &mut Blueprint,
+    dir: &std::path::Path,
+    executable: bool,
+) -> Result<()> {
+    let rendered = dir
+        .to_str()
+        .ok_or_else(|| anyhow!("session directory is not valid UTF-8 (FW-INV6)"))?;
+    let subtree =
+        PathPattern::parse(&format!("{rendered}/**")).context("granting a session directory")?;
+    blueprint.fs.reads.push(subtree.clone());
+    blueprint
+        .fs
+        .write_subtract
+        .push(PathPattern::parse(rendered).context("write-protecting a session directory")?);
+    blueprint.fs.write_subtract.push(subtree.clone());
+    if executable {
+        if let formwork_blueprint::ExecPosture::Allowlist(allowed) = &mut blueprint.exec {
+            allowed.push(subtree);
+        }
+    }
+    Ok(())
+}
+
+/// The opener shim (FW-ISO17): a read-only directory first in `PATH`, and the socket its scripts
+/// write URLs to. The host end is served after the spawn (FW-ISO18).
+struct OpenerSetup {
+    dir: PathBuf,
+    /// Served from this process once the workload is spawned.
+    host_end: Option<std::os::unix::net::UnixStream>,
+    /// The workload's copy, dropped here once it has inherited it.
+    session_end: Option<std::os::fd::OwnedFd>,
+    /// `session_end`'s number, which the workload's environment names.
+    session_fd: std::os::fd::RawFd,
+    service: Option<formwork_gateway::OpenerService>,
+}
+
+fn prepare_opener(blueprint: &mut Blueprint, tmp: &mut SessionTmp) -> Result<OpenerSetup> {
+    use std::os::fd::AsRawFd;
+    let dir = tmp.sibling("opener")?;
+    let script = formwork_gateway::opener::shim_script(
+        blueprint
+            .channels
+            .lifted(formwork_blueprint::Channel::OpenUrl),
+    );
+    for name in formwork_gateway::opener::SHIM_NAMES {
+        write_launcher_file(&dir.join(name), script.as_bytes(), 0o500)?;
+    }
+    grant_launcher_dir(blueprint, &dir, true)?;
+    tracing::info!(shim = %dir.display(), "opener shim first in PATH and BROWSER (FW-ISO17)");
+    let (host_end, session_end) =
+        std::os::unix::net::UnixStream::pair().context("creating the opener socket")?;
+    let session_end = std::os::fd::OwnedFd::from(session_end);
+    Ok(OpenerSetup {
+        dir,
+        host_end: Some(host_end),
+        session_fd: session_end.as_raw_fd(),
+        session_end: Some(session_end),
+        service: None,
+    })
+}
+
+fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) -> Result<Session> {
     let resolved = args.resolve()?;
     let mut blueprint = args.load(&resolved.path, &home())?;
+    refuse_unavailable_isolation(&blueprint, &host, purpose)?;
     let catalog =
         ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
     // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
@@ -737,13 +1131,31 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
         .subtract
         .extend(blueprint_load::env_file_ref_denies(
             &catalog,
-            &blueprint.allow_credentials,
+            &blueprint.exposed_credentials(),
         )?);
     // The policy inputs are write-denied inside the session: a confined agent must not be able
     // to edit the blueprint, forge the discovered layer, or doctor the proposal that shapes its
     // own NEXT run (FW-XR8 / FW-INV8). Keys off the RESOLVED path, so a discovered FORMWORK.toml
     // is protected exactly like an explicit one.
     blueprint_load::protect_policy_inputs(&mut blueprint, &resolved.path)?;
+    announce_split_root(&blueprint, &resolved.path, &host);
+    // FW-TRA9/FW-TRA10: the Launcher-owned temporary directory is a write grant in every read mode.
+    let tmp_dir = SessionTmp::create()?;
+    let tmp_rendered = tmp_dir
+        .path
+        .to_str()
+        .ok_or_else(|| anyhow!("session temp directory is not valid UTF-8 (FW-INV6)"))?;
+    blueprint.fs.writes.push(
+        PathPattern::parse(&format!("{tmp_rendered}/**"))
+            .context("granting the session temp directory")?,
+    );
+    tracing::info!(tmp = %tmp_dir.path.display(), "session temp directory (TMPDIR/TMP/TEMP)");
+    let mut tmp_dir = tmp_dir;
+    let tls = prepare_inspection(&mut blueprint, &catalog, &mut tmp_dir, purpose)?;
+    let opener = match purpose {
+        Purpose::Spawn => Some(prepare_opener(&mut blueprint, &mut tmp_dir)?),
+        Purpose::ConfineSelf | Purpose::GatewayBackend => None,
+    };
     // Resolve symlinks in grant paths so the kernel's resolved-path matching lines up (macOS
     // firmlinks). Enforcement path only, never dry-run. Fails loud on a path that can't be
     // faithfully rendered (FW-INV6). The catalog's paths get the same treatment -- a floor hole
@@ -752,48 +1164,520 @@ fn prepare_session(args: &BlueprintArgs) -> Result<Session> {
         .context("canonicalizing grant paths")?;
     let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
         .context("canonicalizing credential catalog paths")?;
-    let host = detect();
-    let policy = compile(&blueprint, &host, &catalog);
+    let (egress_env, inspection, brokers) = match tls {
+        Some(t) => (t.env, Some(t.inspection), t.brokers),
+        None => (Vec::new(), None, Vec::new()),
+    };
+    let egress = start_egress(&blueprint, &host, purpose, inspection, brokers)?;
+    let gateway_port = egress.as_ref().map(|e| e.proxy.addr().port());
+    let policy = formwork_compile::compile_for_session(&blueprint, &host, &catalog, gateway_port);
     itemize_credential_floor(&policy.report, &catalog);
     Ok(Session {
         blueprint,
         catalog,
         policy,
         blueprint_path: resolved.path,
+        tmp_dir,
+        egress,
+        egress_env,
+        opener,
+        host,
+        refused_sockets: Default::default(),
     })
 }
 
+/// FW-ISO18: serve the opener socket from this process, outside the sandbox.
+fn start_opener(opener: &mut OpenerSetup, lifted: bool) {
+    let Some(host_end) = opener.host_end.take() else {
+        return;
+    };
+    let host_opener = std::env::var_os("FORMWORK_HOST_OPENER")
+        .map(PathBuf::from)
+        .unwrap_or_else(formwork_gateway::opener::host_opener);
+    match formwork_gateway::OpenerService::start(host_end, lifted, host_opener) {
+        Ok(service) => opener.service = Some(service),
+        Err(e) => tracing::warn!(error = %e, "the open-url service failed to start"),
+    }
+}
+
+/// What inspection and brokering add to a session.
+struct PreparedInspection {
+    inspection: formwork_gateway::Inspection,
+    brokers: Vec<formwork_gateway::Broker>,
+    env: Vec<(String, String)>,
+}
+
+/// Clients that honor one of these read the trust bundle; the list is the common set across
+/// OpenSSL, Node, Python requests, curl, git, and pip (FW-EGR13).
+const TRUST_VARS: &[&str] = &[
+    "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "PIP_CERT",
+];
+
+/// FW-EGR13 / FW-CRED11-14: when any host rule is inspected, mint the session CA, write the trust
+/// bundle (the CA plus the host's roots, so uninspected tunnels still verify) into a read-only
+/// directory the session may read, and resolve each brokered credential's secret on this side of
+/// the sandbox. A brokered credential with no value is refused before spawn (FW-XR9): the
+/// workload would otherwise start and fail on its first request.
+fn prepare_inspection(
+    blueprint: &mut Blueprint,
+    catalog: &ResolvedCatalog,
+    tmp: &mut SessionTmp,
+    purpose: Purpose,
+) -> Result<Option<PreparedInspection>> {
+    let Some(table) = blueprint.net.host_table() else {
+        return Ok(None);
+    };
+    if purpose != Purpose::Spawn || !table.rules.iter().any(|r| r.is_inspected()) {
+        return Ok(None);
+    }
+    let plans =
+        formwork_blueprint::resolve_brokers(&blueprint.allow_credentials, catalog, Some(table))
+            .map_err(|errors| anyhow!("allow-credentials:\n  {}", errors.join("\n  ")))?;
+    let ca = formwork_gateway::SessionCa::generate().context("generating the session CA")?;
+    let roots = formwork_gateway::native_roots();
+    let trust_dir = tmp.sibling("trust")?;
+    let file = trust_dir.join("ca-bundle.pem");
+    write_launcher_file(&file, ca.trust_bundle(&roots).as_bytes(), 0o400)?;
+    grant_launcher_dir(blueprint, &trust_dir, false)?;
+    let file = file.display().to_string();
+    let mut env: Vec<(String, String)> = TRUST_VARS
+        .iter()
+        .map(|v| (v.to_string(), file.clone()))
+        .collect();
+    tracing::info!(bundle = %file, "inspection trust bundle");
+
+    let mut brokers = Vec::new();
+    for plan in plans {
+        let Some((var, secret)) = plan.env_sources.iter().find_map(|v| {
+            std::env::var(v)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| (v, s))
+        }) else {
+            bail!(
+                "{} is brokered, but none of its variables is set here ({}); set one, or drop \
+                  `broker:{}` from allow-credentials",
+                plan.name,
+                plan.env_sources.join(", "),
+                plan.name
+            );
+        };
+        let placeholder = format!("fwcred-{}-{}", plan.name, session_nonce()?);
+        tracing::info!(credential = %plan.name, var = %var, "brokered; the session holds a placeholder");
+        env.push((var.clone(), placeholder.clone()));
+        brokers.push(formwork_gateway::Broker {
+            name: plan.name,
+            placeholder,
+            secret,
+            bindings: plan.bindings,
+        });
+    }
+    Ok(Some(PreparedInspection {
+        inspection: formwork_gateway::Inspection::new(std::sync::Arc::new(ca), &roots),
+        brokers,
+        env,
+    }))
+}
+
+/// FW-EGR14: a blueprint with host rules gets its Gateway egress listener here, in the `formwork`
+/// process that stays outside the sandbox. Refused before the workload starts wherever it cannot
+/// be carried (FW-XR9): under confine-self, behind the MCP gateway, and on a Linux host without
+/// connect supervision.
+fn start_egress(
+    blueprint: &Blueprint,
+    host: &HostProfile,
+    purpose: Purpose,
+    inspection: Option<formwork_gateway::Inspection>,
+    brokers: Vec<formwork_gateway::Broker>,
+) -> Result<Option<Egress>> {
+    let Some(table) = blueprint.net.host_table() else {
+        return Ok(None);
+    };
+    match purpose {
+        Purpose::Spawn => {}
+        Purpose::ConfineSelf => bail!(
+            "host rules route egress through the Gateway, which runs in the `formwork` process \
+             outside the sandbox; `run --confine-self` leaves no such process. Use the spawn \
+             posture (`formwork run -- …`)"
+        ),
+        Purpose::GatewayBackend => bail!(
+            "host rules apply to `formwork run`; an MCP backend behind `formwork gateway` takes \
+             `net = \"deny\"` or a port tier"
+        ),
+    }
+    if host.os == formwork_detect::Os::Linux && !host.can_supervise_connect() {
+        bail!(
+            "host rules need connect supervision, which this host lacks: {}. Alternatives: \
+             `net = {{ ports = [443] }}` (any host on the port), or `net = \"deny\"`",
+            formwork_detect::CONNECT_SUPERVISION_NEEDS
+        );
+    }
+    let registry = (host.os == formwork_detect::Os::Linux)
+        .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())));
+    let proxy = formwork_gateway::EgressProxy::start(formwork_gateway::EgressConfig {
+        table: table.clone(),
+        resolver: formwork_gateway::Resolver::System,
+        admission: formwork_gateway::Admission {
+            credential: session_nonce()?,
+            registry: registry.clone(),
+        },
+        inspection,
+        brokers,
+    })
+    .context("starting the Gateway egress listener")?;
+    for rule in &table.rules {
+        tracing::info!(rule = %rule, "egress host rule");
+    }
+    Ok(Some(Egress { proxy, registry }))
+}
+
+/// Variables the Launcher sets after the posture ran (FW-TRA10, FEP-5 §3.1): the session temp
+/// directory and, under host rules, the proxy that reaches the Gateway.
+fn session_env(session: &Session) -> Vec<(String, String)> {
+    let tmp = session.tmp_dir.path.display().to_string();
+    let mut vars: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
+        .iter()
+        .map(|v| (v.to_string(), tmp.clone()))
+        .collect();
+    if let Some(egress) = &session.egress {
+        let url = egress.proxy.proxy_url();
+        for var in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            if std::env::var_os(var).is_some() {
+                tracing::info!(
+                    var,
+                    "overriding an inherited proxy variable with the session Gateway"
+                );
+            }
+            vars.push((var.to_string(), url.clone()));
+        }
+        for var in ["NO_PROXY", "no_proxy"] {
+            vars.push((var.to_string(), String::new()));
+        }
+    }
+    vars.extend(session.egress_env.iter().cloned());
+    if let Some(opener) = &session.opener {
+        // `PATH` is prefixed with the shim directory in `apply_env`, over the posture's own value.
+        let shim = opener.dir.display().to_string();
+        vars.push(("BROWSER".to_string(), format!("{shim}/xdg-open")));
+        vars.push((
+            formwork_gateway::opener::OPENER_FD_ENV.to_string(),
+            opener.session_fd.to_string(),
+        ));
+    }
+    vars
+}
+
+/// FW-XR10: the workload's status; a signal death is 128 + the signal, as a shell reports it.
+fn exit_code(status: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
+/// FW-XR11: a Formwork failure after the workload started exits 125 with one attributed line on
+/// stderr; stdout stays the workload's.
+fn formwork_failure(what: &str) -> ! {
+    eprintln!("formwork: {what}");
+    std::process::exit(125);
+}
+
+/// FW-XR9: an isolation member the host cannot provide is refused before the workload starts,
+/// naming every alternative, never run weaker than the blueprint asked (FW-INV6).
+fn refuse_unavailable_isolation(
+    blueprint: &Blueprint,
+    host: &HostProfile,
+    purpose: Purpose,
+) -> Result<()> {
+    if blueprint.isolate.is_empty() || host.os != formwork_detect::Os::Linux {
+        return Ok(());
+    }
+    let members: Vec<&str> = blueprint.isolate.iter().map(|m| m.name()).collect();
+    if !host.user_namespaces {
+        bail!(
+            "isolate = {members:?} needs unprivileged user namespaces that can mount a fresh \
+             /proc, which this host does not allow. Alternatives: on Ubuntu 24.04 lift the \
+             AppArmor restriction with `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`; \
+             check `user.max_user_namespaces` is non-zero; run formwork under bwrap, which \
+             provides the namespaces itself; or drop the member from `isolate`"
+        );
+    }
+    match purpose {
+        Purpose::Spawn => Ok(()),
+        Purpose::ConfineSelf => bail!(
+            "isolate = {members:?} creates namespaces around the workload, which needs the spawn \
+             posture (`formwork run -- …`); `run --confine-self` execs in place. Use the spawn \
+             posture, or drop the member from `isolate`"
+        ),
+        Purpose::GatewayBackend => bail!(
+            "isolate = {members:?} applies to `formwork run`; an MCP backend behind `formwork \
+             gateway` runs without the isolation tier. Drop the member from `isolate`"
+        ),
+    }
+}
+
+/// FEP-5 D3: a FORMWORK.toml inside a writable grant is write-protected, which splits the grant
+/// around it; on Linux the split directory cannot be granted whole, so new files cannot be created
+/// directly in it. Say so, and name the layout that avoids it.
+fn announce_split_root(
+    blueprint: &Blueprint,
+    blueprint_path: &std::path::Path,
+    host: &HostProfile,
+) {
+    if host.os != formwork_detect::Os::Linux {
+        return;
+    }
+    let Some(dir) = blueprint_path.parent() else {
+        return;
+    };
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if dir.ends_with(".formwork") {
+        return;
+    }
+    let probe = dir.join(".formwork-split-probe");
+    if blueprint.fs.writes.iter().any(|w| w.matches_path(&probe)) {
+        tracing::info!(
+            dir = %dir.display(),
+            "the blueprint is write-protected inside a writable grant, which splits {} on Linux: \
+             files that exist stay writable, but new files cannot be created directly in it. \
+             Move the blueprint to {} to keep the root whole",
+            dir.display(),
+            blueprint_load::DOTDIR_BLUEPRINT
+        );
+    }
+}
+
 fn spawn_confined_child(
-    session: &Session,
+    session: &mut Session,
     program: &str,
     args: &[String],
 ) -> Result<std::process::ExitStatus> {
-    let mut command = Command::new(program);
-    command.args(args);
-    apply_env(&mut command, &session.blueprint, &session.catalog);
+    #[cfg(target_os = "linux")]
+    let isolated = !session.blueprint.isolate.is_empty();
+    #[cfg(not(target_os = "linux"))]
+    let isolated = false;
+    // Under the isolation tier the spawned process is this binary as the isolation stage, which
+    // execs the workload inside the namespaces (FW-ISO10); it carries the workload's environment.
+    let mut command = if isolated {
+        Command::new("/proc/self/exe")
+    } else {
+        let mut c = Command::new(program);
+        c.args(args);
+        c
+    };
+    apply_env(
+        &mut command,
+        &session.blueprint,
+        &session.catalog,
+        &session_env(session),
+        session.opener.as_ref().map(|o| o.dir.as_path()),
+    );
+    #[cfg(target_os = "linux")]
+    let pending = if isolated {
+        let argv: Vec<String> = std::iter::once(program.to_string())
+            .chain(args.iter().cloned())
+            .collect();
+        formwork_confine::spawn_isolated(
+            &mut command,
+            &argv,
+            &session.policy,
+            Some(&session.tmp_dir.path),
+        )
+        .context("applying confinement with the isolation tier")?
+    } else {
+        formwork_confine::spawn_confined_supervised(&mut command, &session.policy)
+            .context("applying confinement")?
+    };
+    #[cfg(not(target_os = "linux"))]
     formwork_confine::spawn_confined(&mut command, &session.policy)
         .context("applying confinement")?;
+    if let Some(opener) = &session.opener {
+        // The session holds the descriptor open until after the spawn.
+        formwork_confine::inherit_fd(&mut command, opener.session_fd);
+    }
     tracing::info!(program = %program, "spawning confined command");
-    let status = command.status().context("spawning confined command")?;
+    let child = command.spawn();
+    let lifted = session
+        .blueprint
+        .channels
+        .lifted(formwork_blueprint::Channel::OpenUrl);
+    if let Some(opener) = &mut session.opener {
+        // The session holds the only copies now; EOF arrives when its last process exits.
+        opener.session_end = None;
+        if child.is_ok() {
+            start_opener(opener, lifted);
+        }
+    }
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            session.tmp_dir.remove();
+            return Err(e).context("spawning confined command");
+        }
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(pending) = pending {
+        let Some(egress) = &session.egress else {
+            let _ = child.kill();
+            formwork_failure("the policy needs the connect supervisor but no Gateway is running");
+        };
+        let unix_grants = match &session.policy.confiner {
+            formwork_compile::ConfinerPolicy::Linux(l) => l.unix_socket_grants.clone(),
+            _ => Vec::new(),
+        };
+        let config = formwork_confine::SupervisorConfig {
+            gateway: egress.proxy.addr(),
+            registry: egress.registry.clone().unwrap_or_default(),
+            unix_grants,
+            refused_sockets: session.refused_sockets.clone(),
+        };
+        if let Err(e) = pending.start(config) {
+            let _ = child.kill();
+            let _ = child.wait();
+            session.tmp_dir.remove();
+            formwork_failure(&format!("the connect supervisor failed to start: {e}"));
+        }
+    }
+    let status = child.wait();
+    session.tmp_dir.remove();
+    let status = status.context("waiting for the confined command")?;
     log_exit("confined command exited", &status);
+    if let Some(egress) = &session.egress {
+        if !egress.proxy.is_alive() {
+            formwork_failure("the Gateway egress listener stopped during the session");
+        }
+    }
     Ok(status)
 }
 
-fn run(blueprint: BlueprintArgs, argv: Vec<String>, posture: Posture) -> Result<()> {
-    let session = prepare_session(&blueprint)?;
-    let (program, args) = argv.split_first().expect("argv is required");
-    match posture {
-        Posture::Spawn => {
-            let status = spawn_confined_child(&session, program, args)?;
-            std::process::exit(status.code().unwrap_or(1));
-        }
-        Posture::Self_ => {
-            formwork_confine::enforce_self(&session.policy).context("confining self")?;
-            tracing::info!(program = %program, "exec after confine-self");
-            let err = exec_replace(program, args, &session.blueprint, &session.catalog);
-            bail!("exec failed after confine-self: {err}");
+/// The descriptor a Linux `learn` handed this `run` for its observations (FW-DISC12), taken
+/// from the environment before anything else reads it, so no workload inherits it.
+static LEARNING_REPORT_FD: std::sync::OnceLock<std::os::fd::RawFd> = std::sync::OnceLock::new();
+
+fn take_learning_report_fd() {
+    let Some(raw) = std::env::var_os(learn::REPORT_FD_ENV) else {
+        return;
+    };
+    // Single-threaded here: telemetry and every runtime start after this.
+    std::env::remove_var(learn::REPORT_FD_ENV);
+    let Some(fd) = raw
+        .to_str()
+        .and_then(|s| s.parse::<std::os::fd::RawFd>().ok())
+    else {
+        return;
+    };
+    // SAFETY: F_SETFD on a descriptor the learning parent handed us; the workload must not
+    // inherit it.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0 {
+        let _ = LEARNING_REPORT_FD.set(fd);
+    }
+}
+
+/// What this session was refused beyond paths (FW-DISC12): the Gateway's policy refusals, the
+/// opener's `open-url` refusals, and pathname sockets the supervisor refused, mapped onto the
+/// channels whose facilities `detect` found. The keyring's sockets are a credential type, not a
+/// channel, so they are withheld rather than proposed.
+fn session_observations(session: &Session) -> learn::SessionObservations {
+    use formwork_blueprint::Channel;
+    let mut obs = learn::SessionObservations::default();
+    if let Some(egress) = &session.egress {
+        obs.egress = egress
+            .proxy
+            .violations()
+            .into_iter()
+            .filter_map(|v| v.need)
+            .collect();
+    }
+    if let Some(service) = session.opener.as_ref().and_then(|o| o.service.as_ref()) {
+        // Unlifted, every URL is refused for the channel alone (FW-DISC12).
+        let records = service.records_within(std::time::Duration::from_millis(500));
+        if !session.blueprint.channels.lifted(Channel::OpenUrl) && !records.is_empty() {
+            obs.channels.push(Channel::OpenUrl.name().to_string());
         }
     }
+    let f = &session.host.facilities;
+    let refused = session
+        .refused_sockets
+        .lock()
+        .map(|r| r.clone())
+        .unwrap_or_default();
+    for path in refused {
+        let p = path.display().to_string();
+        let is = |candidate: &Option<String>| candidate.as_deref() == Some(p.as_str());
+        let channel = if is(&f.keyring) {
+            obs.withheld.push((
+                p.clone(),
+                "the keyring is a credential type; lift it with allow-credentials = \
+                 [\"os-keyring\"]"
+                    .to_string(),
+            ));
+            None
+        } else if is(&f.session_bus) || is(&f.user_manager) {
+            Some(Channel::RunOutside)
+        } else if f.display.contains(&p) {
+            Some(Channel::Clipboard)
+        } else if is(&f.audio) {
+            Some(Channel::Microphone)
+        } else {
+            None
+        };
+        if let Some(c) = channel {
+            obs.channels.push(c.name().to_string());
+        }
+    }
+    obs
+}
+
+/// Hand this session's observations to the Linux `learn` that spawned it, if one did.
+fn report_to_learning_run(session: &Session) {
+    let Some(&fd) = LEARNING_REPORT_FD.get() else {
+        return;
+    };
+    use std::os::fd::FromRawFd;
+    // SAFETY: the descriptor was handed to this process for exactly this write; it is owned here.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let body = serde_json::to_vec(&session_observations(session)).unwrap_or_default();
+    if let Err(e) = std::io::Write::write_all(&mut file, &body) {
+        tracing::warn!(error = %e, "could not report observations to the learning run");
+    }
+}
+
+fn run(blueprint: BlueprintArgs, argv: Vec<String>, confine_self: bool) -> Result<()> {
+    let purpose = if confine_self {
+        Purpose::ConfineSelf
+    } else {
+        Purpose::Spawn
+    };
+    let mut session = prepare_session(&blueprint, purpose, detect())?;
+    let (program, args) = argv.split_first().expect("argv is required");
+    if !confine_self {
+        let status = spawn_confined_child(&mut session, program, args)?;
+        report_to_learning_run(&session);
+        std::process::exit(exit_code(&status));
+    }
+    formwork_confine::enforce_self(&session.policy).context("confining self")?;
+    tracing::info!(program = %program, "exec after confine-self");
+    // The session temp directory outlives an exec in place: no launcher remains to remove it.
+    let err = exec_replace(
+        program,
+        args,
+        &session.blueprint,
+        &session.catalog,
+        &session_env(&session),
+    );
+    bail!("exec failed after confine-self: {err}");
 }
 
 /// Which denial feed this host carries (FW-XR6 parity on the discovery axis), or -- as the error
@@ -861,24 +1745,25 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
         Ok(feed) => feed,
         Err(_) => {
             // --observe-anyway: enforced run, loudly observation-free, no proposal (FW-E2E-062).
-            let session = prepare_session(&blueprint)?;
+            let mut session = prepare_session(&blueprint, Purpose::Spawn, host.clone())?;
             let (program, args) = argv.split_first().expect("argv is non-empty");
-            let status = spawn_confined_child(&session, program, args)?;
+            let status = spawn_confined_child(&mut session, program, args)?;
             tracing::warn!(
                 "--observe-anyway: ran enforced, but this host has no denial feed -- no proposal was written (FW-INV5: reported, not pretended)"
             );
-            std::process::exit(status.code().unwrap_or(1));
+            std::process::exit(exit_code(&status));
         }
     };
     match feed {
         DenialFeed::MacosUnifiedLog => {
-            let session = prepare_session(&blueprint)?;
+            let mut session = prepare_session(&blueprint, Purpose::Spawn, host.clone())?;
             tracing::info!(
                 "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
             );
             let started = std::time::Instant::now();
             let (program, args) = argv.split_first().expect("argv is non-empty");
-            let status = spawn_confined_child(&session, program, args)?;
+            let status = spawn_confined_child(&mut session, program, args)?;
+            let observations = session_observations(&session);
             let records = learn::collect_denials_quiescent(started)?;
             learn::conclude_learning_run(
                 &session.blueprint,
@@ -886,9 +1771,10 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
                 &session.catalog,
                 &run_id,
                 records,
+                &observations,
                 &status,
             )?;
-            std::process::exit(status.code().unwrap_or(1));
+            std::process::exit(exit_code(&status));
         }
         DenialFeed::LinuxPtrace(strace) => learn_run_linux(strace, &blueprint, &argv, &run_id),
     }
@@ -934,14 +1820,47 @@ fn learn_run_linux(
         .arg(&trace_path)
         .arg("--")
         .arg(&current_exe)
-        .args(["run", "--confine-self", "--blueprint"])
+        // Host rules need the spawn posture's Gateway and supervisor outside the sandbox, and the
+        // isolation tier its stage; the tracer follows the spawned child the same way it follows
+        // a confine-self exec.
+        .args(
+            if loaded.net.host_table().is_some() || !loaded.isolate.is_empty() {
+                &["run", "--blueprint"][..]
+            } else {
+                &["run", "--confine-self", "--blueprint"][..]
+            },
+        )
         .arg(&resolved.path)
         .args(args.forward_overrides())
         .arg("--")
         .args(argv);
+    // FW-DISC12: the shim's Gateway, opener and supervisor report over a pipe it inherits.
+    let (report_read, report_write) =
+        cloexec_pipe().context("creating the learning report pipe")?;
+    let report_fd = {
+        use std::os::fd::AsRawFd;
+        report_write.as_raw_fd()
+    };
+    command.env(learn::REPORT_FD_ENV, report_fd.to_string());
+    // `report_write` stays open until the spawn returns.
+    formwork_confine::inherit_fd(&mut command, report_fd);
+    let reader = std::thread::spawn(move || {
+        let mut body = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut &report_read, &mut body);
+        body
+    });
     tracing::info!(tracer = %strace.display(), "spawning the workload under the ptrace denial feed");
-    let status = command.status().context("spawning strace")?;
+    let status = command.status();
+    drop(command);
+    drop(report_write);
+    let status = status.context("spawning strace")?;
     log_exit("traced workload exited", &status);
+    let observations: learn::SessionObservations = reader
+        .join()
+        .ok()
+        .filter(|b| !b.is_empty())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
 
     let trace = std::fs::read_to_string(&trace_path)
         .with_context(|| format!("reading the strace log {}", trace_path.display()))?;
@@ -954,9 +1873,35 @@ fn learn_run_linux(
         &catalog,
         run_id,
         records,
+        &observations,
         &status,
     )?;
-    std::process::exit(status.code().unwrap_or(1));
+    std::process::exit(exit_code(&status));
+}
+
+/// A close-on-exec pipe, read end first (`std::io::pipe` postdates the MSRV, and macOS has no
+/// `pipe2`). Created before any child is spawned from this thread.
+fn cloexec_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe writes two descriptors into `fds`; both are owned below.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fresh descriptors from pipe, owned from here on.
+    let (read, write) = unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    };
+    for fd in fds {
+        // SAFETY: F_SETFD on a descriptor owned above.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok((read, write))
 }
 
 /// The operator channel's compile-time itemization (FW-CRED7). The full roll-call is identical
@@ -1009,16 +1954,40 @@ fn itemize_credential_floor(report: &formwork_compile::FidelityReport, catalog: 
 /// strip partitions first (FW-CRED2/4), then the posture (FW-ENV1/2). Impure -- it reads the real
 /// process environment -- so it lives in the CLI shell; the decision itself is the pure
 /// `construct_env`. Itemization is names and types only, never values (FW-CRED7).
-fn apply_env(command: &mut Command, blueprint: &Blueprint, catalog: &ResolvedCatalog) {
+fn apply_env(
+    command: &mut Command,
+    blueprint: &Blueprint,
+    catalog: &ResolvedCatalog,
+    session_vars: &[(String, String)],
+    path_prefix: Option<&std::path::Path>,
+) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let built = formwork_blueprint::construct_env(
         &blueprint.env,
         catalog,
-        &blueprint.allow_credentials,
+        &blueprint.exposed_credentials(),
+        &blueprint.channels,
         vars,
     );
     command.env_clear();
     command.envs(built.kept.iter().cloned());
+    // Set after the posture ran, so no scrub or allowlist can drop the session's own variables.
+    command.envs(session_vars.iter().map(|(k, v)| (k, v)));
+    // FW-ISO17: the opener shim goes first in the PATH the posture built (or, when the posture
+    // dropped it, this process's own).
+    if let Some(prefix) = path_prefix {
+        let base = built
+            .kept
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_else(|| "/usr/bin:/bin".to_string());
+        command.env("PATH", format!("{}:{base}", prefix.display()));
+    }
+    if !built.locator_stripped.is_empty() {
+        tracing::info!(stripped = ?built.locator_stripped, "channel locator variables stripped (channels not lifted, FW-BP11)");
+    }
     if !built.posture_dropped.is_empty() {
         tracing::info!(count = built.posture_dropped.len(), dropped = ?built.posture_dropped, "scrubbed environment variables");
     }
@@ -1032,7 +2001,7 @@ fn apply_env(command: &mut Command, blueprint: &Blueprint, catalog: &ResolvedCat
 /// `[mcp.<server>]` entry shades the protocol, its fs/net grant confines the backend the same way
 /// `run` confines any command (FW-GW5), so the backend spawns behind the same wall.
 fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Result<()> {
-    let session = prepare_session(&blueprint)?;
+    let session = prepare_session(&blueprint, Purpose::GatewayBackend, detect())?;
 
     // An unlisted server is a config error, not a silent deny: a typo would otherwise masquerade as
     // a backend that legitimately exposes nothing, hiding the mistake.
@@ -1046,12 +2015,20 @@ fn gateway(blueprint: BlueprintArgs, server: String, argv: Vec<String>) -> Resul
         .context("building confined backend command")?;
     // The gateway is a launcher too: the backend it spawns is part of the session, so the same
     // env construction applies (FW-CRED2 env arm; FW-INV7 covers the whole tree).
-    apply_env(&mut backend, &session.blueprint, &session.catalog);
+    apply_env(
+        &mut backend,
+        &session.blueprint,
+        &session.catalog,
+        &session_env(&session),
+        None,
+    );
 
     tracing::info!(server = %server, backend = %program, "starting MCP gateway");
     // The async runtime lives entirely in `formwork-gateway` (constitution Layers): the CLI stays
     // synchronous and hands the confined backend over as a plain command.
-    formwork_gateway::serve_stdio(backend, policy).context("proxying MCP traffic")
+    let served = formwork_gateway::serve_stdio(backend, policy).context("proxying MCP traffic");
+    session.tmp_dir.remove();
+    served
 }
 
 #[cfg(unix)]
@@ -1060,10 +2037,11 @@ fn exec_replace(
     args: &[String],
     blueprint: &Blueprint,
     catalog: &ResolvedCatalog,
+    session_vars: &[(String, String)],
 ) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(program);
     command.args(args);
-    apply_env(&mut command, blueprint, catalog);
+    apply_env(&mut command, blueprint, catalog, session_vars, None);
     command.exec()
 }

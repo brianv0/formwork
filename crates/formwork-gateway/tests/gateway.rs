@@ -619,7 +619,18 @@ async fn fw_e2e_019_backend_confinement_recursion() {
     use formwork_compile::compile;
     use formwork_detect::detect;
 
-    // Grant read of the repo tree (so the fixture binary + cwd load), net denied. /etc/hosts is out.
+    // Grant read of the repo tree (so the fixture binary + cwd load), net denied. The probe target is
+    // a file outside both the grant and the platform read essentials (`/private/etc` is one since
+    // FEP-5 D11, so `/etc/hosts` no longer serves).
+    let outside = std::env::temp_dir().join(format!("fw-e2e-019-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).unwrap();
+    let outside = std::fs::canonicalize(&outside).unwrap();
+    let target = outside.join("secret");
+    std::fs::write(&target, "outside the grant").unwrap();
+    assert!(
+        std::fs::read(&target).is_ok(),
+        "control: readable unconfined"
+    );
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -680,7 +691,10 @@ async fn fw_e2e_019_backend_confinement_recursion() {
 
     // Its out-of-scope read and direct connect are both denied by its own confinement.
     agent
-        .notify("trigger/probe", json!({"path": "/etc/hosts"}))
+        .notify(
+            "trigger/probe",
+            json!({"path": target.display().to_string()}),
+        )
         .await;
     let note = agent.recv().await;
     assert_eq!(note["method"], "note/probe");
@@ -691,5 +705,71 @@ async fn fw_e2e_019_backend_confinement_recursion() {
     assert_eq!(
         note["params"]["net_ok"], false,
         "backend direct egress must be denied"
+    );
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// FW-ADV-016 (FEP-5 D6): the three frame-level bypasses of per-call shading. A batch array is
+/// refused whole, an id-less `tools/call` for a shaded tool never reaches the backend, and a
+/// non-JSON frame closes the connection. The backend fixture answers `tools/call` for any name, so
+/// a frame that slipped through would produce a reply the agent could observe.
+#[tokio::test]
+async fn fw_adv_016_gateway_frame_bypass() {
+    let mut agent = start(tools_only(&["read_file"]));
+
+    agent
+        .send(json!([{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "http_fetch", "arguments": {}}}]))
+        .await;
+    let batch = agent.recv().await;
+    assert_eq!(
+        batch["error"]["code"], -32600,
+        "a batch is refused: {batch}"
+    );
+    assert!(batch.get("result").is_none());
+
+    // Id-less calls to shaded items are dropped on every gated axis; the fixture announces any
+    // id-less call it receives, so the next request's reply being the first frame back shows none
+    // reached it.
+    agent
+        .notify("tools/call", json!({"name": "http_fetch", "arguments": {}}))
+        .await;
+    agent
+        .notify("resources/subscribe", json!({"uri": "file:///secret"}))
+        .await;
+    agent
+        .notify(
+            "completion/complete",
+            json!({"ref": {"type": "ref/prompt", "name": "secret_prompt"}, "argument": {"name": "a", "value": ""}}),
+        )
+        .await;
+    agent
+        .notify(
+            "completion/complete",
+            json!({"ref": {"type": "ref/unknown"}, "argument": {"name": "a", "value": ""}}),
+        )
+        .await;
+    agent
+        .request(
+            2,
+            "tools/call",
+            json!({"name": "read_file", "arguments": {}}),
+        )
+        .await;
+    let next = agent.recv().await;
+    assert_eq!(
+        next["id"], 2,
+        "the shaded notification produced no reply: {next}"
+    );
+    assert_eq!(next["result"]["content"][0]["text"], "ok:read_file");
+
+    // A non-JSON frame closes the connection: the agent's read side reaches EOF.
+    agent.writer.write_all(b"this is not json\n").await.unwrap();
+    agent.writer.flush().await.unwrap();
+    let eof = timeout(Duration::from_secs(5), agent.reader.next_line())
+        .await
+        .expect("the gateway must close, not hang");
+    assert!(
+        matches!(eof, Ok(None)),
+        "a non-JSON frame must close the connection, got {eof:?}"
     );
 }

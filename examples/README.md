@@ -26,24 +26,37 @@ Formwork claims only what the current host can back. Check yours:
 
 ```sh
 formwork explain                                  # capabilities of this machine, human-readably
-formwork explain --blueprint examples/blueprints/agent-session.toml   # + this blueprint's per-capability fidelity
-formwork compile --blueprint examples/blueprints/agent-session.toml --report-only   # the same, as JSON for CI
+formwork explain --blueprint examples/blueprints/claude-code.toml   # + this blueprint's per-capability fidelity
+formwork compile --blueprint examples/blueprints/claude-code.toml --report-only   # the same, as JSON for CI
 ```
 
-On macOS (Seatbelt) fs read/write, default-deny egress, and the direct-TCP port tier are all
-enforced by the kernel. Egress is **port-scoped, not host-scoped**: `net = { ports = [443] }` allows
-any HTTPS host, so the agent reaches its model API — the filesystem sandbox, not an egress
-allowlist, is what stops secrets being read to exfiltrate in the first place. On Linux the port tier
-also denies UDP and raw sockets (FW-INV3: direct DNS fails closed), so a confined process cannot
-resolve hostnames there; on macOS the port tier re-allows the system resolver. Host-scoped egress
-through the gateway, which resolves names on the agent's behalf, is specified in `docs/fep-5.md`. On a host that can't
-enforce a capability, `formwork` reports the gap instead of pretending (it never fails open).
+Egress is **host-scoped** in the per-agent blueprints (`claude-code.toml`, `codex.toml`,
+`opencode.toml`): every connection goes through the session Gateway, and only the hosts the
+blueprint names are reachable. On Linux this needs connect supervision (seccomp user notification
+and `pidfd_getfd`, Linux 5.6+); `formwork explain --hosts` shows the table and what this host
+enforces. On a host that can't enforce a capability, `formwork` reports the gap instead of
+pretending (it never fails open).
+
+Where host rules are refused (Linux without connect supervision), fall back to the port tier on the
+shared base. It allows any HTTPS host, so there the filesystem sandbox is what stops secrets being
+read to exfiltrate. On Linux the port tier also denies UDP and raw sockets, so a confined process
+cannot resolve hostnames there; on macOS it re-allows the system resolver:
+
+```sh
+formwork run --blueprint examples/blueprints/agent-base.toml --net ports:443 \
+  --allow-cred claude --rule "readwrite:~/.claude/**" -- claude --dangerously-skip-permissions
+```
 
 ## Layout
 
 ```
 examples/
-  blueprints/agent-session.toml   # Axis A: confine an agent — scoped writes, secrets subtracted, HTTPS-only egress
+  blueprints/agent-base.toml      # the filesystem and environment every agent example shares
+  blueprints/claude-code.toml     # Axis A for Claude Code: host-scoped egress, login through open-url
+  blueprints/claude-code-api-key.toml  # the same with ANTHROPIC_API_KEY brokered, never held by the agent
+  blueprints/codex.toml           # Axis A for codex signed in with ChatGPT: host-scoped egress
+  blueprints/codex-api-key.toml   # the same with OPENAI_API_KEY brokered, never held by the agent
+  blueprints/opencode.toml        # Axis A for opencode: host-scoped egress, ANTHROPIC_API_KEY brokered
   blueprints/mcp-gateway.toml      # Axis B: gateway policy — [mcp.files] shading + backend confinement
   blueprints/rules-demo.toml       # flat verb rules (rules/mode) — same model, terser to write
   gateway-demo.sh             # runnable Axis B demo against the built-in fixture (no external deps)
@@ -78,7 +91,7 @@ credential floor compiles into that same deny layer, so it can never be punched 
 formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos --report-only
 
 # The same vocabulary on the CLI, layered over any base blueprint — a deny narrows from anywhere:
-formwork run --blueprint examples/blueprints/agent-session.toml \
+formwork run --blueprint examples/blueprints/claude-code.toml \
   --rule "deny:$CWD/secrets" -- <agent> <flags>
 ```
 
@@ -93,23 +106,23 @@ compiled-in default with `extends = ["builtin:default"]`, no repo checkout neede
 
 ```sh
 # Add extra denies for one run — safe from any layer, since deny is terminal:
-formwork run --blueprint examples/blueprints/agent-session.toml \
+formwork run --blueprint examples/blueprints/claude-code.toml \
   --rule "deny:$CWD/secrets" --rule "deny:$CWD/.env.production" -- claude --dangerously-skip-permissions
 
 # Let the agent EDIT existing files but not CREATE new ones (the create/write split):
-formwork run --blueprint examples/blueprints/agent-session.toml \
+formwork run --blueprint examples/blueprints/claude-code.toml \
   --rule "modify:$CWD/var/log/app.log" -- <agent>
 
 # Flip a blueprint to unveil (empty universe) and hand-pick what's readable/runnable:
-formwork run --blueprint examples/blueprints/agent-session.toml --mode unveil \
+formwork run --blueprint examples/blueprints/claude-code.toml --mode unveil \
   --rule "readonly:/usr/**" --rule "readexec:/bin/**" --rule "readwrite:$CWD/**" -- <agent>
 
 # Tighten an otherwise-unrestricted agent's exec down to an allowlist (last-wins over `exec = "unrestricted"`):
-formwork run --blueprint examples/blueprints/agent-session.toml \
+formwork run --blueprint examples/blueprints/claude-code.toml \
   --rule "exec:/usr/bin/git" --rule "exec:/usr/bin/python3" -- <agent>
 
 # Let one credential type through the floor AND grant its directory, in one invocation:
-formwork run --blueprint examples/blueprints/agent-session.toml \
+formwork run --blueprint examples/blueprints/claude-code.toml \
   --allow-cred aws --rule "readonly:$HOME/.aws/**" -- <agent>
 
 # Mix verb rules with a `--set` TOML fragment — both parse as the same model:
@@ -122,10 +135,18 @@ formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos 
 # Compile a Linux policy on a Mac (or vice-versa) to review it before enforcing — pure, no kernel:
 formwork compile --blueprint examples/blueprints/rules-demo.toml --target linux-v6 --report-only
 
+# Host-scoped egress: show the host table and the layer each rule came from:
+formwork explain --blueprint examples/blueprints/claude-code.toml --hosts
+
+# Under an inspected rule, clients must trust the session CA. Most read SSL_CERT_FILE and friends,
+# which the Launcher sets; uv needs UV_NATIVE_TLS=1 to read them:
+UV_NATIVE_TLS=1 formwork run --blueprint examples/blueprints/agent-base.toml --rule "get:pypi.org" \
+  --rule "get:files.pythonhosted.org" -- uv sync
+
 # Ask why one path is granted or denied — the deciding rule and the layer it came from:
 formwork explain --blueprint examples/blueprints/rules-demo.toml '$CWD/.env'
 # Overrides apply here too, so you can check a deny before running under it (deny is terminal):
-formwork explain --blueprint examples/blueprints/agent-session.toml \
+formwork explain --blueprint examples/blueprints/claude-code.toml \
   --rule "deny:$CWD/secrets/**" "$CWD/secrets/key"
 ```
 

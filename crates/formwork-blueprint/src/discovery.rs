@@ -7,7 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{canonicalize_set, Blueprint, FsBlueprint, PathPattern, ReadMode, ResolvedCatalog};
+use crate::{
+    canonicalize_set, Blueprint, CredentialEntry, FsBlueprint, PathPattern, ReadMode,
+    ResolvedCatalog,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -171,7 +174,10 @@ pub fn synthesize_blueprint(
             writes: canonicalize_set(&writes),
             ..FsBlueprint::default()
         },
-        allow_credentials: allow.to_vec(),
+        allow_credentials: allow
+            .iter()
+            .map(|a| CredentialEntry::Expose(a.clone()))
+            .collect(),
         ..Blueprint::empty()
     }
 }
@@ -199,6 +205,127 @@ fn tag_candidate(
             CandidateTag::NeedsReview
         },
     }
+}
+
+/// A destination the Gateway refused as a policy decision (FW-DISC12): the host and port, and for
+/// a request refused on an inspected host, its method and canonical path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct EgressObservation {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// Host rules `learn` proposes, and the destinations it withholds with the reason
+/// (operator-channel material, like the credential floor's withheld list).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EgressProposal {
+    pub rules: Vec<crate::HostRule>,
+    pub withheld: Vec<(String, String)>,
+}
+
+/// FW-DISC12: refused destinations -> host rules at the grade the host already has. A host no rule
+/// names is proposed at the tunnel grade (`https:host`); a request refused on an inspected host is
+/// proposed as that method on that exact path. Metadata names and restricted addresses are never
+/// proposed (FW-EGR4), and neither is a host a `deny:` rule names -- lifting an authored deny is
+/// an authoring decision. Deterministic: deduplicated and sorted.
+pub fn propose_host_rules(
+    observed: &[EgressObservation],
+    table: Option<&crate::HostTable>,
+) -> EgressProposal {
+    use crate::{
+        canonicalize_host, ConnectDecision, Denial, HostRule, HostTable, HttpMethod,
+        DEFAULT_HTTPS_PORT,
+    };
+    let empty = HostTable::default();
+    let table = table.unwrap_or(&empty);
+    let mut out = EgressProposal::default();
+    for obs in observed {
+        let Ok(host) = canonicalize_host(&obs.host) else {
+            continue;
+        };
+        let target = format!("{host}:{}", obs.port);
+        if host.is_restricted() {
+            out.withheld.push((
+                target,
+                "a metadata, private, loopback or link-local destination is never proposed \
+                 (FW-EGR4); name it in a rule by hand if the session truly needs it"
+                    .to_string(),
+            ));
+            continue;
+        }
+        let port = if obs.port == DEFAULT_HTTPS_PORT {
+            String::new()
+        } else {
+            format!(":{}", obs.port)
+        };
+        let rule = match table.decide_connect(&host, obs.port) {
+            ConnectDecision::Deny(Denial {
+                rule: Some(rule), ..
+            }) => {
+                out.withheld
+                    .push((target, format!("denied by the rule `{rule}`")));
+                continue;
+            }
+            ConnectDecision::Deny(Denial { rule: None, .. }) => {
+                HostRule::parse("https", &format!("{host}{port}"))
+            }
+            ConnectDecision::Inspect => {
+                let (Some(method), Some(path)) = (&obs.method, &obs.path) else {
+                    continue;
+                };
+                let Some(method) = HttpMethod::from_token(method) else {
+                    out.withheld
+                        .push((target, format!("the method {method:?} has no rule atom")));
+                    continue;
+                };
+                if !path.starts_with('/') {
+                    continue;
+                }
+                // A requested path is a literal; `*` in it would become a glob in the rule and
+                // widen the proposal past what the session asked for.
+                if path.contains('*') {
+                    out.withheld.push((
+                        target,
+                        format!("the path {path:?} carries `*`, which a rule would read as a glob"),
+                    ));
+                    continue;
+                }
+                HostRule::parse(method.atom(), &format!("{host}{port}{path}"))
+            }
+            // Admitted already: the refusal was not a missing rule (e.g. the name resolved to a
+            // restricted address).
+            ConnectDecision::Tunnel(_) => continue,
+        };
+        match rule {
+            Ok(rule) => out.rules.push(rule),
+            Err(e) => out.withheld.push((target, e)),
+        }
+    }
+    out.rules.sort();
+    out.rules.dedup();
+    out.withheld.sort();
+    out.withheld.dedup();
+    out
+}
+
+/// FW-DISC12: channels a run was refused -> the ones not already lifted, deduplicated and sorted.
+pub fn propose_channels(
+    observed: &[crate::Channel],
+    policy: &crate::ChannelPolicy,
+) -> Vec<crate::Channel> {
+    let mut out: Vec<crate::Channel> = observed
+        .iter()
+        .copied()
+        .filter(|c| !policy.lifted(*c))
+        .collect();
+    out.sort_by_key(|c| c.name());
+    out.dedup();
+    out
 }
 
 #[cfg(test)]
@@ -270,7 +397,7 @@ mod tests {
             &catalog(),
             &["aws".to_string()],
         );
-        assert_eq!(bp.allow_credentials, vec!["aws".to_string()]);
+        assert_eq!(bp.exposed_credentials(), vec!["aws".to_string()]);
         let reads: Vec<String> = bp.fs.reads.iter().map(|p| p.canonical()).collect();
         assert_eq!(reads, vec!["/home/x/.aws/config"]);
     }
@@ -395,5 +522,78 @@ mod tests {
             .collect();
         assert_eq!(patterns, vec!["/home/x/.aws/config"]);
         assert_eq!(out.withheld.len(), 1);
+    }
+
+    fn obs(host: &str, port: u16, req: Option<(&str, &str)>) -> EgressObservation {
+        EgressObservation {
+            host: host.into(),
+            port,
+            method: req.map(|(m, _)| m.into()),
+            path: req.map(|(_, p)| p.into()),
+        }
+    }
+
+    #[test]
+    fn fw_disc12_hosts_are_proposed_at_their_grade_and_metadata_is_withheld() {
+        let table = crate::HostTable::new(vec![
+            crate::HostRule::parse("get", "api.github.com/repos/**").unwrap(),
+            crate::HostRule::parse("deny", "evil.test").unwrap(),
+        ]);
+        let out = propose_host_rules(
+            &[
+                obs("blocked.test", 443, None),
+                obs("Blocked.test.", 443, None),
+                obs("registry.test", 8443, None),
+                obs(
+                    "api.github.com",
+                    443,
+                    Some(("POST", "/repos/acme/x/issues")),
+                ),
+                obs("169.254.169.254", 80, None),
+                obs("metadata.google.internal", 80, None),
+                obs("evil.test", 443, None),
+                obs("api.github.com", 443, Some(("GET", "/repos/**"))),
+            ],
+            Some(&table),
+        );
+        let rules: Vec<String> = out.rules.iter().map(|r| r.to_string()).collect();
+        assert!(
+            rules.contains(&"https:blocked.test".to_string()),
+            "{rules:?}"
+        );
+        assert!(
+            rules.contains(&"https:registry.test:8443".to_string()),
+            "{rules:?}"
+        );
+        assert!(
+            rules.contains(&"post:api.github.com/repos/acme/x/issues".to_string()),
+            "{rules:?}"
+        );
+        assert_eq!(rules.len(), 3, "{rules:?}");
+        let withheld: Vec<&str> = out.withheld.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(withheld.contains(&"169.254.169.254:80"), "{withheld:?}");
+        assert!(
+            withheld.contains(&"metadata.google.internal:80"),
+            "{withheld:?}"
+        );
+        assert!(withheld.contains(&"evil.test:443"), "{withheld:?}");
+        assert!(
+            out.withheld.iter().any(|(_, why)| why.contains("glob")),
+            "a literal `*` in a requested path is never proposed as a glob: {:?}",
+            out.withheld
+        );
+    }
+
+    #[test]
+    fn fw_disc12_channels_already_lifted_are_not_proposed() {
+        use crate::{Channel, ChannelPolicy};
+        let lifted = ChannelPolicy::allow([Channel::Clipboard]);
+        assert_eq!(
+            propose_channels(
+                &[Channel::OpenUrl, Channel::Clipboard, Channel::OpenUrl],
+                &lifted
+            ),
+            vec![Channel::OpenUrl]
+        );
     }
 }

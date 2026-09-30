@@ -45,30 +45,27 @@ const BASELINE_DENY: &[&str] = &[
     "setns",
 ];
 
-/// How the seccomp filter carries the inet-egress deny for a given net plan. Landlock net governs
-/// only TCP, so seccomp always carries at least the UDP/raw half of net default-deny on Linux -- there
-/// is no "Landlock-only" net-deny variant, which is exactly what closes the port-tier UDP/raw hole.
+/// How the seccomp filter carries the inet-egress deny for a net plan. Landlock net governs only
+/// TCP, so seccomp carries at least the UDP/raw half of net default-deny on every Linux path
+/// (FW-ISO11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InetSeccompDeny {
-    /// Deny inet `socket(2)` at the family level: TCP + UDP + raw blocked at creation. The outright
-    /// net-deny, and the sub-ABI-v4 port-tier fallback.
+    /// Deny inet `socket(2)` at the family level: TCP + UDP + raw blocked at creation.
     FullInet,
-    /// The port tier: deny inet/inet6 DGRAM and RAW `socket(2)` while allowing STREAM, so the Landlock
-    /// per-port TCP rules govern TCP and direct UDP/raw egress fails closed (FW-ISO3/FW-INV3).
+    /// Deny inet/inet6 DGRAM and RAW `socket(2)` while allowing STREAM.
     DgramRawOnly,
 }
 
 /// Build the seccomp baseline plus whatever inet-egress deny `inet_deny` calls for.
-pub fn seccomp_plan(inet_deny: InetSeccompDeny) -> SeccompPlan {
+pub fn seccomp_plan(inet_deny: InetSeccompDeny, supervise_connect: bool) -> SeccompPlan {
     let deny_syscalls: Vec<String> = BASELINE_DENY.iter().map(|s| s.to_string()).collect();
     debug_assert!(
         deny_syscalls.windows(2).all(|w| w[0] < w[1]),
         "BASELINE_DENY must stay sorted"
     );
 
-    // AF_UNIX and socketpair are never listed, so the injected-fd seam stays untouched (FW-XR7).
+    // AF_UNIX and socketpair are never listed, so the injected-fd seam is untouched (FW-XR7).
     let (deny_socket_families, deny_inet_dgram_raw) = match inet_deny {
-        // Full inet deny: block the whole inet/inet6 families plus packet + non-route netlink.
         InetSeccompDeny::FullInet => (
             vec![
                 SocketFamily::Inet,
@@ -90,27 +87,23 @@ pub fn seccomp_plan(inet_deny: InetSeccompDeny) -> SeccompPlan {
         deny_syscalls,
         deny_socket_families,
         deny_inet_dgram_raw,
+        supervise_connect,
         restrict_userns: true,
         set_no_new_privs: true,
     }
 }
 
-/// Returns `(plan, inet_deny, port_tier)`. `inet_deny` tells the compiler which seccomp inet deny to
-/// build and lets the report state honestly that net-deny is (at least partly) seccomp-carried.
+/// Returns `(plan, inet_deny, port_tier)`.
 pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, InetSeccompDeny, PortTier) {
     let abi = host.landlock_abi.unwrap_or(0);
     match net {
-        NetPosture::Deny => {
-            // Deny ALL inet egress via seccomp (blocks TCP, UDP, and raw at the socket-family level),
-            // matching macOS `(deny network*)`. Landlock net governs *only* TCP, so carrying deny with
-            // it would leave UDP/raw open -- an exfil channel. AF_UNIX (the injected-fd seam) stays
-            // allowed. Landlock net is reserved for the port tier, where per-port TCP allow is needed.
-            (
-                LinuxNetPlan::SeccompDenyInet,
-                InetSeccompDeny::FullInet,
-                PortTier::NotRequested,
-            )
-        }
+        // Deny ALL inet egress via seccomp (TCP, UDP and raw at the socket-family level), matching
+        // macOS `(deny network*)`. AF_UNIX (the injected-fd seam) stays allowed.
+        NetPosture::Deny => (
+            LinuxNetPlan::SeccompDenyInet,
+            InetSeccompDeny::FullInet,
+            PortTier::NotRequested,
+        ),
         NetPosture::Ports(ports) => {
             if abi >= LANDLOCK_NET_ABI {
                 // Landlock allow-connects the granted TCP ports; seccomp denies inet DGRAM/RAW so the
@@ -132,6 +125,18 @@ pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, InetSecc
                 )
             }
         }
+        // FW-EGR7: the supervisor mediates every connect; without it the posture fails closed to
+        // the full inet deny and the report says so (FW-INV6).
+        NetPosture::AllowHosts(_) if host.can_supervise_connect() => (
+            LinuxNetPlan::SupervisedConnect,
+            InetSeccompDeny::DgramRawOnly,
+            PortTier::NotRequested,
+        ),
+        NetPosture::AllowHosts(_) => (
+            LinuxNetPlan::SeccompDenyInet,
+            InetSeccompDeny::FullInet,
+            PortTier::NotRequested,
+        ),
     }
 }
 
@@ -149,7 +154,7 @@ mod tests {
     #[test]
     fn baseline_is_sorted_and_denies_escalation_surfaces() {
         // The escalation/shedding baseline is present regardless of which inet deny rides along.
-        let plan = seccomp_plan(InetSeccompDeny::FullInet);
+        let plan = seccomp_plan(InetSeccompDeny::FullInet, false);
         assert!(plan.deny_syscalls.windows(2).all(|w| w[0] < w[1]));
         assert!(plan.deny_syscalls.iter().any(|s| s == "bpf"));
         assert!(plan.deny_syscalls.iter().any(|s| s == "setns"));
@@ -169,7 +174,7 @@ mod tests {
 
     #[test]
     fn full_inet_deny_blocks_whole_families() {
-        let plan = seccomp_plan(InetSeccompDeny::FullInet);
+        let plan = seccomp_plan(InetSeccompDeny::FullInet, false);
         assert!(plan.deny_socket_families.contains(&SocketFamily::Inet));
         assert!(plan.deny_socket_families.contains(&SocketFamily::Inet6));
         assert!(plan.deny_socket_families.contains(&SocketFamily::Packet));
@@ -184,7 +189,7 @@ mod tests {
     fn port_tier_seccomp_denies_dgram_raw_but_not_stream() {
         // Under the port tier the blanket inet/inet6 deny is replaced by a DGRAM/RAW-only deny (so
         // STREAM survives for Landlock), while packet + non-route netlink stay blocked.
-        let plan = seccomp_plan(InetSeccompDeny::DgramRawOnly);
+        let plan = seccomp_plan(InetSeccompDeny::DgramRawOnly, false);
         assert!(plan.deny_inet_dgram_raw, "UDP/raw must be denied");
         assert!(
             !plan.deny_socket_families.contains(&SocketFamily::Inet)

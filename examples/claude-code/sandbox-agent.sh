@@ -8,7 +8,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 cargo build -q -p formwork-cli
 FORMWORK="$REPO/target/debug/formwork"
-BLUEPRINT="$REPO/examples/blueprints/agent-session.toml"
+BLUEPRINT="$REPO/examples/blueprints/claude-code.toml"
 
 # Never claim more confinement than this host can back — print the per-capability fidelity report.
 echo "What this host actually enforces for this blueprint:"
@@ -24,7 +24,7 @@ echo "Confined launch:"
 printf '  '; printf '%q ' "${CMD[@]}"; echo; echo
 
 if command -v claude >/dev/null 2>&1; then
-    echo "Launching Claude Code confined. It can write ~/project and reach HTTPS (its model API),"
+    echo "Launching Claude Code confined. It can write ~/project and reach only the hosts its blueprint names,"
     echo "but cannot read ~/.ssh, ~/.aws, keychains, or other projects — whatever it's prompted to do."
     exec "${CMD[@]}" "$@"
 else

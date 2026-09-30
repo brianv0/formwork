@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Blueprint, EnvPosture, ExecPosture, McpPolicy, Mode, NetPosture, PathPattern, ReadMode,
+    Blueprint, ChannelPolicy, EnvPosture, ExecPosture, IsolateMember, McpPolicy, Mode, NetPosture,
+    PathPattern, ReadMode,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,9 +45,19 @@ pub struct BlueprintLayer {
     pub mcp: BTreeMap<String, McpPolicy>,
     /// Credential types deliberately let through (FW-CRED5); unions across layers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow_credentials: Vec<String>,
+    pub allow_credentials: Vec<crate::CredentialEntry>,
     #[serde(default, skip_serializing_if = "DiscoveryLayer::is_empty")]
     pub discovery: DiscoveryLayer,
+    /// Channel lifts (FW-BP9); `allow` unions and `deny` is terminal across layers (FW-BP10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<ChannelPolicy>,
+    /// Isolation-tier members (FW-ISO10); unions across layers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub isolate: Vec<IsolateMember>,
+    /// Host rules desugared from `rules` by the loader (FW-BP13); never authored as a field. They
+    /// union across layers, and any host rule sets the net posture to `AllowHosts`.
+    #[serde(skip)]
+    pub hosts: Vec<crate::HostRule>,
 }
 
 /// [`crate::FsBlueprint`] with set-vs-unset distinguishable: in a layer, an absent `read-mode`
@@ -112,7 +123,9 @@ pub struct ProvenanceEntry {
 /// here, so no layer stack can carry it away.
 pub fn merge(layers: &[BlueprintLayer]) -> Blueprint {
     let mut out = Blueprint::empty();
+    let mut hosts: Vec<crate::HostRule> = Vec::new();
     for layer in layers {
+        hosts.extend(layer.hosts.iter().cloned());
         if let Some(mode) = layer.fs.read_mode {
             out.fs.read_mode = mode;
         }
@@ -142,6 +155,15 @@ pub fn merge(layers: &[BlueprintLayer]) -> Blueprint {
         out.discovery
             .auto_widen
             .extend(layer.discovery.auto_widen.iter().cloned());
+        if let Some(channels) = &layer.channels {
+            out.channels.merge_from(channels);
+        }
+        out.isolate.extend(layer.isolate.iter().copied());
+    }
+    // Any host rule is the host-allowlist posture (FW-BP13). A port tier alongside it is refused by
+    // the loader before merge ever sees it (FW-EGR1: the postures are exclusive).
+    if !hosts.is_empty() {
+        out.net = NetPosture::AllowHosts(crate::HostTable::new(hosts));
     }
     out.canonicalize()
 }
@@ -173,6 +195,13 @@ impl BlueprintLayer {
                 auto_widen: bp.discovery.auto_widen.clone(),
                 provenance: BTreeMap::new(),
             },
+            channels: Some(bp.channels.clone()),
+            isolate: bp.isolate.clone(),
+            hosts: bp
+                .net
+                .host_table()
+                .map(|t| t.rules.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -302,8 +331,31 @@ mod tests {
         );
         let b = layer_toml(r#"allow-credentials = ["aws", "gcp"]"#);
         let merged = merge(&[a, b]);
-        assert_eq!(merged.allow_credentials, vec!["aws", "gcp"]);
+        assert_eq!(merged.exposed_credentials(), vec!["aws", "gcp"]);
         assert_eq!(merged.discovery.auto_widen, vec![pp("/work/project/**")]);
+    }
+
+    #[test]
+    fn channels_union_allow_and_keep_deny_terminal_across_layers() {
+        use crate::Channel;
+        let base = layer_toml(r#"channels = "deny""#);
+        let team = layer_toml(r#"channels = ["desktop"]"#);
+        let leaf = layer_toml(r#"channels = { deny = ["screen"] }"#);
+        let merged = merge(&[base, team, leaf.clone()]);
+        assert!(merged.channels.lifted(Channel::Clipboard));
+        assert!(!merged.channels.lifted(Channel::Screen));
+        // A deny from a base locks every downstream user out, as an fs subtract does.
+        let locked = merge(&[leaf, layer_toml(r#"channels = ["media"]"#)]);
+        assert!(!locked.channels.lifted(Channel::Screen));
+        assert!(locked.channels.lifted(Channel::Camera));
+        let iso = merge(&[
+            layer_toml(r#"isolate = ["processes"]"#),
+            layer_toml(r#"isolate = ["ipc", "processes"]"#),
+        ]);
+        assert_eq!(
+            iso.isolate,
+            vec![crate::IsolateMember::Processes, crate::IsolateMember::Ipc]
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 cargo build -q -p formwork-cli
 FORMWORK="$REPO/target/debug/formwork"
-BLUEPRINT="$REPO/examples/blueprints/agent-session.toml"
+BLUEPRINT="$REPO/examples/blueprints/opencode.toml"
 
 echo "What this host actually enforces for this blueprint:"
 "$FORMWORK" compile --blueprint "$BLUEPRINT" --report-only \
