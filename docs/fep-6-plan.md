@@ -17,7 +17,7 @@ are defined in `fep-6.md`, anchored there, and cited bare in code.
 | Session CA | ECDSA P-256, path length 0, `keyCertSign` and `cRLSign`, name-constrained to the inspected hosts (`FW-EGR25`); one leaf key per session, distinct from the CA's; random positive serials; subject and authority key identifiers; §4.9 lifetimes; a 1,024-host LRU with re-minting at half life | `formwork-gateway/src/ca.rs` |
 | Upstream proxy | `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` from `formwork run`'s own environment (`FW-EGR26`) | `formwork-gateway/src/upstream.rs`, `formwork-cli/src/main.rs` |
 | Records | violation records with a reason from the closed set and the capability (`FW-FID12`); grant records (`FW-FID13`) | `formwork-gateway/src/egress.rs` |
-| Launcher | both spellings of the proxy and `no_proxy` variables, `NODE_USE_ENV_PROXY=1` (§9 c) | `formwork-cli/src/main.rs` |
+| Launcher | both spellings of the proxy and `no_proxy` variables, `NODE_USE_ENV_PROXY=1` (§9 c), and an inherited npm proxy setting overridden | `formwork-cli/src/main.rs` |
 | Operator surface | `learn` proposes `allow:` for an unlisted host, withholds `address-class` refusals, and names the `tunnel:` rule for a host whose client rejected the session CA; `explain --hosts` reports per-host address classification and the upstream trust source | `formwork-blueprint/src/discovery.rs`, `formwork-cli/src/{learn,main}.rs` |
 | Amendments | §9 (a)–(j) | `formwork.md`, `constitution.md`, `fep-1.md`, `fep-5.md`, `examples/`, `README.md` |
 
@@ -109,34 +109,72 @@ rather than silently deviated.
   `Expect: 100-continue` itself and does not forward the header. An IP-literal leaf carries a
   subject name that is not host-shaped, so OpenSSL does not check it against the CA's DNS
   constraints.
+- **npm's proxy settings are overridden (FEP-6 §4.11 amended).** `FW-E2E-094` found npm going
+  around the Gateway: it prefers an inherited `npm_config_https_proxy` to `https_proxy`, so the
+  session's npm dialed the operator's proxy and the supervisor refused it. The Launcher now
+  overrides `npm_config_proxy`, `npm_config_https_proxy` and `npm_config_noproxy` when inherited.
+- **The client matrix uses proxied names.** npm (and Go's `net/http`) never send a loopback
+  destination through a proxy, so a matrix against `127.0.0.1` measures that, not the Launcher's
+  variables. `FW-E2E-094` names its hosts and reaches them through an operator's proxy fixture
+  (`FW-EGR26`), which resolves them, so the Gateway needs no DNS.
 - **`fw-egress-probe` is not built.** The gateway tests drive rustls clients and raw sockets
   directly, which produce every case the probe was for (a mismatched server name, a mismatched
   `Host`, a non-TLS first byte, an `h2`-only ALPN offer, the raw heads of `FW-ADV-024`).
 
 ## 4. Tests
 
+Gateway-level tests drive the in-process listener over real sockets with the fixture resolver.
+Run-level tests drive the built `formwork` binary against the real supervisor and kernel, with real
+clients, loopback fixtures, and the operator's `SSL_CERT_FILE` naming the fixture root (§7.1).
+
 | ID | Where | Runs on | Coverage |
 |---|---|---|---|
 | `FW-E2E-092` | `formwork-gateway/tests/inspect.rs` (`fw_egr21_…`) | both | 3 MiB chunked and length-framed uploads byte-identical; the memory bound and `git push` are owed |
 | `FW-E2E-093` | `formwork-gateway/tests/inspect.rs` | both | ordering, not the 20 ms bound (§5 register) |
+| `FW-E2E-094` | `formwork-cli/tests/fep6_run.rs` | Linux | the matrix below |
 | `FW-E2E-095` | `formwork-gateway/tests/inspect.rs` | both | full |
-| `FW-E2E-097` | `formwork-gateway/tests/inspect.rs` (`fw_egr25_…`), `src/ca.rs`, `fep5_run.rs` (`fw_e2e_098_…`, curl verifies a constrained IP leaf) | both / Linux | the constraints' effect, not an `openssl verify` transcript |
-| `FW-E2E-098` | `fep5_run.rs` (rows 1, 8, 9), `formwork-gateway/tests/{egress,inspect}.rs` (rows 2, 6, 7) | Linux / both | rows 3–5 are FEP-5's `FW-E2E-075` |
-| `FW-E2E-099` | `formwork-gateway/tests/inspect.rs` (`fw_e2e_078_…`), `fep5_run.rs` (`fw_e2e_078_…`) | both / Linux | rows 1–3, 5–7 |
-| `FW-E2E-103` | `formwork-gateway/tests/egress.rs` (`fw_egr26_…`, `fw_adv_023_…`) | both | rows 1, 2, 5 |
-| `FW-E2E-104` | `fep5_run.rs` | both | full |
-| `FW-ADV-021` | `formwork-gateway/tests/inspect.rs` | both | full |
+| `FW-E2E-097` | `formwork-gateway/tests/inspect.rs` (`fw_egr25_…`), `src/ca.rs`, `fep6_run.rs` (`FW-E2E-098`, `FW-E2E-094`: OpenSSL, GnuTLS, Node, Go and Python verify constrained leaves) | both / Linux | the constraints' effect, not an `openssl verify` transcript |
+| `FW-E2E-098` | `fep6_run.rs` (rows 1, 8, 9, and an upstream the Gateway cannot verify), `formwork-gateway/tests/{egress,inspect}.rs` (rows 2, 6, 7) | Linux / both | rows 3–5 are FEP-5's `FW-E2E-075` |
+| `FW-E2E-099` | `fep6_run.rs` (every row through `run`), `formwork-gateway/tests/inspect.rs` (`fw_e2e_078_…`) | Linux / both | row 4's 20 ms bound is `FW-E2E-093`'s |
+| `FW-E2E-103` | `fep6_run.rs` (rows 1, 2, 4 through `run`), `formwork-gateway/tests/egress.rs` (`fw_egr26_…`, `fw_adv_023_…`) | Linux / both | row 3 is FEP-5's `FW-E2E-075`; row 5 at the Gateway |
+| `FW-E2E-104` | `fep6_run.rs` | both | full |
+| `FW-ADV-021` | `formwork-gateway/tests/inspect.rs`, `fep6_run.rs` (`FW-E2E-099`'s reflection row) | both / Linux | full |
 | `FW-ADV-022` | `formwork-gateway/tests/{egress,inspect}.rs` (`fw_egr16_…`, `fw_egr10_…`, `fw_egr20_…`) | both | full |
 | `FW-ADV-023` | `formwork-gateway/tests/egress.rs` | both | the Gateway's own listener case is a unit test (`gateway_endpoints_and_host_addresses_are_classes`): the listener port is not known before the table is written |
 | `FW-ADV-024` | `formwork-gateway/tests/egress.rs`, `src/http.rs`, `src/egress.rs` | both | full |
-| `FW-CRED16` | `fep5_run.rs` (`fw_cred16_…`) | Linux, unprivileged | root owns every `/proc` entry, so a root runner cannot observe it |
+| `FW-CRED16` | `fep6_run.rs` (`fw_cred16_…`) | Linux, unprivileged | root owns every `/proc` entry, so a root runner cannot observe it |
+| `FW-EGR17`, `FW-EGR19` through the host resolver | `fep6_run.rs` (`fw_egr17_…`) | Linux | `localhost` by exact name; an unresolvable name refused as `resolution` |
+| `learn`'s `tunnel:` line (§9 j) | `fep6_run.rs` | Linux | full |
+
+The recorded client matrix (`FW-E2E-094`), observed on Linux with the Launcher's variables alone
+and an inherited `npm_config_https_proxy`:
+
+| Client | Inspected | Tunnel | Reads |
+|---|---|---|---|
+| curl 8.5 (OpenSSL) | reached | reached | `https_proxy`, `CURL_CA_BUNDLE` |
+| Python `urllib` (3.11) | reached | reached | `https_proxy`, `SSL_CERT_FILE` |
+| Python `requests` | expected reached | expected reached | `https_proxy`, `REQUESTS_CA_BUNDLE`; absent from the runner's session |
+| Node `fetch`, `https` (22.22) | reached | reached | `NODE_USE_ENV_PROXY`, `NODE_EXTRA_CA_CERTS`; Node below 22.21 (or 24.5) is expected refused |
+| git 2.43 (libcurl, GnuTLS) | reached | reached | `https_proxy`, `GIT_SSL_CAINFO` |
+| pip | reached | reached | `https_proxy`, `PIP_CERT` |
+| npm 10.9 | reached | reached | `npm_config_https_proxy` (overridden), `NODE_EXTRA_CA_CERTS` |
+| Go `net/http` | reached | reached | `HTTPS_PROXY`, `SSL_CERT_FILE` (Linux) |
+| uv | reached | reached | `https_proxy`, `SSL_CERT_FILE` |
 
 ## 5. Still owed
 
 - **macOS characterization of `FW-CRED16`.** `PT_DENY_ATTACH` is untested on Seatbelt hosts;
   `credential-broker` reports `Partial` on macOS with that reason until it runs.
-- **`FW-E2E-094` (client matrix)** and **`FW-E2E-096` (latency budget)**. Neither runs yet; the §8
-  performance rows in `formwork.md` are targets until `FW-E2E-096` measures them.
+- **`FW-E2E-096` (latency budget).** It does not run yet; the §8 performance rows in `formwork.md`
+  are targets until it measures them.
+- **Run-level egress on macOS.** Every `fep6_run.rs` test that drives traffic is Linux-only, as
+  FEP-5's are; on macOS the engine is covered by the gateway-level tests, which run on both, and
+  the Seatbelt endpoint by FEP-5's owed characterization. `FW-E2E-094`'s macOS column (where Go and
+  Swift clients ignore the trust variables, FEP-5 §3.2) is owed with it, as are cargo and rustup.
+- **A Launcher defect `FW-E2E-094` found, outside this FEP.** The FW-ENV2 scrub drops
+  `GIT_CONFIG_KEY_<n>` (the name contains `KEY`) while keeping `GIT_CONFIG_COUNT` and
+  `GIT_CONFIG_VALUE_<n>`, so git refuses to start in a session whose operator configures git through
+  the environment. The matrix clears those variables; the scrub is not changed here.
 - **The integrated scenario forms `FW-E2E-100`, `101`, `102`, `105` and `FW-ADV-025`** need fixture
   `git http-backend`, npm and pip registries and a second network namespace for wildcard success
   paths (§7.1). Their mechanisms are covered by the gateway tests above; the integrated flows are

@@ -18,9 +18,9 @@ every departure from the text below, and what is still owed. The requirements (�
 are defined here, anchored, and code cites them bare. The §9 amendments are applied to `formwork.md`,
 `constitution.md`, `docs/fep-1.md`, `docs/fep-5.md`, the shipped examples and the README, with
 the FEP-5 verbs `https:` and `any:` replaced outright, not aliased: no release has shipped them.
-What remains is the macOS characterization of `FW-CRED16`'s debugger denial, the client matrix
-(`FW-E2E-094`) and the latency budget (`FW-E2E-096`); until they run, the report keeps
-`credential-broker` `Partial` on macOS. Identifiers continue FEP-5's sequences: FEP-5 anchored up to
+What remains is the macOS characterization of `FW-CRED16`'s debugger denial, the run-level egress
+tests and client matrix on macOS (`FW-E2E-094` runs on Linux), and the latency budget
+(`FW-E2E-096`); until they run, the report keeps `credential-broker` `Partial` on macOS. Identifiers continue FEP-5's sequences: FEP-5 anchored up to
 `FW-EGR15`, `FW-CRED15`, `FW-FID11`, `FW-BP15`, `FW-INV14`, `FW-E2E-091` and `FW-ADV-020`, and
 FEP-4 drafted `FW-INV12` and `FW-DISC7`–`FW-DISC10`; this FEP mints `FW-EGR16`–26, `FW-CRED16`–19,
 `FW-BP16`, `FW-FID12`–13, `FW-INV15`, `FW-E2E-092`–106 and `FW-ADV-021`–025. §7.2 walks through
@@ -581,6 +581,10 @@ variable set in FEP-5 §3.1 needs two additions, listed in §9 (c):
   `https_proxy`, `HTTP_PROXY` and `HTTPS_PROXY`, and empties both spellings of `no_proxy`.
 - **Node.** Node's built-in `fetch` (22.21 and 24.0 onward) and `http`/`https` (22.21 and 24.5
   onward) use the proxy variables only when `NODE_USE_ENV_PROXY=1` is set; the Launcher sets it.
+- **npm's own settings.** npm reads `npm_config_proxy` and `npm_config_https_proxy`, in any case,
+  before the proxy variables. The Launcher overrides an inherited one with the Gateway, and an
+  inherited `npm_config_noproxy` with an empty value, as it does `HTTP_PROXY` (found by
+  `FW-E2E-094`).
   Older Node, and any client that ignores proxy variables, attempts a direct `connect()`, which the
   supervisor refuses on Linux and Seatbelt refuses on macOS, with an operator line naming the cause.
 

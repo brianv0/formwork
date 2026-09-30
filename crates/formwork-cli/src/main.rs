@@ -1450,6 +1450,21 @@ fn session_env(session: &Session) -> Vec<(String, String)> {
             vars.push((var.to_string(), String::new()));
         }
         vars.push(("NODE_USE_ENV_PROXY".to_string(), "1".to_string()));
+        // npm reads its own config variables, in any case, before the proxy variables; an
+        // inherited one would send npm around the Gateway, where the supervisor refuses it.
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy().into_owned();
+            let value = match name.to_ascii_lowercase().as_str() {
+                "npm_config_proxy" | "npm_config_https_proxy" => url.clone(),
+                "npm_config_noproxy" => String::new(),
+                _ => continue,
+            };
+            tracing::info!(
+                var = %name,
+                "overriding an inherited npm proxy setting with the session Gateway"
+            );
+            vars.push((name, value));
+        }
     }
     vars.extend(session.egress_env.iter().cloned());
     if let Some(opener) = &session.opener {
