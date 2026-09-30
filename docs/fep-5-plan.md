@@ -81,16 +81,18 @@ here rather than silently deviated.
 - **The README's brokered example uses `any:`, not `https:`.** The proposal's README sketch pairs
   `https:api.anthropic.com` with `broker:anthropic`, which `FW-CRED12` itself refuses: the Gateway
   cannot present a credential on a tunnel it cannot see into. The README and the examples use the
-  inspected grade. *Resolved: `any:` kept, and the §3.2 sketch in `fep-5.md` amended to match.*
+  inspected grade. *Resolved: `any:` kept, and the §3.2 sketch in `fep-5.md` amended to match.
+  Superseded by FEP-6 §9 (j): `allow:` and `tunnel:` replaced `any:` and `https:`.*
 - **Sockets are granted by a literal write grant.** §3.1 says "granted by `allow`". `allow` also
   turns on the exec allowlist, so granting a socket through it would restrict exec as a side
   effect. A literal write grant on the socket path admits it (`FW-ISO12`); the compiler keeps
   literal write grants under a granted subtree for exactly this.
 - **Loopback is restricted by name.** `localhost` and loopback literals are restricted destinations
   like private ranges, unless a rule names them explicitly. The tests' fixture resolver maps test
-  names to loopback upstreams; the production resolver never does.
-- **No `hyper`.** HTTP/1.1 framing is hand-written in `inspect.rs` (content-length or chunked,
-  never both, strict header parsing). The dependency list is `rustls`, `tokio-rustls`, `rcgen` and
+  names to loopback upstreams; the production resolver never does. *Superseded by FEP-6's
+  `FW-EGR19`: an exact-name rule admits a loopback answer, and the fixture exception is gone.*
+- **No `hyper`.** HTTP/1.1 framing is hand-written (content-length or chunked, never both, strict
+  header parsing), now in `http.rs` (FEP-6). The dependency list is `rustls`, `tokio-rustls`, `rcgen` and
   `rustls-native-certs`, all confined to `formwork-gateway`.
 - **The opener transport is one-way.** A shell script cannot hold a request-reply exchange on a
   socket shared by every process in the session without interleaving replies, so the shim cannot

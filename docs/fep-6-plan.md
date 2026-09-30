@@ -1,0 +1,146 @@
+# FEP-6 execution record
+
+Companion to `fep-6.md` (what and why). This records how FEP-6 was built on the engine FEP-5 landed,
+where the build departed from the proposal and why, and what is still owed. Requirement and test IDs
+are defined in `fep-6.md`, anchored there, and cited bare in code.
+
+## 1. What landed
+
+| Area | Scope | Where |
+|---|---|---|
+| Grammar | `allow:` and `tunnel:` replace `any:` and `https:` with no alias; inspection is the default grade; host targets need a dot, `localhost` or an IP literal (`FW-BP16`); one grade per host and port (`FW-BP14`); fs `allow:` is read, write and create, with `exec` separate | `formwork-blueprint/src/egress.rs`, `formwork-cli/src/blueprint_load.rs` |
+| Parse edge | the authority grammar of §4.2 (`[A-Za-z0-9.-]`, numeric spellings read as IPv4 and accepted only dotted-decimal, bracketed IPv6 without a zone); `CanonicalPath` as the one form rules match and the Gateway forwards | `formwork-blueprint/src/egress.rs` |
+| Destination | the §4.5 class table with embedded IPv4 (mapped, compatible, NAT64, 6to4, Teredo); one resolution, every address classified, a mixed answer refused whole (`FW-EGR17`); the Gateway's own endpoints (`FW-EGR18`); local, private and host addresses by exact name or IP literal only (`FW-EGR19`); the host's interface addresses from `getifaddrs` | `formwork-blueprint/src/egress.rs` (`classify`, `admit_addresses`), `formwork-detect` (`interface_addresses`), `formwork-gateway/src/egress.rs` |
+| Front door and tunnel | limits and timeouts of §4.9; the ClientHello buffered and parsed with rustls's `Acceptor` before a byte goes upstream (`FW-EGR16`) | `formwork-gateway/src/egress.rs` |
+| Inspected grade | server name and ALPN checked before the handshake (`FW-EGR20`); streamed bodies (`FW-EGR21`); the request line written from the canonical path with hop-by-hop fields removed (`FW-EGR22`); TRACE and CONNECT refused (`FW-EGR23`); a per-session keep-alive pool; WebSocket spliced after `101`; plain HTTP through the same pipeline | `formwork-gateway/src/{http,inspect}.rs` |
+| Brokering | the placeholder scan; no credential on OPTIONS (`FW-CRED18`) or over plain HTTP (`FW-CRED19`); the reflection guard (`FW-CRED17`); the operator line on a brokered `401`/`403`; custody (`FW-CRED16`); the compiler refuses a binding whose only inspected rule is on port 80 (§9 i) | `formwork-gateway/src/inspect.rs`, `formwork-confine` (`deny_inspection_of_self`), `formwork-blueprint/src/credential.rs` |
+| Session CA | ECDSA P-256, path length 0, `keyCertSign` and `cRLSign`, name-constrained to the inspected hosts (`FW-EGR25`); one leaf key per session, distinct from the CA's; random positive serials; subject and authority key identifiers; §4.9 lifetimes; a 1,024-host LRU with re-minting at half life | `formwork-gateway/src/ca.rs` |
+| Upstream proxy | `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` from `formwork run`'s own environment (`FW-EGR26`) | `formwork-gateway/src/upstream.rs`, `formwork-cli/src/main.rs` |
+| Records | violation records with a reason from the closed set and the capability (`FW-FID12`); grant records (`FW-FID13`) | `formwork-gateway/src/egress.rs` |
+| Launcher | both spellings of the proxy and `no_proxy` variables, `NODE_USE_ENV_PROXY=1` (§9 c) | `formwork-cli/src/main.rs` |
+| Operator surface | `learn` proposes `allow:` for an unlisted host, withholds `address-class` refusals, and names the `tunnel:` rule for a host whose client rejected the session CA; `explain --hosts` reports per-host address classification and the upstream trust source | `formwork-blueprint/src/discovery.rs`, `formwork-cli/src/{learn,main}.rs` |
+| Amendments | §9 (a)–(j) | `formwork.md`, `constitution.md`, `fep-1.md`, `fep-5.md`, `examples/`, `README.md` |
+
+## 2. Mechanisms, as built
+
+**The pipeline.** The front door reads the proxy head within **head-timeout** and **head-limit**,
+checks the per-session credential, and dispatches `CONNECT` to the host decision and an
+absolute-form request to the plain-HTTP relay. A `CONNECT` host is decided, then its destination is
+resolved and classified, and only then does the client get `200`: a refused host or address is a
+`403` before any certificate is minted. A tunnel reads the ClientHello, checks the server name,
+dials the first reachable admitted address, replays the buffered bytes and copies. An inspected host
+reads the same ClientHello, checks the server name and ALPN, and completes the handshake with the
+host's leaf over the replayed bytes.
+
+**Requests.** Each inner request is read strictly (token method, visible-ASCII target, CRLF only, at
+most 100 fields), then decided in order: target form, canonical path, framing, `Host`, TRACE and
+CONNECT, host (plain HTTP only), method and path, placeholders. A refused request with a readable
+body has the body drained and gets `403` on a connection that stays open; a request the engine
+cannot frame gets `400` and the connection closes, as does a `Host` mismatch. The upstream is taken
+from the pool, whose idle connections are probed for a close before reuse, or dialed; a bodiless
+request whose reused connection turns out closed is retried once on a fresh one.
+
+**The reflection guard.** For a request on which a credential was presented, the Gateway replaces
+`Accept-Encoding` with `identity`, drops `Sec-WebSocket-Extensions`, refuses a response with any
+other content coding, scans response headers and trailers, and scans the body stream holding back
+only the longest suffix that is a proper prefix of an encoding (the secret, and the full scheme
+value: `Bearer <secret>` or the base64 of `user:secret`). On a match the client connection is
+dropped mid-response and a `reflection` record is written.
+
+**Custody.** Before the Launcher spawns a workload whose blueprint brokers a credential, the
+`formwork` process calls `prctl(PR_SET_DUMPABLE, 0)` on Linux and `ptrace(PT_DENY_ATTACH)` on
+macOS. `FW-CRED16`'s Linux test observes the effect from outside: the process's `/proc` entries
+belong to root, and a same-uid reader of its `environ` is refused.
+
+**The upstream proxy.** `https_proxy` (or `HTTPS_PROXY`) carries TLS by `CONNECT`, `http_proxy` (or
+`HTTP_PROXY`) carries plain HTTP in absolute form with the URL's Basic credentials, and `no_proxy`
+(or `NO_PROXY`) exempts names by suffix, addresses and CIDR blocks. A name the proxy carries is not
+resolved by the Gateway; an IP literal is classified either way.
+
+## 3. Departures from the proposal
+
+Each is a visible amendment in the sense of the constitution's Precedence & Conflicts, recorded here
+rather than silently deviated.
+
+- **No `hyper`; FEP-5's hand-written HTTP/1.1 stays.** §5 recommends `hyper`, `hyper-util` and
+  `http-body-util`. The landed framing (content length or chunked, never both, strict heads) already
+  met `FW-EGR11`, and the requirements FEP-6 adds -- streaming, authorized forwarding, the pool, the
+  guard's re-chunking -- are a few hundred lines on it. The engine adds no crate, stays on `rcgen`
+  0.13 and `time` 0.3.44, and keeps the MSRV at 1.85 (§5's toolchain note applies only to the
+  recommended set). `hyper` stays the answer if the §11 HTTP/2 spike adds a server codec.
+- **The types keep their landed names.** FEP-6 §5 names `HostName`, `HostPattern`, `CanonicalPath`,
+  `EgressPolicy` and `EgressError`. As built: `CanonicalHost` (a name or an IP literal, the one
+  value the parse edge yields for both), `HostPattern` and `CanonicalPath` in `formwork-blueprint`;
+  the compiled table is the landed `HostTable` in `GatewayPolicy`, matched by a linear scan, since
+  host tables run to tens of rules and a map would change the serialized shape for no measured gain;
+  the engine's error is the crate-internal `Refusal`, so no variant is API surface.
+- **`FW-BP16` also reads `**` as a path.** An any-depth pattern (`deny:**/.env`) begins with `**`,
+  which no host can, so the anchored statement lists it beside `/`, `~` and `$`.
+- **Admission failures are operator lines, not violation records.** A connection the supervisor did
+  not register, and a proxy request without the session credential, come from outside the
+  session's egress; the closed reason set of `FW-FID12` covers refusals of the session's own
+  traffic. Both still produce one operator line (the unregistered connection) or a `407`.
+- **A record names the deciding rule, not its layer.** The Gateway holds the compiled table, which
+  carries no provenance; the record's `explain` invocation prints the layer. Carrying provenance
+  into the Gateway is deferred until an embedder needs it in the record.
+- **Timeouts.** **head-timeout** runs from accept for the proxy head, from the `200` reply for the
+  first inner request, and from the first byte for later ones; the wait for that first byte is
+  **idle-timeout**. A response has no timeout at all, head included: a non-streaming model request
+  can take minutes before its first byte.
+- **The guard ends the connection by dropping it.** §4.7 says "resets"; the TLS stream is dropped
+  without `close_notify`, which the client reads as a truncated response, and no TCP `RST` is forced.
+- **OPTIONS loses its placeholder.** `FW-CRED18` withholds the credential; the header that carried
+  the placeholder is removed too, so the upstream sees no credential-shaped value.
+- **The placeholder scan runs in every session**, brokered or not: an `fwcred-` value with no known
+  placeholder is refused as unknown.
+- **WebSocket after a brokered upgrade.** `Sec-WebSocket-Extensions` is removed so frames stay
+  uncompressed and scannable; the guard scans the upstream's frame bytes, so an echo split across
+  fragments is not recognized. The `credential-broker` verdict is `Partial` and names this and the
+  identity-coding condition.
+- **Upstream proxy scope.** Loopback destinations (`localhost`, loopback literals) are always exempt,
+  as in Go's `net/http`. `https://` and SOCKS proxy URLs are refused at session start. Per-host
+  classification is reported by `explain --hosts` and one session-start operator line; the compile
+  report stays a pure function of the blueprint and the HostProfile and carries no environment.
+- **`learn` does not propose `tunnel:`.** A host whose client rejected the session CA already has an
+  inspected rule, and a `tunnel:` rule beside it fails `FW-BP14`. `learn` names the rule to swap in
+  an operator line, listed apart from the proposals.
+- **Protocol details.** A `CONNECT` authority without a port is `malformed` (FEP-5 defaulted it to
+  443). An absolute-form request to a tunnel host is refused as `not-tls`. The Gateway answers
+  `Expect: 100-continue` itself and does not forward the header. An IP-literal leaf carries a
+  subject name that is not host-shaped, so OpenSSL does not check it against the CA's DNS
+  constraints.
+- **`fw-egress-probe` is not built.** The gateway tests drive rustls clients and raw sockets
+  directly, which produce every case the probe was for (a mismatched server name, a mismatched
+  `Host`, a non-TLS first byte, an `h2`-only ALPN offer, the raw heads of `FW-ADV-024`).
+
+## 4. Tests
+
+| ID | Where | Runs on | Coverage |
+|---|---|---|---|
+| `FW-E2E-092` | `formwork-gateway/tests/inspect.rs` (`fw_egr21_…`) | both | 3 MiB chunked and length-framed uploads byte-identical; the memory bound and `git push` are owed |
+| `FW-E2E-093` | `formwork-gateway/tests/inspect.rs` | both | ordering, not the 20 ms bound (§5 register) |
+| `FW-E2E-095` | `formwork-gateway/tests/inspect.rs` | both | full |
+| `FW-E2E-097` | `formwork-gateway/tests/inspect.rs` (`fw_egr25_…`), `src/ca.rs`, `fep5_run.rs` (`fw_e2e_098_…`, curl verifies a constrained IP leaf) | both / Linux | the constraints' effect, not an `openssl verify` transcript |
+| `FW-E2E-098` | `fep5_run.rs` (rows 1, 8, 9), `formwork-gateway/tests/{egress,inspect}.rs` (rows 2, 6, 7) | Linux / both | rows 3–5 are FEP-5's `FW-E2E-075` |
+| `FW-E2E-099` | `formwork-gateway/tests/inspect.rs` (`fw_e2e_078_…`), `fep5_run.rs` (`fw_e2e_078_…`) | both / Linux | rows 1–3, 5–7 |
+| `FW-E2E-103` | `formwork-gateway/tests/egress.rs` (`fw_egr26_…`, `fw_adv_023_…`) | both | rows 1, 2, 5 |
+| `FW-E2E-104` | `fep5_run.rs` | both | full |
+| `FW-ADV-021` | `formwork-gateway/tests/inspect.rs` | both | full |
+| `FW-ADV-022` | `formwork-gateway/tests/{egress,inspect}.rs` (`fw_egr16_…`, `fw_egr10_…`, `fw_egr20_…`) | both | full |
+| `FW-ADV-023` | `formwork-gateway/tests/egress.rs` | both | the Gateway's own listener case is a unit test (`gateway_endpoints_and_host_addresses_are_classes`): the listener port is not known before the table is written |
+| `FW-ADV-024` | `formwork-gateway/tests/egress.rs`, `src/http.rs`, `src/egress.rs` | both | full |
+| `FW-CRED16` | `fep5_run.rs` (`fw_cred16_…`) | Linux, unprivileged | root owns every `/proc` entry, so a root runner cannot observe it |
+
+## 5. Still owed
+
+- **macOS characterization of `FW-CRED16`.** `PT_DENY_ATTACH` is untested on Seatbelt hosts;
+  `credential-broker` reports `Partial` on macOS with that reason until it runs.
+- **`FW-E2E-094` (client matrix)** and **`FW-E2E-096` (latency budget)**. Neither runs yet; the §8
+  performance rows in `formwork.md` are targets until `FW-E2E-096` measures them.
+- **The integrated scenario forms `FW-E2E-100`, `101`, `102`, `105` and `FW-ADV-025`** need fixture
+  `git http-backend`, npm and pip registries and a second network namespace for wildcard success
+  paths (§7.1). Their mechanisms are covered by the gateway tests above; the integrated flows are
+  not.
+- **`FW-E2E-106`** stays blocked on FEP-6 §11 (in-session loopback).
+- **Test-method exceptions**, in `docs/STATUS.md`'s register: `FW-E2E-092`'s memory bound and
+  `FW-E2E-093`'s 20 ms bound are asserted by ordering and byte identity instead of measurement.

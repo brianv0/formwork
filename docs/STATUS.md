@@ -17,6 +17,7 @@ identifiers*).
 | 7 | Degraded-host honesty + optional tiers | **done** — fail-closed fidelity reporting on incapable hosts; Landlock net port-tier and ABI-v6 socket/signal scoping and exec allow-lists ([`docs/linux-backend.md`](linux-backend.md)) |
 | — | Python E2E harness | **done** — black-box CLI tests + generated traceability, `uv`-managed |
 | — | FEP-5: host-scoped egress, brokering, channels, isolation | **landed; macOS characterization owed** — host rules through the session Gateway ([`FW-EGR7`](fep-5.md#fw-egr7)–15) with the Linux connect supervisor, TLS inspection and credential brokering ([`FW-CRED10`](fep-5.md#fw-cred10)–15), the host-service channel baseline and the `open-url` opener shim ([`FW-ISO13`](fep-5.md#fw-iso13)–18), the Linux isolation tier ([`FW-ISO10`](fep-5.md#fw-iso10)), private temp directories, and host/channel discovery in `learn` ([`FW-DISC12`](fep-5.md#fw-disc12)). Record and departures: [`fep-5-plan.md`](fep-5-plan.md). The macOS characterization suite (FEP-5 §6.3) and `FW-E2E-080`/081/091, `FW-ADV-019` are **still owed**; those macOS verdicts report `Partial` until then |
+| — | FEP-6: the egress engine | **landed; macOS characterization owed** — the tunnel grade checks the ClientHello's server name ([`FW-EGR16`](fep-6.md#fw-egr16)); one resolution, every address classified, private and host addresses by exact name only ([`FW-EGR17`](fep-6.md#fw-egr17)–19); inspection by default with `allow:` and `tunnel:` replacing `any:` and `https:` ([`FW-BP16`](fep-6.md#fw-bp16)); HTTP/1.1-only ALPN, streamed bodies, authorized forwarding, a keep-alive upstream pool ([`FW-EGR20`](fep-6.md#fw-egr20)–24); a name-constrained session CA ([`FW-EGR25`](fep-6.md#fw-egr25)); the operator's upstream proxy ([`FW-EGR26`](fep-6.md#fw-egr26)); custody, the reflection guard and presentation limits ([`FW-CRED16`](fep-6.md#fw-cred16)–19); refusal reasons and grant records ([`FW-FID12`](fep-6.md#fw-fid12)–13). Record and departures: [`fep-6-plan.md`](fep-6-plan.md). The macOS characterization of `FW-CRED16`, the client matrix (`FW-E2E-094`) and the latency budget (`FW-E2E-096`) are **still owed** |
 | — | Discovery (`learn` / accept loop, FEP-2 Part D) | **done, both OSes** — macOS via the unified-log feed (post-hoc, polled to quiescence, [`FW-E2E-064`](../formwork.md#fw-e2e-064)); Linux via the ptrace feed ([`FW-E2E-071`](../formwork.md#fw-e2e-071)): an unconfined `strace` traces the confined run, so denials are exact-attributed with no persistence latency (needs `strace` installed and Landlock). A host with neither fails fast before the workload runs ([`FW-E2E-062`](../formwork.md#fw-e2e-062)). Landlock's native audit feed (kernel 6.15+) remains a future alternative tap. |
 
 `cargo test --workspace` runs the pure + native-backend tests on any host; `cd py && uv run
@@ -34,6 +35,8 @@ rule it suspends, the reason, and an expiry). The live register:
 |---|---|---|---|---|
 | [`FW-INV2`](../formwork.md#fw-inv2) | fuzzed over random spawn trees | one targeted assertion — a nested forked descendant down to the shed-probe leaf (`crates/formwork-confine/tests/linux_confine.rs`) | fuzz/property infra not yet built | deferred; fuzz-infra FEP TBD |
 | [`FW-INV4`](../formwork.md#fw-inv4) | fuzzed over guessed names and out-of-band identifiers | one targeted assertion — a hidden-real and an out-of-band identity per axis (`crates/formwork-gateway/tests/gateway.rs`) | fuzz/property infra not yet built | deferred; fuzz-infra FEP TBD |
+| [`FW-E2E-092`](fep-6.md#fw-e2e-092) | a 256 MiB upload with the Gateway's resident memory measured | 3 MiB chunked and length-framed uploads asserted byte-identical (`crates/formwork-gateway/tests/inspect.rs`); the body buffer is bounded by construction (`READ_CHUNK`) | a portable RSS probe of the Gateway thread is not built | the FEP-6 performance pass, with `FW-E2E-096` |
+| [`FW-E2E-093`](fep-6.md#fw-e2e-093) | every event within 20 ms of the fixture writing it | ordering: the fixture sends the second event only after the client has read the first through the reflection guard (`crates/formwork-gateway/tests/inspect.rs`) | a wall-clock bound flakes on shared CI runners (constitution *Testing*) | the FEP-6 performance pass, with `FW-E2E-096` |
 
 ## Deprecations
 
@@ -47,6 +50,7 @@ were removed ahead of the first tagged release; each surface now has exactly one
 | hidden `formwork enforce-self` | `formwork run --confine-self` |
 | hidden `formwork accept` | `formwork learn --list` / `--accept` |
 | `--spec` alias | `--blueprint` |
+| host-rule verbs `https:` and `any:` (FEP-5) | `tunnel:` and `allow:` (FEP-6 §9 j); refused at parse |
 
 Enhancement proposals and their planning docs live in this directory:
 
@@ -58,6 +62,9 @@ Enhancement proposals and their planning docs live in this directory:
   **in flight** — the pure core has landed, the deviating mechanism has not.
 - [`fep-5.md`](fep-5.md) + [`fep-5-plan.md`](fep-5-plan.md) — host-scoped egress, credential brokering,
   host-service channels, process isolation (landed; macOS characterization owed).
+- [`fep-6.md`](fep-6.md) + [`fep-6-plan.md`](fep-6-plan.md) — the egress engine: tunnel and inspected
+  grades, destination classes, the session CA, brokering in the engine (landed; macOS
+  characterization owed).
 
 Supporting docs: [`linux-backend.md`](linux-backend.md) (Landlock/seccomp design),
 [`mcp-tool-patterns.md`](mcp-tool-patterns.md) (FW-GW9 shading), [`spikes.md`](spikes.md)

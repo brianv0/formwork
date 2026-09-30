@@ -117,7 +117,9 @@ compatibility discipline concentrate here.
   authored ones ([FW-DISC6](formwork.md#fw-disc6)).
 - **broker** = the Gateway presenting a credential it holds, never disclosing its bytes ·
   **placeholder** = the per-session stand-in for a brokered env var · **inspect** = TLS termination
-  at the Gateway for a host rule that needs request-level policy · **supervise** = the Gateway
+  at the Gateway for every host rule except `tunnel:` · **tunnel** = a host grant the Gateway
+  forwards without terminating TLS, checking the host and the server name but not the contents ·
+  **supervise** = the Gateway
   receiving a confined `connect()` through seccomp user notification and minting the connection
   itself · **channel** = a host service that can act outside the sandbox on a confined process's
   behalf, named by a portable enum value · **characterize** = a CI test that records how a platform
