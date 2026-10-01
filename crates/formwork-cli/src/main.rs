@@ -1653,6 +1653,11 @@ fn spawn_confined_child(
     let status = child.wait();
     session.tmp_dir.remove();
     let status = status.context("waiting for the confined command")?;
+    // The opener logs each URL from its own thread; let it drain before the session ends, or the
+    // line for a URL handed over just before the workload exited races this process's exit.
+    if let Some(service) = session.opener.as_ref().and_then(|o| o.service.as_ref()) {
+        service.records_within(std::time::Duration::from_millis(500));
+    }
     log_exit("confined command exited", &status);
     if let Some(egress) = &session.egress {
         if !egress.proxy.is_alive() {

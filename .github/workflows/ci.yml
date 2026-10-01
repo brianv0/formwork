@@ -1,4 +1,5 @@
-# Continuous integration: format, lint, and test the workspace on every push to main and every PR.
+# Continuous integration: format, lint, and test the workspace on every push to main or an agent
+# branch and every PR.
 # Uses only first-party `actions/*` and the runner's preinstalled rustup — no third-party actions,
 # to keep the supply-chain surface of a sandboxing tool minimal (constitution: enforcement is real,
 # not assumed). Release artifacts are built separately in release.yml.
@@ -6,8 +7,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Agent branches run CI on every push, so platform work (macOS above all, which no agent
+    # container can run) is verified on real runners before a pull request exists.
+    branches: [main, "claude/**"]
   pull_request:
+  workflow_dispatch:
 
 # Least privilege: CI only reads the repo.
 permissions:

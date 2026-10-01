@@ -1,0 +1,19 @@
+# Temporary: Seatbelt characterization probes on hosted runners. Removed before merge.
+name: macOS probe
+on:
+  push:
+    branches: ["claude/**"]
+    paths: [".github/macos-probe/**", ".github/workflows/macos-probe.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/macos-probe/probe.sh 2>&1
