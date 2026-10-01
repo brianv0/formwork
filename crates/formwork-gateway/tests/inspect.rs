@@ -426,6 +426,10 @@ async fn fw_e2e_093_streamed_events_pass_the_guard_as_they_arrive() {
 /// larger than any buffer and a length-framed one arrive byte-identical.
 #[tokio::test(flavor = "multi_thread")]
 async fn fw_egr21_bodies_stream_byte_identical() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("formwork_gateway=debug")
+        .try_init();
     let s = inspected(&["post:api.test:{port}/sum"], vec![]).await;
     let host = s.host_header("api.test");
     let body: Vec<u8> = (0..3 * 1024 * 1024u32)
@@ -441,9 +445,18 @@ async fn fw_egr21_bodies_stream_byte_identical() {
         chunked.extend_from_slice(b"\r\n");
     }
     chunked.extend_from_slice(b"0\r\n\r\n");
+    let started = std::time::Instant::now();
     tls.write_all(&chunked).await.unwrap();
+    let written = started.elapsed();
     let out = read_response(&mut tls).await;
-    assert!(out.ends_with(&format!("{} {sum}", body.len())), "{out}");
+    assert!(
+        out.ends_with(&format!("{} {sum}", body.len())),
+        "written in {written:?}, answered after {:?}: {out:?}; the fixture saw {} request(s); \
+         refusals: {:?}",
+        started.elapsed(),
+        s.up.seen().len(),
+        s.proxy.violations()
+    );
     let mut sized = format!(
         "POST /sum HTTP/1.1\r\n{host}Content-Length: {}\r\n\r\n",
         body.len()

@@ -214,8 +214,11 @@ pub fn fixture_cert(dir: &Path, names: &[&str]) -> FixtureCert {
     let mut leaf =
         CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
     leaf.distinguished_name.push(DnType::CommonName, names[0]);
+    leaf.is_ca = IsCa::ExplicitNoCa;
     leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    // Python 3.13's VERIFY_X509_STRICT refuses a leaf without an authority key identifier.
+    leaf.use_authority_key_identifier_extension = true;
     window(&mut leaf);
     let leaf = leaf.signed_by(&key, &ca, &ca_key).unwrap();
 

@@ -584,7 +584,11 @@ async fn exchange(
                 shared.refuse(at(malformed(why)));
                 return Ok(Next::Close);
             }
-            Err(_) => return Ok(Next::Close),
+            Err(BodyError::Io(e)) => {
+                tracing::info!(host = %host, error = %e, "egress request body did not pass through");
+                return Ok(Next::Close);
+            }
+            Err(BodyError::Reflected) => return Ok(Next::Close),
         }
         if conn.s.flush().await.is_err() {
             if retryable {

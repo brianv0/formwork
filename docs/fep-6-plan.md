@@ -171,14 +171,15 @@ names the root.
 | pip, `python3 -m pip` | reached / reached | reached / reached | `https_proxy`, `PIP_CERT`. pip verifies through `truststore`, which on macOS hands the bundle's CA certificates to the platform verifier as anchors |
 | npm 10 | reached / reached | reached / reached | `npm_config_https_proxy` (overridden), `NODE_EXTRA_CA_CERTS` |
 | Go `net/http` | reached / reached | refused / refused | `HTTPS_PROXY`; `SSL_CERT_FILE` on Linux, the platform verifier on macOS |
-| Swift `URLSession` | -- | refused / refused | `https_proxy`; the keychain only |
+| Swift `URLSession` | -- | refused / refused | neither: the system proxy settings and the keychain. It connects directly, which the session refuses |
 | uv 0.8 | reached / reached | reached / reached | `https_proxy`, `SSL_CERT_FILE` -- without `UV_NATIVE_TLS` |
 | cargo | reached / reached | reached / reached | `https_proxy`, `CARGO_HTTP_CAINFO` |
 | rustup | reached / reached | refused / refused | `https_proxy`; `SSL_CERT_FILE` on Linux, the platform verifier on macOS |
 
-The macOS refusals are the platform-verifier caveat of FEP-5 §3.2: the inspected row fails on the
-session CA, the tunnel row on a root the keychain does not hold. Against a real origin, whose root
-the keychain holds, the tunnel row reaches.
+Go's and rustup's macOS refusals are the platform-verifier caveat of FEP-5 §3.2: the inspected row
+fails on the session CA, the tunnel row on a root the keychain does not hold; against a real
+origin, whose root the keychain holds, the tunnel row reaches. Swift's `URLSession` never reaches
+the Gateway: it ignores the proxy variables and connects directly, which the session refuses.
 
 ## 5. Still owed
 

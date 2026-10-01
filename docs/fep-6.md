@@ -602,7 +602,7 @@ variable set in FEP-5 §3.1 needs two additions, listed in §9 (c):
 | uv | either case | `SSL_CERT_FILE` (uv 0.8; older releases with `UV_NATIVE_TLS=1`) | amended: found by `FW-E2E-094` |
 | cargo | `https_proxy` (either case) | `CARGO_HTTP_CAINFO`, which the Launcher sets (amended: found by `FW-E2E-094`) | |
 | rustup | `https_proxy` (either case) | `SSL_CERT_FILE` on Linux; ignored on macOS | the platform verifier, like Go on macOS (characterized) |
-| Swift `URLSession` (macOS) | `https_proxy` | ignored: the keychain only | like Go on macOS |
+| Swift `URLSession` (macOS) | ignored: the system proxy settings only | ignored: the keychain only | it connects directly, which the session refuses (characterized by `FW-E2E-094`) |
 
 A client that ignores the CA variables fails its handshake against an inspected host, and the
 operator line suggests `tunnel:` for that host (S1, variant). `FW-E2E-094` turns this table into a

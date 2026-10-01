@@ -920,15 +920,20 @@ fn fw_e2e_087_host_session_detection() {
     }
 }
 
-/// C9 (FEP-5 §6.3): Claude Code's keychain use on macOS. A `security` shim first in `PATH` records
-/// what Claude Code asks the keychain for. Under `claude-code.toml` -- the `claude` type lifts the
-/// keychain on macOS -- the lookup reaches the keychain; under the same rules without the lift it
-/// is denied with a `com.apple.SecurityServer` record. `claude -p` without a login prints its
-/// login instruction and opens no browser. Runs in the `agent-examples` job, which installs the
-/// agents and sets `FW_AGENTS_INSTALLED=1`.
+/// C9 (FEP-5 §6.3): Claude Code's keychain use on macOS, without a login. An unconfined control
+/// run records what Claude Code does here: its output, and any `security` call through a shim first
+/// in `PATH`. Under `claude-code.toml` -- the `claude` type lifts the keychain on macOS -- the
+/// session behaves as the control did; under the same rules without the lift, the keychain lookup
+/// is denied with a Sandbox record naming one of the keychain's services. Runs in the
+/// `agent-examples` job, which installs the agents and sets `FW_AGENTS_INSTALLED=1`.
 #[test]
 fn c9_claude_code_keychain_use() {
     use std::os::unix::fs::PermissionsExt;
+    const KEYCHAIN: [&str; 3] = [
+        "com.apple.SecurityServer",
+        "com.apple.securityd",
+        "com.apple.securityd.xpc",
+    ];
     let dir = Scratch::new("mac-c9");
     if !seatbelt_host(dir.path()) {
         return;
@@ -945,6 +950,13 @@ fn c9_claude_code_keychain_use() {
     for file in ["agent-base.toml", "claude-code.toml"] {
         std::fs::copy(examples.join(file), dir.path().join(file)).unwrap();
     }
+    let base = std::fs::read_to_string(dir.path().join("claude-code.toml")).unwrap();
+    assert!(base.contains("allow-credentials = [\"claude\"]"));
+    std::fs::write(
+        dir.path().join("no-keychain.toml"),
+        base.replace("allow-credentials = [\"claude\"]", ""),
+    )
+    .unwrap();
     std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
     let shim = dir.path().join("shim");
     std::fs::create_dir_all(&shim).unwrap();
@@ -967,43 +979,76 @@ fn c9_claude_code_keychain_use() {
         shim.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let claude = |blueprint: &str| {
+    let asked = || {
+        let got = std::fs::read_to_string(&calls).unwrap_or_default();
         let _ = std::fs::remove_file(&calls);
-        let out = formwork_env(
+        got
+    };
+    let keychain_denials = |since: Instant| {
+        sandbox_records(since, |m| {
+            m.contains(" deny(")
+                && KEYCHAIN
+                    .iter()
+                    .any(|s| m.contains(&format!("mach-lookup {s}")))
+        })
+    };
+
+    // The control: Claude Code unconfined, in the same home and with the same PATH.
+    let control = Command::new("claude")
+        .args(["-p", "hi"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("PATH", &path)
+        .env_remove("ANTHROPIC_API_KEY")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let control_said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&control.stdout),
+        String::from_utf8_lossy(&control.stderr)
+    );
+    let control_asked = asked();
+    eprintln!(
+        "C9 control: exit {:?}\n{control_said}\nsecurity calls: {control_asked:?}",
+        control.status.code()
+    );
+    assert!(control_said.contains("/login"), "{control_said}");
+
+    let session = |blueprint: &str| {
+        formwork_env(
             dir.path(),
             &["run", "--blueprint", blueprint, "--", "claude", "-p", "hi"],
             &[("PATH", path.as_str())],
             &["ANTHROPIC_API_KEY"],
-        );
-        let asked = std::fs::read_to_string(&calls).unwrap_or_default();
-        (out, asked)
+        )
     };
-
-    let (lifted, asked) = claude("claude-code.toml");
-    eprintln!("C9: Claude Code asked the keychain:\n{asked}");
+    let lifted = session("claude-code.toml");
+    let lifted_asked = asked();
+    eprintln!(
+        "C9 claude-code.toml: exit {}\n{}{}\nsecurity calls: {lifted_asked:?}",
+        lifted.code, lifted.stdout, lifted.stderr
+    );
     assert!(
         format!("{}{}", lifted.stdout, lifted.stderr).contains("/login"),
         "{}\n{}",
         lifted.stdout,
         lifted.stderr
     );
-    assert!(asked.contains("find-generic-password"), "{asked}");
+    assert_eq!(
+        lifted_asked, control_asked,
+        "the session asked the keychain differently from the control"
+    );
 
     // The same rules without the `claude` lift: the keychain is denied.
-    let base = std::fs::read_to_string(dir.path().join("claude-code.toml")).unwrap();
-    std::fs::write(
-        dir.path().join("no-keychain.toml"),
-        base.replace("allow-credentials = [\"claude\"]", ""),
-    )
-    .unwrap();
     let started = Instant::now();
-    let (_, asked_denied) = claude("no-keychain.toml");
-    assert!(
-        asked_denied.contains("find-generic-password"),
-        "{asked_denied}"
+    let unlifted = session("no-keychain.toml");
+    let unlifted_asked = asked();
+    let records = keychain_denials(started);
+    eprintln!(
+        "C9 without the lift: exit {}\n{}{}\nsecurity calls: {unlifted_asked:?}\nkeychain \
+         records: {records:#?}",
+        unlifted.code, unlifted.stdout, unlifted.stderr
     );
-    assert!(
-        denied_since(started, "mach-lookup", "com.apple.SecurityServer"),
-        "no Sandbox record for the keychain"
-    );
+    assert!(!records.is_empty(), "no Sandbox record for the keychain");
 }

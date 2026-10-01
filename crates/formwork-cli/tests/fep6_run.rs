@@ -333,6 +333,8 @@ fn fw_e2e_094_client_matrix() {
                     ("SSL_CERT_FILE", &root),
                     ("https_proxy", &proxy_url),
                     ("npm_config_https_proxy", "http://127.0.0.1:1"),
+                    // A Rust client's error, not its backtrace.
+                    ("RUST_BACKTRACE", "0"),
                 ],
                 // The operator's environment may configure git through GIT_CONFIG_COUNT and
                 // GIT_CONFIG_KEY_n/VALUE_n; the FW-ENV2 scrub strips the KEY_n names alone, which
@@ -340,21 +342,33 @@ fn fw_e2e_094_client_matrix() {
                 &["GIT_CONFIG_COUNT"],
             );
             let reached = fixture.seen().iter().any(|s| s.path().starts_with(&path));
-            // A refusal records the client's last word on it, so the matrix says why.
+            // A refusal records the client's last error line (else its last line), so the matrix
+            // says why.
             let why = if reached {
                 String::new()
             } else {
-                let last = out.stdout.lines().rev().find(|l| !l.trim().is_empty());
-                let last = last.unwrap_or("").trim();
-                format!("  ({})", last.chars().take(110).collect::<String>())
+                let lines: Vec<&str> = out
+                    .stdout
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+                let last = lines
+                    .iter()
+                    .rev()
+                    .find(|l| l.to_ascii_lowercase().contains("error"))
+                    .or(lines.last())
+                    .map(|l| l.trim())
+                    .unwrap_or("");
+                format!("  ({})", last.chars().take(140).collect::<String>())
             };
             matrix.push(format!(
                 "{client:16} {grade:9} {}{why}",
                 if reached { "reached" } else { "refused" }
             ));
-            // Go, Swift and rustup verify through the platform on macOS and ignore the trust
-            // variables: the inspected row is refused for the session CA, the tunnel row for the
-            // fixture root the keychain does not hold.
+            // Go and rustup verify through the platform on macOS and ignore the trust variables:
+            // the inspected row is refused for the session CA, the tunnel row for the fixture
+            // root the keychain does not hold. Swift's URLSession also ignores the proxy
+            // variables, so it never reaches the Gateway.
             let expected = if macos { on_macos } else { on_linux };
             if let Some(expected) = expected {
                 if reached != expected {
