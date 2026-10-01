@@ -176,30 +176,58 @@ impl Seen {
     }
 }
 
-/// A self-signed certificate for `names` (DNS names or IP addresses), which is its own root; the
-/// PEM is written to `<dir>/fixture-root.pem` for the operator's `SSL_CERT_FILE` (FEP-6 §7.1: the
-/// Gateway's upstream trust comes from its own environment).
+/// A test root CA and a leaf it issues for `names` (DNS names or IP addresses), shaped like a
+/// real origin's: the leaf carries `serverAuth` and a short validity window. The root's PEM is
+/// written to `<dir>/fixture-root.pem` for the operator's `SSL_CERT_FILE` (FEP-6 §7.1: the
+/// Gateway's upstream trust comes from its own environment). A self-signed leaf would not do:
+/// clients that verify through the platform (pip's `truststore` on macOS) pass only CA
+/// certificates from a bundle on as anchors.
 pub struct FixtureCert {
     pub root: PathBuf,
     config: Arc<rustls::ServerConfig>,
 }
 
 pub fn fixture_cert(dir: &Path, names: &[&str]) -> FixtureCert {
-    let key = rcgen::KeyPair::generate().unwrap();
-    let cert =
-        rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let epoch = rcgen::date_time_ymd(1970, 1, 1);
+    let day = Duration::from_secs(86_400);
+    let window = |params: &mut CertificateParams| {
+        params.not_before = epoch + (now - day);
+        params.not_after = epoch + (now + 30 * day);
+    };
+
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca = CertificateParams::default();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    ca.distinguished_name
+        .push(DnType::CommonName, "Formwork test fixture root");
+    window(&mut ca);
+    let ca = ca.self_signed(&ca_key).unwrap();
+
+    let key = KeyPair::generate().unwrap();
+    let mut leaf =
+        CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
+    leaf.distinguished_name.push(DnType::CommonName, names[0]);
+    leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    window(&mut leaf);
+    let leaf = leaf.signed_by(&key, &ca, &ca_key).unwrap();
+
     let root = dir.join("fixture-root.pem");
-    std::fs::write(&root, cert.pem()).unwrap();
+    std::fs::write(&root, ca.pem()).unwrap();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
-            vec![cert.der().clone()],
+            vec![leaf.der().clone()],
             rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
                 key.serialize_der(),
             )),

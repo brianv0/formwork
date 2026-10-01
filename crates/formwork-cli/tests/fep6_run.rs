@@ -264,7 +264,7 @@ fn fw_e2e_094_client_matrix() {
         ("git", "git", Some(true), Some(true), |u| {
             format!("git ls-remote {u}/repo.git")
         }),
-        ("pip", "pip3", Some(true), None, |u| {
+        ("pip", "pip3", Some(true), Some(true), |u| {
             format!(
                 "pip3 download --no-deps --no-cache-dir --disable-pip-version-check --retries 0 \
                  --timeout 10 -d \"$TMPDIR/dl\" --index-url {u}/simple/ fixture-pkg"
@@ -279,13 +279,13 @@ fn fw_e2e_094_client_matrix() {
         ("swift", "swiftc", None, Some(false), |u| {
             format!("./swift-get {u}")
         }),
-        ("uv", "uv", Some(true), None, |u| {
+        ("uv", "uv", Some(true), Some(true), |u| {
             format!("echo fixture-pkg | uv pip compile --no-cache --index-url {u}/simple/ -")
         }),
-        ("cargo", "cargo", Some(true), None, |u| {
+        ("cargo", "cargo", Some(true), Some(true), |u| {
             format!("cargo search --limit 1 --index sparse+{u}/index/ fixture-pkg")
         }),
-        ("rustup", "rustup", Some(true), None, |u| {
+        ("rustup", "rustup", Some(true), Some(false), |u| {
             // A fresh RUSTUP_HOME in the session; the install fetches the channel manifest's
             // checksum from the dist server first, and fails there against the fixture.
             format!(
@@ -293,7 +293,7 @@ fn fw_e2e_094_client_matrix() {
                  rustup toolchain install stable --profile minimal --no-self-update"
             )
         }),
-        ("pip-module", "python3", None, None, |u| {
+        ("pip-module", "python3", Some(true), Some(true), |u| {
             format!(
                 "python3 -m pip download --no-deps --no-cache-dir --disable-pip-version-check \
                  --retries 0 --timeout 10 -d \"$TMPDIR/dl\" --index-url {u}/simple/ fixture-pkg"
@@ -340,12 +340,21 @@ fn fw_e2e_094_client_matrix() {
                 &["GIT_CONFIG_COUNT"],
             );
             let reached = fixture.seen().iter().any(|s| s.path().starts_with(&path));
+            // A refusal records the client's last word on it, so the matrix says why.
+            let why = if reached {
+                String::new()
+            } else {
+                let last = out.stdout.lines().rev().find(|l| !l.trim().is_empty());
+                let last = last.unwrap_or("").trim();
+                format!("  ({})", last.chars().take(110).collect::<String>())
+            };
             matrix.push(format!(
-                "{client:16} {grade:9} {}",
+                "{client:16} {grade:9} {}{why}",
                 if reached { "reached" } else { "refused" }
             ));
-            // Go and Swift ignore the trust variables on macOS: the inspected row is refused for
-            // the session CA, the tunnel row for the fixture root the keychain does not hold.
+            // Go, Swift and rustup verify through the platform on macOS and ignore the trust
+            // variables: the inspected row is refused for the session CA, the tunnel row for the
+            // fixture root the keychain does not hold.
             let expected = if macos { on_macos } else { on_linux };
             if let Some(expected) = expected {
                 if reached != expected {

@@ -99,8 +99,10 @@ jobs:
       # under the baseline (FW-E2E-084).
       # --no-fail-fast: every test binary runs, so one run reports every failure on the platform;
       # the summary step repeats each failure at the end of the log, where it is read first.
+      # A hung test fails the step (the summary below then names it) instead of holding the runner.
       - name: Test
         shell: bash
+        timeout-minutes: 25
         run: |
           set -o pipefail
           cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test.log"
@@ -117,7 +119,7 @@ jobs:
       - name: Test failure summary
         if: failure()
         shell: bash
-        run: grep -E -A20 '^---- |^test .* FAILED$|targets? failed' "$RUNNER_TEMP/test.log" | head -600
+        run: grep -E -A20 '^---- |^test .* FAILED$|targets? failed|running for over' "$RUNNER_TEMP/test.log" | head -600
 
       # The Python black-box harness drives the built `formwork` binary at the outermost real
       # boundary; platform-inappropriate tests skip via markers (macOS Seatbelt vs Linux Landlock),
@@ -151,10 +153,15 @@ jobs:
 
   # FW-E2E-084 with real agents: install Claude Code, codex and opencode from npm (network, like
   # mcp-integration) and run each one's non-interactive smoke command under `learn` with its shipped
-  # blueprints; the run must propose nothing the example does not document.
+  # blueprints; the run must propose nothing the example does not document. On macOS the job also
+  # records Claude Code's keychain use (FEP-5 §6.3 C9).
   agent-examples:
-    name: agent examples
-    runs-on: ubuntu-22.04
+    name: agent examples (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v4
 
@@ -162,15 +169,27 @@ jobs:
         with:
           cache-prefix: agents
 
-      - name: Install strace and the agents
-        run: |
-          sudo apt-get update && sudo apt-get install -y strace
-          npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
+      - name: Install strace
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y strace
+
+      - name: Install the agents
+        run: npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
 
       - name: Agent examples under the baseline
+        timeout-minutes: 10
         run: cargo test -p formwork-cli --test fep5_run --locked fw_e2e_084 -- --nocapture
         env:
           FW_REQUIRE_EXERCISED: "1"
+          FW_AGENTS_INSTALLED: "1"
+
+      - name: Claude Code's keychain use (C9)
+        timeout-minutes: 10
+        if: runner.os == 'macOS' && !cancelled()
+        run: cargo test -p formwork-cli --test fep5_macos --locked c9_ -- --nocapture
+        env:
+          FW_REQUIRE_EXERCISED: "1"
+          FW_AGENTS_INSTALLED: "1"
 
   # Enforce the declared MSRV (Cargo.toml `rust-version`). Without this the pin is documentation
   # only: every other job uses stable, so post-1.85 code could merge green while violating it.

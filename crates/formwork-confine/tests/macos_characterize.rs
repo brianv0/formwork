@@ -217,6 +217,8 @@ fn c1_network_filters_name_only_star_or_localhost() {
 /// connections each and ten reparented grandchildren holding ten each -- makes 1,000 connections
 /// to a listener while it is still forking; each accepted connection is attributed to the session
 /// by its client end and the session marker, and a connection from an unconfined process is not.
+/// Accepting runs on its own thread, as the Gateway's does: a lookup in the accept loop lets the
+/// listen queue (128 on macOS) overflow, and macOS resets the connections past it.
 #[test]
 fn c2_peer_lookup_attributes_every_connection() {
     let Some(py) = python() else {
@@ -245,8 +247,15 @@ fn c2_peer_lookup_attributes_every_connection() {
     let script = r#"
 import os, socket, sys, time
 port, stop = int(sys.argv[1]), sys.argv[2]
+def connect():
+    for _ in range(200):
+        try:
+            return socket.create_connection(("127.0.0.1", port))
+        except OSError:
+            time.sleep(0.05)
+    os._exit(1)
 def hold(n):
-    held = [socket.create_connection(("127.0.0.1", port)) for _ in range(n)]
+    held = [connect() for _ in range(n)]
     while not os.path.exists(stop):
         time.sleep(0.05)
     os._exit(0)
@@ -273,12 +282,25 @@ while True:
         stop.to_str().unwrap(),
     ]);
     formwork_confine::spawn_confined(&mut cmd, &policy).unwrap();
+    let (accepted, arrivals) = std::sync::mpsc::channel();
+    let acceptor = listener.try_clone().unwrap();
+    std::thread::spawn(move || loop {
+        if let Ok(conn) = acceptor.accept() {
+            if accepted.send(conn).is_err() {
+                break;
+            }
+        }
+    });
     let mut tree = cmd.spawn().unwrap();
     let started = Instant::now();
+    let deadline = started + Duration::from_secs(120);
     let mut attributed = 0;
     let mut missed = Vec::new();
-    for _ in 0..1000 {
-        let (stream, peer) = listener.accept().unwrap();
+    while attributed + missed.len() < 1000 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok((stream, peer)) = arrivals.recv_timeout(left) else {
+            break;
+        };
         if formwork_confine::session_holds_connection(&marker, peer, local) {
             attributed += 1;
         } else {
@@ -288,12 +310,18 @@ while True:
     }
     let elapsed = started.elapsed();
     let outsider = TcpStream::connect(local).unwrap();
-    let (_s, peer) = listener.accept().unwrap();
+    let (_s, peer) = arrivals.recv_timeout(Duration::from_secs(10)).unwrap();
     let outsider_admitted = formwork_confine::session_holds_connection(&marker, peer, local);
     std::fs::write(&stop, "").unwrap();
     let _ = tree.wait();
     drop(outsider);
-    eprintln!("C2: 1000 connections attributed in {elapsed:?}");
+    eprintln!("C2: {attributed} connections attributed in {elapsed:?}");
+    assert_eq!(
+        attributed + missed.len(),
+        1000,
+        "the confined tree made only {} connections in {elapsed:?}",
+        attributed + missed.len()
+    );
     assert_eq!(attributed, 1000, "unattributed: {missed:?}");
     assert!(
         !outsider_admitted,

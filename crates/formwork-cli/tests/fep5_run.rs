@@ -937,18 +937,19 @@ fn a_discovered_layer_without_provenance_for_hosts_or_channels_is_refused() {
     }
 }
 
-/// FW-E2E-084 (Linux): each shipped agent blueprint starts under the baseline, and where the
+/// FW-E2E-084 (both): each shipped agent blueprint starts under the baseline, and where the
 /// agent is installed, its non-interactive smoke command (`--version`) runs under `learn` with no
-/// denial to propose. The blueprints are copied out of the repo so the proposal files land in
-/// scratch.
-#[cfg(target_os = "linux")]
+/// denial to propose -- the strace feed on Linux, the session's tagged Sandbox records on macOS.
+/// The blueprints are copied out of the repo so the proposal files land in scratch. The
+/// `agent-examples` CI job sets `FW_AGENTS_INSTALLED=1`, which makes a missing agent a failure.
 #[test]
 fn fw_e2e_084_agent_examples_under_the_baseline() {
     let dir = Scratch::new("examples");
-    if !supervision_host(dir.path()) {
-        not_exercised("connect supervision unavailable (the agent examples use host rules)");
+    if !egress_host(dir.path()) {
+        not_exercised("no host-scoped egress on this host (the agent examples use host rules)");
         return;
     }
+    let agents_required = std::env::var("FW_AGENTS_INSTALLED").as_deref() == Ok("1");
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = repo.join("examples/blueprints");
     let copy = dir.path().join("blueprints");
@@ -976,16 +977,17 @@ fn fw_e2e_084_agent_examples_under_the_baseline() {
     ];
     // Denials the host imposes whatever the sandbox does, which each example documents: the strace
     // feed sees them as the same EACCES a Landlock denial produces.
+    let opencode_host: &[&str] = if cfg!(target_os = "linux") {
+        &["/sys/kernel/debug/tracing/trace_marker"]
+    } else {
+        &[]
+    };
     let examples: [(&str, &str, &[&str]); 5] = [
         ("claude-code.toml", "claude", &[]),
         ("claude-code-api-key.toml", "claude", &[]),
         ("codex.toml", "codex", &[]),
         ("codex-api-key.toml", "codex", &[]),
-        (
-            "opencode.toml",
-            "opencode",
-            &["/sys/kernel/debug/tracing/trace_marker"],
-        ),
+        ("opencode.toml", "opencode", opencode_host),
     ];
     for (file, agent, host_imposed) in examples {
         let blueprint = copy.join(file);
@@ -1005,7 +1007,12 @@ fn fw_e2e_084_agent_examples_under_the_baseline() {
         );
         assert_eq!(started.code, 0, "{file}: {}", started.stderr);
         assert_eq!(started.stdout, "started\n", "{file}");
-        if !on_path(agent) || !on_path("strace") {
+        let feed = cfg!(target_os = "macos") || on_path("strace");
+        if !on_path(agent) || !feed {
+            assert!(
+                !agents_required,
+                "{file}: {agent} or the denial feed is missing"
+            );
             eprintln!("{file}: {agent} or strace not installed; the smoke command is skipped");
             continue;
         }
