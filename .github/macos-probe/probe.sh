@@ -9,24 +9,22 @@ h() { echo; echo "=================== $* ==================="; }
 logs() { sleep 4; log show --last "${1:-30s}" --style compact --predicate 'sender == "Sandbox" OR eventMessage CONTAINS "Sandbox:"' 2>/dev/null | grep -v '^Timestamp' | grep -E "$2" | sed -E 's/^.*Sandbox: //' | sort | uniq -c | head -${3:-60}; }
 PY=$(command -v python3)
 sw_vers -productVersion
-cc -o $W/peer $D/peer.c && cc -o $W/procargs $D/procargs.c && cc -o $W/confstr $D/confstr.c || echo "CC FAILED"
+for c in peer procargs conceal; do cc -o $W/$c $D/$c.c || echo "CC $c FAILED"; done
 
-h "C5 which rule hides another process's environment"
-perl -e 'setpgrp(0,0); exec "sleep", "90"' &
-SIBP=$!; FW_CANARY=canary-77 perl -e 'setpgrp(0,0); exec "sleep", "90"' & SIB=$!; sleep 0.3
-for r in '(deny process-info* (target others))' '(deny process-info-pidinfo (target others))' '(deny process-info-pidfdinfo (target others))' '(deny process-info-codesignature (target others))' '(deny process-info-listpids)' '(deny process-info-rusage (target others))' '(deny sysctl-read (sysctl-name "kern.procargs2"))' '(deny sysctl-read (sysctl-name-prefix "kern.procargs"))' '(deny sysctl-read (sysctl-name-prefix "kern.proc"))' '(deny process-info* (target others))(allow process-info-pidinfo (target others))'; do
-  printf '%s => ' "$r"; sb "(version 1)(allow default)$r" $W/procargs $SIB 2>&1 | tail -1
-done
-printf 'with report: '; sb '(version 1)(allow default)(allow process-info* (with report))(allow sysctl-read (with report))' $W/procargs $SIB
-logs 20s 'procargs' 20
-NARROW='(version 1)(allow default)(deny process-info* (target others))(allow process-info* (target same-sandbox))'
-printf 'narrow: kill -0 sibling => '; sb "$NARROW" /bin/sh -c "kill -0 $SIB 2>/dev/null && echo SIGNALABLE || echo refused"
-printf 'narrow: pgrep sleep => '; sb "$NARROW" pgrep -l sleep 2>&1 | head -3; echo
-printf 'narrow: node process.kill(sib,0) => '; sb "$NARROW" node -e "try{process.kill($SIB,0);console.log('alive')}catch(e){console.log(e.code)}"
-printf 'narrow: python psutil-less os.kill(sib,0) => '; sb "$NARROW" $PY -c "import os;os.kill($SIB,0);print('alive')" 2>&1 | tail -1
-kill $SIB $SIBP
+h "Mach-name marker"
+M='(version 1)(allow default)(deny mach-lookup (global-name "dev.formwork.session.x.d"))(allow mach-lookup (global-name "dev.formwork.session.x.a"))'
+sandbox-exec -p "$M" /bin/sh -c 'echo $$ > m; exec sleep 20' &
+sleep 20 & echo $! > u
+sandbox-exec -p '(version 1)(deny default)(allow process*)(allow file-read*)(allow file-write*)(allow sysctl-read)' /bin/sh -c 'echo $$ > d; exec sleep 20' &
+sandbox-exec -p '(version 1)(deny default)(allow process*)(allow file-read*)(allow file-write*)(allow sysctl-read)(allow mach-lookup)' /bin/sh -c 'echo $$ > d2; exec sleep 20' &
+sandbox-exec -p '(version 1)(allow default)' /bin/sh -c 'echo $$ > a; exec sleep 20' &
+sleep 1
+for k in m u d d2 a; do echo "-- $k ($(cat $k))"; $W/peer $(cat $k) dev.formwork.session.x.d dev.formwork.session.x.a; done
+printf -- '-- m checked from inside a sandbox:\n'; sb '(version 1)(allow default)' $W/peer $(cat m) dev.formwork.session.x.d dev.formwork.session.x.a
+logs 10s 'formwork.session' 5
+kill $(cat m u d d2 a) 2>/dev/null
 
-h "signal to the unconfined parent"
+h "signal and process-info: deny all, allow same-sandbox"
 cat > $W/parent.py <<'PYS'
 import os, signal, subprocess, sys, time
 got = []
@@ -35,78 +33,88 @@ p = subprocess.run(["sandbox-exec", "-p", sys.argv[1], "/bin/sh", "-c", "kill -U
 time.sleep(0.3)
 print("parent received SIGUSR1:", bool(got))
 PYS
-for r in '(deny signal (target others))(allow signal (target same-sandbox))' '(deny signal)(allow signal (target self))'; do printf '%s => ' "$r"; $PY $W/parent.py "(version 1)(allow default)$r"; done
-logs 15s 'signal' 5
-
-h "session marker forms for sandbox_check"
-mkdir -p $W/mark && touch $W/mark/a $W/mark/b
-MP="(version 1)(allow default)(deny file-read* (literal \"$W/mark/a\"))(allow file-read* (literal \"$W/mark/b\"))(deny mach-lookup (global-name \"dev.formwork.mark-a\"))"
-$PY -c 'import socket,time;s=socket.socket();s.bind(("127.0.0.1",18090));s.listen(9);time.sleep(40)' & L=$!
-sleep 0.5
-rm -f $W/pid-*
-sandbox-exec -p "$MP" $PY -c "import os,socket,time;open('$W/pid-m','w').write(str(os.getpid()));c=socket.create_connection(('127.0.0.1',18090));time.sleep(20)" &
-$PY -c "import os,socket,time;open('$W/pid-u','w').write(str(os.getpid()));c=socket.create_connection(('127.0.0.1',18090));time.sleep(20)" &
-sandbox-exec -p '(version 1)(deny default)(allow process*)(allow file-read*)(allow file-write*)(allow network*)(allow sysctl-read)(allow mach-lookup)(allow file-ioctl)' $PY -c "import os,socket,time;open('$W/pid-d','w').write(str(os.getpid()));c=socket.create_connection(('127.0.0.1',18090));time.sleep(20)" &
-sandbox-exec -p '(version 1)(allow default)' $PY -c "import os,socket,time;open('$W/pid-a','w').write(str(os.getpid()));c=socket.create_connection(('127.0.0.1',18090));time.sleep(20)" &
-sleep 2
-for k in m u d a; do p=$(cat $W/pid-$k); echo "--- $k pid $p"; $W/peer $p $W/mark/a $W/mark/b /nonexistent/x | grep -v '^sizeof\|^off\|^SOCK\|^SANDBOX'; done
-logs 20s 'mark' 10
-kill $L; wait 2>/dev/null
-
-h "inbound filters"
-listen() { # profile bindaddr connectaddr
-  rm -f $W/port; sb "$1" $PY -c "
-import socket
-fam = socket.AF_INET6 if ':' in '$2' else socket.AF_INET
-s=socket.socket(fam); s.bind(('$2',0)); s.listen(1); open('$W/port','w').write(str(s.getsockname()[1])); s.settimeout(5)
-try:
-  c,a=s.accept(); print('accepted', a[0], c.recv(16))
-except Exception as e: print('accept:', type(e).__name__, e)" 2>&1 | tail -1 & local S=$!
-  for i in $(seq 20); do [ -s $W/port ] && break; sleep 0.2; done
-  $PY -c "import socket;c=socket.create_connection(('$3',int(open('$W/port').read())),timeout=3);c.sendall(b'n')" 2>/dev/null
-  wait $S
-}
-LAN=$(ipconfig getifaddr en0 || ipconfig getifaddr en1)
-BASE='(version 1)(allow default)(deny network*)'
-for f in '(allow network-bind (local ip "localhost:*"))(allow network-inbound (local ip "localhost:*"))' \
-         '(allow network-bind (local ip "localhost:*"))(allow network-inbound (remote ip "localhost:*"))' \
-         '(allow network-bind (local ip "localhost:*"))(allow network-inbound (local ip "localhost:*") (remote ip "localhost:*"))' \
-         '(allow network-bind (local ip "localhost:*"))(allow network-inbound (require-all (local ip "localhost:*") (remote ip "localhost:*")))'; do
-  echo "## $f"
-  printf '  compile => '; sb "$BASE$f" /usr/bin/true 2>&1 | head -1; echo
-  printf '  127.0.0.1 <- 127.0.0.1 => '; listen "$BASE$f" 127.0.0.1 127.0.0.1
-  printf '  0.0.0.0 <- 127.0.0.1 => '; listen "$BASE$f" 0.0.0.0 127.0.0.1
-  printf '  0.0.0.0 <- LAN => '; listen "$BASE$f" 0.0.0.0 $LAN
-  printf '  ::1 <- ::1 => '; listen "$BASE$f" ::1 ::1
+SIG='(deny signal)(allow signal (target same-sandbox))'
+printf 'parent under %s => ' "$SIG"; $PY $W/parent.py "(version 1)(allow default)$SIG"
+ISO="(version 1)(allow default)$SIG(deny process-info*)(allow process-info* (target same-sandbox))"
+ISO2="(version 1)(allow default)$SIG(deny process-info* (target others))(deny process-info* (target pgrp))(allow process-info* (target same-sandbox))"
+FW_CANARY=canary-77 perl -e 'setpgrp(0,0); exec "sleep", "60"' & SIB=$!; sleep 0.3
+cat > $W/mp.py <<'PYS'
+import multiprocessing as mp
+def f(x): return x*x
+if __name__ == "__main__":
+    with mp.Pool(2) as p: print("ok", sum(p.map(f, range(10))))
+PYS
+mkdir -p mk; printf 'all: a b c\na:\n\tsleep 0.2\nb:\n\tsleep 0.2\nc:\n\tsleep 0.2\n' > mk/Makefile
+for P in "$ISO" "$ISO2"; do
+  echo "## $P"
+  printf '  kill -0 sibling => '; sb "$P" /bin/sh -c "kill -0 $SIB 2>/dev/null && echo SIGNALABLE || echo refused"
+  printf '  lsof sibling => '; sb "$P" /bin/sh -c "lsof -p $SIB >/dev/null 2>&1 && echo VISIBLE || echo refused"
+  printf '  pgrep sleep => '; sb "$P" pgrep sleep 2>&1 | tr '\n' ' '; echo
+  printf '  bash job control => '; sb "$P" /bin/bash -c 'set -m; sleep 5 & kill -TERM %1; wait; echo ok' 2>/dev/null
+  printf '  reparented grandchild => '; sb "$P" /bin/sh -c '(perl -e "setpgrp(0,0); sleep 5" & echo $! > gc) ; sleep 0.3; kill $(cat gc) && echo ok'
+  printf '  python multiprocessing => '; sb "$P" $PY $W/mp.py 2>&1 | tail -1
+  printf '  node child_process => '; sb "$P" node -e 'const c=require("child_process");const p=c.spawn("sleep",["5"]);setTimeout(()=>p.kill(),200);p.on("exit",(code,s)=>console.log("exit",s))'
+  printf '  make -j3 => '; sb "$P" make -s -j3 -C mk && echo ok
+  printf '  node os.cpus+exec => '; sb "$P" node -e 'require("child_process").execSync("true");console.log(require("os").cpus().length>0)'
+  printf '  python subprocess.run => '; sb "$P" $PY -c 'import subprocess;print(subprocess.run(["echo","ok"],capture_output=True).stdout.decode().strip())'
+  printf '  cargo --version => '; sb "$P" cargo --version | head -1
+  printf '  git status => '; sb "$P" git -C $D status --short >/dev/null && echo ok
+  printf '  parent signal => '; $PY $W/parent.py "$P"
 done
-for f in '(allow network-bind (local ip "127.0.0.1:*"))' '(allow network-bind (local ip4 "localhost:*"))' '(allow network-bind (local tcp "localhost:*"))' '(deny job-creation)' '(deny iokit-open*)' '(deny iokit-open-user-client)' '(deny iokit-open-service)'; do printf 'compile %s => ' "$f"; sb "(version 1)(allow default)$f" /usr/bin/true 2>&1 | head -1; echo; done
-logs 60s 'network' 10
+logs 60s 'deny\(1\) (signal|process-info)' 15
+kill $SIB
 
-h "System Events as an AppleEvent target"
-printf 'control do shell script => '; t 20 osascript -e "tell application \"System Events\" to do shell script \"echo se >> $W/se-marker\"" 2>&1; echo " marker: $(cat $W/se-marker 2>&1)"; rm -f $W/se-marker
-printf 'control make folder => '; t 20 osascript -e "tell application \"System Events\" to make new folder at end of folder \"$W\" with properties {name:\"se-folder\"}" 2>&1; echo " folder: $(ls -d $W/se-folder 2>&1)"; rm -rf $W/se-folder
-printf 'deny appleevent-send make folder => '; sb '(version 1)(allow default)(deny appleevent-send)' osascript -e "tell application \"System Events\" to make new folder at end of folder \"$W\" with properties {name:\"se-folder\"}" 2>&1; echo " folder: $(ls -d $W/se-folder 2>&1)"; rm -rf $W/se-folder
-printf 'allow-default make folder => '; sb '(version 1)(allow default)' osascript -e "tell application \"System Events\" to make new folder at end of folder \"$W\" with properties {name:\"se-folder\"}" 2>&1; echo " folder: $(ls -d $W/se-folder 2>&1)"; rm -rf $W/se-folder
+h "C5 environment concealment"
+printf 'unconditional sysctl-read deny => '; FW_CANARY=c1 sleep 30 & S1=$!; sleep 0.2; sb '(version 1)(allow default)(deny sysctl-read)' $W/procargs $S1 2>&1 | tail -1; kill $S1
+FW_CANARY=c2 $W/conceal 20 & C=$!; sleep 0.5
+printf 'after concealing, unconfined reader => '; $W/procargs $C
+printf 'after concealing, ps -E => '; ps -E -p $C -o command= | grep -o 'FW_CANARY=[^ ]*' || echo "not shown"
+kill $C
 
-h "swift build under a sandbox"
-mkdir -p $W/swpkg/Sources/hello && printf '// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: "hello", targets: [.executableTarget(name: "hello")])\n' > $W/swpkg/Package.swift && echo 'print("hi")' > $W/swpkg/Sources/hello/main.swift
-printf 'allow-default swift build => '; sb '(version 1)(allow default)' swift build --package-path $W/swpkg 2>&1 | tail -2
-printf 'iokit deny swift build --disable-sandbox => '; sb '(version 1)(allow default)(deny iokit-open)' swift build --disable-sandbox --package-path $W/swpkg 2>&1 | tail -2
-cat > $W/metal.swift <<'SW'
-import Metal
-print(MTLCreateSystemDefaultDevice()?.name ?? "no device")
+h "binding the LAN address and the wildcard"
+LAN=$(ipconfig getifaddr en0 || ipconfig getifaddr en1)
+for f in '(local ip "localhost:*")' '(local ip4 "localhost:*")' '(local tcp "localhost:*")'; do
+  P="(version 1)(allow default)(deny network*)(allow network-bind $f)(allow network-inbound $f)"
+  for a in 127.0.0.1 $LAN 0.0.0.0; do printf '%s bind+listen %s => ' "$f" $a; sb "$P" $PY -c "import socket;s=socket.socket();s.bind(('$a',0));s.listen(1);print('listening',s.getsockname())" 2>&1 | tail -1; done
+done
+P='(version 1)(allow default)(deny network*)(allow network-bind (local ip "localhost:*"))'
+printf 'bind-only 0.0.0.0 then listen => '; sb "$P" $PY -c "import socket;s=socket.socket();s.bind(('0.0.0.0',0));print('bound');s.listen(1);print('listening')" 2>&1 | tail -1
+logs 30s 'network' 10
+
+h "NSTemporaryDirectory vs TMPDIR"
+cat > $W/tmp.swift <<'SW'
+import Foundation
+print(NSTemporaryDirectory(), FileManager.default.temporaryDirectory.path)
 SW
-t 120 swiftc -o $W/metal $W/metal.swift 2>&1 | tail -2
-printf 'metal control => '; t 20 $W/metal
-printf 'metal iokit report => '; sb '(version 1)(allow default)(allow iokit-open (with report))(allow iokit-open-user-client (with report))(allow iokit-open-service (with report))' $W/metal
-printf 'metal iokit deny => '; sb '(version 1)(allow default)(deny iokit-open)(deny iokit-open-user-client)' $W/metal
-logs 60s 'iokit' 20
+t 120 swiftc -o $W/tmpdir $W/tmp.swift && TMPDIR=$W/session-tmp/ $W/tmpdir
 
-h "log stream startup"
-(log stream --style ndjson --predicate 'sender == "Sandbox"' > $W/stream.txt 2>&1 &) ; sleep 2
-sb '(version 1)(allow default)(deny file-read* (literal "/etc/hosts"))' cat /etc/hosts >/dev/null 2>&1
-sleep 2; pkill -f 'log stream --style ndjson'; echo "first line: $(head -c 300 $W/stream.txt)"; echo "lines: $(wc -l < $W/stream.txt)"; grep -c 'deny(1) file-read-data /private/etc/hosts' $W/stream.txt
-
-h "confstr temp dir vs TMPDIR"
-$W/confstr; TMPDIR=$W/ $W/confstr
+h "system keychain trust for a test CA"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout $W/ca.key -out $W/ca.pem -days 2 -subj "/CN=Formwork Probe CA" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" 2>/dev/null
+openssl req -newkey rsa:2048 -nodes -keyout $W/leaf.key -out $W/leaf.csr -subj "/CN=localhost" 2>/dev/null
+printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > $W/ext
+openssl x509 -req -in $W/leaf.csr -CA $W/ca.pem -CAkey $W/ca.key -CAcreateserial -out $W/leaf.pem -days 2 -extfile $W/ext 2>/dev/null
+cat > $W/srv.py <<'PYS'
+import http.server, ssl, sys
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(sys.argv[1], sys.argv[2])
+s = http.server.HTTPServer(("127.0.0.1", 18443), http.server.SimpleHTTPRequestHandler)
+s.socket = ctx.wrap_socket(s.socket, server_side=True); s.serve_forever()
+PYS
+$PY $W/srv.py $W/leaf.pem $W/leaf.key 2>/dev/null & SRV=$!; sleep 1
+cat > $W/get.swift <<'SW'
+import Foundation
+let s = DispatchSemaphore(value: 0)
+URLSession.shared.dataTask(with: URL(string: CommandLine.arguments[1])!) { _, r, e in
+  print((r as? HTTPURLResponse)?.statusCode ?? -1, e?.localizedDescription ?? ""); s.signal() }.resume()
+s.wait()
+SW
+t 120 swiftc -o $W/swiftget $W/get.swift
+printf 'before trust: '; t 15 $W/swiftget https://localhost:18443/
+printf 'add-trusted-cert => '; t 30 sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain $W/ca.pem; echo "rc $?"
+printf 'after trust: '; t 15 $W/swiftget https://localhost:18443/
+GO=$(ls -d /Users/runner/hostedtoolcache/go/*/arm64/bin/go 2>/dev/null | tail -1)
+printf 'package main\nimport ("fmt";"net/http";"os")\nfunc main(){ r,err:=http.Get(os.Args[1]); if err!=nil {fmt.Println("err",err); os.Exit(1)}; fmt.Println(r.StatusCode)}\n' > $W/get.go
+(cd $W && t 120 $GO build -o goget get.go) && printf 'go after trust: ' && t 15 $W/goget https://localhost:18443/
+printf 'cargo/rustup TLS libs: '; otool -L $(command -v cargo) 2>/dev/null | grep -iE 'ssl|security|curl' | tr '\n' ' '; echo
+t 30 sudo security delete-certificate -c "Formwork Probe CA" /Library/Keychains/System.keychain; echo "removed rc $?"
+kill $SRV
 echo done
