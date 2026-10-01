@@ -446,7 +446,11 @@ async fn fw_egr21_bodies_stream_byte_identical() {
     }
     chunked.extend_from_slice(b"0\r\n\r\n");
     let started = std::time::Instant::now();
+    // tokio-rustls returns from a write once the session holds the bytes, even while the socket
+    // would block; without a flush the tail of a large upload can stay in the client's TLS buffer
+    // (macOS's loopback buffers are small enough for that).
     tls.write_all(&chunked).await.unwrap();
+    tls.flush().await.unwrap();
     let written = started.elapsed();
     let out = read_response(&mut tls).await;
     assert!(
@@ -464,6 +468,7 @@ async fn fw_egr21_bodies_stream_byte_identical() {
     .into_bytes();
     sized.extend_from_slice(&body);
     tls.write_all(&sized).await.unwrap();
+    tls.flush().await.unwrap();
     let out = read_response(&mut tls).await;
     assert!(out.ends_with(&format!("{} {sum}", body.len())), "{out}");
 }

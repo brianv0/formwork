@@ -960,7 +960,11 @@ fn c9_claude_code_keychain_use() {
     std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
     let shim = dir.path().join("shim");
     std::fs::create_dir_all(&shim).unwrap();
-    let calls = dir.path().join("security-calls");
+    // The log lives where both blueprints let the session write (`agent-base.toml` grants the
+    // temp directories, not the home directory).
+    let log_dir = PathBuf::from(format!("/private/tmp/formwork-c9-{}", std::process::id()));
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let calls = log_dir.join("security-calls");
     std::fs::write(
         shim.join("security"),
         format!(
@@ -1050,5 +1054,6 @@ fn c9_claude_code_keychain_use() {
          records: {records:#?}",
         unlifted.code, unlifted.stdout, unlifted.stderr
     );
+    let _ = std::fs::remove_dir_all(&log_dir);
     assert!(!records.is_empty(), "no Sandbox record for the keychain");
 }
