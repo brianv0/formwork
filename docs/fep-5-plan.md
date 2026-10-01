@@ -114,10 +114,28 @@ here rather than silently deviated.
   supervisor or outside process to observe, so host and channel proposals need host rules on Linux.
   The shim reports its observations to `learn` over an inherited pipe. *Resolved: kept as is. The
   only proposal lost is `open-url` on Linux without host rules or `isolate`; the README says so.*
-- **macOS: the peer-PID check on the egress endpoint is not built.** The endpoint is gated by the
-  per-session credential only, and `net-host-scope` says `Partial` with that reason.
-- **macOS: the `os-keyring` and `securityd` denies are withheld** until the characterization suite
-  confirms toolchains run without them (§1.1's gate); the report says so.
+- **macOS: the peer check identifies the session by its sandbox, not by ancestry** (built with the
+  characterization). The listener maps an accepted connection's client end to the processes that
+  hold it (`proc_pidfdinfo`), and admits it only when one of them carries the session marker: the
+  profile denies one Mach service name derived from a per-session secret and allows another, and
+  `sandbox_check` (without a violation record) tells a session process from an unconfined one and
+  from any other sandbox. A parent-PID walk would miss reparented descendants, and the marker never
+  appears where the session can read it. `net-host-scope` is `Enforced` on macOS.
+- **macOS: the keychain is denied until lifted** (with the characterization). C3 showed TLS
+  clients verify through `trustd`, not the keychain's services, so the `os-keyring` denies are
+  emitted; the `claude` type reaches them too, since Claude Code keeps its macOS login there
+  (§3.4).
+- **macOS: other processes' environments stay readable** (C5): no Seatbelt operation mediates
+  `kern.procargs2`, so the `sysctl-read` deny is not emitted and `process-environment` is
+  `Unenforceable`. `formwork` zeroes its own exec-time environment at startup, which keeps the
+  operator's credentials out of the session's reach.
+- **macOS: the loopback-callback grant reaches the network** (C1): `localhost` in a local filter
+  matches every local address, so `net-default-deny` is `Partial` on macOS with that reason, and
+  `FW-E2E-028`'s intersection accepts it as a reported difference.
+- **macOS: a session's denies carry a tag.** Every deny in a spawned session's profile has a
+  `(with message …)` modifier naming the session, which the unified log appends to the record; the
+  macOS `learn` feed keeps only its own records, and streams them live (`log stream`) beside the
+  post-hoc `log show`.
 - **`FW-E2E-086`'s second half** (killing the Gateway mid-session) is not reachable from a
   black-box test: the Gateway is a thread in the `formwork` process. The exit path is implemented
   (`run` checks the listener after the workload exits and fails with 125 and one `formwork:` line).
@@ -154,38 +172,36 @@ here rather than silently deviated.
 
 | ID | Where | Runs on |
 |---|---|---|
-| `FW-E2E-075` | `formwork-confine/tests/linux_supervise.rs`, `formwork-cli/tests/fep5_run.rs` | Linux |
+| `FW-E2E-075` | `formwork-confine/tests/linux_supervise.rs`, `formwork-cli/tests/fep5_run.rs` (Linux), `fep5_macos.rs` (macOS) | both |
 | `FW-E2E-076` | `formwork-confine/tests/linux_supervise.rs` | Linux |
 | `FW-E2E-077` | `formwork-gateway/tests/inspect.rs` | both |
-| `FW-E2E-078` | `formwork-gateway/tests/inspect.rs` (Gateway half), `fep5_run.rs` (session half) | both / Linux |
+| `FW-E2E-078` | `formwork-gateway/tests/inspect.rs` (Gateway half), `fep5_run.rs` (session half) | both |
 | `FW-E2E-079` | `fep5_run.rs` (tier on 22.04, refusal on 24.04) | Linux |
+| `FW-E2E-080` | `fep5_macos.rs` | macOS |
+| `FW-E2E-081` | `fep5_macos.rs` against a fixture app, System Events, the pasteboard and a test keychain | macOS |
 | `FW-E2E-082` | `fep5_run.rs` against a fixture `dbus-daemon` | Linux |
-| `FW-E2E-083` | `fep5_run.rs` | Linux |
-| `FW-E2E-084` | `fep5_run.rs`; the `agent-examples` CI job installs Claude Code, codex and opencode | Linux |
-| `FW-E2E-085` | `fep5_run.rs` | Linux |
+| `FW-E2E-083` | `fep5_run.rs` (Linux), `fep5_macos.rs` (macOS) | both |
+| `FW-E2E-084` | `fep5_run.rs`; the `agent-examples` CI job installs Claude Code, codex and opencode on ubuntu-22.04 and macos-15 | both |
+| `FW-E2E-085` | `fep5_run.rs` (Linux), `fep5_macos.rs` (macOS: the clipboard proposed from a Sandbox record) | both |
 | `FW-E2E-086` | `fep5_run.rs` (first half) | both |
-| `FW-E2E-087` | `fep5_run.rs` against a fixture `dbus-daemon` and `Xvfb` | Linux |
-| `FW-E2E-088` | `fep5_run.rs` | Linux |
-| `FW-E2E-089` | `fep5_run.rs` | Linux |
-| `FW-E2E-090` | `fep5_run.rs` | Linux |
+| `FW-E2E-087` | `fep5_run.rs` against a fixture `dbus-daemon` and `Xvfb` (Linux), `fep5_macos.rs` (macOS) | both |
+| `FW-E2E-088` | `fep5_run.rs` (Linux), `fep5_macos.rs` (macOS) | both |
+| `FW-E2E-089` | `fep5_run.rs` (Linux), `fep5_macos.rs` (macOS) | both |
+| `FW-E2E-090` | `fep5_run.rs` (Linux), `fep5_macos.rs` (macOS) | both |
+| `FW-E2E-091` | `fep5_macos.rs`, under `net = "deny"`, a port tier and a host rule, and from the host's network address | macOS |
 | `FW-ADV-016` | `formwork-gateway/tests/gateway.rs` | both |
 | `FW-ADV-017` | `formwork-gateway/tests/{egress,inspect}.rs` | both |
 | `FW-ADV-018` | `formwork-confine/tests/linux_supervise.rs` | Linux |
-| `FW-ADV-020` | `fep5_run.rs` (the opener route; the bus route is `FW-E2E-082`, the direct route `FW-E2E-075`) | Linux |
+| `FW-ADV-019` | `fep5_macos.rs` (an unconfined process with the session's credential), `formwork-gateway/tests/egress.rs` (the gate) | macOS |
+| `FW-ADV-020` | `fep5_run.rs` (Linux, the opener route; the bus route is `FW-E2E-082`, the direct route `FW-E2E-075`), `fep5_macos.rs` (macOS: the opener, LaunchServices, an AppleEvent and the clipboard) | both |
+| C1–C8 | `formwork-confine/tests/macos_characterize.rs` (§6.3; answers in `docs/macos-characterization.md`) | macOS |
+| C9 | `fep5_macos.rs` (`c9_…`), in the macOS `agent-examples` job: Claude Code's `security` calls through a shim, reaching the keychain under `claude-code.toml` and denied without the lift | macOS |
 
 CI sets `FW_REQUIRE_EXERCISED=1`, so a test that cannot exercise its mechanism on a runner fails
 instead of skipping. The README quickstart is read verbatim from `README.md` and run.
 
 ## 5. Still owed
 
-- **The macOS characterization suite (§6.3)** and the macOS-only tests that depend on it:
-  `FW-E2E-080` (isolation tier), `FW-E2E-081` (channels), `FW-E2E-091` (loopback callback),
-  `FW-ADV-019` (endpoint theft). Until they run, every macOS channel, isolation and
-  environment-disclosure verdict stays `Partial`, and the macOS cells marked `Enforced` in §3.6 are
-  targets. Several `fep5_run.rs` tests are Linux-only for the same reason: they have not been
-  observed on Seatbelt, and a test that has never run on its platform is a claim.
-- **macOS channel proposals in `learn`.** The unified-log feed yields path denials; mapping Seatbelt
-  service denials (pasteboard, AppleEvents) onto channels is not built. Opener and Gateway
-  refusals are proposed on macOS, since the spawn is in-process there.
-- **The `uv` recipe.** `uv` ignores `SSL_CERT_FILE` unless `UV_NATIVE_TLS=1`; the examples README
-  carries the recipe, and the Launcher does not set it.
+Nothing in FEP-5's scope. The macOS answers come from GitHub's virtual runners, which run with
+System Integrity Protection off; `docs/macos-characterization.md` asks for a repeat on a
+SIP-enabled Mac before a release that changes a verdict.

