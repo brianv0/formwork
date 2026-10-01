@@ -65,8 +65,11 @@ pub struct CompileInput {
     /// Whether the `os-keyring` type is lifted (FW-CRED13).
     pub keyring_lifted: bool,
     /// The keychain's Mach services (the catalog's `mach:` services of `os-keyring`), denied on
-    /// macOS until the type is lifted (FW-CRED13).
+    /// macOS until a type that reaches them is lifted (FW-CRED13).
     pub keyring_services: Vec<String>,
+    /// Whether an exposed type reaches the keychain on macOS: `os-keyring` itself, or a type whose
+    /// macOS location is the keychain (`claude`, FEP-5 §3.4).
+    pub keychain_lifted: bool,
 }
 
 impl CompileInput {
@@ -76,6 +79,14 @@ impl CompileInput {
         // Write grants imply read; the no-create grant is a write grant too.
         reads.extend(blueprint.fs.writes_no_create.iter().cloned());
         let exposed = blueprint.exposed_credentials();
+        let keyring_services: Vec<String> = catalog
+            .types
+            .iter()
+            .filter(|(name, _)| name.as_str() == formwork_blueprint::OS_KEYRING)
+            .flat_map(|(_, entry)| entry.services.iter())
+            .filter_map(|s| s.strip_prefix("mach:"))
+            .map(str::to_string)
+            .collect();
         let floor_exempt: Vec<PathPattern> = catalog
             .types
             .iter()
@@ -99,14 +110,14 @@ impl CompileInput {
             session_marker: None,
             brokered: blueprint.brokered_credentials().next().is_some(),
             keyring_lifted: exposed.iter().any(|t| t == formwork_blueprint::OS_KEYRING),
-            keyring_services: catalog
+            keyring_services: keyring_services.clone(),
+            keychain_lifted: catalog
                 .types
                 .iter()
-                .filter(|(name, _)| name.as_str() == formwork_blueprint::OS_KEYRING)
+                .filter(|(name, _)| exposed.iter().any(|e| e == name.as_str()))
                 .flat_map(|(_, entry)| entry.services.iter())
                 .filter_map(|s| s.strip_prefix("mach:"))
-                .map(str::to_string)
-                .collect(),
+                .any(|s| keyring_services.iter().any(|k| k == s)),
             // A literal (non-subtree) write grant names one file; that is how a session grants a
             // socket (`readwrite:$SSH_AUTH_SOCK`). Subtree grants never admit sockets, or a
             // writable `/tmp/**` would admit the X11 socket beneath it.

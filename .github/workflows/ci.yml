@@ -97,8 +97,9 @@ jobs:
       # fails instead of skipping (FEP-5 §6.1) -- a skipped platform test is a claim, not a
       # verification. It also covers the README quickstart (D1) and the agent examples starting
       # under the baseline (FW-E2E-084).
+      # --no-fail-fast: every test binary runs, so one run reports every failure on the platform.
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
         env:
           FW_REQUIRE_EXERCISED: "1"
 

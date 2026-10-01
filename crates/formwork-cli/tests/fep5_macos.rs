@@ -161,10 +161,15 @@ screencapture -x '{o}/shot.png' 2>/dev/null; [ -s '{o}/shot.png' ] && echo scree
             denied.stdout
         );
     }
+    // The AppleEvent is stopped at its Mach lookup, before `appleevent-send` is asked.
+    assert!(
+        denied_since(started, "mach-lookup", "com.apple.coreservices.appleevents")
+            || denied_since(started, "appleevent-send", ""),
+        "no Sandbox record for the AppleEvent"
+    );
     for (operation, argument) in [
         ("lsopen", ""),
         ("job-creation", ""),
-        ("appleevent-send", ""),
         ("mach-lookup", "com.apple.pasteboard.1"),
         ("mach-lookup", "com.apple.windowserver.active"),
         ("mach-lookup", "com.apple.SecurityServer"),
@@ -274,7 +279,7 @@ fn fw_e2e_080_isolation_tier() {
         "control: the sibling is signalable and inspectable unconfined"
     );
     let script = format!(
-        r#"kill -0 {sib} 2>/dev/null && echo kill-sibling=1 || echo kill-sibling=0
+        r#"kill -USR1 {sib} 2>/dev/null && echo kill-sibling=1 || echo kill-sibling=0
 lsof -p {sib} >/dev/null 2>&1 && echo info-sibling=1 || echo info-sibling=0
 kill -0 $PPID 2>/dev/null && echo kill-parent=1 || echo kill-parent=0
 sleep 30 & kill $! && wait $! ; echo job=$?
@@ -284,8 +289,10 @@ pgrep -x sleep | grep -qx {sib} && echo listed=1 || echo listed=0
     );
     let started = Instant::now();
     let out = formwork(dir.path(), &["run", "--", "/bin/sh", "-c", &script], &[]);
+    let survived = sibling.try_wait().unwrap().is_none();
     let _ = sibling.kill();
     let _ = sibling.wait();
+    assert!(survived, "the session's SIGUSR1 reached the sibling");
     assert_eq!(out.code, 0, "{}", out.stderr);
     for want in [
         "kill-sibling=0",
@@ -315,13 +322,14 @@ pgrep -x sleep | grep -qx {sib} && echo listed=1 || echo listed=0
 const PROCARGS: &str = r#"
 import ctypes, sys
 libc = ctypes.CDLL(None, use_errno=True)
+needle = open(sys.argv[2][1:]).read() if sys.argv[2].startswith("@") else sys.argv[2]
 mib = (ctypes.c_int * 3)(1, 49, int(sys.argv[1]))
 size = ctypes.c_size_t(1 << 20)
 buf = ctypes.create_string_buffer(size.value)
 if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
     print(sys.argv[3] + "=unreadable")
 else:
-    print(sys.argv[3] + ("=seen" if sys.argv[2].encode() in buf.raw[: size.value] else "=absent"))
+    print(sys.argv[3] + ("=seen" if needle.encode() in buf.raw[: size.value] else "=absent"))
 "#;
 
 /// FW-E2E-083 (macOS): the report and the observation agree. A same-uid sibling's exec-time
@@ -354,9 +362,12 @@ fn fw_e2e_083_environment_disclosure_matches_the_report() {
         "control=seen",
         "control: the canary is live"
     );
+    // The needle reaches the reader through a file: on the command line it would be in
+    // `formwork`'s own argv, which `kern.procargs2` returns too.
     let secret = format!("gateway-secret-{}", std::process::id());
+    std::fs::write(dir.path().join("needle"), &secret).unwrap();
     let script = format!(
-        "python3 procargs.py {} {nonce} sibling; python3 procargs.py $PPID {secret} gateway",
+        "python3 procargs.py {} {nonce} sibling; python3 procargs.py $PPID @needle gateway",
         sibling.id()
     );
     let out = formwork(
@@ -768,11 +779,15 @@ osascript -e 'tell application "System Events" to make new folder at end of fold
         assert!(denied.stdout.contains(want), "{want}:\n{}", denied.stdout);
     }
     let explained = formwork(dir.path(), &["explain", "--set", deny, "desktop"], &[]);
-    assert!(
-        explained.stdout.contains("denied by channels deny desktop"),
-        "{}",
-        explained.stdout
-    );
+    for member in ["clipboard", "open-url"] {
+        assert!(
+            explained.stdout.contains(&format!(
+                "verdict: denied by channels deny {member} (cli override)"
+            )),
+            "{}",
+            explained.stdout
+        );
+    }
     let _ = sh("printf '' | pbcopy");
 }
 

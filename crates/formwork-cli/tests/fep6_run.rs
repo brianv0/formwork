@@ -286,8 +286,12 @@ fn fw_e2e_094_client_matrix() {
             format!("cargo search --limit 1 --index sparse+{u}/index/ fixture-pkg")
         }),
         ("rustup", "rustup", Some(true), None, |u| {
-            // An empty RUSTUP_HOME in the session: rustup then checks its own update first.
-            format!("RUSTUP_HOME=\"$TMPDIR/rustup\" RUSTUP_UPDATE_ROOT={u}/rustup rustup check")
+            // A fresh RUSTUP_HOME in the session; the install fetches the channel manifest's
+            // checksum from the dist server first, and fails there against the fixture.
+            format!(
+                "RUSTUP_HOME=\"$TMPDIR/rustup\" RUSTUP_DIST_SERVER={u} \
+                 rustup toolchain install stable --profile minimal --no-self-update"
+            )
         }),
         ("pip-module", "python3", None, None, |u| {
             format!(

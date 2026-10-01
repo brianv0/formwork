@@ -48,7 +48,7 @@ pub fn render(input: &CompileInput) -> String {
     render_baseline(
         &mut b,
         &input.channels,
-        (!input.keyring_lifted).then_some(input.keyring_services.as_slice()),
+        (!input.keychain_lifted).then_some(input.keyring_services.as_slice()),
     );
     render_isolate(&mut b, &input.isolate);
     if let Some(marker) = &input.session_marker {
@@ -572,6 +572,7 @@ mod tests {
             brokered: false,
             keyring_lifted: false,
             keyring_services: vec!["com.apple.SecurityServer".to_string()],
+            keychain_lifted: false,
         }
     }
 
@@ -722,7 +723,7 @@ mod tests {
         let deny = "(deny mach-lookup (global-name \"com.apple.SecurityServer\"))";
         assert!(render(&input()).contains(deny));
         let mut i = input();
-        i.keyring_lifted = true;
+        i.keychain_lifted = true;
         assert!(!render(&i).contains("com.apple.SecurityServer"));
     }
 
