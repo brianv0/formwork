@@ -13,6 +13,8 @@ use std::ptr;
 use super::*;
 use formwork_compile::ConfinerPolicy;
 
+pub mod peer;
+
 // From <sandbox.h>, via libSystem. flags = 0 treats `profile` as a literal SBPL string to compile
 // and apply (the path `sandbox-exec -p` and older Chromium use).
 extern "C" {
@@ -74,4 +76,38 @@ pub fn spawn_confined(command: &mut Command, policy: &CompiledPolicy) -> Result<
 pub fn enforce_self(policy: &CompiledPolicy) -> Result<(), ConfineError> {
     let profile = sbpl_of(policy)?;
     apply(&profile).map_err(ConfineError::MechanismFailed)
+}
+
+/// FW-CRED16 / FW-ISO16 on macOS (characterization C5): any same-uid process -- a confined
+/// workload among them -- reads another process's exec-time environment through the
+/// `kern.procargs2` sysctl, which Seatbelt does not mediate. `formwork`'s own environment carries
+/// the operator's credentials, brokered ones included, so it moves its environment to the heap and
+/// zeroes the exec-time strings the kernel reports. Returns how many variables it concealed.
+///
+/// # Safety
+/// Replaces the process's `environ`: call it first thing in `main`, before any other thread
+/// exists and before anything holds a pointer into the environment.
+pub unsafe fn conceal_environment() -> usize {
+    let envp = libc::_NSGetEnviron();
+    let original = *envp;
+    if original.is_null() {
+        return 0;
+    }
+    let mut count = 0;
+    while !(*original.add(count)).is_null() {
+        count += 1;
+    }
+    // Heap copies, leaked: the environment lives as long as the process.
+    let mut copies: Vec<*mut c_char> = Vec::with_capacity(count + 1);
+    for i in 0..count {
+        copies.push(libc::strdup(*original.add(i)));
+    }
+    copies.push(ptr::null_mut());
+    let copies = copies.leak();
+    *envp = copies.as_mut_ptr();
+    for i in 0..count {
+        let s = *original.add(i);
+        ptr::write_bytes(s, 0, libc::strlen(s));
+    }
+    count
 }

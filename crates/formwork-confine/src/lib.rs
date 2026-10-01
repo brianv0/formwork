@@ -84,6 +84,14 @@ pub fn deny_inspection_of_self() -> Result<(), ConfineError> {
     Ok(())
 }
 
+/// The egress listener's peer-process check (FW-EGR9 on macOS).
+#[cfg(target_os = "macos")]
+pub use backend::peer::{carries_marker, held_sockets, session_holds_connection, HeldSocket};
+
+/// FW-CRED16 / FW-ISO16 on macOS: conceal `formwork`'s own exec-time environment.
+#[cfg(target_os = "macos")]
+pub use backend::conceal_environment;
+
 /// The connect supervisor's configuration and handles (FW-EGR7); Linux only.
 #[cfg(target_os = "linux")]
 pub use backend::supervise::{Pending as PendingSupervisor, SupervisorConfig};

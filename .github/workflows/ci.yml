@@ -81,6 +81,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y strace dbus libglib2.0-bin xvfb curl
 
+      # The FW-E2E-094 client matrix drives Go and uv clients; Go is in the runner's tool cache but
+      # not on PATH, and uv comes from the runner's preinstalled `pipx` (not a third-party action).
+      - name: Put Go and uv on PATH
+        shell: bash
+        run: |
+          go_bin=$(ls -d "$RUNNER_TOOL_CACHE"/go/*/*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -n "$go_bin" ]; then echo "$go_bin" >> "$GITHUB_PATH"; fi
+          pipx install uv
+
       - name: Build
         run: cargo build --workspace --locked
 
@@ -95,11 +104,8 @@ jobs:
 
       # The Python black-box harness drives the built `formwork` binary at the outermost real
       # boundary; platform-inappropriate tests skip via markers (macOS Seatbelt vs Linux Landlock),
-      # so each OS runs exactly what it can enforce. `uv` comes via the runner's preinstalled `pipx`
-      # (not a third-party action), matching the Dockerfile's uv-managed harness.
-      - name: Install uv
-        run: pipx install uv
-
+      # so each OS runs exactly what it can enforce. `uv`, installed above, matches the
+      # Dockerfile's uv-managed harness.
       - name: Python E2E harness
         working-directory: py
         run: uv run pytest -q

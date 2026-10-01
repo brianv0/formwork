@@ -1,5 +1,5 @@
 //! FEP-6 black-box tests of `formwork run`: the egress engine at the real boundary -- the connect
-//! supervisor routes a confined client's connection to the Gateway, the Launcher's variables steer
+//! supervisor (Linux) or Seatbelt (macOS) leaves the Gateway the only way out, the Launcher's variables steer
 //! real clients (curl, Python, Node, git, pip, npm) through it, and the engine inspects, brokers,
 //! resolves with the host's own resolver, and leaves through the operator's upstream proxy. Each
 //! drives the built binary with `$HOME` and the launch directory pinned inside a scratch directory;
@@ -7,14 +7,11 @@
 
 mod support;
 
-#[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
-#[cfg(target_os = "linux")]
 use std::path::Path;
 
 use support::*;
 
-#[cfg(target_os = "linux")]
 fn blueprint(dir: &Path, rules: &[String], extra: &str) {
     let rules: Vec<String> = std::iter::once("\"readwrite:$CWD/**\"".to_string())
         .chain(rules.iter().map(|r| format!("{r:?}")))
@@ -29,11 +26,11 @@ fn blueprint(dir: &Path, rules: &[String], extra: &str) {
     .unwrap();
 }
 
-/// A session with the connect supervisor and the named tools, or a stated reason why not.
-#[cfg(target_os = "linux")]
+/// A session that can carry host-scoped egress (the connect supervisor on Linux, Seatbelt on
+/// macOS) and the named tools, or a stated reason why not.
 fn session_host(dir: &Path, tools: &[&str]) -> bool {
-    if !supervision_host(dir) {
-        not_exercised("connect supervision unavailable");
+    if !egress_host(dir) {
+        not_exercised("no host-scoped egress on this host");
         return false;
     }
     if let Some(missing) = tools.iter().find(|t| !on_path(t)) {
@@ -43,13 +40,12 @@ fn session_host(dir: &Path, tools: &[&str]) -> bool {
     true
 }
 
-/// FW-E2E-098 (Linux; FEP-6 S1 rows 1, 8 and 9, and `FW-EGR24`): under `allow:` a client that
+/// FW-E2E-098 (both; FEP-6 S1 rows 1, 8 and 9, and `FW-EGR24`): under `allow:` a client that
 /// trusts the session bundle reaches the upstream through inspection -- the leaf is minted for an
 /// IP literal and name-constrained to it (FW-EGR25), and the Gateway verifies the upstream against
 /// the operator's `SSL_CERT_FILE`. Without that root the Gateway refuses the upstream: it never
 /// trusts its own session bundle. A client that ignores the bundle fails its handshake and the
 /// operator line names the `tunnel:` rule; under that rule the same client gets through.
-#[cfg(target_os = "linux")]
 #[test]
 fn fw_e2e_098_inspected_https_through_run() {
     let dir = Scratch::new("fep6-inspect");
@@ -118,7 +114,6 @@ fn fw_e2e_098_inspected_https_through_run() {
 
 /// Node reads the proxy variables only with `NODE_USE_ENV_PROXY`, from 22.21 on the 22 line and
 /// 24.5 on the 24 line (FEP-6 §4.11); older Node connects directly and is refused.
-#[cfg(target_os = "linux")]
 fn node_uses_env_proxy() -> bool {
     let out = std::process::Command::new("node")
         .arg("--version")
@@ -139,13 +134,15 @@ fn node_uses_env_proxy() -> bool {
     }
 }
 
-/// FW-E2E-094 (Linux): the client matrix. Each client on the runner fetches from an inspected host
+/// FW-E2E-094 (both): the client matrix. Each client on the runner fetches from an inspected host
 /// and a tunnel host with nothing but the variables the Launcher sets (FEP-6 §4.11): the proxy
 /// variables in both spellings, `NODE_USE_ENV_PROXY`, and the trust variables. The hosts are names
 /// the operator's proxy fixture carries (FW-EGR26), not loopback addresses, which several clients
-/// (npm among them) never send through a proxy. The matrix below is the recorded expectation; a
+/// (npm among them) never send through a proxy. The fixtures' root is the operator's
+/// `SSL_CERT_FILE`, which the Gateway trusts and the trust bundle carries; a client that verifies
+/// against the platform's keychain instead (Go and Swift on macOS) trusts neither the session CA
+/// nor the fixture, so it reaches neither. Each row's expectation is recorded per platform; a
 /// client absent from the runner is listed as absent, and curl and Python are required.
-#[cfg(target_os = "linux")]
 #[test]
 fn fw_e2e_094_client_matrix() {
     let dir = Scratch::new("fep6-matrix");
@@ -178,12 +175,10 @@ fn fw_e2e_094_client_matrix() {
     let node_proxy = node_uses_env_proxy();
     let proxy_url = format!("http://127.0.0.1:{}", proxy.port);
     let root = cert.root.to_str().unwrap().to_string();
-    // (client, the tool it needs, whether it is expected to reach the fixture, command for a URL)
-    type Invocation = fn(&str) -> String;
-    // Go builds outside the session, once: a cold build inside would compile the standard
-    // library into the session's cache.
-    let go_client = dir.path().join("go-get");
-    if on_path("go") {
+    let macos = cfg!(target_os = "macos");
+    // Go and Swift build outside the session, once: a cold build inside would compile the
+    // standard library into the session's cache.
+    let go_built = on_path("go") && {
         std::fs::write(
             dir.path().join("go-get.go"),
             "package main\n\nimport (\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n)\n\n\
@@ -194,52 +189,111 @@ fn fw_e2e_094_client_matrix() {
         .unwrap();
         let built = std::process::Command::new("go")
             .args(["build", "-o"])
-            .arg(&go_client)
+            .arg(dir.path().join("go-get"))
             .arg(dir.path().join("go-get.go"))
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         assert!(built, "building the Go client failed");
-    }
-    let clients: [(&str, &str, bool, Invocation); 10] = [
-        ("curl", "curl", true, |u| format!("curl -sS -m 10 {u}")),
-        ("python-urllib", "python3", true, |u| {
+        true
+    };
+    let swift_built = macos
+        && on_path("swiftc")
+        && {
+            std::fs::write(
+            dir.path().join("swift-get.swift"),
+            "import Foundation\nlet done = DispatchSemaphore(value: 0)\n\
+             URLSession.shared.dataTask(with: URL(string: CommandLine.arguments[1])!) { d, _, e in\n\
+             print(d.map { String(decoding: $0, as: UTF8.self) } ?? \"\\(e!)\"); done.signal() }.resume()\n\
+             done.wait()\n",
+        )
+        .unwrap();
+            let built = std::process::Command::new("swiftc")
+                .arg("-o")
+                .arg(dir.path().join("swift-get"))
+                .arg(dir.path().join("swift-get.swift"))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(built, "building the Swift client failed");
+            true
+        };
+    type Invocation = fn(&str) -> String;
+    /// A row's expectation on this platform: reached or refused, or `None` while uncharacterized
+    /// (recorded, not asserted).
+    type Expect = Option<bool>;
+    // (client, the tool it needs, expectation on Linux, expectation on macOS, command for a URL)
+    let clients: [(&str, &str, Expect, Expect, Invocation); 14] = [
+        ("curl", "curl", Some(true), Some(true), |u| {
+            format!("curl -sS -m 10 {u}")
+        }),
+        ("python-urllib", "python3", Some(true), Some(true), |u| {
             format!(
                 "python3 -c 'import sys, urllib.request; \
                  print(urllib.request.urlopen(sys.argv[1], timeout=10).read().decode())' {u}"
             )
         }),
-        ("python-requests", "python3", true, |u| {
+        ("python-requests", "python3", Some(true), Some(true), |u| {
             format!(
                 "python3 -c 'import sys, requests; print(requests.get(sys.argv[1], timeout=10).text)' {u}"
             )
         }),
-        ("node-fetch", "node", node_proxy, |u| {
-            format!(
+        (
+            "node-fetch",
+            "node",
+            Some(node_proxy),
+            Some(node_proxy),
+            |u| {
+                format!(
                 "node -e 'fetch(process.argv[1]).then(r => r.text()).then(t => console.log(t))' {u}"
             )
-        }),
-        ("node-https", "node", node_proxy, |u| {
-            format!(
-                "node -e 'require(\"https\").get(process.argv[1], r => {{ let d = \"\"; \
+            },
+        ),
+        (
+            "node-https",
+            "node",
+            Some(node_proxy),
+            Some(node_proxy),
+            |u| {
+                format!(
+                    "node -e 'require(\"https\").get(process.argv[1], r => {{ let d = \"\"; \
                  r.on(\"data\", c => d += c); r.on(\"end\", () => console.log(d)); }})' {u}"
-            )
-        }),
-        ("git", "git", true, |u| {
+                )
+            },
+        ),
+        ("git", "git", Some(true), Some(true), |u| {
             format!("git ls-remote {u}/repo.git")
         }),
-        ("pip", "pip", true, |u| {
+        ("pip", "pip3", Some(true), None, |u| {
             format!(
-                "pip download --no-deps --no-cache-dir --disable-pip-version-check --retries 0 \
+                "pip3 download --no-deps --no-cache-dir --disable-pip-version-check --retries 0 \
                  --timeout 10 -d \"$TMPDIR/dl\" --index-url {u}/simple/ fixture-pkg"
             )
         }),
-        ("npm", "npm", true, |u| {
+        ("npm", "npm", Some(true), Some(true), |u| {
             format!("npm view --no-update-notifier --fetch-retries=0 --registry {u}/ fixture-pkg")
         }),
-        ("go", "go", true, |u| format!("./go-get {u}")),
-        ("uv", "uv", true, |u| {
+        ("go", "go", Some(true), Some(false), |u| {
+            format!("./go-get {u}")
+        }),
+        ("swift", "swiftc", None, Some(false), |u| {
+            format!("./swift-get {u}")
+        }),
+        ("uv", "uv", Some(true), None, |u| {
             format!("echo fixture-pkg | uv pip compile --no-cache --index-url {u}/simple/ -")
+        }),
+        ("cargo", "cargo", Some(true), None, |u| {
+            format!("cargo search --limit 1 --index sparse+{u}/index/ fixture-pkg")
+        }),
+        ("rustup", "rustup", Some(true), None, |u| {
+            // An empty RUSTUP_HOME in the session: rustup then checks its own update first.
+            format!("RUSTUP_HOME=\"$TMPDIR/rustup\" RUSTUP_UPDATE_ROOT={u}/rustup rustup check")
+        }),
+        ("pip-module", "python3", None, None, |u| {
+            format!(
+                "python3 -m pip download --no-deps --no-cache-dir --disable-pip-version-check \
+                 --retries 0 --timeout 10 -d \"$TMPDIR/dl\" --index-url {u}/simple/ fixture-pkg"
+            )
         }),
     ];
     let mut matrix = Vec::new();
@@ -248,8 +302,13 @@ fn fw_e2e_094_client_matrix() {
         ("inspected", "inspected.test", &inspected),
         ("tunnel", "tunnel.test", &tunneled),
     ] {
-        for (client, tool, expected, command) in clients {
-            if !on_path(tool) || (client == "python-requests" && !requests_present) {
+        for (client, tool, on_linux, on_macos, command) in clients {
+            let built = match client {
+                "go" => go_built,
+                "swift" => swift_built,
+                _ => true,
+            };
+            if !on_path(tool) || !built || (client == "python-requests" && !requests_present) {
                 matrix.push(format!("{client:16} {grade:9} absent"));
                 continue;
             }
@@ -281,14 +340,21 @@ fn fw_e2e_094_client_matrix() {
                 "{client:16} {grade:9} {}",
                 if reached { "reached" } else { "refused" }
             ));
-            if reached != expected {
-                mismatches.push(format!(
-                    "{client} ({grade}): expected {}, got {}\n{}\n{}",
-                    if expected { "reached" } else { "refused" },
-                    if reached { "reached" } else { "refused" },
-                    out.stdout,
-                    out.stderr
-                ));
+            // Go and Swift ignore the trust variables on macOS: the inspected row is refused for
+            // the session CA, the tunnel row for the fixture root the keychain does not hold.
+            let expected = if macos { on_macos } else { on_linux };
+            if let Some(expected) = expected {
+                if reached != expected {
+                    mismatches.push(format!(
+                        "{client} ({grade}): expected {}, got {}\n{}\n{}",
+                        if expected { "reached" } else { "refused" },
+                        if reached { "reached" } else { "refused" },
+                        out.stdout,
+                        out.stderr
+                    ));
+                }
+            } else {
+                eprintln!("{client} ({grade}) output:\n{}", out.stdout);
             }
         }
     }
@@ -296,12 +362,11 @@ fn fw_e2e_094_client_matrix() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n---\n"));
 }
 
-/// FW-E2E-099 (Linux; FEP-6 S2 through `run`): a brokered credential end to end. The session holds
+/// FW-E2E-099 (both; FEP-6 S2 through `run`): a brokered credential end to end. The session holds
 /// a placeholder; the Gateway puts the real key in its header on the bound host -- substituted, or
 /// added when absent, never on OPTIONS (FW-CRED18) -- refuses the placeholder toward another host,
 /// and ends a response that echoes the key (FW-CRED17). The key appears nowhere the session can
 /// see. The other host is `localhost`, reached through the host's own resolver (FW-EGR19).
-#[cfg(target_os = "linux")]
 #[test]
 fn fw_e2e_099_a_brokered_request_through_run() {
     let dir = Scratch::new("fep6-broker");
@@ -390,7 +455,6 @@ curl -sS -m 10 -H "x-api-key: $FIXTURE_MODEL_KEY" https://127.0.0.1:{m}/reflect;
     }
 }
 
-#[cfg(target_os = "linux")]
 fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -404,10 +468,9 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// FW-EGR17 / FW-EGR19 (Linux): the production resolver. An exact-name rule reaches a loopback
+/// FW-EGR17 / FW-EGR19 (both): the production resolver. An exact-name rule reaches a loopback
 /// answer of the host's own resolver; a name that does not resolve is refused as `resolution`
 /// before any upstream socket.
-#[cfg(target_os = "linux")]
 #[test]
 fn fw_egr17_the_host_resolver_decides_through_run() {
     let dir = Scratch::new("fep6-resolve");
@@ -448,11 +511,10 @@ fn fw_egr17_the_host_resolver_decides_through_run() {
     );
 }
 
-/// FW-E2E-103 (Linux; FEP-6 S6 rows 1, 2 and 4, `FW-EGR26`): `formwork run`'s own proxy variables
+/// FW-E2E-103 (both; FEP-6 S6 rows 1, 2 and 4, `FW-EGR26`): `formwork run`'s own proxy variables
 /// send admitted egress through the operator's proxy -- the lowercase spelling winning, as curl
 /// reads it -- while `NO_PROXY` exempts the intranet, which the Gateway resolves itself; `explain
 /// --hosts` reports the proxied host's address classification `Partial`.
-#[cfg(target_os = "linux")]
 #[test]
 fn fw_e2e_103_the_operators_upstream_proxy_through_run() {
     let dir = Scratch::new("fep6-proxy");
@@ -522,14 +584,18 @@ fn fw_e2e_103_the_operators_upstream_proxy_through_run() {
     );
 }
 
-/// FEP-6 §9 (j), `learn` (Linux): a host whose client rejected the session CA is never proposed
+/// FEP-6 §9 (j), `learn` (both): a host whose client rejected the session CA is never proposed
 /// as a `tunnel:` rule beside its inspected one (FW-BP14 would refuse the pair); the learning run
 /// names the rule to swap in, apart from the proposals.
-#[cfg(target_os = "linux")]
 #[test]
 fn learn_names_the_tunnel_rule_a_rejecting_client_needs() {
     let dir = Scratch::new("fep6-learn");
-    if !session_host(dir.path(), &["curl", "strace"]) {
+    let feed: &[&str] = if cfg!(target_os = "linux") {
+        &["curl", "strace"]
+    } else {
+        &["curl"]
+    };
+    if !session_host(dir.path(), feed) {
         return;
     }
     let cert = fixture_cert(dir.path(), &["127.0.0.1"]);
@@ -556,7 +622,6 @@ fn learn_names_the_tunnel_rule_a_rejecting_client_needs() {
     assert!(!list.stdout.contains("tunnel:"), "{}", list.stdout);
 }
 
-#[cfg(target_os = "linux")]
 const BROKERED: &str = "extends = [\"builtin:default\"]\n\
                         rules = [\"readwrite:$CWD/**\", \"get,post:api.anthropic.com\"]\n\
                         allow-credentials = [\"broker:anthropic\"]\n";
@@ -610,6 +675,75 @@ fn fw_cred16_the_gateway_is_not_dumpable_while_it_brokers() {
         read.is_err(),
         "a same-uid process read the Gateway's environment"
     );
+}
+
+/// FW-CRED16 (macOS): while it brokers a credential, the `formwork` process denies debugger
+/// attachment (`PT_DENY_ATTACH`): `lldb` attaches to a plain process on this runner and fails to
+/// attach to the Gateway. Its exec-time environment, which carries the operator's key and which
+/// any same-uid process reads through `kern.procargs2`, is blank (characterization C5).
+#[cfg(target_os = "macos")]
+#[test]
+fn fw_cred16_the_gateway_denies_debugger_attachment_while_it_brokers() {
+    let dir = Scratch::new("fep6-custody");
+    if !egress_host(dir.path()) || !on_path("lldb") || !on_path("python3") {
+        not_exercised("Seatbelt, lldb or python3 unavailable");
+        return;
+    }
+    std::fs::write(dir.path().join("FORMWORK.toml"), BROKERED).unwrap();
+    let key = format!("sk-custody-fixture-{}", std::process::id());
+    let attach = |pid: u32| -> String {
+        let out = std::process::Command::new("lldb")
+            .args(["-p", &pid.to_string(), "--batch", "-o", "detach"])
+            .output()
+            .unwrap();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let mut plain = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let control = attach(plain.id());
+    let _ = plain.kill();
+    let _ = plain.wait();
+    assert!(
+        control.contains("stopped"),
+        "control: lldb attaches on this runner: {control}"
+    );
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_formwork"))
+        .args(["run", "--", "/bin/sh", "-c", "sleep 15"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("ANTHROPIC_API_KEY", &key)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let denied = attach(child.id());
+    let environment = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import ctypes, sys\nlibc = ctypes.CDLL(None)\n\
+             mib = (ctypes.c_int * 3)(1, 49, int(sys.argv[1]))\nsize = ctypes.c_size_t(1 << 20)\n\
+             buf = ctypes.create_string_buffer(size.value)\n\
+             libc.sysctl(mib, 3, buf, ctypes.byref(size), None, ctypes.c_size_t(0))\n\
+             print('seen' if sys.argv[2].encode() in buf.raw[: size.value] else 'blank')",
+            &child.id().to_string(),
+            &key,
+        ])
+        .output()
+        .unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        denied.contains("attach failed") && !denied.contains("stopped"),
+        "a debugger attached to the brokering Gateway: {denied}"
+    );
+    assert_eq!(String::from_utf8_lossy(&environment.stdout).trim(), "blank");
 }
 
 /// FW-E2E-104 (FEP-6 S8): blueprints the compiler refuses, each naming the lines at fault, and the

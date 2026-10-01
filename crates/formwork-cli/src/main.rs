@@ -450,6 +450,14 @@ fn main() -> Result<()> {
     if let Some(code) = formwork_confine::isolation_stage() {
         std::process::exit(code);
     }
+    // FW-CRED16 / FW-ISO16 on macOS: a confined workload reads same-uid environments through
+    // kern.procargs2, which Seatbelt does not mediate, and this process's holds the operator's
+    // credentials. Single-threaded here: nothing else has started.
+    #[cfg(target_os = "macos")]
+    // SAFETY: first thing in main, before any thread or environment pointer exists.
+    unsafe {
+        formwork_confine::conceal_environment();
+    }
     take_learning_report_fd();
     init_telemetry();
     let cli = parse_cli();
@@ -996,11 +1004,13 @@ struct Session {
 }
 
 /// A host-scoped session's egress door: the in-process Gateway listener and, on Linux, the port
-/// registry the connect supervisor fills (FW-EGR9).
+/// registry the connect supervisor fills, or on macOS the marker its peer check asks for (FW-EGR9).
 struct Egress {
     proxy: formwork_gateway::EgressProxy,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     registry: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>>,
+    /// The marker the session's profile carries for the macOS peer check (FW-EGR9).
+    marker: formwork_compile::SessionMarker,
 }
 
 /// What a session is prepared for: which postures can carry host-scoped egress differs (FEP-5
@@ -1206,8 +1216,12 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
         None => (Vec::new(), None, Vec::new()),
     };
     let egress = start_egress(&blueprint, &host, purpose, inspection, brokers)?;
-    let gateway_port = egress.as_ref().map(|e| e.proxy.addr().port());
-    let policy = formwork_compile::compile_for_session(&blueprint, &host, &catalog, gateway_port);
+    let gateway = egress.as_ref().map(|e| formwork_compile::SessionGateway {
+        port: e.proxy.addr().port(),
+        marker: e.marker.clone(),
+    });
+    let policy =
+        formwork_compile::compile_for_session(&blueprint, &host, &catalog, gateway.as_ref());
     itemize_credential_floor(&policy.report, &catalog);
     Ok(Session {
         blueprint,
@@ -1245,7 +1259,7 @@ struct PreparedInspection {
 }
 
 /// Clients that honor one of these read the trust bundle; the list is the common set across
-/// OpenSSL, Node, Python requests, curl, git, and pip (FW-EGR13).
+/// OpenSSL, Node, Python requests, curl, git, pip and cargo (FW-EGR13).
 const TRUST_VARS: &[&str] = &[
     "SSL_CERT_FILE",
     "NODE_EXTRA_CA_CERTS",
@@ -1253,6 +1267,7 @@ const TRUST_VARS: &[&str] = &[
     "CURL_CA_BUNDLE",
     "GIT_SSL_CAINFO",
     "PIP_CERT",
+    "CARGO_HTTP_CAINFO",
 ];
 
 /// FW-EGR13 / FW-CRED11-14: when any host rule is inspected, mint the session CA, write the trust
@@ -1373,6 +1388,8 @@ fn start_egress(
     }
     let registry = (host.os == formwork_detect::Os::Linux)
         .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())));
+    let marker = formwork_compile::SessionMarker::new(&session_nonce()?);
+    let peer_check = peer_check(&marker);
     let host_addresses = formwork_detect::interface_addresses().unwrap_or_else(|e| {
         tracing::warn!(
             error = %e,
@@ -1387,6 +1404,7 @@ fn start_egress(
         admission: formwork_gateway::Admission {
             credential: session_nonce()?,
             registry: registry.clone(),
+            peer_check,
         },
         inspection,
         brokers,
@@ -1397,7 +1415,26 @@ fn start_egress(
     for rule in &table.rules {
         tracing::info!(rule = %rule, "egress host rule");
     }
-    Ok(Some(Egress { proxy, registry }))
+    Ok(Some(Egress {
+        proxy,
+        registry,
+        marker,
+    }))
+}
+
+/// FW-EGR9 on macOS: the listener admits a connection only when a process carrying the session's
+/// marker holds its client end. Linux has the supervisor's registry instead.
+#[cfg(target_os = "macos")]
+fn peer_check(marker: &formwork_compile::SessionMarker) -> Option<formwork_gateway::PeerCheck> {
+    let marker = marker.clone();
+    Some(formwork_gateway::PeerCheck(std::sync::Arc::new(
+        move |peer, local| formwork_confine::session_holds_connection(&marker, peer, local),
+    )))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn peer_check(_marker: &formwork_compile::SessionMarker) -> Option<formwork_gateway::PeerCheck> {
+    None
 }
 
 /// FW-EGR26: the operator's upstream proxy, read from `formwork run`'s own environment -- never
@@ -1877,11 +1914,13 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
             tracing::info!(
                 "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
             );
-            let started = std::time::Instant::now();
+            let feed = learn::UnifiedLogFeed::start();
             let (program, args) = argv.split_first().expect("argv is non-empty");
             let status = spawn_confined_child(&mut session, program, args)?;
-            let observations = session_observations(&session);
-            let records = learn::collect_denials_quiescent(started)?;
+            let mut observations = session_observations(&session);
+            let messages = feed.collect_quiescent()?;
+            learn::service_observations(&messages, &session.catalog, &mut observations);
+            let records = learn::fs_denials(&messages);
             learn::conclude_learning_run(
                 &session.blueprint,
                 &session.blueprint_path,

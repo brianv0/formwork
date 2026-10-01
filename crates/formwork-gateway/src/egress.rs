@@ -65,9 +65,24 @@ pub struct Admission {
     /// The per-session credential every proxy request carries (`Proxy-Authorization: Basic`).
     pub credential: String,
     /// Linux: source ports the supervisor registered for connections it performed. A connection
-    /// from an unregistered port is closed before a byte is read. `None` on macOS, where the
-    /// credential is the admission (FW-EGR9's residual, reported `Partial`).
+    /// from an unregistered port is closed before a byte is read. `None` on macOS.
     pub registry: Option<Arc<Mutex<HashSet<u16>>>>,
+    /// macOS: whether a process of the session holds the client end of an accepted connection.
+    /// A connection it refuses is closed before a byte is read.
+    pub peer_check: Option<PeerCheck>,
+}
+
+/// A check the listener runs on every accepted connection before reading a byte (FW-EGR9 on
+/// macOS): given the connection's peer and local addresses, whether a process of the session
+/// holds its client end. It blocks -- it walks the process table -- so the listener runs it off
+/// the async workers.
+#[derive(Clone)]
+pub struct PeerCheck(pub Arc<dyn Fn(SocketAddr, SocketAddr) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for PeerCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PeerCheck(..)")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -501,6 +516,24 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         let _ = stream.set_nodelay(true);
         let shared = shared.clone();
         tokio::spawn(async move {
+            if let Some(check) = shared.config.admission.peer_check.clone() {
+                let Ok(local) = stream.local_addr() else {
+                    return;
+                };
+                let admitted = tokio::task::spawn_blocking(move || (check.0)(peer, local))
+                    .await
+                    .unwrap_or(false);
+                if !admitted {
+                    // FW-EGR9: a process outside the session that learned the port and the
+                    // credential is dropped before a byte is read.
+                    tracing::warn!(
+                        peer = %peer,
+                        "formwork: the egress listener closed a connection no session process \
+                         holds (FW-EGR9)"
+                    );
+                    return;
+                }
+            }
             if let Err(e) = serve(stream, shared).await {
                 tracing::debug!(error = %e, "egress connection ended");
             }

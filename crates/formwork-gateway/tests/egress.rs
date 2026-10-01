@@ -292,8 +292,9 @@ async fn fw_adv_008_rebinding_to_a_blocked_ip_is_refused() {
 }
 
 /// FW-ADV-009 / FW-EGR9: no unauthenticated door. Without the credential the listener answers 407;
-/// with a registry, a connection the supervisor did not register is closed before any byte, and a
-/// registered one is served.
+/// with a registry (Linux), a connection the supervisor did not register is closed before any
+/// byte, and a registered one is served; with a peer check (macOS), likewise for a connection no
+/// session process holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn fw_adv_009_no_unauthenticated_door() {
     let up = upstream(None).await;
@@ -334,6 +335,34 @@ async fn fw_adv_009_no_unauthenticated_door() {
         .seen()
         .iter()
         .all(|s| s.header("proxy-authorization").is_none()));
+
+    // macOS's second gate: a connection whose client end no session process holds is closed
+    // before any byte, and the check sees the connection's own addresses.
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let admit_from = Arc::new(Mutex::new(None::<u16>));
+    let mut session = Session::new(&rules, resolver(&[("allowed.test", "127.0.0.1")]));
+    let (log, admit) = (asked.clone(), admit_from.clone());
+    session.peer_check = Some(formwork_gateway::PeerCheck(Arc::new(move |peer, local| {
+        log.lock().unwrap().push((peer, local));
+        *admit.lock().unwrap() == Some(peer.port())
+    })));
+    let (checked, _) = session.start();
+    let refused = raw(&checked, with_auth(&request_line).as_bytes()).await;
+    assert!(
+        refused.is_empty(),
+        "a peer outside the session gets nothing: {refused:?}"
+    );
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    *admit_from.lock().unwrap() = Some(port);
+    let mut stream = socket.connect(checked.addr()).await.unwrap();
+    let out = request(&mut stream, &with_auth(&request_line)).await;
+    assert!(out.ends_with("ok:/door"), "{out}");
+    let asked = asked.lock().unwrap();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!(asked[1].0.port(), port);
+    assert_eq!(asked[1].1, checked.addr());
 }
 
 /// Plain HTTP runs the inspected request pipeline without TLS (FEP-6 §4.8): decided by method and

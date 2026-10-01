@@ -105,6 +105,58 @@ pub fn supervision_host(dir: &Path) -> bool {
     host_profile(dir)["connect-supervision"].as_bool() == Some(true)
 }
 
+/// A host that can carry host-scoped egress through the Gateway: the connect supervisor on Linux,
+/// Seatbelt on macOS.
+pub fn egress_host(dir: &Path) -> bool {
+    if cfg!(target_os = "macos") {
+        host_profile(dir)["seatbelt"].as_bool() == Some(true)
+    } else {
+        supervision_host(dir)
+    }
+}
+
+/// The Sandbox records the unified log has persisted since `since` that satisfy `want`, polled
+/// until one does or 30 seconds pass (macOS; the store persists lazily, FW-E2E-064).
+pub fn sandbox_records(since: std::time::Instant, want: impl Fn(&str) -> bool) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let window = since.elapsed().as_secs() + 5;
+        let out = Command::new("/usr/bin/log")
+            .args([
+                "show",
+                "--style",
+                "ndjson",
+                "--last",
+                &format!("{window}s"),
+                "--predicate",
+                r#"sender == "Sandbox""#,
+            ])
+            .output()
+            .expect("running log show");
+        let found: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v["eventMessage"].as_str().map(str::to_string))
+            .filter(|m| want(m))
+            .collect();
+        if !found.is_empty() || std::time::Instant::now() > deadline {
+            return found;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Whether a Sandbox deny record naming `operation` (and `argument`, when given) arrived since
+/// `since`.
+pub fn denied_since(since: std::time::Instant, operation: &str, argument: &str) -> bool {
+    let needle = if argument.is_empty() {
+        format!(") {operation}")
+    } else {
+        format!(") {operation} {argument}")
+    };
+    !sandbox_records(since, |m| m.contains(" deny(") && m.contains(&needle)).is_empty()
+}
+
 /// One request a fixture upstream received: its head, request line first.
 #[derive(Clone, Debug)]
 pub struct Seen {

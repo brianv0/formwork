@@ -3,7 +3,9 @@
 //! directory, channel locator variables, and the environment-disclosure report line. Each drives
 //! the built binary with `$HOME` and the launch directory pinned inside a scratch directory.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::Command;
 
 mod support;
@@ -491,21 +493,19 @@ fn fw_e2e_082_session_bus_is_closed_until_run_outside_is_lifted() {
     assert!(lifted.stdout.contains("org.freedesktop.DBus"));
 }
 
-#[cfg(target_os = "linux")]
 const BROKERED: &str = "extends = [\"builtin:default\"]\n\
                         rules = [\"readwrite:$CWD/**\", \"get,post:api.anthropic.com\"]\n\
                         allow-credentials = [\"broker:anthropic\"]\n";
 
-/// FW-E2E-078 (Linux, the `run` half; the Gateway half is `formwork-gateway`'s inspect test): a
+/// FW-E2E-078 (both; the `run` half -- the Gateway half is `formwork-gateway`'s inspect test): a
 /// brokered credential reaches the session only as its placeholder, the secret bytes appear
 /// nowhere in the confined environment, and the inspection trust bundle is readable but not
 /// writable (FW-EGR13, FW-CRED14, FW-INV13).
-#[cfg(target_os = "linux")]
 #[test]
 fn fw_e2e_078_session_holds_the_placeholder_and_a_read_only_trust_bundle() {
     let dir = Scratch::new("broker");
-    if !supervision_host(dir.path()) {
-        not_exercised("connect supervision unavailable");
+    if !egress_host(dir.path()) {
+        not_exercised("no host-scoped egress on this host");
         return;
     }
     std::fs::write(dir.path().join("FORMWORK.toml"), BROKERED).unwrap();
@@ -572,12 +572,11 @@ env"#;
 
 /// FW-XR9 for brokering: a brokered credential with no value on the launching host is refused
 /// before the workload starts, naming the variable to set.
-#[cfg(target_os = "linux")]
 #[test]
 fn a_brokered_credential_without_a_value_is_refused_before_spawn() {
     let dir = Scratch::new("broker-unset");
-    if !supervision_host(dir.path()) {
-        not_exercised("connect supervision unavailable");
+    if !egress_host(dir.path()) {
+        not_exercised("no host-scoped egress on this host");
         return;
     }
     std::fs::write(dir.path().join("FORMWORK.toml"), BROKERED).unwrap();

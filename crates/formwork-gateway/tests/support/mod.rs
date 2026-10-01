@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use formwork_blueprint::{HostRule, HostTable, RefusalReason};
 use formwork_gateway::{
-    Admission, Broker, EgressConfig, EgressProxy, Inspection, Resolver, SessionCa, UpstreamProxy,
-    Violation,
+    Admission, Broker, EgressConfig, EgressProxy, Inspection, PeerCheck, Resolver, SessionCa,
+    UpstreamProxy, Violation,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -41,6 +41,7 @@ pub struct Session {
     pub rules: Vec<String>,
     pub resolver: Resolver,
     pub registry: Option<Arc<Mutex<HashSet<u16>>>>,
+    pub peer_check: Option<PeerCheck>,
     /// Roots the Gateway verifies upstreams against; inspection is on when this is set.
     pub upstream_roots: Option<Vec<CertificateDer<'static>>>,
     pub brokers: Vec<Broker>,
@@ -54,6 +55,7 @@ impl Session {
             rules: rules.to_vec(),
             resolver,
             registry: None,
+            peer_check: None,
             upstream_roots: None,
             brokers: Vec::new(),
             host_addresses: Vec::new(),
@@ -77,6 +79,7 @@ impl Session {
             admission: Admission {
                 credential: CREDENTIAL.to_string(),
                 registry: self.registry,
+                peer_check: self.peer_check,
             },
             inspection,
             brokers: self.brokers,

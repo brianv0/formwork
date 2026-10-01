@@ -26,7 +26,7 @@ pub mod opener;
 mod upstream;
 
 pub use ca::{native_roots, native_roots_source, SessionCa};
-pub use egress::{Admission, EgressConfig, EgressProxy, Grant, Resolver, Violation};
+pub use egress::{Admission, EgressConfig, EgressProxy, Grant, PeerCheck, Resolver, Violation};
 pub use inspect::{Broker, Inspection, PLACEHOLDER_PREFIX};
 pub use opener::{OpenRecord, OpenerService};
 pub use upstream::{ProxyEndpoint, UpstreamProxy};
