@@ -243,10 +243,12 @@ fn c2_peer_lookup_attributes_every_connection() {
             marker: marker.clone(),
         }),
     );
-    let stop = dir.0.join("stop");
+    // Each holder keeps its connections until the test has checked and closed them -- or until
+    // the test process is gone -- so no holder outlives the test.
     let script = r#"
 import os, socket, sys, time
-port, stop = int(sys.argv[1]), sys.argv[2]
+port = int(sys.argv[1])
+deadline = time.monotonic() + 180
 def connect():
     for _ in range(200):
         try:
@@ -256,8 +258,12 @@ def connect():
     os._exit(1)
 def hold(n):
     held = [connect() for _ in range(n)]
-    while not os.path.exists(stop):
-        time.sleep(0.05)
+    for s in held:
+        try:
+            s.settimeout(max(deadline - time.monotonic(), 0.01))
+            s.recv(1)
+        except OSError:
+            pass
     os._exit(0)
 for _ in range(9):
     if os.fork() == 0:
@@ -274,13 +280,12 @@ while True:
     except ChildProcessError:
         break
 "#;
+    // The tree's output goes to a file, not the test's pipe, which a stray holder would keep open.
+    let errors = dir.0.join("tree.err");
     let mut cmd = Command::new(&py);
-    cmd.args([
-        "-c",
-        script,
-        &local.port().to_string(),
-        stop.to_str().unwrap(),
-    ]);
+    cmd.args(["-c", script, &local.port().to_string()])
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&errors).unwrap());
     formwork_confine::spawn_confined(&mut cmd, &policy).unwrap();
     let (accepted, arrivals) = std::sync::mpsc::channel();
     let acceptor = listener.try_clone().unwrap();
@@ -312,15 +317,15 @@ while True:
     let outsider = TcpStream::connect(local).unwrap();
     let (_s, peer) = arrivals.recv_timeout(Duration::from_secs(10)).unwrap();
     let outsider_admitted = formwork_confine::session_holds_connection(&marker, peer, local);
-    std::fs::write(&stop, "").unwrap();
     let _ = tree.wait();
     drop(outsider);
     eprintln!("C2: {attributed} connections attributed in {elapsed:?}");
     assert_eq!(
         attributed + missed.len(),
         1000,
-        "the confined tree made only {} connections in {elapsed:?}",
-        attributed + missed.len()
+        "the confined tree made only {} connections in {elapsed:?}:\n{}",
+        attributed + missed.len(),
+        std::fs::read_to_string(&errors).unwrap_or_default()
     );
     assert_eq!(attributed, 1000, "unattributed: {missed:?}");
     assert!(
