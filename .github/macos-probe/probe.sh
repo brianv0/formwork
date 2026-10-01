@@ -1,148 +1,159 @@
 #!/bin/bash
 # Temporary: characterize Seatbelt behaviour on a hosted runner. Removed before merge.
 set +e
+D=$(cd "$(dirname "$0")" && pwd)
 W=/tmp/fwprobe; rm -rf $W; mkdir -p $W; cd $W
 t() { perl -e 'alarm shift; exec @ARGV' "$@"; }
-sb() { local prof="$1"; shift; t 20 sandbox-exec -p "$prof" "$@"; }
+sb() { local prof="$1"; shift; t 30 sandbox-exec -p "$prof" "$@"; }
 h() { echo; echo "=================== $* ==================="; }
 logs() { sleep 4; log show --last "${1:-30s}" --style compact --predicate 'sender == "Sandbox" OR eventMessage CONTAINS "Sandbox:"' 2>/dev/null | grep -v '^Timestamp' | grep -E "$2" | sed -E 's/^.*Sandbox: //' | sort | uniq -c | head -${3:-60}; }
 PY=$(command -v python3)
+GO=$(ls -d /Users/runner/hostedtoolcache/go/*/arm64/bin/go 2>/dev/null | tail -1)
+sw_vers -productVersion; echo "GO=$GO"; ls /Users/runner/hostedtoolcache 2>/dev/null | tr '\n' ' '; echo
+cc -o $W/peer $D/peer.c && cc -o $W/procargs $D/procargs.c || echo "CC FAILED"
 
-h runner
-sw_vers; uname -a; id; csrutil status; DevToolsSecurity -status 2>&1; launchctl managername
-echo PY=$PY; for c in go swift node npm cargo rustup gh brew curl git uv pip3; do printf '%s: ' $c; (command -v $c && t 10 $c --version 2>&1 | head -1) | tr '\n' ' '; echo; done
-ls /Applications | head -30
-
-h "C1 remote filters"
-for f in '"127.0.0.1:8080"' '"localhost:8080"' '"*:8080"' '"::1:8080"' '"localhost:*"'; do
-  printf '%s => ' "$f"; sb "(version 1)(allow default)(deny network*)(allow network-outbound (remote tcp $f))" /usr/bin/true 2>&1 && echo ok
+h "C6 target forms with a sibling in another process group"
+perl -e 'setpgrp(0,0); exec "sleep", "60"' & SIB=$!
+sleep 0.3; echo "sibling $SIB pgid $(ps -o pgid= -p $SIB) mine $(ps -o pgid= -p $$)"
+for tgt in self children pgrp others same-sandbox descendants; do
+  printf 'compile (target %s) => ' $tgt; sb "(version 1)(allow default)(allow signal (target $tgt))" /usr/bin/true 2>&1 | head -1; [ ${PIPESTATUS[0]} -eq 0 ] && echo ok
 done
-printf 'remote ip 127.0.0.1 => '; sb '(version 1)(allow default)(deny network*)(allow network-outbound (remote ip "127.0.0.1:8080"))' /usr/bin/true 2>&1 && echo ok
-# Does localhost:P admit a connect to 127.0.0.1:P and [::1]:P?
-$PY -c 'import socket,time;s=socket.socket();s.bind(("127.0.0.1",18080));s.listen(9);s6=socket.socket(socket.AF_INET6);s6.bind(("::1",18080));s6.listen(9);time.sleep(30)' & SRV=$!
-sleep 1
-for a in 127.0.0.1 ::1 127.0.0.2; do printf 'connect %s:18080 under localhost:18080 => ' $a; sb '(version 1)(allow default)(deny network*)(allow network-outbound (remote tcp "localhost:18080"))' $PY -c "import socket,sys;fam=socket.AF_INET6 if ':' in '$a' else socket.AF_INET;s=socket.socket(fam);s.settimeout(2);s.connect(('$a',18080));print('connected')" 2>&1 | tail -1; done
-printf 'connect 127.0.0.1:18081 (other port) => '; sb '(version 1)(allow default)(deny network*)(allow network-outbound (remote tcp "localhost:18080"))' $PY -c "import socket;s=socket.socket();s.settimeout(2);s.connect(('127.0.0.1',18081));print('connected')" 2>&1 | tail -1
-kill $SRV
+ISO='(version 1)(allow default)(deny process-info* (target others))(allow process-info* (target children))(allow process-info* (target pgrp))(deny signal (target others))(allow signal (target children))(allow signal (target pgrp))'
+printf 'kill -0 other-pgrp sibling => '; sb "$ISO" /bin/sh -c "kill -0 $SIB 2>/dev/null && echo SIGNALABLE || echo refused"
+printf 'lsof other-pgrp sibling => '; sb "$ISO" /bin/sh -c "lsof -p $SIB >/dev/null 2>&1 && echo VISIBLE || echo refused"
+printf 'procargs other-pgrp sibling => '; sb "$ISO" $W/procargs $SIB
+printf 'kill -0 parent (formwork stand-in) => '; sb "$ISO" /bin/sh -c 'kill -0 $PPID 2>/dev/null && echo SIGNALABLE || echo refused'
+SS='(version 1)(allow default)(deny process-info* (target others))(allow process-info* (target same-sandbox))(deny signal (target others))(allow signal (target same-sandbox))'
+printf 'same-sandbox: kill -0 sibling => '; sb "$SS" /bin/sh -c "kill -0 $SIB 2>/dev/null && echo SIGNALABLE || echo refused"
+printf 'same-sandbox: kill -0 parent => '; sb "$SS" /bin/sh -c 'kill -0 $PPID 2>/dev/null && echo SIGNALABLE || echo refused'
+printf 'same-sandbox: job control => '; sb "$SS" /bin/bash -c 'set -m; sleep 5 & kill -TERM %1; wait; echo ok'
+printf 'same-sandbox: reparented grandchild => '; sb "$SS" /bin/sh -c '(perl -e "setpgrp(0,0); sleep 5" & echo $! > gc) ; sleep 0.3; kill $(cat gc) && echo ok'
+printf 'same-sandbox: setsid child => '; sb "$SS" $PY -c '
+import os,signal,subprocess,time
+p=subprocess.Popen(["sleep","5"],start_new_session=True); time.sleep(0.2); os.kill(p.pid,signal.SIGTERM); print("rc",p.wait())'
+cat > $W/mp.py <<'PYS'
+import multiprocessing as mp
+def f(x): return x*x
+if __name__ == "__main__":
+    with mp.Pool(2) as p: print("ok", sum(p.map(f, range(10))))
+PYS
+printf 'same-sandbox: python multiprocessing => '; sb "$SS" $PY $W/mp.py 2>&1 | tail -1
+printf 'same-sandbox: node child_process => '; sb "$SS" node -e 'const c=require("child_process");const p=c.spawn("sleep",["5"]);setTimeout(()=>p.kill(),200);p.on("exit",(code,s)=>console.log("exit",s))'
+mkdir -p mk; printf 'all: a b c\na:\n\tsleep 0.2\nb:\n\tsleep 0.2\nc:\n\tsleep 0.2\n' > mk/Makefile
+printf 'same-sandbox: make -j3 => '; sb "$SS" make -s -j3 -C mk && echo ok
+printf 'same-sandbox: lsof sibling => '; sb "$SS" /bin/sh -c "lsof -p $SIB >/dev/null 2>&1 && echo VISIBLE || echo refused"
+printf 'same-sandbox: procargs sibling => '; sb "$SS" $W/procargs $SIB
+printf 'same-sandbox: procargs self-child => '; sb "$SS" /bin/sh -c "FW_CANARY=x sleep 2 & $W/procargs \$!"
+logs 40s 'deny' 30
+kill $SIB
 
-h "FW-E2E-091 loopback bind/accept under deny network + localhost bind/inbound"
+h "C5 procargs2 from a non-setuid reader"
+FW_CANARY=canary-77 sleep 60 & SIB=$!; sleep 0.3
+printf 'control => '; $W/procargs $SIB
+printf 'deny kern.procargs2 => '; sb '(version 1)(allow default)(deny sysctl-read (sysctl-name "kern.procargs2"))' $W/procargs $SIB
+sb '(version 1)(allow default)(allow sysctl-read (with report))' $W/procargs $SIB >/dev/null
+logs 15s 'sysctl' 10
+kill $SIB
+
+h "launchctl submit control and confined"
+rm -f /tmp/fwprobe-marker
+t 20 launchctl submit -l dev.formwork.ctl -- /bin/sh -c 'echo launchd >> /tmp/fwprobe-marker'; echo "control rc $?"; sleep 2; launchctl remove dev.formwork.ctl; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
+sb '(version 1)(allow default)' launchctl submit -l dev.formwork.sb -- /bin/sh -c 'echo launchd >> /tmp/fwprobe-marker'; echo "allow-default rc $?"; sleep 2; launchctl remove dev.formwork.sb 2>/dev/null; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
+sb '(version 1)(allow default)' launchctl load -w /dev/null 2>&1 | head -2
+printf 'launchctl bootstrap gui => '; cat > $W/job.plist <<PL
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>dev.formwork.boot</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>echo boot &gt;&gt; /tmp/fwprobe-marker</string></array><key>RunAtLoad</key><true/></dict></plist>
+PL
+sb '(version 1)(allow default)' launchctl bootstrap gui/$(id -u) $W/job.plist; echo "rc $?"; sleep 2; launchctl bootout gui/$(id -u)/dev.formwork.boot 2>/dev/null; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
+t 20 launchctl bootstrap gui/$(id -u) $W/job.plist; echo "control bootstrap rc $?"; sleep 2; launchctl bootout gui/$(id -u)/dev.formwork.boot 2>/dev/null; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
+logs 30s 'launchctl|job' 10
+
+h "AppleEvents: applet fixture"
+osacompile -s -o $W/FwApplet.app -e 'on fwmark()' -e 'do shell script "echo applet >> /tmp/fwprobe-marker"' -e 'return "marked"' -e 'end fwmark' -e 'on idle' -e 'return 30' -e 'end idle' && echo compiled
+t 20 open -g $W/FwApplet.app; sleep 3; pgrep -fl FwApplet | head -2
+printf 'control AE => '; t 20 osascript -e "tell application \"$W/FwApplet.app\" to fwmark()" 2>&1; sleep 1; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
+printf 'allow-default AE => '; sb '(version 1)(allow default)' osascript -e "tell application \"$W/FwApplet.app\" to fwmark()" 2>&1; sleep 1; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
+printf 'deny appleevent-send AE => '; sb '(version 1)(allow default)(deny appleevent-send)' osascript -e "tell application \"$W/FwApplet.app\" to fwmark()" 2>&1; sleep 1; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
+printf 'deny AE mach name only => '; sb '(version 1)(allow default)(deny mach-lookup (global-name "com.apple.coreservices.appleevents"))' osascript -e "tell application \"$W/FwApplet.app\" to fwmark()" 2>&1; sleep 1; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
+printf 'System Events control => '; t 20 osascript -e 'tell application "System Events" to get name of first process' 2>&1
+sb '(version 1)(allow default)(allow mach-lookup (with report))(allow appleevent-send (with report))' osascript -e "tell application \"$W/FwApplet.app\" to fwmark()" >/dev/null 2>&1
+logs 40s 'appleevent|osascript' 30
+osascript -e "tell application \"$W/FwApplet.app\" to quit" 2>/dev/null
+
+h "screen capture under service denies"
+for prof in '(deny mach-lookup (global-name-regex #"^com\.apple\.(screencapture|replayd)"))' \
+            '(deny mach-lookup (global-name "com.apple.windowserver.active"))' \
+            '(deny mach-lookup (global-name "com.apple.windowserver.active") (global-name "com.apple.CARenderServer") (global-name-regex #"^com\.apple\.(screencapture|replayd)"))'; do
+  rm -f $W/shot.png; sb "(version 1)(allow default)$prof" screencapture -x $W/shot.png 2>&1 | head -2; echo "rc ${PIPESTATUS[0]} file: $(ls $W/shot.png 2>/dev/null || echo none)"
+done
+WS='(version 1)(allow default)(deny mach-lookup (global-name "com.apple.windowserver.active") (global-name "com.apple.CARenderServer"))'
+for c in "git --version" "$PY -c print(1)" "node -e 1" "swift --version" "cargo --version" "gh --version" "brew --version" "open -g $W/FwApplet.app"; do sb "$WS" $c >/dev/null 2>&1; echo "under windowserver deny: $c rc $?"; done
+
+h "securityd deny vs TLS clients"
+KS='(version 1)(allow default)(deny mach-lookup (global-name "com.apple.SecurityServer"))'
+security create-keychain -p pw $W/fw.keychain; security add-generic-password -s fw-svc -a fw -w keychain-secret $W/fw.keychain
+printf 'keychain item => '; sb "$KS" security find-generic-password -s fw-svc -w $W/fw.keychain 2>&1
+printf 'login keychain list => '; sb "$KS" security list-keychains 2>&1 | head -2
+for c in "/usr/bin/curl -sS -o /dev/null -w %{http_code} https://example.com" "git ls-remote https://github.com/octocat/Hello-World HEAD" "$PY -c import\ urllib.request;print(urllib.request.urlopen('https://example.com').status)" "node -e fetch('https://example.com').then(r=>console.log(r.status))" "gh api /zen" "$GO version"; do
+  printf '%s => ' "$c"; sb "$KS" $c 2>&1 | tail -1
+done
+cat > $W/get.swift <<'SW'
+import Foundation
+let s = DispatchSemaphore(value: 0)
+URLSession.shared.dataTask(with: URL(string: CommandLine.arguments[1])!) { _, r, e in
+  print((r as? HTTPURLResponse)?.statusCode ?? -1, e?.localizedDescription ?? ""); s.signal() }.resume()
+s.wait()
+SW
+t 120 swiftc -O -o $W/swiftget $W/get.swift && echo "swiftget built"
+printf 'swift URLSession control => '; t 20 $W/swiftget https://example.com
+printf 'swift URLSession securityd deny => '; sb "$KS" $W/swiftget https://example.com
+if [ -n "$GO" ]; then
+cat > $W/get.go <<'GOS'
+package main
+import ("fmt";"net/http";"os")
+func main(){ r,err:=http.Get(os.Args[1]); if err!=nil {fmt.Println("err",err); os.Exit(1)}; fmt.Println(r.StatusCode)}
+GOS
+(cd $W && t 120 $GO build -o goget get.go) && echo "goget built"
+printf 'go control => '; t 20 $W/goget https://example.com
+printf 'go securityd deny => '; sb "$KS" $W/goget https://example.com
+fi
+logs 60s 'SecurityServer|trustd' 20
+
+h "iokit deny vs toolchains"
+IOD='(version 1)(allow default)(deny iokit-open)'
+printf 'compile iokit-open deny => '; sb "$IOD" /usr/bin/true && echo ok
+mkdir -p $W/swpkg/Sources/hello && printf '// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: "hello", targets: [.executableTarget(name: "hello")])\n' > $W/swpkg/Package.swift && echo 'print("hi")' > $W/swpkg/Sources/hello/main.swift
+mkdir -p $W/rspkg/src && printf '[package]\nname="hello"\nversion="0.1.0"\nedition="2021"\n' > $W/rspkg/Cargo.toml && echo 'fn main(){println!("hi");}' > $W/rspkg/src/main.rs
+for c in "git --version" "$PY -c print(1)" "node -e 1" "cc -o $W/a.out -x c /dev/null -Wl,-undefined,dynamic_lookup -nostartfiles -c" "swift build --package-path $W/swpkg" "cargo build --manifest-path $W/rspkg/Cargo.toml" "gh --version" "brew --version" "/usr/bin/curl -sI https://example.com" "xcrun --show-sdk-path" "caffeinate -t 1" "$W/swiftget https://example.com" "pbcopy </dev/null" "screencapture -x $W/io.png"; do
+  sb "$IOD" $c >/dev/null 2>&1; echo "iokit deny: $c rc $?"
+done
+logs 120s 'iokit' 40
+
+h "wildcard bind inbound from the LAN address"
+LAN=$(ipconfig getifaddr en0 || ipconfig getifaddr en1); echo "LAN=$LAN"
 P='(version 1)(allow default)(deny network*)(allow network-bind (local ip "localhost:*"))(allow network-inbound (local ip "localhost:*"))'
 rm -f port; sb "$P" $PY -c '
 import socket
-s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(1); open("port","w").write(str(s.getsockname()[1]))
-c,_=s.accept(); print("got", c.recv(64).decode())' & SB=$!
+s=socket.socket(); s.bind(("0.0.0.0",0)); s.listen(1); open("port","w").write(str(s.getsockname()[1])); s.settimeout(8)
+try:
+  c,a=s.accept(); print("accepted from", a, c.recv(64))
+except Exception as e: print("accept:", e)' & SB=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -s port ] && break; sleep 0.3; done
-$PY -c "import socket;c=socket.create_connection(('127.0.0.1',int(open('port').read())));c.sendall(b'nonce-42')"; wait $SB; echo "exit $?"
-printf 'bind localhost name => '; sb "$P" $PY -c 'import socket;s=socket.socket();s.bind(("localhost",0));s.listen(1);print("bound",s.getsockname())' 2>&1 | tail -1
-printf 'bind ::1 => '; sb "$P" $PY -c 'import socket;s=socket.socket(socket.AF_INET6);s.bind(("::1",0));s.listen(1);print("bound",s.getsockname())' 2>&1 | tail -1
-printf 'bind 0.0.0.0 => '; sb "$P" $PY -c 'import socket;s=socket.socket();s.bind(("0.0.0.0",0));s.listen(1);print("bound",s.getsockname())' 2>&1 | tail -1
+$PY -c "import socket;c=socket.create_connection(('$LAN',int(open('port').read())),timeout=5);c.sendall(b'lan-nonce');print('client sent')" 2>&1; wait $SB
+logs 20s 'network' 10
 
-h "fixture app"
-APP=$W/FwFixture.app; mkdir -p $APP/Contents/MacOS
-cat > $APP/Contents/Info.plist <<PL
-<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>CFBundleExecutable</key><string>fixture</string><key>CFBundleIdentifier</key><string>dev.formwork.fixture</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleName</key><string>FwFixture</string><key>LSUIElement</key><true/></dict></plist>
-PL
-printf '#!/bin/sh\necho "launched $$ $*" >> /tmp/fwprobe-marker\n' > $APP/Contents/MacOS/fixture; chmod +x $APP/Contents/MacOS/fixture
-rm -f /tmp/fwprobe-marker; t 20 open -g -n $APP; sleep 2; echo "control open: $(cat /tmp/fwprobe-marker 2>&1)"
-
-h "C3 mach-lookup names (allow with report)"
-REP='(version 1)(allow default)(allow mach-lookup (with report))'
-printf 'compile with-report => '; sb "$REP" /usr/bin/true && echo ok
-rm -f /tmp/fwprobe-marker
-echo nonce-clip | sb "$REP" pbcopy; echo "pbcopy rc $?"
-sb "$REP" pbpaste; echo "pbpaste rc $?"
-logs 20s 'pbcopy|pbpaste'
-sb "$REP" open -g -n $APP; echo "open rc $?"; sleep 2; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"
-logs 20s '\(.*open\(|open\[| open'
-sb "$REP" launchctl submit -l dev.formwork.probe -- /bin/sh -c 'echo launchd >> /tmp/fwprobe-marker'; echo "launchctl rc $?"; sleep 2; launchctl remove dev.formwork.probe 2>/dev/null; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"
-logs 20s 'launchctl'
-sb "$REP" osascript -e 'tell application id "dev.formwork.fixture" to activate'; echo "osascript rc $?"; sleep 1
-logs 20s 'osascript'
-security create-keychain -p pw $W/fw.keychain; security add-generic-password -s fw-svc -a fw -w keychain-secret $W/fw.keychain
-printf 'control keychain: '; security find-generic-password -s fw-svc -w $W/fw.keychain
-sb "$REP" security find-generic-password -s fw-svc -w $W/fw.keychain; echo "security rc $?"
-logs 20s 'security'
-sb "$REP" screencapture -x $W/shot.png; echo "screencapture rc $? $(ls -la $W/shot.png 2>&1)"
-logs 20s 'screencapture'
-
-h "C3b deny-all mach-lookup, which names deny"
-DEN='(version 1)(allow default)(deny mach-lookup)'
-echo x | sb "$DEN" pbcopy; echo "pbcopy rc $?"; sb "$DEN" pbpaste; echo "pbpaste rc $?"
-sb "$DEN" security find-generic-password -s fw-svc -w $W/fw.keychain; echo "security rc $?"
-logs 20s 'deny' 80
-
-h "C4 lsopen / appleevent under sandbox"
-rm -f /tmp/fwprobe-marker
-sb '(version 1)(allow default)' open -g -n $APP; echo "allow-default open rc $?"; sleep 2; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
-sb '(version 1)(allow default)(deny lsopen)' open -g -n $APP; echo "deny-lsopen open rc $?"; sleep 2; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
-sb '(version 1)(allow default)(deny lsopen)(deny appleevent-send)(deny mach-lookup (global-name "com.apple.coreservices.appleevents"))' osascript -e 'tell application id "dev.formwork.fixture" to activate'; echo "deny-ae osascript rc $?"; sleep 2; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
-t 20 osascript -e 'tell application id "dev.formwork.fixture" to activate'; echo "control osascript rc $?"; sleep 2; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
-sb '(version 1)(allow default)(deny lsopen)' launchctl submit -l dev.formwork.probe2 -- /bin/sh -c 'echo launchd >> /tmp/fwprobe-marker'; echo "launchctl under deny-lsopen rc $?"; sleep 2; launchctl remove dev.formwork.probe2 2>/dev/null; echo "marker: $(cat /tmp/fwprobe-marker 2>&1)"; rm -f /tmp/fwprobe-marker
-logs 40s 'deny' 40
-
-h "C5 procargs2"
-FW_CANARY=canary-77 sleep 60 & SIB=$!
+h "peer check"
+$W/peer
+MARK='(version 1)(allow default)(deny file-read* (literal "/private/var/empty/fw-abc/a"))(allow file-read* (literal "/private/var/empty/fw-abc/b"))'
+$PY -c 'import socket,time;s=socket.socket();s.bind(("127.0.0.1",18090));s.listen(9);time.sleep(30)' & L=$!
 sleep 0.5
-printf 'control ps -E: '; ps -E -p $SIB -o command= | grep -o 'FW_CANARY=[^ ]*' || echo "not shown"
-printf 'confined ps -E: '; sb '(version 1)(allow default)(deny sysctl-read (sysctl-name "kern.procargs2"))' ps -E -p $SIB -o command= | grep -o 'FW_CANARY=[^ ]*' || echo "not shown"
-printf 'confined ps -ww command: '; sb '(version 1)(allow default)(deny sysctl-read (sysctl-name "kern.procargs2"))' ps -ww -p $SIB -o command=
-sb '(version 1)(allow default)(allow sysctl-read (with report))' ps -E -p $SIB -o command= >/dev/null
-logs 20s 'sysctl' 40
-
-h "C6 isolate processes target forms"
-ISO='(version 1)(allow default)(deny process-info* (target others))(allow process-info* (target children))(allow process-info* (target pgrp))(deny signal (target others))(allow signal (target children))(allow signal (target pgrp))'
-printf 'compile => '; sb "$ISO" /usr/bin/true && echo ok
-printf 'kill -0 sibling => '; sb "$ISO" /bin/sh -c "kill -0 $SIB && echo SIGNALABLE || echo refused"
-printf 'ps sibling => '; sb "$ISO" /bin/sh -c "ps -p $SIB -o pid= || echo hidden"
-printf 'ps -ax count => '; sb "$ISO" /bin/sh -c 'ps -ax | wc -l'; printf 'control ps -ax count => '; ps -ax | wc -l
-printf 'job control => '; sb "$ISO" /bin/sh -c 'sleep 0.2 & kill %1 2>/dev/null; wait; sleep 0.1 & wait $!; echo ok'
-printf 'bash job control => '; sb "$ISO" /bin/bash -c 'set -m; sleep 5 & kill -TERM %1; wait; echo ok'
-printf 'setsid child signal => '; sb "$ISO" $PY -c '
-import os,signal,subprocess,time
-p=subprocess.Popen(["sleep","5"],start_new_session=True); time.sleep(0.2); os.kill(p.pid,signal.SIGTERM); print("rc",p.wait())'
-printf 'grandchild signal => '; sb "$ISO" /bin/sh -c 'sh -c "sleep 5 & echo \$! > gc; wait" & sleep 0.3; kill $(cat gc) && echo ok'
-printf 'python multiprocessing => '; sb "$ISO" $PY -c '
-import multiprocessing as mp
-def f(x): return x*x
-if __name__=="__main__":
-    with mp.Pool(2) as p: print(sum(p.map(f, range(10))))'
-printf 'node child_process => '; sb "$ISO" node -e 'const c=require("child_process");const p=c.spawn("sleep",["5"]);setTimeout(()=>{p.kill();},200);p.on("exit",(code,s)=>console.log("exit",s))'
-mkdir -p mk; printf 'all: a b c\na:\n\tsleep 0.2\nb:\n\tsleep 0.2\nc:\n\tsleep 0.2\n' > mk/Makefile
-printf 'make -j3 => '; sb "$ISO" make -s -j3 -C mk && echo ok
-printf 'proc_pidinfo sibling (lsof) => '; sb "$ISO" /bin/sh -c "lsof -p $SIB >/dev/null 2>&1 && echo VISIBLE || echo refused"
-logs 60s 'deny' 40
-kill $SIB
-
-h "C7 posix ipc prefix"
-IPC='(version 1)(allow default)(deny ipc-posix*)(allow ipc-posix* (ipc-posix-name-prefix "/fw"))'
-printf 'compile => '; sb "$IPC" /usr/bin/true && echo ok
-printf 'shared_memory default name => '; sb "$IPC" $PY -c 'from multiprocessing import shared_memory as s; m=s.SharedMemory(create=True,size=16); print("ok",m.name); m.close(); m.unlink()' 2>&1 | tail -1
-printf 'shared_memory /fw name => '; sb "$IPC" $PY -c 'from multiprocessing import shared_memory as s; m=s.SharedMemory(name="fwx",create=True,size=16); print("ok",m.name); m.close(); m.unlink()' 2>&1 | tail -1
-printf 'mp Lock => '; sb "$IPC" $PY -c 'import multiprocessing as mp; l=mp.Lock(); print("ok")' 2>&1 | tail -1
-printf 'sysv deny compile + ipcs => '; sb '(version 1)(allow default)(deny ipc-sysv*)' $PY -c 'print("ok")'
-printf 'node worker => '; sb "$IPC" node -e 'const {Worker}=require("worker_threads");new Worker("process.exit(0)",{eval:true}).on("exit",c=>console.log("ok",c))'
-
-h "C8 iokit with report"
-IOK='(version 1)(allow default)(allow iokit-open (with report))'
-printf 'compile => '; sb "$IOK" /usr/bin/true && echo ok
-sb '(version 1)(allow default)(allow iokit-open-user-client (with report))' /usr/bin/true && echo "iokit-open-user-client ok"
-sb '(version 1)(allow default)(allow iokit-open-service (with report))' /usr/bin/true && echo "iokit-open-service ok"
-for c in "git --version" "$PY -c print(1)" "node -e 1" "swift --version" "cc --version" "go version" "cargo --version" "gh --version" "brew --version" "curl -sI https://example.com"; do sb "$IOK" $c >/dev/null 2>&1; echo "$c rc $?"; done
-logs 90s 'iokit' 60
-
-h "CRED16 PT_DENY_ATTACH"
-cat > $W/deny.py <<PYS
-import ctypes,sys,time,os
-libc=ctypes.CDLL(None)
-if sys.argv[1]=="deny": print("ptrace rc",libc.ptrace(31,0,None,0),flush=True)
-time.sleep(40)
-PYS
-SECRET_TOKEN=sekrit-1 $PY $W/deny.py deny & D=$!
-SECRET_TOKEN=sekrit-2 $PY $W/deny.py none & N=$!
-sleep 1
-printf 'ps -E denied proc: '; ps -E -p $D -o command= | grep -o 'SECRET_TOKEN=[^ ]*' || echo "not shown"
-printf 'lldb attach to plain: '; t 30 lldb -p $N --batch -o 'detach' 2>&1 | grep -E 'Process .* stopped|attach failed|error' | head -2
-printf 'lldb attach to denied: '; t 30 lldb -p $D --batch -o 'detach' 2>&1 | grep -E 'Process .* stopped|attach failed|error' | head -2
-kill $D $N 2>/dev/null
+sb "$MARK" $PY -c 'import socket,time;c=socket.create_connection(("127.0.0.1",18090));time.sleep(15)' & M=$!
+$PY -c 'import socket,time;c=socket.create_connection(("127.0.0.1",18090));time.sleep(15)' & U=$!
+sb '(version 1)(deny default)(allow process*)(allow file-read*)(allow network*)(allow sysctl-read)(allow mach-lookup)(allow file-ioctl)(allow file-write-data (literal "/dev/null"))' $PY -c 'import socket,time;c=socket.create_connection(("127.0.0.1",18090));time.sleep(15)' & DD=$!
+sb '(version 1)(allow default)' $PY -c 'import socket,time;c=socket.create_connection(("127.0.0.1",18090));time.sleep(15)' & AD=$!
+sleep 2
+for p in $M $U $DD $AD; do echo "--- pid $p: $(ps -o command= -p $p | cut -c1-70)"; $W/peer $p /private/var/empty/fw-abc/a /private/var/empty/fw-abc/b | grep -v '^sizeof\|^off\|^SOCK\|^SANDBOX'; done
+printf 'peer check from inside a sandbox => '; sb '(version 1)(allow default)(deny file-read* (literal "/x"))' $W/peer $M /private/var/empty/fw-abc/a | grep 'sandbox_check' | head -1
+logs 30s 'fw-abc' 10
+kill $L $M $U $DD $AD 2>/dev/null
 echo done
