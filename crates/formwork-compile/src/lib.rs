@@ -58,6 +58,9 @@ pub struct CompileInput {
     /// The marker the Gateway's peer check recognizes the session's processes by (FW-EGR9 on
     /// macOS); known only when compiling for a spawn with host rules.
     pub session_marker: Option<SessionMarker>,
+    /// The tag every macOS deny carries into its Sandbox record (FW-DISC2); known only when
+    /// compiling for a spawn.
+    pub deny_tag: Option<String>,
     /// Pathname sockets granted by a literal write grant (FW-ISO12, FEP-5 §3.1.1).
     pub unix_socket_grants: Vec<PathPattern>,
     /// Whether any credential is brokered (FW-CRED11).
@@ -108,6 +111,7 @@ impl CompileInput {
             isolate: blueprint.isolate.clone(),
             gateway_port: None,
             session_marker: None,
+            deny_tag: None,
             brokered: blueprint.brokered_credentials().next().is_some(),
             keyring_lifted: exposed.iter().any(|t| t == formwork_blueprint::OS_KEYRING),
             keyring_services: keyring_services.clone(),
@@ -142,7 +146,7 @@ pub fn compile(
     host: &HostProfile,
     catalog: &ResolvedCatalog,
 ) -> CompiledPolicy {
-    compile_for_session(blueprint, host, catalog, None)
+    compile_for_session(blueprint, host, catalog, &SessionSpec::default())
 }
 
 /// A per-session secret the macOS profile carries so the Gateway can tell the session's processes
@@ -184,20 +188,32 @@ pub struct SessionGateway {
     pub marker: SessionMarker,
 }
 
-/// [`compile`] for a session: `gateway` is the per-spawn Gateway listener the session's egress
-/// goes to (FW-EGR8/FW-EGR14), not blueprint content. A dry run compiles with none, and the macOS
-/// profile then allows no outbound endpoint at all (fail-closed). Still pure and deterministic in
-/// its inputs (FW-FID4).
+/// What a spawned session's profile names beyond the blueprint.
+#[derive(Clone, Debug, Default)]
+pub struct SessionSpec {
+    /// The Gateway listener the session's egress goes to and the marker its peer check asks for
+    /// (FW-EGR8, FW-EGR9, FW-EGR14).
+    pub gateway: Option<SessionGateway>,
+    /// A per-session tag every macOS deny carries into its Sandbox record, so the unified log's
+    /// records name the session that produced them (FW-DISC2). Distinct from the marker: a session
+    /// that reads its own records learns this tag, never the marker.
+    pub deny_tag: Option<String>,
+}
+
+/// [`compile`] for a session: the per-spawn Gateway listener and deny tag are not blueprint
+/// content. A dry run compiles with neither, and the macOS profile then allows no outbound
+/// endpoint at all (fail-closed). Still pure and deterministic in its inputs (FW-FID4).
 pub fn compile_for_session(
     blueprint: &Blueprint,
     host: &HostProfile,
     catalog: &ResolvedCatalog,
-    gateway: Option<&SessionGateway>,
+    session: &SessionSpec,
 ) -> CompiledPolicy {
     let blueprint = blueprint.canonicalize();
     let mut input = CompileInput::from_blueprint(&blueprint, catalog);
-    input.gateway_port = gateway.map(|g| g.port);
-    input.session_marker = gateway.map(|g| g.marker.clone());
+    input.gateway_port = session.gateway.as_ref().map(|g| g.port);
+    input.session_marker = session.gateway.as_ref().map(|g| g.marker.clone());
+    input.deny_tag = session.deny_tag.clone();
 
     let mut per_capability: BTreeMap<Capability, Fidelity> = BTreeMap::new();
     let mut withheld: Vec<String> = Vec::new();

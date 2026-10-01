@@ -292,6 +292,24 @@ impl LogStream {
     }
 }
 
+/// The records this session produced: those carrying its deny tag on their own line, with the
+/// tag removed (characterized: `(with message …)` appends it to the record). Without a tag, every
+/// record in the run window -- over-capture, which is safe (FW-INV10).
+pub fn this_session(messages: Vec<String>, tag: Option<&str>) -> Vec<String> {
+    let Some(tag) = tag else {
+        return messages;
+    };
+    messages
+        .into_iter()
+        .filter_map(|m| {
+            let (record, rest) = m.split_once('\n')?;
+            rest.lines()
+                .any(|l| l.trim() == tag)
+                .then(|| record.to_string())
+        })
+        .collect()
+}
+
 /// The filesystem denials among a feed's records (FW-DISC2).
 pub fn fs_denials(messages: &[String]) -> Vec<DenialRecord> {
     messages
@@ -1051,6 +1069,20 @@ mod tests {
 
     /// The millisecond-workload trap (FW-E2E-064): before anything has flushed, the store reads
     /// empty and "stable" -- the floor forbids trusting that until real settle time has passed.
+    #[test]
+    fn a_session_keeps_only_its_tagged_records() {
+        let messages = vec![
+            "Sandbox: cat(1) deny(1) file-read-data /x\nfw-session-a".to_string(),
+            "Sandbox: mdworker(2) deny(1) file-read-data /y".to_string(),
+            "Sandbox: cat(3) deny(1) file-read-data /z\nfw-session-b".to_string(),
+        ];
+        assert_eq!(
+            this_session(messages.clone(), Some("fw-session-a")),
+            vec!["Sandbox: cat(1) deny(1) file-read-data /x".to_string()]
+        );
+        assert_eq!(this_session(messages.clone(), None), messages);
+    }
+
     #[test]
     fn macos_service_denials_map_to_channels_and_withhold_the_keychain() {
         let catalog = ResolvedCatalog::builtin_for_home("/Users/x").unwrap();

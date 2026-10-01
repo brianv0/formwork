@@ -61,7 +61,35 @@ pub fn render(input: &CompileInput) -> String {
         ));
     }
 
-    b
+    match &input.deny_tag {
+        Some(tag) => tag_denies(&b, tag),
+        None => b,
+    }
+}
+
+/// Every deny carries `tag` into its Sandbox record (characterized: `(with message …)` appends
+/// the text to the record on its own line), so the unified log's records are attributed to the
+/// session that produced them (FW-DISC2). Each rule is one line, `(deny <operation> <filters>)`.
+fn tag_denies(profile: &str, tag: &str) -> String {
+    let modifier = format!("(with message \"{}\")", escape(tag));
+    let mut out = String::with_capacity(profile.len() * 2);
+    for line in profile.lines() {
+        match line.strip_prefix("(deny ") {
+            Some(rest) => {
+                let split = rest.find([' ', ')']).unwrap_or(rest.len());
+                let (operation, filters) = rest.split_at(split);
+                let filters = filters.trim_start();
+                out.push_str(&format!("(deny {operation} {modifier}"));
+                if filters != ")" {
+                    out.push(' ');
+                }
+                out.push_str(filters);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// A Mach service name, matched exactly or by prefix.
@@ -568,6 +596,7 @@ mod tests {
             isolate: Vec::new(),
             gateway_port: None,
             session_marker: None,
+            deny_tag: None,
             unix_socket_grants: Vec::new(),
             brokered: false,
             keyring_lifted: false,
@@ -725,6 +754,28 @@ mod tests {
         let mut i = input();
         i.keychain_lifted = true;
         assert!(!render(&i).contains("com.apple.SecurityServer"));
+    }
+
+    #[test]
+    fn a_session_tags_every_deny() {
+        let mut i = input();
+        i.deny_tag = Some("fw-session-t1".to_string());
+        let s = render(&i);
+        assert!(
+            s.contains("(deny network* (with message \"fw-session-t1\"))"),
+            "{s}"
+        );
+        assert!(
+            s.contains("(deny file-read* (with message \"fw-session-t1\") (subpath \"/\"))"),
+            "{s}"
+        );
+        assert!(
+            s.lines()
+                .filter(|l| l.starts_with("(deny "))
+                .all(|l| l.contains("(with message \"fw-session-t1\")")),
+            "{s}"
+        );
+        assert!(!render(&input()).contains("with message"));
     }
 
     #[test]

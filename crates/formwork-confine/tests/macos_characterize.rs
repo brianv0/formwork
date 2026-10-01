@@ -15,7 +15,9 @@ use formwork_blueprint::{
     Blueprint, Channel, ChannelPolicy, CredentialEntry, FsBlueprint, HostRule, HostTable,
     IsolateMember, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
 };
-use formwork_compile::{CompiledPolicy, ConfinerPolicy, SessionGateway, SessionMarker};
+use formwork_compile::{
+    CompiledPolicy, ConfinerPolicy, SessionGateway, SessionMarker, SessionSpec,
+};
 use formwork_detect::detect;
 
 struct Scratch(PathBuf);
@@ -80,7 +82,10 @@ fn compile(blueprint: &Blueprint, gateway: Option<&SessionGateway>) -> CompiledP
         blueprint,
         &detect(),
         &ResolvedCatalog::builtin_for_home(&home).unwrap(),
-        gateway,
+        &SessionSpec {
+            gateway: gateway.cloned(),
+            deny_tag: None,
+        },
     )
 }
 
@@ -220,7 +225,10 @@ fn c2_peer_lookup_attributes_every_connection() {
     let dir = Scratch::new("c2");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let local = listener.local_addr().unwrap();
-    let nonce = format!("{:016x}", std::process::id() as u64 * 0x9e37_79b9_7f4a_7c15);
+    let nonce = format!(
+        "{:016x}",
+        (std::process::id() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    );
     let marker = SessionMarker::new(&nonce);
     let mut blueprint = ambient(&dir.0);
     blueprint.net = NetPosture::AllowHosts(HostTable::new(vec!["allow:example.test"
@@ -452,19 +460,29 @@ fn c3_c4_channel_services_and_operations() {
 /// process may exec a setuid binary (`ps` among them): Seatbelt's `forbidden-exec-sugid`.
 #[test]
 fn c5_procargs2_is_not_mediated() {
-    let Some(py) = python() else {
-        return not_exercised("no sandboxable python3");
-    };
     let dir = Scratch::new("c5");
-    let reader = dir.0.join("procargs.py");
+    // A C reader: under `(deny sysctl-read)` an interpreter cannot start (it reads sysctls).
     std::fs::write(
-        &reader,
-        "import ctypes, sys\nlibc = ctypes.CDLL(None)\nmib = (ctypes.c_int * 3)(1, 49, int(sys.argv[1]))\n\
-         size = ctypes.c_size_t(1 << 20)\nbuf = ctypes.create_string_buffer(size.value)\n\
-         ok = libc.sysctl(mib, 3, buf, ctypes.byref(size), None, ctypes.c_size_t(0)) == 0\n\
-         print('seen' if ok and sys.argv[2].encode() in buf.raw[: size.value] else 'hidden')\n",
+        dir.0.join("procargs.c"),
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <sys/sysctl.h>\n\
+         int main(int c, char **v) { int mib[3] = {CTL_KERN, KERN_PROCARGS2, atoi(v[1])};\n\
+         static char b[1 << 20]; size_t n = sizeof b;\n\
+         if (sysctl(mib, 3, b, &n, NULL, 0)) { puts(\"unreadable\"); return 2; }\n\
+         for (size_t i = 0; i + strlen(v[2]) <= n; i++) if (!memcmp(b + i, v[2], strlen(v[2]))) { puts(\"seen\"); return 0; }\n\
+         puts(\"hidden\"); return 1; }\n",
     )
     .unwrap();
+    let reader = dir.0.join("procargs");
+    let built = Command::new("/usr/bin/cc")
+        .arg("-o")
+        .arg(&reader)
+        .arg(dir.0.join("procargs.c"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !built {
+        return not_exercised("no C compiler");
+    }
     let nonce = format!("canary-{}", std::process::id());
     let mut sibling = Command::new("/bin/sleep")
         .arg("30")
@@ -479,10 +497,7 @@ fn c5_procargs2_is_not_mediated() {
         "(version 1)(allow default)(deny sysctl-read)",
         "(version 1)(allow default)(deny process-info*)",
     ] {
-        let out = sandbox_exec(
-            profile,
-            &[py.to_str().unwrap(), reader.to_str().unwrap(), &pid, &nonce],
-        );
+        let out = sandbox_exec(profile, &[reader.to_str().unwrap(), &pid, &nonce]);
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             "seen",
@@ -492,6 +507,41 @@ fn c5_procargs2_is_not_mediated() {
     }
     let _ = sibling.kill();
     let _ = sibling.wait();
+
+    // A process that zeroes its exec-time environment strings is read as blank.
+    std::fs::write(
+        dir.0.join("conceal.c"),
+        "#include <crt_externs.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\
+         #include <unistd.h>\nint main(void) { char ***e = _NSGetEnviron(); size_t n = 0;\n\
+         while ((*e)[n]) n++; char **c = calloc(n + 1, sizeof *c);\n\
+         for (size_t i = 0; i < n; i++) c[i] = strdup((*e)[i]); char **o = *e; *e = c;\n\
+         for (size_t i = 0; i < n; i++) memset(o[i], 0, strlen(o[i]));\n\
+         puts(\"ready\"); fflush(stdout); sleep(10); return 0; }\n",
+    )
+    .unwrap();
+    let conceal = dir.0.join("conceal");
+    assert!(Command::new("/usr/bin/cc")
+        .arg("-o")
+        .arg(&conceal)
+        .arg(dir.0.join("conceal.c"))
+        .status()
+        .unwrap()
+        .success());
+    let mut concealed = Command::new(&conceal)
+        .env("FW_CANARY", &nonce)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = [0u8; 6];
+    std::io::Read::read_exact(concealed.stdout.as_mut().unwrap(), &mut ready).unwrap();
+    let out = Command::new(&reader)
+        .args([&concealed.id().to_string(), &nonce])
+        .output()
+        .unwrap();
+    let _ = concealed.kill();
+    let _ = concealed.wait();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hidden");
+
     let ps = sandbox_exec("(version 1)(allow default)", &["/bin/ps", "-p", "1"]);
     assert!(!ps.status.success(), "a sandboxed process exec'd setuid ps");
 }

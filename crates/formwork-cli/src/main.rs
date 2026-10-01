@@ -1001,6 +1001,8 @@ struct Session {
     /// Pathname sockets the connect supervisor refused (FW-DISC12).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     refused_sockets: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    /// The tag this session's macOS denies carry into the unified log (FW-DISC2).
+    deny_tag: Option<String>,
 }
 
 /// A host-scoped session's egress door: the in-process Gateway listener and, on Linux, the port
@@ -1216,14 +1218,21 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
         None => (Vec::new(), None, Vec::new()),
     };
     let egress = start_egress(&blueprint, &host, purpose, inspection, brokers)?;
-    let gateway = egress.as_ref().map(|e| formwork_compile::SessionGateway {
-        port: e.proxy.addr().port(),
-        marker: e.marker.clone(),
-    });
-    let policy =
-        formwork_compile::compile_for_session(&blueprint, &host, &catalog, gateway.as_ref());
+    let spec = formwork_compile::SessionSpec {
+        gateway: egress.as_ref().map(|e| formwork_compile::SessionGateway {
+            port: e.proxy.addr().port(),
+            marker: e.marker.clone(),
+        }),
+        // FW-DISC2 on macOS: the unified log carries every sandboxed process's records; the tag
+        // lets `learn` keep this session's.
+        deny_tag: (host.os == formwork_detect::Os::MacOs && purpose == Purpose::Spawn)
+            .then(|| session_nonce().map(|n| format!("fw-session-{}", &n[..16])))
+            .transpose()?,
+    };
+    let policy = formwork_compile::compile_for_session(&blueprint, &host, &catalog, &spec);
     itemize_credential_floor(&policy.report, &catalog);
     Ok(Session {
+        deny_tag: spec.deny_tag,
         blueprint,
         catalog,
         policy,
@@ -1918,7 +1927,8 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
             let (program, args) = argv.split_first().expect("argv is non-empty");
             let status = spawn_confined_child(&mut session, program, args)?;
             let mut observations = session_observations(&session);
-            let messages = feed.collect_quiescent()?;
+            let messages =
+                learn::this_session(feed.collect_quiescent()?, session.deny_tag.as_deref());
             learn::service_observations(&messages, &session.catalog, &mut observations);
             let records = learn::fs_denials(&messages);
             learn::conclude_learning_run(

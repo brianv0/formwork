@@ -97,11 +97,20 @@ jobs:
       # fails instead of skipping (FEP-5 §6.1) -- a skipped platform test is a claim, not a
       # verification. It also covers the README quickstart (D1) and the agent examples starting
       # under the baseline (FW-E2E-084).
-      # --no-fail-fast: every test binary runs, so one run reports every failure on the platform.
+      # --no-fail-fast: every test binary runs, so one run reports every failure on the platform;
+      # the summary step repeats each failure at the end of the log, where it is read first.
       - name: Test
-        run: cargo test --workspace --locked --no-fail-fast
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test.log"
         env:
           FW_REQUIRE_EXERCISED: "1"
+
+      - name: Test failure summary
+        if: failure()
+        shell: bash
+        run: grep -E -A20 '^---- |^test .* FAILED$|targets? failed' "$RUNNER_TEMP/test.log" | head -600
 
       # The Python black-box harness drives the built `formwork` binary at the outermost real
       # boundary; platform-inappropriate tests skip via markers (macOS Seatbelt vs Linux Landlock),

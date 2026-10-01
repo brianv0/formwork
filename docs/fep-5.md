@@ -1,6 +1,6 @@
 # FEP-5 (landed): host-scoped egress, credential brokering, host-service channels, and process isolation on both backends
 
-**Formwork Enhancement Proposal 5 — landed, macOS characterization owed.** Companion to
+**Formwork Enhancement Proposal 5 — landed; macOS characterized.** Companion to
 `formwork.md` (design + end-to-end spec), `constitution.md` (doctrine), and `docs/fep-1.md`
 (host-scoped egress, which this FEP gives a transport). Motivated by
 `docs/omnigent-integration-eval.md`.
@@ -9,9 +9,10 @@
 discovery; `docs/fep-5-plan.md` records how, every departure from the text below, and what is
 still owed. The requirements stay defined here, anchored, and code cites them bare; the §7
 amendments are applied to `formwork.md`, `docs/fep-1.md`, `docs/unstated-requirements.md` and
-`constitution.md`. What remains is the macOS characterization suite (§6.3) and the macOS-only
-tests that depend on it; until it runs, the report keeps every macOS verdict it would settle at
-`Partial`. The draft-numbering note below is kept as the record of how the numbers were chosen:
+`constitution.md`. The macOS characterization suite (§6.3) ran on `macos-14` and `macos-15`;
+`docs/macos-characterization.md` records each answer and what the build does with it, and the
+**(characterize)** marks below are amended to the observed answers (some disagreed with the
+expectation: §3.3, §3.6). The draft-numbering note below is kept as the record of how the numbers were chosen:
 `FW-E2E-074` and `FW-ADV-015` were the highest landed; `FW-INV12` and `FW-DISC7`–`FW-DISC10` were
 drafted or reserved by FEP-4; `FW-EGR6` and `FW-FID5` were drafted by FEP-1. Three PRs touched this
 FEP's ground and are accounted for in §2 and §8: #28 (spec-conformance fixes), #29 (UDP/raw
@@ -42,8 +43,8 @@ the FidelityReport with `explain` and `learn`, and MCP shading. The gaps, per pl
 | G4 | Pathname AF_UNIX (Docker, ssh-agent, session bus) | not mounted | denied except the relay | `connect()` unmediated | closed except the resolver literal |
 | G5 | Process isolation: other PIDs, `/proc`, IPC, private `/tmp` | namespaces | `signal` / `process-info` limited to self | none; shared `/tmp` | none; shared `/tmp` and `$DARWIN_USER_TEMP_DIR` |
 | G6 | Privileged kernel interfaces (IOKit, `mach-priv*`) | n/a (seccomp) | not granted | seccomp baseline ([FW-ISO8](../formwork.md#fw-iso8)) | allowed: `(allow default)` has no baseline |
-| G7 | Host-service channels: a service outside the sandbox that runs code, opens URLs, or releases secrets for the confined process | closed (private `$XDG_RUNTIME_DIR`, `DBUS_*` stripped) | AppleEvents/`lsopen` presumed closed **(characterize)**; all `mach-lookup` allowed | open: session bus, `systemd --user`, X11/Wayland sockets | open: `appleevent-send`, `lsopen`, all `mach-lookup` |
-| G8 | Other processes' arguments and environment | hidden (PID ns) | `kern.procargs2` readable **(characterize)** | open for same-uid processes (verified: a confined process read a sibling's `environ` and `cmdline`) | `kern.procargs2` returns same-uid environments **(characterize)** |
+| G7 | Host-service channels: a service outside the sandbox that runs code, opens URLs, or releases secrets for the confined process | closed (private `$XDG_RUNTIME_DIR`, `DBUS_*` stripped) | AppleEvents/`lsopen` presumed closed (characterized: both are checked for a `sandbox_init` process, open unless denied); all `mach-lookup` allowed | open: session bus, `systemd --user`, X11/Wayland sockets | open: `appleevent-send`, `lsopen`, all `mach-lookup` |
+| G8 | Other processes' arguments and environment | hidden (PID ns) | `kern.procargs2` readable (characterized, C5) | open for same-uid processes (verified: a confined process read a sibling's `environ` and `cmdline`) | `kern.procargs2` returns same-uid environments (characterized, C5) |
 
 G7 is the largest gap. A confined process that can reach a host service acting on its behalf leaves
 the sandbox without breaking anything in it. On macOS, `(allow default)` permits `open <url>`
@@ -156,13 +157,18 @@ session can instead receive an `lo`-only network namespace with an in-namespace 
 
 The profile keeps `(deny network*)` and re-allows exactly
 `(allow network-outbound (remote tcp "localhost:<P>"))` for the session's listener. SBPL remote
-filters accept only `*` or `localhost` as the host **(characterize)**, so the listener authenticates
+filters accept only `*` or `localhost` as the host (characterized, C1), so the listener authenticates
 connections itself, in two layers: a per-session credential in `HTTP(S)_PROXY`
 (`http://fw:<nonce>@127.0.0.1:<P>`), and a peer-process check that maps the loopback 4-tuple to its
 owning PID (`proc_pidfdinfo` / `PROC_PIDFDSOCKETINFO`) and requires that PID to belong to the
 session; an unresolvable peer is refused. [FW-EGR6](fep-1.md#fw-egr6) is `Enforced` on macOS if the
 peer check characterizes as reliable, otherwise `Partial` with the residual named (a same-uid
-process that reads the agent's environment).
+process that reads the agent's environment). *Amended on characterization (C2):* the check is
+reliable -- 1,000 connections from a forking tree, a tenth from reparented processes, each
+attributed -- and membership is asked of the sandbox, not inferred from ancestry: the profile
+denies one Mach service name derived from a per-session secret and allows another, and
+`sandbox_check` tells a session process (denied the first, allowed the second) from an unconfined
+one (allowed both) and from any other sandbox. `net-host-scope` is `Enforced` on macOS.
 
 UDP and pathname sockets are closed by `(deny network*)` apart from granted literals. Under a host
 rule the mDNSResponder literal is dropped; HTTP clients using a proxy do not resolve names locally,
@@ -265,7 +271,12 @@ allow-credentials = ["broker:anthropic"]                   # the agent sees a pl
 
 Environment disclosure is a credential-disclosure path, so it is not part of the opt-in tier. On
 macOS the default profile denies `sysctl-read` of `kern.procargs2` **(characterize)**, which returns
-the full environment of same-uid processes. On Linux, access to `/proc/<pid>/environ` is decided
+the full environment of same-uid processes. *Amended on characterization (C5):* no Seatbelt
+operation mediates `kern.procargs2` -- not `sysctl-read` by name or whole, nor `process-info` -- so
+the deny is not emitted and the macOS verdict is `Unenforceable`. What the session could have read
+that matters most, `formwork`'s own environment with the operator's credentials, is closed another
+way: `formwork` moves its environment to the heap and zeroes the exec-time strings first thing in
+`main`, so `kern.procargs2` returns them blank. On Linux, access to `/proc/<pid>/environ` is decided
 by `ptrace_may_access`, and Landlock hooks that check: a confined process is refused ptrace-class
 access to any process outside its domain. A process holding `CAP_SYS_ADMIN` or `CAP_PERFMON` gets
 past the refusal, so a root container reads a same-uid sibling's environment while an ordinary user
@@ -296,8 +307,8 @@ members.
 
 | Member | Linux | macOS |
 |---|---|---|
-| `processes`: other processes are not visible, signalable or inspectable, including their arguments | user + PID namespaces with a fresh `/proc` (plus UTS); a minimal Formwork init as PID 1. `Enforced` where user namespaces exist | `(deny process-info* (target others))`, `(deny signal (target others))` with session re-allows **(characterize)**; `sysctl-read` denies on the process-enumeration MIBs. `Enforced` or `Partial` per characterization |
-| `ipc`: SysV and POSIX IPC confined to the session | IPC namespace. `Enforced` where user namespaces exist | `ipc-sysv-*` denied; POSIX names restricted to a session prefix **(characterize)**. `Partial` (POSIX names are global) |
+| `processes`: other processes are not visible, signalable or inspectable, including their arguments | user + PID namespaces with a fresh `/proc` (plus UTS); a minimal Formwork init as PID 1. `Enforced` where user namespaces exist | `(deny signal)` and `(deny process-info*)` whole, with `(target same-sandbox)` re-allowed (characterized, C6: `(target others)` leaves out the session's process group, which holds `formwork`); `sysctl` still lists pids and arguments and `kern.procargs2` still returns environments (C5). `Partial` |
+| `ipc`: SysV and POSIX IPC confined to the session | IPC namespace. `Enforced` where user namespaces exist | `ipc-sysv-*` denied; POSIX names stay global (characterized, C7: a session prefix breaks Python's `multiprocessing`, which names its own semaphores). `Partial` |
 
 On Linux the user, PID, IPC, UTS and mount namespaces are created before Landlock and seccomp are
 installed; the seccomp baseline still denies `CLONE_NEWUSER` and the mount family afterwards
@@ -319,12 +330,12 @@ channel is a credential store.
 
 | Channel | Lifted by | macOS mechanism (SBPL deny) | Linux mechanism |
 |---|---|---|---|
-| `run-outside` | `channels` | `appleevent-send`; `mach-lookup` of launchd job submission and the AppleEvent server **(characterize: names)** | supervisor denies the session-bus and `systemd --user` sockets; `DBUS_*` stripped |
+| `run-outside` | `channels` | `appleevent-send`, launchd `job-creation`, and `mach-lookup` of `com.apple.coreservices.appleevents` (characterized, C3; launchd and System Events also refuse every sandboxed caller, C4) | supervisor denies the session-bus and `systemd --user` sockets; `DBUS_*` stripped |
 | `open-url` | `channels`; brokered, never a host-service lift | the Gateway opens the URL on the host; `lsopen` and `launchservicesd` stay denied | the Gateway opens the URL on the host; the session bus stays denied |
 | `clipboard` | `channels` | `mach-lookup` `com.apple.pasteboard.*` | X11/Wayland sockets; abstract X11 is scoped by Landlock ABI 6 |
-| `screen` | `channels` | `mach-lookup` of WindowServer/screencapture services **(characterize)** | X11/Wayland sockets |
+| `screen` | `channels` | `mach-lookup` of `com.apple.windowserver.active`, `com.apple.CARenderServer`, `com.apple.replayd` and `com.apple.screencapture*` (characterized, C3: on macOS 14 `screencapture` needs only WindowServer) | X11/Wayland sockets |
 | `camera`, `microphone` | `channels` | `iokit-open` of those classes; `mach-lookup` `com.apple.cmio.*` / `com.apple.audio.*` | `/dev/video*`, `/dev/snd/*` denied by default subtract |
-| `os-keyring` | `allow-credentials` (a Catalog type) | `mach-lookup` of `securityd` / `SecurityServer` **(characterize)** | session bus `org.freedesktop.secrets` (coupled with `run-outside`, below); `$XDG_RUNTIME_DIR/keyring/*` |
+| `os-keyring` | `allow-credentials` (a Catalog type) | `mach-lookup` of `com.apple.SecurityServer` and `com.apple.securityd` (characterized, C3: TLS clients verify through `trustd` and are unaffected) | session bus `org.freedesktop.secrets` (coupled with `run-outside`, below); `$XDG_RUNTIME_DIR/keyring/*` |
 | (none) | — | `mach-priv-host-port`, `mach-priv-task-port`; `iokit-open` outside the shipped allowlist | seccomp (unchanged) |
 
 #### `open-url` is brokered
@@ -392,7 +403,8 @@ does. `explain desktop` prints each member's verdict, deciding layer, and host r
 - **Keychain granularity.** Seatbelt gates the keychain as one service. Lifting `os-keyring` opens
   every keychain item that does not prompt and lets the agent trigger keychain prompts; the `explain`
   and report lines state both. A narrower lift is not available on macOS (§9).
-- **Claude Code.** On macOS it stores its OAuth credential in the keychain **(characterize: item
+- **Claude Code.** On macOS it stores its OAuth credential in the keychain (characterized by the
+  `agent-examples` macOS job, C9) **(characterize: item
   name)** and opens a browser to log in, listening on `localhost:<port>` for the callback. The `claude`
   Catalog type gains the keychain as its macOS location, so `allow-credentials = ["claude"]` lifts
   `os-keyring` there with the granularity note; the example lifts `desktop`; the loopback listen is
@@ -461,14 +473,17 @@ explainable with the tools the operator already uses and discoverable through `l
 | Property | Linux | macOS | Why |
 |---|---|---|---|
 | Violation latency | synchronous per `connect()` | post-hoc (unified log) | Seatbelt has no notification channel |
-| Egress endpoint authentication | by construction | credential + peer-PID check | SBPL cannot scope `localhost` to a session |
+| Egress endpoint authentication | by construction | credential + peer check (sandbox marker) | SBPL cannot scope `localhost` to a session |
+| Loopback listen (`FW-EGR15`) | not granted | also listens on the host's other addresses (`net-default-deny` `Partial`) | `localhost` in an SBPL local filter matches every local address (C1) |
 | TLS inspection clients | all env-trust clients | excludes Security.framework clients | no per-process trust on macOS |
 | Keychain lift granularity | per bus name (Secret Service as a whole) | whole keychain channel | Seatbelt gates `securityd` as one service |
 | `os-keyring` lift | `Partial` (shares the session bus with `run-outside`) | `Enforced` (own mach service) | D-Bus routes by bus name inside the socket |
-| Other processes' environment | `Enforced` unprivileged; `Partial` with `CAP_SYS_ADMIN`/`CAP_PERFMON`/`CAP_SYS_PTRACE` | `Enforced` (sysctl deny) | Landlock's ptrace refusal yields to those capabilities |
+| Other processes' environment | `Enforced` unprivileged; `Partial` with `CAP_SYS_ADMIN`/`CAP_PERFMON`/`CAP_SYS_PTRACE` | `Unenforceable`; `formwork`'s own is zeroed | Landlock's ptrace refusal yields to those capabilities; Seatbelt does not mediate `kern.procargs2` (C5) |
 | Any-depth `**/` rows | `Partial` | `Enforced` | Landlock cannot root them |
 | `stat` on denied paths | `Partial` | `Enforced` | kernel mechanism |
-| `isolate` members | `Enforced` where user namespaces exist | `Partial` or `Enforced` per characterization | no namespaces on macOS |
+| `isolate` members | `Enforced` where user namespaces exist | `Partial`: signals and inspection refused, pids, arguments and POSIX IPC names still global (C5–C7) | no namespaces on macOS |
+| Privileged interfaces | seccomp | Mach privileged ports denied; IOKit open (`Partial`) | the GPU's user-client classes differ by hardware (C8) |
+| Setuid binaries in a session | allowed | refused to every sandboxed process (`forbidden-exec-sugid`: no `ps`, `sudo`, `top`) | Seatbelt platform policy (C5) |
 | Private tmp | directory form by default; tmpfs under `isolate` | directory form | no mount namespace on macOS |
 | Name resolution under `Ports` | none (PR #29 closes UDP; no Gateway) | mDNSResponder literal | reported (D8); host rules restore it through the Gateway on both |
 | ENOENT invisibility | not provided | not provided | `formwork.md` §3 non-goal |
@@ -693,6 +708,10 @@ These run in CI on `macos-14` and `macos-15` with `FW_REQUIRE_EXERCISED=1`. Each
 observed behavior as a fixture that the requirement tests assert against, so a change across macOS
 releases fails CI instead of widening the sandbox unnoticed. Every **(characterize)** mark above is
 settled by one of them.
+
+*Landed:* `crates/formwork-confine/tests/macos_characterize.rs` asserts C1–C8, the channel map is
+`CHANNEL_SERVICES` in `formwork-compile`, and C9 runs in the `agent-examples` macOS job. The answers
+and what the build does with each are in `docs/macos-characterization.md`.
 
 | # | Question | Test shape |
 |---|---|---|
@@ -1029,20 +1048,20 @@ revision under `read-mode = "closed"`, and the findings below cite them by role.
 
 ## 10. Parity after this FEP
 
-Conditional on the characterization suite confirming the **(characterize)** marks.
+As characterized on `macos-14` and `macos-15` (`docs/macos-characterization.md`).
 
 | Capability | Omnigent Linux | Omnigent macOS | Formwork Linux | Formwork macOS |
 |---|---|---|---|---|
-| Mandatory egress host allowlist | Enforced (netns) | Enforced (SBPL) | Enforced (supervisor) | Enforced (SBPL + authenticated listener), or `Partial` per C2 |
+| Mandatory egress host allowlist | Enforced (netns) | Enforced (SBPL) | Enforced (supervisor) | Enforced (SBPL + authenticated listener, C2) |
 | Method/path rules | Enforced, not canonicalized | same | Enforced, canonicalized | Enforced for env-trust clients; platform-verifier clients refused |
 | Credential injection | `Authorization` only; CA key on disk | same | any header scheme; ephemeral CA; floor holds | same, with the client-trust caveat |
 | Private IP / metadata block | Enforced | Enforced | Enforced under host rules ([FW-EGR4](fep-1.md#fw-egr4)) | same |
 | UDP / local resolver | closed | closed | closed (PR #29, `FW-EGR12`) | closed under host rules; resolver reported under `Ports` |
 | Pathname AF_UNIX | unreachable (not mounted) | denied | mediated (supervisor) | Enforced (literals) |
 | Host-service channels | closed | partly (mach open) | closed under supervised connect, else `Partial` | closed; keychain lift is whole-channel |
-| Privileged interfaces | seccomp | not granted | seccomp | denied, IOKit allowlist |
-| Other processes' environment | hidden | open **(characterize)** | `Enforced` unprivileged (Landlock); `Partial` with ptrace-class capabilities; `Enforced` under `isolate` | blocked, default-on |
-| Process visibility / IPC | namespaces | self-only signal/info | opt-in, namespaces | opt-in, filters |
+| Privileged interfaces | seccomp | not granted | seccomp | Mach privileged ports denied; IOKit open (C8) |
+| Other processes' environment | hidden | open (C5) | `Enforced` unprivileged (Landlock); `Partial` with ptrace-class capabilities; `Enforced` under `isolate` | open (C5); `formwork`'s own zeroed |
+| Process visibility / IPC | namespaces | self-only signal/info | opt-in, namespaces | opt-in, filters (`same-sandbox`); pids and POSIX names global |
 | Runs without user namespaces | no | n/a | yes, except `isolate` | n/a |
 | `explain` / `learn` for egress and channels | no | no | yes | yes |
 | Windows | Job Object only | — | not provided (non-goal) | — |
