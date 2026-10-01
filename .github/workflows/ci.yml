@@ -107,6 +107,13 @@ jobs:
         env:
           FW_REQUIRE_EXERCISED: "1"
 
+      # FW-E2E-094: the client matrix, recorded in the log on each OS (FEP-6 §4.11).
+      - name: Client matrix (recorded)
+        shell: bash
+        run: |
+          cargo test -p formwork-cli --test fep6_run --locked fw_e2e_094 -- --nocapture 2>&1 \
+            | sed -n '/client matrix:/,/^test /p'
+
       - name: Test failure summary
         if: failure()
         shell: bash
