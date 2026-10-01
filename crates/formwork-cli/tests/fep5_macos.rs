@@ -454,13 +454,20 @@ fn fw_e2e_091_loopback_callback() {
                 std::io::Write::write_all(&mut s, nonce.as_bytes()).ok()
             })
         };
+        let case_started = Instant::now();
         let out = formwork(dir.path(), &["run", "--", "python3", "listen.py"], &[]);
         let sent = client.join().unwrap();
-        assert!(
-            sent.is_some(),
-            "{posture} {bind}: the client could not connect\n{}",
-            out.stderr
-        );
+        if sent.is_none() {
+            // Whether Seatbelt refused the listener, and under which rule (seen once on macos-14:
+            // a bind to 127.0.0.1:0 refused under `localhost:*`).
+            let records = sandbox_records(case_started, |m| {
+                m.contains(" deny(") && m.contains("python") && m.contains("network")
+            });
+            panic!(
+                "{posture} {bind}: the client could not connect\n{}\nSandbox records: {records:#?}",
+                out.stderr
+            );
+        }
         assert_eq!(out.code, 0, "{posture} {bind}: {}", out.stderr);
         assert_eq!(
             out.stdout.trim(),
@@ -1039,8 +1046,15 @@ fn c9_claude_code_keychain_use() {
         lifted.stdout,
         lifted.stderr
     );
+    // Claude Code issues its two lookups concurrently, so their order varies run to run.
+    let sorted = |calls: &str| {
+        let mut lines: Vec<String> = calls.lines().map(str::to_string).collect();
+        lines.sort();
+        lines
+    };
     assert_eq!(
-        lifted_asked, control_asked,
+        sorted(&lifted_asked),
+        sorted(&control_asked),
         "the session asked the keychain differently from the control"
     );
 

@@ -190,10 +190,63 @@ pub struct UnifiedLogFeed {
 struct LogStream {
     child: std::process::Child,
     messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The liveness probe's file, whose records are the feed's own and never a proposal.
+    probe: Option<String>,
 }
 
 /// How long a learning run waits for the live stream to attach before spawning the workload.
-const STREAM_ATTACH: std::time::Duration = std::time::Duration::from_secs(3);
+const STREAM_ATTACH: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Proof the live stream is delivering events. `log stream` prints its filter banner before the
+/// events flow, so a workload spawned on the banner can lose its first records to the gap -- with
+/// the store's lazy persistence, a millisecond workload's only denial. A throwaway `cat` under
+/// `sandbox-exec` (deprecated, still shipped) is denied a probe file until the stream reports
+/// that denial. Without `sandbox-exec` the banner is all there is.
+struct StreamProbe {
+    path: std::path::PathBuf,
+}
+
+impl StreamProbe {
+    fn new() -> Option<StreamProbe> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path =
+            std::env::temp_dir().join(format!("formwork-log-probe-{}-{nanos}", std::process::id()));
+        std::fs::write(&path, b"probe").ok()?;
+        // Seatbelt matches the resolved path (/var is /private/var).
+        let path = std::fs::canonicalize(&path).ok()?;
+        Some(StreamProbe { path })
+    }
+
+    fn name(&self) -> String {
+        self.path.display().to_string()
+    }
+
+    /// One denial for the stream to report; false when `sandbox-exec` cannot run.
+    fn fire(&self) -> bool {
+        let literal = self.name().replace('\\', "\\\\").replace('"', "\\\"");
+        Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(format!(
+                "(version 1)(allow default)(deny file-read-data (literal \"{literal}\"))"
+            ))
+            .arg("/bin/cat")
+            .arg(&self.path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    }
+}
+
+impl Drop for StreamProbe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 const SANDBOX_PREDICATE: &str = r#"sender == "Sandbox""#;
 
@@ -221,6 +274,9 @@ impl UnifiedLogFeed {
                     collect_messages(started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS)?;
                 if let Some(s) = &stream {
                     all.extend(s.messages());
+                    if let Some(probe) = &s.probe {
+                        all.retain(|m| !m.contains(probe.as_str()));
+                    }
                 }
                 all.sort();
                 all.dedup();
@@ -279,12 +335,48 @@ impl LogStream {
                 }
             }
         });
-        if ready.recv_timeout(STREAM_ATTACH).is_err() {
-            tracing::debug!(
-                "the live log stream did not attach in time; `log show` still covers the run"
-            );
+        let deadline = std::time::Instant::now() + STREAM_ATTACH;
+        let probe = StreamProbe::new();
+        let mut live = false;
+        if let Some(p) = &probe {
+            let name = p.name();
+            'probing: while std::time::Instant::now() < deadline && p.fire() {
+                let next = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                while std::time::Instant::now() < next.min(deadline) {
+                    if messages
+                        .lock()
+                        .map(|m| m.iter().any(|m| m.contains(&name)))
+                        .unwrap_or(false)
+                    {
+                        live = true;
+                        break 'probing;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
         }
-        Some(LogStream { child, messages })
+        if !live {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if ready.recv_timeout(left).is_err() {
+                tracing::debug!(
+                    "the live log stream did not attach in time; `log show` still covers the run"
+                );
+            } else if probe.is_some() {
+                tracing::debug!(
+                    "the live log stream never reported its probe; trusting its banner"
+                );
+            }
+        }
+        Some(LogStream {
+            child,
+            messages,
+            probe: probe.map(|p| {
+                let name = p.name();
+                // The file can go; its name still marks the probe's records.
+                drop(p);
+                name
+            }),
+        })
     }
 
     fn messages(&self) -> Vec<String> {
