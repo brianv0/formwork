@@ -266,8 +266,8 @@ fn fw_e2e_094_client_matrix() {
         }),
         ("pip", "pip3", Some(true), Some(true), |u| {
             format!(
-                "pip3 download --no-deps --no-cache-dir --disable-pip-version-check --retries 0 \
-                 --timeout 10 -d \"$TMPDIR/dl\" --index-url {u}/simple/ fixture-pkg"
+                "pip3 download -v --no-deps --no-cache-dir --disable-pip-version-check \
+                 --retries 0 --timeout 10 -d \"$TMPDIR/dl\" --index-url {u}/simple/ fixture-pkg"
             )
         }),
         ("npm", "npm", Some(true), Some(true), |u| {
@@ -295,8 +295,9 @@ fn fw_e2e_094_client_matrix() {
         }),
         ("pip-module", "python3", Some(true), Some(true), |u| {
             format!(
-                "python3 -m pip download --no-deps --no-cache-dir --disable-pip-version-check \
-                 --retries 0 --timeout 10 -d \"$TMPDIR/dl\" --index-url {u}/simple/ fixture-pkg"
+                "python3 -m pip download -v --no-deps --no-cache-dir \
+                 --disable-pip-version-check --retries 0 --timeout 10 -d \"$TMPDIR/dl\" \
+                 --index-url {u}/simple/ fixture-pkg"
             )
         }),
     ];
@@ -335,6 +336,8 @@ fn fw_e2e_094_client_matrix() {
                     ("npm_config_https_proxy", "http://127.0.0.1:1"),
                     // A Rust client's error, not its backtrace.
                     ("RUST_BACKTRACE", "0"),
+                    // A refused row shows the Gateway's side too (handshakes log at debug).
+                    ("RUST_LOG", "info,formwork_gateway=debug"),
                 ],
                 // The operator's environment may configure git through GIT_CONFIG_COUNT and
                 // GIT_CONFIG_KEY_n/VALUE_n; the FW-ENV2 scrub strips the KEY_n names alone, which
@@ -355,7 +358,13 @@ fn fw_e2e_094_client_matrix() {
                 let last = lines
                     .iter()
                     .rev()
-                    .find(|l| l.to_ascii_lowercase().contains("error"))
+                    .find(|l| l.contains("Could not fetch URL"))
+                    .or_else(|| {
+                        lines
+                            .iter()
+                            .rev()
+                            .find(|l| l.to_ascii_lowercase().contains("error"))
+                    })
                     .or(lines.last())
                     .map(|l| l.trim())
                     .unwrap_or("");
