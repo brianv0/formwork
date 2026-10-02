@@ -209,6 +209,32 @@ fn explain_with_no_path_summarizes_host_and_fidelity() {
     }
 }
 
+#[test]
+fn rule_help_names_path_and_host_targets() {
+    let dir = Scratch::new("rule-help");
+    let out = formwork(dir.path(), dir.path(), &["compile", "--help"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let help = out.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    for fs_verb in [
+        "read/readonly",
+        "readwrite",
+        "modify",
+        "readexec",
+        "deny:~/.ssh",
+    ] {
+        assert!(help.contains(fs_verb), "{fs_verb} missing:\n{help}");
+    }
+    for host_form in [
+        "host[:port][/glob]",
+        "allow:host",
+        "get,post:",
+        "tunnel:host[:port]",
+        "deny:host",
+    ] {
+        assert!(help.contains(host_form), "{host_form} missing:\n{help}");
+    }
+}
+
 /// A file named `credentials` in a granted working set is denied by the backstop (deny beats
 /// allow, FW-CAP8): `explain PATH` must name the exact shape and the lift, so the cause of the
 /// confined tool's bare EACCES (FW-CRED7) is one command away.

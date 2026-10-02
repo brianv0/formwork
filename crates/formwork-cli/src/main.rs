@@ -199,9 +199,13 @@ struct BlueprintArgs {
     /// Net posture: "deny" or "ports:443,8080".
     #[arg(long)]
     net: Option<String>,
-    /// Append a flat capability rule "<verb>:<path>" (repeatable), e.g. --rule "deny:~/.ssh". The
-    /// same vocabulary as a file `rules` line (FW-BP1). Verbs: read/readonly, readwrite, modify
-    /// (write without create), allow, readexec, exec, deny.
+    /// Append a flat capability rule "<verb>:<target>" (repeatable), the same vocabulary as a file
+    /// `rules` line (FW-BP1). A target starting with `/`, `~`, `$` or `**` is a path, and takes
+    /// read/readonly, readwrite, modify (write without create), allow, readexec, exec or deny,
+    /// e.g. --rule "deny:~/.ssh". Any other target is a host, host[:port][/glob] (FW-BP13/FW-BP16),
+    /// and puts all egress behind the session Gateway: allow:host (every method, TLS inspected),
+    /// HTTP method verbs such as get,post:github.com/acme/**, tunnel:host[:port] (TLS passed
+    /// through, not inspected; no path), or deny:host[/glob].
     #[arg(long)]
     rule: Vec<String>,
     /// Reads posture: "unveil" (empty universe) or "subtractive" (ambient minus catalog);
