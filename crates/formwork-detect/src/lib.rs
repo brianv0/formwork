@@ -132,6 +132,46 @@ impl HostProfile {
     }
 }
 
+/// Every address on this host's interfaces, for the egress engine's host-address class
+/// (FW-EGR19). A runtime input to the Gateway at session start, never to compilation (FW-FID4).
+#[cfg(unix)]
+pub fn interface_addresses() -> std::io::Result<Vec<std::net::IpAddr>> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut out = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `list` with a linked list that freeifaddrs releases; each entry's
+    // ifa_addr is null or points to a sockaddr of the family its sa_family names.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut cur = list;
+        while !cur.is_null() {
+            let addr = (*cur).ifa_addr;
+            if !addr.is_null() {
+                match i32::from((*addr).sa_family) {
+                    libc::AF_INET => {
+                        let sin = addr as *const libc::sockaddr_in;
+                        out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                            (*sin).sin_addr.s_addr,
+                        ))));
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = addr as *const libc::sockaddr_in6;
+                        out.push(IpAddr::V6(Ipv6Addr::from((*sin6).sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            cur = (*cur).ifa_next;
+        }
+        libc::freeifaddrs(list);
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// The only function that inspects the live kernel; everything downstream is a pure function of the
 /// value it returns.
 pub fn detect() -> HostProfile {

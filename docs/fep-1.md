@@ -4,9 +4,10 @@
 (design + end-to-end spec) and `constitution.md` (doctrine).
 
 > **FEP-5 gives this document its transport.** The `AllowHosts` posture below is spelled as host
-> rules in `rules` (`https:api.anthropic.com`), carried by the session Gateway and, on Linux, the
-> connect supervisor (`docs/fep-5.md` §3.1, §4). The requirements here keep their IDs; the
-> real-time violation stream ([FW-FID5](#fw-fid5)) stays deferred.
+> rules in `rules` (`allow:api.anthropic.com`), carried by the session Gateway and, on Linux, the
+> connect supervisor (`docs/fep-5.md` §3.1, §4); FEP-6 (`docs/fep-6.md`) specifies the engine that
+> serves them. The requirements here keep their IDs; the real-time violation stream
+> ([FW-FID5](#fw-fid5)) stays deferred.
 
 The capability-model half of FEP-1 has **landed and been folded into `formwork.md`**:
 the environment axis ([FW-ENV1](../formwork.md#fw-env1)/2), execution-vector write-subtract ([FW-TRA7](../formwork.md#fw-tra7)), agent-state
@@ -59,7 +60,7 @@ against the exact bypasses that hit everyone else.
 | <a id="fw-egr1"></a>**FW-EGR1** Host-scoped egress | The net axis becomes a three-way enum — `Deny \| Ports([u16]) \| AllowHosts([HostPattern])` — adding a host-allowlist posture mediated by the gateway (the confiner stays default-deny; kernels can't express hosts). Under `AllowHosts`, a confined process reaches an allowlisted host through the gateway fd and nothing else. | **Concepts amendment** — extends the net axis (`formwork.md` §4). Reuses the [FW-GW7](../formwork.md#fw-gw7) forward proxy; no new door ([FW-XR7](../formwork.md#fw-xr7)). |
 | <a id="fw-egr2"></a>**FW-EGR2** Empty means deny | An empty, absent, or unparseable host allowlist compiles to **full deny**, never allow-all, and the report says so. Directly mirrors CVE-2025-66479, where srt's "block everything" list disabled the proxy and allowed everything. | Fits (compiler + [FW-INV6](../formwork.md#fw-inv6)). A regression guard, not a new axis. |
 | <a id="fw-egr3"></a>**FW-EGR3** Hostname canonicalization before match | Host patterns and requested hosts are canonicalized before comparison: reject or neutralize embedded NUL, percent-encoding, CRLF, leading/trailing dots, IDN/Unicode confusables, and IPv6 zone-IDs. Mirrors the srt SOCKS5 `attacker\x00.google.com` bypass and the IPv6-zone-ID hardening now in srt's `domain-pattern.ts`. | Fits (parse-don't-validate at the gateway edge; Boundaries). |
-| <a id="fw-egr4"></a>**FW-EGR4** SSRF / metadata default-block | Under the gateway-mediated `AllowHosts` posture, egress to cloud-metadata endpoints (`169.254.169.254`, `fd00:ec2::254`, `metadata.google.internal`) and RFC-1918 / link-local / ULA ranges is denied unless a host pattern names them explicitly (mirrors Cursor's anti-SSRF default). The `Ports` posture is a *direct* kernel `connect()` the gateway never sees and the kernel cannot filter by IP, so it cannot carry this block; its report states plainly that it reaches any host on the port, metadata included. That asymmetry is deliberate — it is the concrete reason the shipped examples should move off `ports=[443]` to `AllowHosts` (defaults §4). | Fits (compiler default + gateway enforcement; honest `Ports` report per [FW-XR1](../formwork.md#fw-xr1)). |
+| <a id="fw-egr4"></a>**FW-EGR4** SSRF / metadata default-block | Under the gateway-mediated `AllowHosts` posture, egress to an address outside the global class of the destination class table (FEP-6 §4.5: metadata, the Gateway's own endpoints, the host's own addresses, local and private, special-purpose) is denied unless the rule that admits the host names it as that class requires: metadata and special-purpose addresses only by an IP-literal rule naming the address, local, private and host addresses by an exact-name or IP-literal rule, never by a wildcard ([FW-EGR19](fep-6.md#fw-egr19)), and the Gateway's own endpoints never ([FW-EGR18](fep-6.md#fw-egr18)) (mirrors Cursor's anti-SSRF default). *(Amended by FEP-6 §9 b.)* The `Ports` posture is a *direct* kernel `connect()` the gateway never sees and the kernel cannot filter by IP, so it cannot carry this block; its report states plainly that it reaches any host on the port, metadata included. That asymmetry is deliberate — it is the concrete reason the shipped examples should move off `ports=[443]` to `AllowHosts` (defaults §4). | Fits (compiler default + gateway enforcement; honest `Ports` report per [FW-XR1](../formwork.md#fw-xr1)). |
 | <a id="fw-egr5"></a>**FW-EGR5** Honest allowlist fidelity | Host-scoped egress is reported `Partial` with a stated reason: without TLS interception (which FEP-1 does **not** add — see Non-goals), the allowlist trusts the client-supplied SNI/Host, so domain-fronting and SNI/Host mismatch are not caught. The report never claims `Enforced` for a guarantee MITM would be required to make. Mirrors srt's own acknowledged limitation. | Fits ([FW-FID1](../formwork.md#fw-fid1) / [FW-XR1](../formwork.md#fw-xr1)). |
 | <a id="fw-egr6"></a>**FW-EGR6** No unauthenticated egress door | The gateway exposes no network-reachable, unauthenticated control surface. Egress mediation is the injected fd ([FW-XR7](../formwork.md#fw-xr7)); any proxy port the gateway opens toward its *own* upstreams is not reachable from the confined process nor from co-resident host processes acting as a confused deputy. This is why we need no per-session proxy token where srt does — the fd seam already closes that surface, and this requirement keeps it closed. | Fits (invariant-shaped; codifies an existing strength). |
 
@@ -132,11 +133,13 @@ boundary, the same carve-out that lets the pure compiler take a synthetic `HostP
   `allowed.test`. Pass: each canonicalizes to the genuine `allowed.test` or is rejected;
   none reaches the blocked fixture. Fail: any variant escapes the allowlist. (Mirrors
   the srt SOCKS5 null-byte disclosure.)
-- <a id="fw-adv-008"></a>**FW-ADV-008: DNS-rebinding to a blocked IP.** The resolver returns a blocked address
-  (the metadata literal, or an RFC-1918 fixture) for the allowlisted `allowed.test`.
-  Pass: the gateway drops at connect on the *resolved IP* — violation, no socket — even
-  though the name is allowlisted; the name-based allow never overrides the IP-range
-  block ([FW-EGR4](#fw-egr4)). Fail: the rebind reaches the blocked address.
+- <a id="fw-adv-008"></a>**FW-ADV-008: DNS-rebinding to a blocked IP.** Under a wildcard rule
+  (`tunnel:*.test`), the resolver returns a blocked address (the metadata literal, an RFC-1918
+  fixture, or a public address mixed with a private one) for `allowed.test`; under the exact rule
+  `allow:allowed.test` it returns the metadata literal. Pass: the gateway refuses at the *resolved
+  answer* — violation, no socket — even though the name is allowlisted; the name-based allow never
+  overrides the class table ([FW-EGR4](#fw-egr4), [FW-EGR17](fep-6.md#fw-egr17)). Fail: the rebind
+  reaches the blocked address. *(Amended by FEP-6 §9 b.)*
 - <a id="fw-adv-009"></a>**FW-ADV-009: Confused-deputy against the gateway.** A co-resident *unconfined* host
   process, and separately a *confined* process, each attempt to drive the gateway's
   egress (to the `allowed.test` fixture) other than through the sandbox's own injected
@@ -203,9 +206,10 @@ scrub — are now in `profiles/default.toml`):
 
 **Deliberate non-goals (scoped out, consistent with `formwork.md` §3).**
 
-- **TLS interception and credential brokering** are specified by FEP-5 §3.2 as an opt-in
-  per-host grade; the CONNECT/SNI grade here remains the default for a plain host rule.
-  *(Amended by FEP-5.)*
+- **TLS interception and credential brokering** are specified by FEP-5 §3.2, with inspection as
+  the default grade for a host rule (FEP-6 §9 j); the CONNECT/SNI grade here remains available as
+  `tunnel:`, which FEP-6 adds a server-name check to ([FW-EGR16](fep-6.md#fw-egr16)).
+  *(Amended by FEP-5 and FEP-6.)*
 - **Windows.** Unchanged from `formwork.md` §11 — a later third backend, not this FEP.
 - **Resource-exhaustion DoS and kernel/LSM exploitation** — unchanged §3 out-of-scope.
 
@@ -214,7 +218,8 @@ scrub — are now in `profiles/default.toml`):
 - **Managed/lockdown layer.** Whether a non-weakenable managed default belongs in v1 or
   is deferred; it interacts with [FW-CAP2](../formwork.md#fw-cap2) (narrowing-only) cleanly but adds a policy
   precedence surface.
-- **Egress host-pattern grammar.** *Closed by FEP-5 §4:* host rules in `rules` —
-  `https:host` (tunnel grade), `<methods>:host[/glob]` (inspected), `deny:host[/glob]` — where
+- **Egress host-pattern grammar.** *Closed by FEP-5 §4 and FEP-6 §9 (j):* host rules in `rules` —
+  `allow:host[/glob]` and `<methods>:host[/glob]` (inspected), `tunnel:host` (tunnel grade),
+  `deny:host[/glob]` — where
   `*.example.com` matches subdomains only and `example.com` the name alone, canonicalized at the
   parse edge ([FW-EGR3](#fw-egr3)) before any match.

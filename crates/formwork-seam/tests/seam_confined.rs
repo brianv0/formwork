@@ -57,9 +57,15 @@ fn net_deny_policy(read_dirs: &[&Path]) -> CompiledPolicy {
         ..Blueprint::empty()
     };
     let policy = compile(&blueprint, &detect());
+    // Outbound connections are denied on both backends; macOS reports `partial` only for the
+    // loopback-callback listener's reach (FW-EGR15), which these tests do not use.
     assert!(
-        policy.report.per_capability[&Capability::NetDefaultDeny].is_enforced(),
-        "test premise: net-default-deny must be enforced on this host"
+        policy.report.net_is_fail_closed()
+            && !matches!(
+                policy.report.per_capability[&Capability::NetDefaultDeny],
+                formwork_compile::Fidelity::Unenforceable { .. }
+            ),
+        "test premise: net-default-deny must be carried on this host"
     );
     policy
 }

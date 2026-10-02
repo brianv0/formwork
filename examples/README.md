@@ -139,8 +139,8 @@ formwork compile --blueprint examples/blueprints/rules-demo.toml --target linux-
 formwork explain --blueprint examples/blueprints/claude-code.toml --hosts
 
 # Under an inspected rule, clients must trust the session CA. Most read SSL_CERT_FILE and friends,
-# which the Launcher sets; uv needs UV_NATIVE_TLS=1 to read them:
-UV_NATIVE_TLS=1 formwork run --blueprint examples/blueprints/agent-base.toml --rule "get:pypi.org" \
+# which the Launcher sets (uv before 0.8 reads them only with UV_NATIVE_TLS=1):
+formwork run --blueprint examples/blueprints/agent-base.toml --rule "get:pypi.org" \
   --rule "get:files.pythonhosted.org" -- uv sync
 
 # Ask why one path is granted or denied — the deciding rule and the layer it came from:

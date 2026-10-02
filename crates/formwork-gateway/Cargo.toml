@@ -26,3 +26,5 @@ base64 = { workspace = true }
 formwork-detect = { workspace = true }
 # The inspection tests stand up a real TLS fixture upstream and a rustls client.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+# A failing test prints the Gateway's own account of the request.
+tracing-subscriber = { workspace = true }

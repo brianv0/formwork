@@ -1,10 +1,10 @@
-# opencode under host-scoped egress (FEP-5), with the Anthropic key brokered: the agent's
+# opencode under host-scoped egress, with the Anthropic key brokered: the agent's
 # ANTHROPIC_API_KEY is a per-session placeholder, and the Gateway presents the real key to
 # api.anthropic.com only. opencode reads the session CA through the variables the Launcher sets
 # (verified with opencode 1.18). The run is refused before it starts if ANTHROPIC_API_KEY is unset.
 #
 # Another provider: swap its host into `rules` as an inspected rule and its type into
-# `allow-credentials` (OpenAI: "any:api.openai.com" and "broker:openai"). `formwork learn` proposes
+# `allow-credentials` (OpenAI: "allow:api.openai.com" and "broker:openai"). `formwork learn` proposes
 # the hosts a run needed.
 #
 # opencode keeps its sessions and caches under the XDG directories; create them once outside the
@@ -20,10 +20,10 @@
 extends = ["agent-base.toml"]
 
 rules = [
-    "any:api.anthropic.com",
-    "https:models.dev",
-    "https:models.opencode.ai",
-    "https:opencode.ai",
+    "allow:api.anthropic.com",
+    "allow:models.dev",
+    "allow:models.opencode.ai",
+    "allow:opencode.ai",
 ]
 allow-credentials = ["broker:anthropic"]
 channels = ["open-url"]

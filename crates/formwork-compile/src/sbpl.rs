@@ -45,50 +45,154 @@ pub fn render(input: &CompileInput) -> String {
         &input.floor_exempt,
     );
     render_exec(&mut b, &input.exec);
-    render_baseline(&mut b, &input.channels);
+    render_baseline(
+        &mut b,
+        &input.channels,
+        (!input.keychain_lifted).then_some(input.keyring_services.as_slice()),
+    );
     render_isolate(&mut b, &input.isolate);
+    if let Some(marker) = &input.session_marker {
+        // Last, so no rule above shadows either half (FW-EGR9).
+        b.push_str("\n;; session marker for the egress listener's peer check (FW-EGR9)\n");
+        b.push_str(&format!(
+            "(deny mach-lookup (global-name \"{}\"))\n(allow mach-lookup (global-name \"{}\"))\n",
+            marker.denied_service(),
+            marker.allowed_service()
+        ));
+    }
 
-    b
+    match &input.deny_tag {
+        Some(tag) => tag_denies(&b, tag),
+        None => b,
+    }
 }
 
-/// The SBPL that closes one channel (FW-ISO13). Operation-level denies where one operation is the
-/// channel (`appleevent-send`, `lsopen`), mach service denies by name otherwise. The names are the
-/// ones the characterization suite settles (FEP-5 §6.3 C3); the report says so.
-fn channel_rules(channel: Channel) -> &'static [&'static str] {
-    match channel {
-        Channel::RunOutside => &[
-            "(deny appleevent-send)",
-            "(deny mach-lookup (global-name \"com.apple.coreservices.appleevents\"))",
+/// Every deny carries `tag` into its Sandbox record (characterized: `(with message …)` appends
+/// the text to the record on its own line), so the unified log's records are attributed to the
+/// session that produced them (FW-DISC2). Each rule is one line, `(deny <operation> <filters>)`.
+fn tag_denies(profile: &str, tag: &str) -> String {
+    let modifier = format!("(with message \"{}\")", escape(tag));
+    let mut out = String::with_capacity(profile.len() * 2);
+    for line in profile.lines() {
+        match line.strip_prefix("(deny ") {
+            Some(rest) => {
+                let split = rest.find([' ', ')']).unwrap_or(rest.len());
+                let (operation, filters) = rest.split_at(split);
+                let filters = filters.trim_start();
+                out.push_str(&format!("(deny {operation} {modifier}"));
+                if filters != ")" {
+                    out.push(' ');
+                }
+                out.push_str(filters);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// A Mach service name, matched exactly or by prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Service {
+    Exact(&'static str),
+    Prefix(&'static str),
+}
+
+impl Service {
+    pub fn matches(self, name: &str) -> bool {
+        match self {
+            Service::Exact(s) => name == s,
+            Service::Prefix(p) => name.starts_with(p),
+        }
+    }
+
+    fn filter(self) -> String {
+        match self {
+            Service::Exact(s) => format!("(global-name \"{s}\")"),
+            Service::Prefix(p) => format!("(global-name-regex #\"^{}\")", regex_escape(p)),
+        }
+    }
+}
+
+/// The Mach services each channel's clients reach, as the characterization suite observed them on
+/// macOS 14 and 15 (FEP-5 §6.3 C3): its tests run every channel's probe with each lookup reported,
+/// and fail when a probe reaches a service this map does not name, or still works once the
+/// channel's services are denied. Camera and microphone have no device on a hosted runner and are
+/// not characterized.
+pub const CHANNEL_SERVICES: &[(Channel, &[Service])] = &[
+    (
+        Channel::RunOutside,
+        &[Service::Exact("com.apple.coreservices.appleevents")],
+    ),
+    (Channel::OpenUrl, &[]),
+    (
+        Channel::Clipboard,
+        &[Service::Prefix("com.apple.pasteboard.")],
+    ),
+    (
+        Channel::Screen,
+        &[
+            Service::Exact("com.apple.windowserver.active"),
+            Service::Exact("com.apple.CARenderServer"),
+            Service::Exact("com.apple.replayd"),
+            Service::Prefix("com.apple.screencapture"),
+        ],
+    ),
+    (Channel::Camera, &[Service::Prefix("com.apple.cmio.")]),
+    (
+        Channel::Microphone,
+        &[Service::Exact("com.apple.audio.AudioComponentRegistrar")],
+    ),
+];
+
+/// The Mach services a channel reaches.
+pub fn channel_services(channel: Channel) -> &'static [Service] {
+    CHANNEL_SERVICES
+        .iter()
+        .find(|(c, _)| *c == channel)
+        .map(|(_, s)| *s)
+        .unwrap_or(&[])
+}
+
+/// The SBPL that closes one channel (FW-ISO13): operation-level denies where one operation is the
+/// channel (`appleevent-send`, `lsopen`, launchd `job-creation`), and the channel's Mach services.
+fn channel_rules(channel: Channel) -> Vec<String> {
+    let mut rules: Vec<String> = match channel {
+        Channel::RunOutside => vec![
+            "(deny appleevent-send)".to_string(),
+            "(deny job-creation)".to_string(),
         ],
         // `open-url` is brokered through the Gateway (FW-ISO18); LaunchServices stays denied even
         // when the channel is lifted, so this rule is emitted unconditionally below.
-        Channel::OpenUrl => &["(deny lsopen)"],
-        Channel::Clipboard => &["(deny mach-lookup (global-name-regex #\"^com\\.apple\\.pasteboard\\.\"))"],
-        Channel::Screen => &[
-            "(deny mach-lookup (global-name-regex #\"^com\\.apple\\.(screencapture|replayd)\"))",
-        ],
-        Channel::Camera => &["(deny mach-lookup (global-name-regex #\"^com\\.apple\\.cmio\\.\"))"],
-        Channel::Microphone => &[
-            "(deny mach-lookup (global-name-regex #\"^com\\.apple\\.audio\\.AudioComponentRegistrar\"))",
-        ],
+        Channel::OpenUrl => vec!["(deny lsopen)".to_string()],
+        _ => Vec::new(),
+    };
+    let services = channel_services(channel);
+    if !services.is_empty() {
+        let filters: Vec<String> = services.iter().map(|s| s.filter()).collect();
+        rules.push(format!("(deny mach-lookup {})", filters.join(" ")));
     }
+    rules
 }
 
 /// The mechanism behind a channel's deny, for the report's reason text.
 pub fn channel_mechanism(channel: Channel) -> &'static str {
     match channel {
-        Channel::RunOutside => "appleevent-send and the AppleEvents service",
+        Channel::RunOutside => "appleevent-send, launchd job creation and the AppleEvents service",
         Channel::OpenUrl => "lsopen",
         Channel::Clipboard => "com.apple.pasteboard.* lookups",
-        Channel::Screen => "screen-capture service lookups",
+        Channel::Screen => "WindowServer, CARenderServer and screen-capture service lookups",
         Channel::Camera => "com.apple.cmio.* lookups",
         Channel::Microphone => "audio component registrar lookups",
     }
 }
 
 /// The anti-shedding baseline on macOS (FW-ISO8 as amended): host-service channels not lifted
-/// (FW-ISO13), privileged kernel ports (FW-ISO14), and other processes' environments (FW-ISO16).
-fn render_baseline(b: &mut String, channels: &ChannelPolicy) {
+/// (FW-ISO13), the keychain's services unless `os-keyring` is lifted (FW-CRED13), and privileged
+/// kernel ports (FW-ISO14). Other processes' environments (FW-ISO16) have no rule here: the
+/// `kern.procargs2` sysctl that returns them is not mediated by Seatbelt (characterization C5).
+fn render_baseline(b: &mut String, channels: &ChannelPolicy, keyring: Option<&[String]>) {
     b.push_str("\n;; host-service channel baseline (FW-ISO13)\n");
     for channel in Channel::ALL {
         // LaunchServices is never lifted: `open-url` is brokered by the Gateway (FW-ISO18).
@@ -96,31 +200,43 @@ fn render_baseline(b: &mut String, channels: &ChannelPolicy) {
             continue;
         }
         for rule in channel_rules(channel) {
-            b.push_str(rule);
+            b.push_str(&rule);
             b.push('\n');
         }
+    }
+    // Characterized (C3): `security` reaches the keychain through these alone, while TLS clients
+    // (curl, git, Node, URLSession, Go) verify through `trustd` and keep working without them.
+    if let Some(services) = keyring.filter(|s| !s.is_empty()) {
+        b.push_str(";; the keychain (FW-CRED13): lifted by allow-credentials = [\"os-keyring\"]\n");
+        let filters: Vec<String> = services
+            .iter()
+            .map(|s| format!("(global-name \"{}\")", escape(s)))
+            .collect();
+        b.push_str(&format!("(deny mach-lookup {})\n", filters.join(" ")));
     }
     b.push_str(";; privileged interfaces (FW-ISO14)\n");
     b.push_str("(deny mach-priv-host-port)\n");
     b.push_str("(deny mach-priv-task-port)\n");
-    b.push_str(";; other processes' arguments and environment (FW-ISO16)\n");
-    b.push_str("(deny sysctl-read (sysctl-name \"kern.procargs2\"))\n");
 }
 
-/// The opt-in isolation tier on macOS (FW-ISO10). `children` and `pgrp` re-allow the session's
-/// own process management (shell job control, `make -j`).
+/// The opt-in isolation tier on macOS (FW-ISO10). `same-sandbox` re-allows the session's own
+/// process management (shell job control, `make -j`, worker pools).
 fn render_isolate(b: &mut String, isolate: &[IsolateMember]) {
     if isolate.is_empty() {
         return;
     }
     b.push_str("\n;; isolation tier (FW-ISO10)\n");
     if isolate.contains(&IsolateMember::Processes) {
-        b.push_str("(deny process-info* (target others))\n");
-        b.push_str("(allow process-info* (target children))\n");
-        b.push_str("(allow process-info* (target pgrp))\n");
-        b.push_str("(deny signal (target others))\n");
-        b.push_str("(allow signal (target children))\n");
-        b.push_str("(allow signal (target pgrp))\n");
+        // `same-sandbox` is exactly the session: every process the workload starts carries this
+        // profile, reparented or regrouped, and no other process does. The denies are whole, not
+        // `(target others)`, which leaves out the session's process group -- `formwork` itself
+        // and whatever shares its job (characterization C6). Listing pids stays allowed: `sysctl`
+        // lists them regardless, and `lsof` needs the listing to find the session's own.
+        b.push_str("(deny process-info*)\n");
+        b.push_str("(allow process-info-listpids)\n");
+        b.push_str("(allow process-info* (target same-sandbox))\n");
+        b.push_str("(deny signal)\n");
+        b.push_str("(allow signal (target same-sandbox))\n");
     }
     if isolate.contains(&IsolateMember::Ipc) {
         b.push_str("(deny ipc-sysv*)\n");
@@ -479,9 +595,13 @@ mod tests {
             channels: ChannelPolicy::default(),
             isolate: Vec::new(),
             gateway_port: None,
+            session_marker: None,
+            deny_tag: None,
             unix_socket_grants: Vec::new(),
             brokered: false,
             keyring_lifted: false,
+            keyring_services: vec!["com.apple.SecurityServer".to_string()],
+            keychain_lifted: false,
         }
     }
 
@@ -592,7 +712,11 @@ mod tests {
         assert!(s.contains("(deny lsopen)"));
         assert!(s.contains("com\\.apple\\.pasteboard"));
         assert!(s.contains("(deny mach-priv-task-port)"));
-        assert!(s.contains("(deny sysctl-read (sysctl-name \"kern.procargs2\"))"));
+        assert!(
+            s.contains("com.apple.windowserver.active"),
+            "screen capture goes through WindowServer (C3)"
+        );
+        assert!(s.contains("(deny job-creation)"));
         let mut i = input();
         i.channels = ChannelPolicy::allow([Channel::Clipboard, Channel::OpenUrl]);
         let lifted = render(&i);
@@ -610,7 +734,7 @@ mod tests {
     fn host_rules_allow_only_the_gateway_endpoint_and_drop_the_resolver() {
         let mut i = input();
         i.net = NetPosture::AllowHosts(formwork_blueprint::HostTable::new(vec![
-            serde_json::from_str("\"https:api.anthropic.com\"").unwrap(),
+            serde_json::from_str("\"allow:api.anthropic.com\"").unwrap(),
         ]));
         i.gateway_port = Some(41234);
         let s = render(&i);
@@ -624,14 +748,58 @@ mod tests {
     }
 
     #[test]
+    fn the_keychain_is_denied_until_os_keyring_is_lifted() {
+        let deny = "(deny mach-lookup (global-name \"com.apple.SecurityServer\"))";
+        assert!(render(&input()).contains(deny));
+        let mut i = input();
+        i.keychain_lifted = true;
+        assert!(!render(&i).contains("com.apple.SecurityServer"));
+    }
+
+    #[test]
+    fn a_session_tags_every_deny() {
+        let mut i = input();
+        i.deny_tag = Some("fw-session-t1".to_string());
+        let s = render(&i);
+        assert!(
+            s.contains("(deny network* (with message \"fw-session-t1\"))"),
+            "{s}"
+        );
+        assert!(
+            s.contains("(deny file-read* (with message \"fw-session-t1\") (subpath \"/\"))"),
+            "{s}"
+        );
+        assert!(
+            s.lines()
+                .filter(|l| l.starts_with("(deny "))
+                .all(|l| l.contains("(with message \"fw-session-t1\")")),
+            "{s}"
+        );
+        assert!(!render(&input()).contains("with message"));
+    }
+
+    #[test]
+    fn the_session_marker_is_rendered_last() {
+        let mut i = input();
+        i.session_marker = Some(crate::SessionMarker::new("abc123"));
+        let s = render(&i);
+        let tail = s.trim_end().rsplit_once(";; session marker").unwrap().1;
+        assert!(tail.contains("(deny mach-lookup (global-name \"dev.formwork.session.abc123.d\"))"));
+        assert!(
+            tail.contains("(allow mach-lookup (global-name \"dev.formwork.session.abc123.a\"))")
+        );
+        assert!(!render(&input()).contains("dev.formwork.session"));
+    }
+
+    #[test]
     fn isolate_processes_denies_others_and_keeps_the_session() {
         let mut i = input();
         i.isolate = vec![IsolateMember::Processes, IsolateMember::Ipc];
         let s = render(&i);
-        assert!(s.contains("(deny signal (target others))"));
-        assert!(s.contains("(allow signal (target children))"));
+        assert!(s.contains("(deny signal)\n(allow signal (target same-sandbox))"));
+        assert!(s.contains("(allow process-info* (target same-sandbox))"));
         assert!(s.contains("(deny ipc-sysv*)"));
-        assert!(!render(&input()).contains("target others"));
+        assert!(!render(&input()).contains("same-sandbox"));
     }
 
     #[test]

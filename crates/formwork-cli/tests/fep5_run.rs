@@ -3,46 +3,13 @@
 //! directory, channel locator variables, and the environment-disclosure report line. Each drives
 //! the built binary with `$HOME` and the launch directory pinned inside a scratch directory.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::Command;
 
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new(tag: &str) -> Scratch {
-        let root = std::env::temp_dir().join(format!("formwork-fep5-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        Scratch(std::fs::canonicalize(&root).unwrap())
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-struct Output {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-fn formwork(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_formwork"));
-    cmd.args(args).current_dir(dir).env("HOME", dir);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let out = cmd.output().expect("running formwork");
-    Output {
-        code: out.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-    }
-}
+mod support;
+use support::*;
 
 #[cfg(target_os = "linux")]
 fn landlock_host(dir: &Path) -> bool {
@@ -345,30 +312,6 @@ fn explain_names_the_channel_verdict_and_deciding_layer() {
 }
 
 #[cfg(target_os = "linux")]
-/// Skip with a reason locally; in CI (`FW_REQUIRE_EXERCISED=1`) a test that could not exercise its
-/// mechanism fails instead (FEP-5 §6.1).
-fn not_exercised(reason: &str) {
-    if std::env::var("FW_REQUIRE_EXERCISED").as_deref() == Ok("1") {
-        panic!("not exercised on a CI runner: {reason}");
-    }
-    eprintln!("skipping: {reason}");
-}
-
-#[cfg(target_os = "linux")]
-fn on_path(tool: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "linux")]
-fn supervision_host(dir: &Path) -> bool {
-    let out = formwork(dir, &["explain", "--json"], &[]);
-    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
-    v["host"]["connect-supervision"].as_bool() == Some(true)
-}
-
-#[cfg(target_os = "linux")]
 /// A loopback HTTP upstream that answers every request with `upstream-ok` and counts connections.
 fn http_fixture() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::io::{Read, Write};
@@ -405,7 +348,7 @@ fn fw_e2e_075_run_routes_egress_through_the_gateway() {
     std::fs::write(
         dir.path().join("FORMWORK.toml"),
         format!(
-            "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:{port}\"]\n"
+            "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"allow:127.0.0.1:{port}\"]\n"
         ),
     )
     .unwrap();
@@ -466,6 +409,11 @@ fn fw_e2e_075_run_routes_egress_through_the_gateway() {
         "the refusal names its reproduction (FW-FID9): {}",
         other.stderr
     );
+    assert!(
+        other.stderr.contains("reason=\"host-not-listed\""),
+        "the refusal carries its reason (FW-FID12): {}",
+        other.stderr
+    );
 }
 
 /// FW-E2E-086 (first half, FW-XR10): `run` exits with the workload's status and writes nothing of
@@ -521,7 +469,7 @@ fn fw_e2e_082_session_bus_is_closed_until_run_outside_is_lifted() {
     assert!(control.status.success(), "control: the bus is live");
 
     let base =
-        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:9\"]\n";
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"allow:127.0.0.1:9\"]\n";
     std::fs::write(dir.path().join("FORMWORK.toml"), base).unwrap();
     let env = [("DBUS_SESSION_BUS_ADDRESS", address.as_str())];
     let mut args = vec!["run", "--"];
@@ -545,21 +493,19 @@ fn fw_e2e_082_session_bus_is_closed_until_run_outside_is_lifted() {
     assert!(lifted.stdout.contains("org.freedesktop.DBus"));
 }
 
-#[cfg(target_os = "linux")]
 const BROKERED: &str = "extends = [\"builtin:default\"]\n\
                         rules = [\"readwrite:$CWD/**\", \"get,post:api.anthropic.com\"]\n\
                         allow-credentials = [\"broker:anthropic\"]\n";
 
-/// FW-E2E-078 (Linux, the `run` half; the Gateway half is `formwork-gateway`'s inspect test): a
+/// FW-E2E-078 (both; the `run` half -- the Gateway half is `formwork-gateway`'s inspect test): a
 /// brokered credential reaches the session only as its placeholder, the secret bytes appear
 /// nowhere in the confined environment, and the inspection trust bundle is readable but not
 /// writable (FW-EGR13, FW-CRED14, FW-INV13).
-#[cfg(target_os = "linux")]
 #[test]
 fn fw_e2e_078_session_holds_the_placeholder_and_a_read_only_trust_bundle() {
     let dir = Scratch::new("broker");
-    if !supervision_host(dir.path()) {
-        not_exercised("connect supervision unavailable");
+    if !egress_host(dir.path()) {
+        not_exercised("no host-scoped egress on this host");
         return;
     }
     std::fs::write(dir.path().join("FORMWORK.toml"), BROKERED).unwrap();
@@ -591,6 +537,27 @@ env"#;
         "secret disclosed: {}",
         out.stdout
     );
+    // FEP-6 §4.11: both spellings of the proxy variables, an empty no_proxy, and Node's opt-in.
+    for line in [
+        "http_proxy=http://fw:",
+        "https_proxy=http://fw:",
+        "HTTP_PROXY=http://fw:",
+        "HTTPS_PROXY=http://fw:",
+        "NODE_USE_ENV_PROXY=1",
+    ] {
+        assert!(
+            out.stdout.lines().any(|l| l.starts_with(line)),
+            "{line}: {}",
+            out.stdout
+        );
+    }
+    for line in ["no_proxy=", "NO_PROXY="] {
+        assert!(
+            out.stdout.lines().any(|l| l == line),
+            "{line}: {}",
+            out.stdout
+        );
+    }
     assert!(
         !out.stdout.contains("catalog-file-bytes"),
         "a brokered type keeps its floor: {}",
@@ -605,12 +572,11 @@ env"#;
 
 /// FW-XR9 for brokering: a brokered credential with no value on the launching host is refused
 /// before the workload starts, naming the variable to set.
-#[cfg(target_os = "linux")]
 #[test]
 fn a_brokered_credential_without_a_value_is_refused_before_spawn() {
     let dir = Scratch::new("broker-unset");
-    if !supervision_host(dir.path()) {
-        not_exercised("connect supervision unavailable");
+    if !egress_host(dir.path()) {
+        not_exercised("no host-scoped egress on this host");
         return;
     }
     std::fs::write(dir.path().join("FORMWORK.toml"), BROKERED).unwrap();
@@ -634,7 +600,7 @@ fn a_brokered_credential_without_a_value_is_refused_before_spawn() {
 fn brokering_to_a_tunneled_host_is_refused_at_load() {
     let dir = Scratch::new("broker-tunnel");
     let bp = "extends = [\"builtin:default\"]\n\
-              rules = [\"readwrite:$CWD/**\", \"https:api.anthropic.com\"]\n\
+              rules = [\"readwrite:$CWD/**\", \"tunnel:api.anthropic.com\"]\n\
               allow-credentials = [\"broker:anthropic\"]\n";
     std::fs::write(dir.path().join("FORMWORK.toml"), bp).unwrap();
     let out = formwork(dir.path(), &["explain", "--json"], &[]);
@@ -744,7 +710,7 @@ fn isolation_tier_keeps_supervised_egress() {
         dir.path().join("FORMWORK.toml"),
         format!(
             "extends = [\"builtin:default\"]\n\
-             rules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:{port}\"]\n\
+             rules = [\"readwrite:$CWD/**\", \"allow:127.0.0.1:{port}\"]\n\
              isolate = [\"processes\"]\n"
         ),
     )
@@ -889,7 +855,7 @@ fn fw_adv_020_the_opener_does_not_exfiltrate_when_not_lifted() {
     assert_eq!(out.stdout, "xdg-open=1\n", "the caller hears a refusal");
 }
 
-/// FW-E2E-085 (Linux): a learning run under host rules proposes `https:blocked.test` from the
+/// FW-E2E-085 (Linux): a learning run under host rules proposes `allow:blocked.test` from the
 /// Gateway's refusal and `open-url` from the opener's, withholds the metadata address with an
 /// operator line, and the accepted entries apply from the next run (FW-DISC12).
 #[cfg(target_os = "linux")]
@@ -902,7 +868,7 @@ fn fw_e2e_085_discovery_of_hosts_and_channels() {
     }
     std::fs::write(
         dir.path().join("FORMWORK.toml"),
-        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"https:127.0.0.1:9\"]\n",
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"allow:127.0.0.1:9\"]\n",
     )
     .unwrap();
     let learned = formwork(
@@ -929,7 +895,7 @@ fn fw_e2e_085_discovery_of_hosts_and_channels() {
     );
     let list = formwork(dir.path(), &["learn", "--list"], &[]);
     assert!(
-        list.stdout.contains("\"https:blocked.test:80\""),
+        list.stdout.contains("\"allow:blocked.test:80\""),
         "{}",
         list.stdout
     );
@@ -940,7 +906,7 @@ fn fw_e2e_085_discovery_of_hosts_and_channels() {
     assert_eq!(accepted.code, 0, "{}", accepted.stderr);
     let hosts = formwork(dir.path(), &["explain", "--hosts"], &[]);
     assert!(
-        hosts.stdout.contains("https:blocked.test:80") && hosts.stdout.contains("discovered layer"),
+        hosts.stdout.contains("allow:blocked.test:80") && hosts.stdout.contains("discovered layer"),
         "{}",
         hosts.stdout
     );
@@ -960,7 +926,7 @@ fn a_discovered_layer_without_provenance_for_hosts_or_channels_is_refused() {
     .unwrap();
     let discovered = dir.path().join("FORMWORK.toml.discovered.toml");
     for forged in [
-        "rules = [\"https:evil.test\"]\n",
+        "rules = [\"allow:evil.test\"]\n",
         "rules = [\"readwrite:/etc/**\"]\n",
         "channels = [\"run-outside\"]\n",
     ] {
@@ -971,18 +937,19 @@ fn a_discovered_layer_without_provenance_for_hosts_or_channels_is_refused() {
     }
 }
 
-/// FW-E2E-084 (Linux): each shipped agent blueprint starts under the baseline, and where the
+/// FW-E2E-084 (both): each shipped agent blueprint starts under the baseline, and where the
 /// agent is installed, its non-interactive smoke command (`--version`) runs under `learn` with no
-/// denial to propose. The blueprints are copied out of the repo so the proposal files land in
-/// scratch.
-#[cfg(target_os = "linux")]
+/// denial to propose -- the strace feed on Linux, the session's tagged Sandbox records on macOS.
+/// The blueprints are copied out of the repo so the proposal files land in scratch. The
+/// `agent-examples` CI job sets `FW_AGENTS_INSTALLED=1`, which makes a missing agent a failure.
 #[test]
 fn fw_e2e_084_agent_examples_under_the_baseline() {
     let dir = Scratch::new("examples");
-    if !supervision_host(dir.path()) {
-        not_exercised("connect supervision unavailable (the agent examples use host rules)");
+    if !egress_host(dir.path()) {
+        not_exercised("no host-scoped egress on this host (the agent examples use host rules)");
         return;
     }
+    let agents_required = std::env::var("FW_AGENTS_INSTALLED").as_deref() == Ok("1");
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = repo.join("examples/blueprints");
     let copy = dir.path().join("blueprints");
@@ -1010,16 +977,17 @@ fn fw_e2e_084_agent_examples_under_the_baseline() {
     ];
     // Denials the host imposes whatever the sandbox does, which each example documents: the strace
     // feed sees them as the same EACCES a Landlock denial produces.
+    let opencode_host: &[&str] = if cfg!(target_os = "linux") {
+        &["/sys/kernel/debug/tracing/trace_marker"]
+    } else {
+        &[]
+    };
     let examples: [(&str, &str, &[&str]); 5] = [
         ("claude-code.toml", "claude", &[]),
         ("claude-code-api-key.toml", "claude", &[]),
         ("codex.toml", "codex", &[]),
         ("codex-api-key.toml", "codex", &[]),
-        (
-            "opencode.toml",
-            "opencode",
-            &["/sys/kernel/debug/tracing/trace_marker"],
-        ),
+        ("opencode.toml", "opencode", opencode_host),
     ];
     for (file, agent, host_imposed) in examples {
         let blueprint = copy.join(file);
@@ -1039,7 +1007,12 @@ fn fw_e2e_084_agent_examples_under_the_baseline() {
         );
         assert_eq!(started.code, 0, "{file}: {}", started.stderr);
         assert_eq!(started.stdout, "started\n", "{file}");
-        if !on_path(agent) || !on_path("strace") {
+        let feed = cfg!(target_os = "macos") || on_path("strace");
+        if !on_path(agent) || !feed {
+            assert!(
+                !agents_required,
+                "{file}: {agent} or the denial feed is missing"
+            );
             eprintln!("{file}: {agent} or strace not installed; the smoke command is skipped");
             continue;
         }
@@ -1066,7 +1039,7 @@ fn fw_e2e_084_agent_examples_under_the_baseline() {
                 let pattern = c.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
                 let read = c.get("access").and_then(|a| a.as_str()) == Some("read");
                 // The launch directory is also `$HOME` here, itself an ancestor of the floor.
-                !(read && launch.starts_with(pattern)) && !host_imposed.contains(&pattern)
+                !(host_imposed.contains(&pattern) || (read && launch.starts_with(pattern)))
             })
             .map(|c| c.to_string())
             .collect();
@@ -1141,7 +1114,7 @@ fn fw_e2e_087_host_session_detection() {
     }
     let with_bus = explain(&[]);
     let supervised = supervision_host(dir.path());
-    let under_rules = explain(&["--set", "rules = [\"https:127.0.0.1:9\"]"]);
+    let under_rules = explain(&["--set", "rules = [\"allow:127.0.0.1:9\"]"]);
     let _ = daemon.kill();
     let _ = daemon.wait();
     let channel = &with_bus["report"]["channels"]["run-outside"]["host"];

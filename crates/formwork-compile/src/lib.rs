@@ -8,7 +8,7 @@ mod policy;
 mod report;
 mod sbpl;
 
-pub use sbpl::MACOS_RESOLVER_SOCKET;
+pub use sbpl::{channel_services, Service, CHANNEL_SERVICES, MACOS_RESOLVER_SOCKET};
 
 pub use policy::{
     CompiledPolicy, ConfinerPolicy, ExecPlan, GatewayPolicy, LinuxNetPlan, LinuxPolicy,
@@ -55,12 +55,24 @@ pub struct CompileInput {
     pub isolate: Vec<IsolateMember>,
     /// The session Gateway's loopback port, known only when compiling for a spawn (FW-EGR8).
     pub gateway_port: Option<u16>,
+    /// The marker the Gateway's peer check recognizes the session's processes by (FW-EGR9 on
+    /// macOS); known only when compiling for a spawn with host rules.
+    pub session_marker: Option<SessionMarker>,
+    /// The tag every macOS deny carries into its Sandbox record (FW-DISC2); known only when
+    /// compiling for a spawn.
+    pub deny_tag: Option<String>,
     /// Pathname sockets granted by a literal write grant (FW-ISO12, FEP-5 §3.1.1).
     pub unix_socket_grants: Vec<PathPattern>,
     /// Whether any credential is brokered (FW-CRED11).
     pub brokered: bool,
     /// Whether the `os-keyring` type is lifted (FW-CRED13).
     pub keyring_lifted: bool,
+    /// The keychain's Mach services (the catalog's `mach:` services of `os-keyring`), denied on
+    /// macOS until a type that reaches them is lifted (FW-CRED13).
+    pub keyring_services: Vec<String>,
+    /// Whether an exposed type reaches the keychain on macOS: `os-keyring` itself, or a type whose
+    /// macOS location is the keychain (`claude`, FEP-5 §3.4).
+    pub keychain_lifted: bool,
 }
 
 impl CompileInput {
@@ -70,6 +82,14 @@ impl CompileInput {
         // Write grants imply read; the no-create grant is a write grant too.
         reads.extend(blueprint.fs.writes_no_create.iter().cloned());
         let exposed = blueprint.exposed_credentials();
+        let keyring_services: Vec<String> = catalog
+            .types
+            .iter()
+            .filter(|(name, _)| name.as_str() == formwork_blueprint::OS_KEYRING)
+            .flat_map(|(_, entry)| entry.services.iter())
+            .filter_map(|s| s.strip_prefix("mach:"))
+            .map(str::to_string)
+            .collect();
         let floor_exempt: Vec<PathPattern> = catalog
             .types
             .iter()
@@ -90,8 +110,18 @@ impl CompileInput {
             channels: blueprint.channels.clone(),
             isolate: blueprint.isolate.clone(),
             gateway_port: None,
+            session_marker: None,
+            deny_tag: None,
             brokered: blueprint.brokered_credentials().next().is_some(),
             keyring_lifted: exposed.iter().any(|t| t == formwork_blueprint::OS_KEYRING),
+            keyring_services: keyring_services.clone(),
+            keychain_lifted: catalog
+                .types
+                .iter()
+                .filter(|(name, _)| exposed.iter().any(|e| e == name.as_str()))
+                .flat_map(|(_, entry)| entry.services.iter())
+                .filter_map(|s| s.strip_prefix("mach:"))
+                .any(|s| keyring_services.iter().any(|k| k == s)),
             // A literal (non-subtree) write grant names one file; that is how a session grants a
             // socket (`readwrite:$SSH_AUTH_SOCK`). Subtree grants never admit sockets, or a
             // writable `/tmp/**` would admit the X11 socket beneath it.
@@ -116,22 +146,74 @@ pub fn compile(
     host: &HostProfile,
     catalog: &ResolvedCatalog,
 ) -> CompiledPolicy {
-    compile_for_session(blueprint, host, catalog, None)
+    compile_for_session(blueprint, host, catalog, &SessionSpec::default())
 }
 
-/// [`compile`] for a session: `gateway_port` is the per-spawn Gateway listener the session's
-/// egress goes to (FW-EGR8/FW-EGR14), not blueprint content. A dry run compiles with none, and
-/// the macOS profile then allows no outbound endpoint at all (fail-closed). Still pure and
-/// deterministic in its inputs (FW-FID4).
+/// A per-session secret the macOS profile carries so the Gateway can tell the session's processes
+/// from every other process (FW-EGR9; FEP-5 §3.1, characterization C2): the profile denies one
+/// Mach service name derived from it and allows another. An unconfined process may look up both;
+/// another sandbox denies both, or allows both; only a process confined by this session's profile
+/// is denied the first and allowed the second, and `sandbox_check` asks without a violation record.
+/// The names are never written where the session can read them, so a process outside the session
+/// cannot adopt a profile that carries them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionMarker(String);
+
+impl SessionMarker {
+    /// `nonce` is a per-session random value of hex digits.
+    pub fn new(nonce: &str) -> SessionMarker {
+        SessionMarker(nonce.to_string())
+    }
+
+    pub fn denied_service(&self) -> String {
+        format!("dev.formwork.session.{}.d", self.0)
+    }
+
+    pub fn allowed_service(&self) -> String {
+        format!("dev.formwork.session.{}.a", self.0)
+    }
+}
+
+impl std::fmt::Debug for SessionMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionMarker(..)")
+    }
+}
+
+/// What a spawned session's profile names beyond the blueprint (FW-EGR8, FW-EGR9): the Gateway
+/// listener's loopback port and the marker its peer check recognizes the session by.
+#[derive(Clone, Debug)]
+pub struct SessionGateway {
+    pub port: u16,
+    pub marker: SessionMarker,
+}
+
+/// What a spawned session's profile names beyond the blueprint.
+#[derive(Clone, Debug, Default)]
+pub struct SessionSpec {
+    /// The Gateway listener the session's egress goes to and the marker its peer check asks for
+    /// (FW-EGR8, FW-EGR9, FW-EGR14).
+    pub gateway: Option<SessionGateway>,
+    /// A per-session tag every macOS deny carries into its Sandbox record, so the unified log's
+    /// records name the session that produced them (FW-DISC2). Distinct from the marker: a session
+    /// that reads its own records learns this tag, never the marker.
+    pub deny_tag: Option<String>,
+}
+
+/// [`compile`] for a session: the per-spawn Gateway listener and deny tag are not blueprint
+/// content. A dry run compiles with neither, and the macOS profile then allows no outbound
+/// endpoint at all (fail-closed). Still pure and deterministic in its inputs (FW-FID4).
 pub fn compile_for_session(
     blueprint: &Blueprint,
     host: &HostProfile,
     catalog: &ResolvedCatalog,
-    gateway_port: Option<u16>,
+    session: &SessionSpec,
 ) -> CompiledPolicy {
     let blueprint = blueprint.canonicalize();
     let mut input = CompileInput::from_blueprint(&blueprint, catalog);
-    input.gateway_port = gateway_port;
+    input.gateway_port = session.gateway.as_ref().map(|g| g.port);
+    input.session_marker = session.gateway.as_ref().map(|g| g.marker.clone());
+    input.deny_tag = session.deny_tag.clone();
 
     let mut per_capability: BTreeMap<Capability, Fidelity> = BTreeMap::new();
     let mut withheld: Vec<String> = Vec::new();
@@ -304,7 +386,23 @@ fn compile_macos(
     };
     caps.insert(Capability::FsRead, seatbelt("filesystem read scope"));
     caps.insert(Capability::FsWrite, seatbelt("filesystem write scope"));
-    caps.insert(Capability::NetDefaultDeny, seatbelt("network default-deny"));
+    // FW-EGR15 lets a confined login flow accept its loopback callback, but Seatbelt's local
+    // filter names only `*` or `localhost`, and `localhost` matches every local address: the same
+    // listener accepts connections on the host's other interfaces (characterization C1).
+    caps.insert(
+        Capability::NetDefaultDeny,
+        match seatbelt("network default-deny") {
+            Fidelity::Enforced { backend } => Fidelity::Partial {
+                backend,
+                reason: "outbound connections are denied apart from the granted endpoints; a \
+                         listener the session opens for a loopback callback (FW-EGR15) also \
+                         accepts connections on the host's other addresses, because Seatbelt's \
+                         `localhost` local filter matches every local address"
+                    .to_string(),
+            },
+            other => other,
+        },
+    );
     // Seatbelt path-gates UNIX sockets under `(deny network*)`, so cross-domain socket control and
     // pathname sockets are closed apart from granted literals.
     caps.insert(
@@ -610,18 +708,26 @@ fn baseline_rows(
         }
         let fidelity = match host.os {
             Os::MacOs => {
-                if host.seatbelt {
+                if !host.seatbelt {
+                    Fidelity::Unenforceable {
+                        reason: "Seatbelt unavailable on this host".to_string(),
+                    }
+                } else if matches!(channel, Channel::Camera | Channel::Microphone) {
+                    // A hosted runner has no camera or microphone, so these service names are the
+                    // documented ones, not observed ones.
                     Fidelity::Partial {
                         backend: Backend::Seatbelt,
                         reason: format!(
-                            "SBPL deny installed ({}); the service-name coverage is pending the \
-                             macOS characterization suite (FEP-5 §6.3)",
+                            "SBPL deny installed ({}); not characterized: the CI hosts have no \
+                             capture device",
                             sbpl::channel_mechanism(channel)
                         ),
                     }
                 } else {
-                    Fidelity::Unenforceable {
-                        reason: "Seatbelt unavailable on this host".to_string(),
+                    // Characterized on macOS 14 and 15 (FEP-5 §6.3 C3, C4): each probe is denied
+                    // under these rules, and no probe reaches a service the map does not name.
+                    Fidelity::Enforced {
+                        backend: Backend::Seatbelt,
                     }
                 }
             }
@@ -632,10 +738,15 @@ fn baseline_rows(
     }
 
     let privileged = match host.os {
+        // Characterization C8: the toolchain suite (git, Python, Node, cc, cargo, swift build,
+        // gh, Homebrew, curl) opens no IOKit user client, but Metal opens the GPU's and IOSurface's,
+        // whose class names differ by GPU; an allowlist from the paravirtual GPU of a hosted runner
+        // would break GPU work on real hardware.
         Os::MacOs => Fidelity::Partial {
             backend: Backend::Seatbelt,
-            reason: "mach-priv-host-port and mach-priv-task-port are denied; iokit-open is not \
-                     yet narrowed to an allowlist (pending characterization C8)"
+            reason: "mach-priv-host-port and mach-priv-task-port are denied; IOKit user clients \
+                     stay open, because GPU compute needs the GPU's own user-client classes, \
+                     which differ by hardware"
                 .to_string(),
         },
         Os::Linux if host.seccomp => Fidelity::Enforced {
@@ -649,10 +760,13 @@ fn baseline_rows(
     caps.insert(Capability::PrivilegedInterfaces, privileged);
 
     let environment = match host.os {
-        Os::MacOs => Fidelity::Partial {
-            backend: Backend::Seatbelt,
-            reason: "the kern.procargs2 sysctl is denied, which hides other processes' \
-                     environments; pending characterization C5"
+        // Characterization C5: the kern.procargs2 sysctl returns a same-uid process's exec-time
+        // environment, and no Seatbelt operation mediates it -- not sysctl-read, by name or
+        // whole, nor process-info.
+        Os::MacOs => Fidelity::Unenforceable {
+            reason: "other same-uid processes' exec-time environments are readable through the \
+                     kern.procargs2 sysctl, which Seatbelt does not mediate; formwork zeroes its \
+                     own, so the Gateway's credentials are not among them"
                 .to_string(),
         },
         Os::Linux if host.user_namespaces && input.isolate.contains(&IsolateMember::Processes) => {
@@ -737,11 +851,18 @@ fn baseline_rows(
             Os::MacOs => Fidelity::Partial {
                 backend: Backend::Seatbelt,
                 reason: match member {
+                    // Characterization C6 and C5.
                     IsolateMember::Processes => {
-                        "process-info and signal are denied for processes outside the session's \
-                         children and process group; pending characterization C6"
+                        "signals and process inspection are refused for every process outside \
+                         the session; their pids, names and arguments stay visible through \
+                         sysctl, and their exec-time environments through kern.procargs2"
                     }
-                    IsolateMember::Ipc => "SysV IPC is denied; POSIX IPC names are global on macOS",
+                    // Characterization C7: Python's multiprocessing names its semaphores and
+                    // shared memory itself, so a session prefix would break it.
+                    IsolateMember::Ipc => {
+                        "SysV IPC is denied; POSIX IPC names are global on macOS, and libraries \
+                         choose them, so they cannot be confined to a session prefix"
+                    }
                 }
                 .to_string(),
             },
@@ -858,7 +979,7 @@ fn egress_rows(
         .iter()
         .any(|r| matches!(r.access, formwork_blueprint::HostAccess::Tunnel));
     let has_inspected = table.rules.iter().any(|r| r.is_inspected());
-    let tunnel_gap = "tunnel-grade hosts (`https:`) are admitted by the CONNECT target and trust the client's SNI and Host; domain fronting is not caught (FW-EGR5)";
+    let tunnel_gap = "`tunnel:` hosts are forwarded once the ClientHello's server name matches the CONNECT host (FW-EGR16), but the request inside is opaque: a CDN serving many names from one address can be fronted (FW-EGR5)";
     let unavailable = format!(
         "connect supervision is unavailable on this host: it needs {}; egress fails closed and \
          `run` refuses the host rules",
@@ -917,19 +1038,20 @@ fn egress_rows(
             );
         }
         Os::MacOs => {
-            let mut reason = "the egress listener admits the per-session proxy credential; the \
-                               peer-process check is pending characterization (C2), so a same-uid \
-                               process that reads the agent's environment could reach it"
-                .to_string();
-            if has_tunnel {
-                reason = format!("{reason}; {tunnel_gap}");
-            }
+            // FW-EGR9: the listener admits a connection only when it carries the per-session
+            // credential and a process of the session holds its client end (characterization C2).
             caps.insert(
                 Capability::NetHostScope,
                 if host.seatbelt {
-                    Fidelity::Partial {
-                        backend: Backend::Gateway,
-                        reason,
+                    if has_tunnel {
+                        Fidelity::Partial {
+                            backend: Backend::Gateway,
+                            reason: tunnel_gap.to_string(),
+                        }
+                    } else {
+                        Fidelity::Enforced {
+                            backend: Backend::Gateway,
+                        }
                     }
                 } else {
                     Fidelity::Unenforceable {
@@ -952,10 +1074,20 @@ fn egress_rows(
         );
     }
     if input.brokered {
+        // FW-CRED17: the reflection guard scans for the credential's wire encodings in responses
+        // it can read, which is why it refuses any content coding but identity; an upstream that
+        // echoes the credential transformed (escaped, re-encoded, split across WebSocket frames)
+        // is not recognized.
+        let reason = "responses to brokered requests must be identity-coded (any other content \
+                      coding is refused), and one that carries the credential or its scheme value \
+                      is ended; an echo transformed some other way (escaped, re-encoded, split \
+                      across WebSocket frames) is not recognized"
+            .to_string();
         caps.insert(
             Capability::CredentialBroker,
-            Fidelity::Enforced {
+            Fidelity::Partial {
                 backend: Backend::Gateway,
+                reason,
             },
         );
     }
@@ -1049,7 +1181,11 @@ mod tests {
         let policy = compile(&sample_blueprint(), &HostProfile::synthetic_macos());
         assert!(matches!(policy.confiner, ConfinerPolicy::Macos(_)));
         assert!(policy.report.per_capability[&Capability::FsRead].is_enforced());
-        assert!(policy.report.per_capability[&Capability::NetDefaultDeny].is_enforced());
+        // Outbound is denied, but the loopback-callback listener is not loopback-only (C1).
+        assert!(matches!(
+            &policy.report.per_capability[&Capability::NetDefaultDeny],
+            Fidelity::Partial { backend: Backend::Seatbelt, reason } if reason.contains("FW-EGR15")
+        ));
         assert!(policy.report.per_capability[&Capability::McpShading].is_enforced());
     }
 
@@ -1108,12 +1244,24 @@ mod tests {
     #[test]
     fn macos_with_seatbelt_reports_all_caps_enforced() {
         // The paired allow arm (FW-INV5 report soundness): the SAME six caps that degrade above are
-        // reported Enforced{Seatbelt} when the host carries Seatbelt -- not self-agreement, a real
-        // allow/deny split against the identical blueprint.
+        // reported by Seatbelt when the host carries it -- Enforced, the default deny Partial --
+        // not self-agreement, a real allow/deny split against the identical blueprint.
         let host = HostProfile::synthetic_macos();
         assert!(host.seatbelt, "synthetic macOS host has Seatbelt");
         let policy = compile(&macos_all_caps_blueprint(), &host);
         for cap in MACOS_SEATBELT_CAPS {
+            // Seatbelt carries the default deny, partially: the loopback-callback listener also
+            // accepts on the host's other addresses (characterization C1).
+            if cap == Capability::NetDefaultDeny {
+                assert!(matches!(
+                    policy.report.per_capability[&cap],
+                    Fidelity::Partial {
+                        backend: Backend::Seatbelt,
+                        ..
+                    }
+                ));
+                continue;
+            }
             assert!(
                 matches!(
                     policy.report.per_capability[&cap],

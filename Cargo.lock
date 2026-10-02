@@ -237,6 +237,8 @@ dependencies = [
  "formwork-detect",
  "formwork-gateway",
  "libc",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -298,6 +300,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

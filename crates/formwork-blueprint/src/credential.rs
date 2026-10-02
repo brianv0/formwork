@@ -323,21 +323,33 @@ pub fn resolve_brokers(
                     continue;
                 }
             };
-            let inspected = table
+            // FW-CRED12, FW-CRED19: the Gateway presents a credential only on a request it
+            // inspects and forwards over TLS, so a bound host needs an inspected rule on a port
+            // other than the plain-HTTP one.
+            let inspected: Vec<&crate::HostRule> = table
                 .map(|t| {
-                    t.rules.iter().any(|r| {
-                        r.is_inspected()
-                            && r.port_matches(crate::DEFAULT_HTTPS_PORT)
-                            && r.host.matches(&host)
-                    })
+                    t.rules
+                        .iter()
+                        .filter(|r| r.is_inspected() && r.host.matches(&host))
+                        .collect()
                 })
-                .unwrap_or(false);
-            if !inspected {
-                errors.push(format!(
-                    "{name} is brokered to {host}, which no inspected rule covers, so the Gateway \
-                     could not see its requests; add `any:{host}/**` (or narrower methods and \
-                     paths) to `rules`"
-                ));
+                .unwrap_or_default();
+            let over_tls = inspected
+                .iter()
+                .any(|r| r.port != Some(crate::DEFAULT_HTTP_PORT));
+            if !over_tls {
+                match inspected.first() {
+                    Some(plain) => errors.push(format!(
+                        "{name} is brokered to {host}, whose only inspected rule `{plain}` forwards \
+                         without TLS, and a credential is never presented in cleartext; inspect \
+                         the host over TLS instead (`allow:{host}`)"
+                    )),
+                    None => errors.push(format!(
+                        "{name} is brokered to {host}, which no inspected rule covers, so the \
+                         Gateway could not see its requests; add `allow:{host}` (or narrower \
+                         methods and paths) to `rules`"
+                    )),
+                }
             }
             bindings.push((host, scheme));
         }
@@ -364,14 +376,24 @@ mod broker_tests {
         let entries = vec![CredentialEntry::parse("broker:github")];
         let rule =
             |s: &str| -> crate::HostRule { serde_json::from_str(&format!("\"{s}\"")).unwrap() };
-        let partial = crate::HostTable::new(vec![rule("any:api.github.com")]);
+        let partial = crate::HostTable::new(vec![rule("allow:api.github.com")]);
         let err = resolve_brokers(&entries, &catalog, Some(&partial)).unwrap_err();
         assert_eq!(err.len(), 1);
-        assert!(err[0].contains("any:github.com/**"), "{err:?}");
-        let tunnel =
-            crate::HostTable::new(vec![rule("https:github.com"), rule("any:api.github.com")]);
+        assert!(err[0].contains("`allow:github.com`"), "{err:?}");
+        let tunnel = crate::HostTable::new(vec![
+            rule("tunnel:github.com"),
+            rule("allow:api.github.com"),
+        ]);
         assert!(resolve_brokers(&entries, &catalog, Some(&tunnel)).is_err());
-        let full = crate::HostTable::new(vec![rule("any:github.com"), rule("any:api.github.com")]);
+        // FW-CRED19, FEP-6 §9 (i): an inspected rule on the plain-HTTP port does not carry it.
+        let plain = crate::HostTable::new(vec![
+            rule("allow:github.com:80"),
+            rule("allow:api.github.com"),
+        ]);
+        let err = resolve_brokers(&entries, &catalog, Some(&plain)).unwrap_err();
+        assert!(err[0].contains("`allow:github.com:80`"), "{err:?}");
+        let full =
+            crate::HostTable::new(vec![rule("allow:github.com"), rule("allow:api.github.com")]);
         let plans = resolve_brokers(&entries, &catalog, Some(&full)).unwrap();
         assert_eq!(plans[0].bindings.len(), 2);
         assert_eq!(plans[0].env_sources, vec!["GITHUB_TOKEN", "GH_TOKEN"]);

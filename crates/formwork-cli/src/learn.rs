@@ -5,8 +5,10 @@
 //! denials the kernel produced during the run are collected and reverse-compiled into a proposal
 //! (FW-DISC2). Two feeds exist (FW-XR6 parity on the discovery axis):
 //!
-//! - **macOS**: the unified log's Sandbox records, collected post-hoc with `log show` so there is
-//!   no stream-startup race. Attribution is the run window plus dedup -- deliberately tolerant of
+//! - **macOS**: the unified log's Sandbox records, read live with `log stream` attached before the
+//!   workload starts and post-hoc with `log show` over the run window, so neither the stream's
+//!   startup nor the store's persistence latency loses a record. Attribution is the run window plus
+//!   dedup -- deliberately tolerant of
 //!   over-capture, because a candidate has no effect until accepted (FW-INV10), credentials are
 //!   floored regardless (FW-DISC3), and everything else waits for review.
 //! - **Linux**: the workload runs under an *unconfined* `strace` ancestor (FW-E2E-071) that
@@ -57,7 +59,7 @@ pub struct ProposalFile {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RuleProposal {
-    /// A host rule in `rules` syntax (`https:host`, `post:host/path`).
+    /// A host rule in `rules` syntax (`allow:host`, `post:host/path`).
     pub rule: String,
     pub run_id: String,
 }
@@ -82,6 +84,11 @@ pub struct SessionObservations {
     /// `(what, why)` withheld before proposal, for the operator channel.
     #[serde(default)]
     pub withheld: Vec<(String, String)>,
+    /// `tunnel:` rules for hosts whose clients rejected the session CA. Never proposed: the host
+    /// already has an inspected rule, and a tunnel would drop its request checks and brokering,
+    /// so the operator swaps the rule by hand (FEP-6 §9 j).
+    #[serde(default)]
+    pub tunnel_candidates: Vec<String>,
 }
 
 /// The environment variable naming the descriptor the Linux learning shim reports on.
@@ -170,28 +177,323 @@ const QUIESCENCE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 const QUIESCENCE_MIN_SETTLE: std::time::Duration = std::time::Duration::from_secs(6);
 const QUIESCENCE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Collect the run window's denials, polling until the log store stops yielding new records.
-/// Anchored to the run's start (the window is recomputed as elapsed-since-start each poll), never
-/// to collection time -- a `--last N` fixed at collection would drift off the run it brackets.
-pub fn collect_denials_quiescent(run_started: std::time::Instant) -> Result<Vec<DenialRecord>> {
-    collect_until_quiescent(
-        || collect_denials(run_started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS),
-        QUIESCENCE_POLL,
-        QUIESCENCE_MIN_SETTLE,
-        QUIESCENCE_CAP,
-    )
+/// The macOS feed (FW-E2E-064): the run's Sandbox records from the unified log, from two readers.
+/// A live `log stream`, attached before the workload starts, sees a record as the kernel emits
+/// it, so a millisecond workload's denial never waits on the store's persistence latency; the
+/// post-hoc `log show` over the run window covers whatever the stream missed. Records are the raw
+/// messages, deduplicated: filesystem denials and service denials are parsed from them apart.
+pub struct UnifiedLogFeed {
+    started: std::time::Instant,
+    stream: Option<LogStream>,
+}
+
+struct LogStream {
+    child: std::process::Child,
+    messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The liveness probe's file, whose records are the feed's own and never a proposal.
+    probe: Option<String>,
+}
+
+/// How long a learning run waits for the live stream to attach before spawning the workload.
+const STREAM_ATTACH: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Proof the live stream is delivering events. `log stream` prints its filter banner before the
+/// events flow, so a workload spawned on the banner can lose its first records to the gap -- with
+/// the store's lazy persistence, a millisecond workload's only denial. A throwaway `cat` under
+/// `sandbox-exec` (deprecated, still shipped) is denied a probe file until the stream reports
+/// that denial. Without `sandbox-exec` the banner is all there is.
+struct StreamProbe {
+    path: std::path::PathBuf,
+}
+
+impl StreamProbe {
+    fn new() -> Option<StreamProbe> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path =
+            std::env::temp_dir().join(format!("formwork-log-probe-{}-{nanos}", std::process::id()));
+        std::fs::write(&path, b"probe").ok()?;
+        // Seatbelt matches the resolved path (/var is /private/var).
+        let path = std::fs::canonicalize(&path).ok()?;
+        Some(StreamProbe { path })
+    }
+
+    fn name(&self) -> String {
+        self.path.display().to_string()
+    }
+
+    /// One denial for the stream to report; false when `sandbox-exec` cannot run.
+    fn fire(&self) -> bool {
+        let literal = self.name().replace('\\', "\\\\").replace('"', "\\\"");
+        Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(format!(
+                "(version 1)(allow default)(deny file-read-data (literal \"{literal}\"))"
+            ))
+            .arg("/bin/cat")
+            .arg(&self.path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    }
+}
+
+impl Drop for StreamProbe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+const SANDBOX_PREDICATE: &str = r#"sender == "Sandbox""#;
+
+impl UnifiedLogFeed {
+    /// Attach the live stream (bounded by STREAM_ATTACH; `log show` alone if it cannot attach)
+    /// and start the run window. Call before the workload is spawned.
+    pub fn start() -> UnifiedLogFeed {
+        let stream = LogStream::start();
+        UnifiedLogFeed {
+            started: std::time::Instant::now(),
+            stream,
+        }
+    }
+
+    /// Collect the run window's records, polling until the log store stops yielding new ones.
+    /// Anchored to the run's start (the window is recomputed as elapsed-since-start each poll),
+    /// never to collection time -- a `--last N` fixed at collection would drift off the run it
+    /// brackets.
+    pub fn collect_quiescent(self) -> Result<Vec<String>> {
+        let started = self.started;
+        let stream = self.stream;
+        let messages = collect_until_quiescent(
+            || {
+                let mut all =
+                    collect_messages(started.elapsed().as_secs() + PERSISTENCE_SLACK_SECS)?;
+                if let Some(s) = &stream {
+                    all.extend(s.messages());
+                    if let Some(probe) = &s.probe {
+                        all.retain(|m| !m.contains(probe.as_str()));
+                    }
+                }
+                all.sort();
+                all.dedup();
+                Ok(all)
+            },
+            QUIESCENCE_POLL,
+            QUIESCENCE_MIN_SETTLE,
+            QUIESCENCE_CAP,
+        );
+        if let Some(mut s) = stream {
+            let _ = s.child.kill();
+            let _ = s.child.wait();
+        }
+        messages
+    }
+}
+
+impl LogStream {
+    fn start() -> Option<LogStream> {
+        use std::io::BufRead;
+        let mut child = match Command::new("/usr/bin/log")
+            .args([
+                "stream",
+                "--style",
+                "ndjson",
+                "--predicate",
+                SANDBOX_PREDICATE,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                tracing::debug!(error = %e, "no live log stream; collecting with `log show` alone");
+                return None;
+            }
+        };
+        let stdout = child.stdout.take()?;
+        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = messages.clone();
+        let (attached, ready) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut attached = Some(attached);
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                // `log stream` prints the filter it applied once attached, before any event.
+                if let Some(a) = attached.take() {
+                    let _ = a.send(());
+                }
+                if let Some(message) = event_message(&line) {
+                    if let Ok(mut m) = sink.lock() {
+                        m.push(message);
+                    }
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + STREAM_ATTACH;
+        let probe = StreamProbe::new();
+        let mut live = false;
+        if let Some(p) = &probe {
+            let name = p.name();
+            'probing: while std::time::Instant::now() < deadline && p.fire() {
+                let next = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                while std::time::Instant::now() < next.min(deadline) {
+                    if messages
+                        .lock()
+                        .map(|m| m.iter().any(|m| m.contains(&name)))
+                        .unwrap_or(false)
+                    {
+                        live = true;
+                        break 'probing;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        if !live {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if ready.recv_timeout(left).is_err() {
+                tracing::debug!(
+                    "the live log stream did not attach in time; `log show` still covers the run"
+                );
+            } else if probe.is_some() {
+                tracing::debug!(
+                    "the live log stream never reported its probe; trusting its banner"
+                );
+            }
+        }
+        Some(LogStream {
+            child,
+            messages,
+            probe: probe.map(|p| {
+                let name = p.name();
+                // The file can go; its name still marks the probe's records.
+                drop(p);
+                name
+            }),
+        })
+    }
+
+    fn messages(&self) -> Vec<String> {
+        self.messages.lock().map(|m| m.clone()).unwrap_or_default()
+    }
+}
+
+/// The records this session produced: those carrying its deny tag on their own line, with the
+/// tag removed (characterized: `(with message …)` appends it to the record). Without a tag, every
+/// record in the run window -- over-capture, which is safe (FW-INV10).
+pub fn this_session(messages: Vec<String>, tag: Option<&str>) -> Vec<String> {
+    let Some(tag) = tag else {
+        return messages;
+    };
+    messages
+        .into_iter()
+        .filter_map(|m| {
+            let (record, rest) = m.split_once('\n')?;
+            rest.lines()
+                .any(|l| l.trim() == tag)
+                .then(|| record.to_string())
+        })
+        .collect()
+}
+
+/// The filesystem denials among a feed's records (FW-DISC2).
+pub fn fs_denials(messages: &[String]) -> Vec<DenialRecord> {
+    messages
+        .iter()
+        .filter_map(|m| parse_sandbox_denial(m))
+        .collect()
+}
+
+/// What a macOS learning run's service denials call for (FW-DISC12): the channel whose Mach
+/// service or operation the session was refused, by the characterized map (FEP-5 §6.3 C3), and
+/// the keychain -- a credential type, not a channel -- withheld with its lift. LaunchServices is
+/// withheld too: `open` reaches the opener shim, and `open-url` never lifts LaunchServices
+/// (FW-ISO18), so a client that calls it directly cannot be served by any proposal.
+pub fn service_observations(
+    messages: &[String],
+    catalog: &ResolvedCatalog,
+    observations: &mut SessionObservations,
+) {
+    let keyring: Vec<&str> = catalog
+        .types
+        .iter()
+        .filter(|(name, _)| name.as_str() == formwork_blueprint::OS_KEYRING)
+        .flat_map(|(_, entry)| entry.services.iter())
+        .filter_map(|s| s.strip_prefix("mach:"))
+        .collect();
+    for message in messages {
+        let Some((operation, argument)) = parse_service_denial(message) else {
+            continue;
+        };
+        let channel = match operation {
+            "appleevent-send" | "job-creation" => Some(Channel::RunOutside),
+            "mach-lookup" => {
+                let service = argument.split_whitespace().next().unwrap_or("");
+                if keyring.contains(&service) {
+                    observations.withheld.push((
+                        service.to_string(),
+                        "the keychain is a credential type; lift it with allow-credentials = \
+                         [\"os-keyring\"]"
+                            .to_string(),
+                    ));
+                    None
+                } else {
+                    formwork_compile::CHANNEL_SERVICES
+                        .iter()
+                        .find(|(_, services)| services.iter().any(|s| s.matches(service)))
+                        .map(|(channel, _)| *channel)
+                }
+            }
+            "lsopen" => {
+                observations.withheld.push((
+                    "LaunchServices".to_string(),
+                    "a client opened a URL or an application through LaunchServices, which stays \
+                     denied; `open` and $BROWSER reach the opener shim, which `open-url` lifts"
+                        .to_string(),
+                ));
+                None
+            }
+            _ => None,
+        };
+        if let Some(c) = channel {
+            observations.channels.push(c.name().to_string());
+        }
+    }
+    observations.channels.sort();
+    observations.channels.dedup();
+    observations.withheld.sort();
+    observations.withheld.dedup();
+}
+
+/// One Sandbox record's operation and its argument: `Sandbox: pbcopy(9) deny(1) mach-lookup
+/// com.apple.pasteboard.1` is `("mach-lookup", "com.apple.pasteboard.1")`.
+fn parse_service_denial(event_message: &str) -> Option<(&str, &str)> {
+    let message = event_message
+        .strip_prefix("Sandbox: ")
+        .unwrap_or(event_message);
+    let deny_at = message.find(" deny(")?;
+    let rest = &message[deny_at + 1..];
+    let close = rest.find(") ")?;
+    let rest = &rest[close + 2..];
+    Some(rest.split_once(' ').unwrap_or((rest, "")))
 }
 
 /// The quiescence control flow, separated from the impure `log show` collector so the
 /// stabilization-with-floor property (FW-E2E-064's mechanism) is testable as a pure function of a
 /// chosen record sequence -- the same substitution the constitution allows for the compiler's
 /// HostProfile; the feed itself is exercised by the macOS E2E tests, never mocked there.
-fn collect_until_quiescent(
-    mut collect: impl FnMut() -> Result<Vec<DenialRecord>>,
+fn collect_until_quiescent<T: PartialEq>(
+    mut collect: impl FnMut() -> Result<Vec<T>>,
     poll: std::time::Duration,
     min_settle: std::time::Duration,
     cap: std::time::Duration,
-) -> Result<Vec<DenialRecord>> {
+) -> Result<Vec<T>> {
     let polling_started = std::time::Instant::now();
     let mut last = collect()?;
     loop {
@@ -211,8 +513,17 @@ fn collect_until_quiescent(
     }
 }
 
+/// The `eventMessage` of one ndjson log line.
+fn event_message(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    value
+        .get("eventMessage")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+}
+
 /// Post-hoc collection over the run window (plus slack for log-persistence latency).
-fn collect_denials(window_secs: u64) -> Result<Vec<DenialRecord>> {
+fn collect_messages(window_secs: u64) -> Result<Vec<String>> {
     let output = Command::new("/usr/bin/log")
         .args([
             "show",
@@ -221,7 +532,7 @@ fn collect_denials(window_secs: u64) -> Result<Vec<DenialRecord>> {
             "--last",
             &format!("{window_secs}s"),
             "--predicate",
-            r#"sender == "Sandbox""#,
+            SANDBOX_PREDICATE,
         ])
         .output()
         .context("running `log show` to collect sandbox denials")?;
@@ -232,18 +543,10 @@ fn collect_denials(window_secs: u64) -> Result<Vec<DenialRecord>> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let mut records = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if let Some(message) = value.get("eventMessage").and_then(|m| m.as_str()) {
-            if let Some(record) = parse_sandbox_denial(message) {
-                records.push(record);
-            }
-        }
-    }
-    Ok(records)
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(event_message)
+        .collect())
 }
 
 /// Locate `strace`, the Linux denial feed's tap (FW-E2E-071). PATH-based on purpose: feed
@@ -357,6 +660,14 @@ pub fn conclude_learning_run(
     let egress = propose_host_rules(&observations.egress, blueprint.net.host_table());
     for (target, why) in egress.withheld.iter().chain(observations.withheld.iter()) {
         tracing::info!(target = %target, "learning: withheld, not proposed (FW-DISC12): {why}");
+    }
+    for rule in &observations.tunnel_candidates {
+        tracing::warn!(
+            rule = %rule,
+            "learning: a client rejected the session CA; to serve it, replace the host's \
+             inspected rule with `{rule}`, which drops its method, path and Host checks and its \
+             brokering (not proposed: the grade drop is an authoring decision)"
+        );
     }
     let observed_channels: Vec<Channel> = observations
         .channels
@@ -851,11 +1162,47 @@ mod tests {
     /// The millisecond-workload trap (FW-E2E-064): before anything has flushed, the store reads
     /// empty and "stable" -- the floor forbids trusting that until real settle time has passed.
     #[test]
+    fn a_session_keeps_only_its_tagged_records() {
+        let messages = vec![
+            "Sandbox: cat(1) deny(1) file-read-data /x\nfw-session-a".to_string(),
+            "Sandbox: mdworker(2) deny(1) file-read-data /y".to_string(),
+            "Sandbox: cat(3) deny(1) file-read-data /z\nfw-session-b".to_string(),
+        ];
+        assert_eq!(
+            this_session(messages.clone(), Some("fw-session-a")),
+            vec!["Sandbox: cat(1) deny(1) file-read-data /x".to_string()]
+        );
+        assert_eq!(this_session(messages.clone(), None), messages);
+    }
+
+    #[test]
+    fn macos_service_denials_map_to_channels_and_withhold_the_keychain() {
+        let catalog = ResolvedCatalog::builtin_for_home("/Users/x").unwrap();
+        let messages: Vec<String> = [
+            "Sandbox: pbcopy(12) deny(1) mach-lookup com.apple.pasteboard.1",
+            "Sandbox: screencapture(13) deny(1) mach-lookup com.apple.windowserver.active",
+            "Sandbox: osascript(14) deny(1) appleevent-send",
+            "Sandbox: security(15) deny(1) mach-lookup com.apple.SecurityServer",
+            "Sandbox: open(16) deny(1) lsopen",
+            "Sandbox: mdworker(17) deny(1) mach-lookup com.apple.FileProvider",
+            "Sandbox: cat(18) deny(1) file-read-data /etc/x",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut obs = SessionObservations::default();
+        service_observations(&messages, &catalog, &mut obs);
+        assert_eq!(obs.channels, vec!["clipboard", "run-outside", "screen"]);
+        let withheld: Vec<&str> = obs.withheld.iter().map(|(w, _)| w.as_str()).collect();
+        assert_eq!(withheld, vec!["LaunchServices", "com.apple.SecurityServer"]);
+    }
+
+    #[test]
     fn quiescence_does_not_trust_empty_reads_before_the_floor() {
         let floor = std::time::Duration::from_millis(300);
         let started = std::time::Instant::now();
         let result = collect_until_quiescent(
-            || Ok(Vec::new()),
+            || Ok(Vec::<DenialRecord>::new()),
             std::time::Duration::from_millis(25),
             floor,
             std::time::Duration::from_secs(5),
@@ -930,7 +1277,7 @@ mod tests {
 
     #[test]
     fn quiescence_propagates_collector_errors() {
-        let result = collect_until_quiescent(
+        let result = collect_until_quiescent::<DenialRecord>(
             || bail!("log show failed"),
             std::time::Duration::from_millis(1),
             std::time::Duration::ZERO,

@@ -227,7 +227,7 @@ Applied by the launcher at spawn (§2) — not the confiner — and reported in 
 | Req | Requirement |
 |---|---|
 | <a id="fw-env1"></a>**FW-ENV1** Environment axis | The blueprint carries an `env` posture — passthrough, allowlist (only named vars survive), or scrub (secret-shaped vars removed) — and the child's environment is built at spawn from the filtered set, not inherited wholesale. A capability axis parallel to fs/net/exec/mcp. |
-| <a id="fw-env2"></a>**FW-ENV2** Default secret-shaped scrub | The default profile scrubs env vars whose *name* matches a secret shape (`TOKEN\|SECRET\|PASSWORD\|KEY\|AUTH\|CREDENTIAL\|CERT`) or whose *value* matches a high-confidence secret shape (PEM blocks, `ghp_…`, `AKIA…`, `AIza…`, JWT), minus a blueprint-named allowlist for vars the agent legitimately needs (its model API key). Transparency ([FW-TRA2](#fw-tra2)) is preserved by the allowlist; the scrub is heuristic, so it is reported Partial, never a silent over-claim. |
+| <a id="fw-env2"></a>**FW-ENV2** Default secret-shaped scrub | The default profile scrubs env vars whose *name* matches a secret shape (`TOKEN\|SECRET\|PASSWORD\|KEY\|AUTH\|CREDENTIAL\|CERT`) or whose *value* matches a high-confidence secret shape (PEM blocks, `ghp_…`, `AKIA…`, `AIza…`, JWT); git's environment-supplied configuration (`GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`) is judged per entry by its config key and value -- an `http.<url>.extraheader` or a URL carrying a password is secret -- and the surviving entries keep a matching count; minus a blueprint-named allowlist for vars the agent legitimately needs (its model API key). Transparency ([FW-TRA2](#fw-tra2)) is preserved by the allowlist; the scrub is heuristic, so it is reported Partial, never a silent over-claim. |
 
 ### 5.8 Blueprint model & format (FW-BP)
 
@@ -484,6 +484,11 @@ Confinement is setup-once plus per-operation overhead. The target keeps interact
 | Per-filesystem-op overhead (Landlock/Seatbelt) | negligible; within noise of the raw syscall |
 | Gateway round-trip added latency (granted tool) | < 2 ms over a direct backend call, local |
 | Full default-profile compile + report | < 5 ms, no kernel calls |
+| Egress tunnel grade, added time to first response byte, new connection | < 2 ms median |
+| Egress inspected grade, added time per request on a reused connection | < 1 ms median |
+| Egress inspected grade, first connection to a host (leaf minting included) | < 5 ms median |
+
+The egress rows are measured on a loopback fixture against the same client connecting directly (FEP-6 §9 f, `FW-E2E-096`): in release on every CI runner, as a 95% interval for the median added latency, against the targets scaled to the runner's speed (at most 3x).
 
 A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a small bounded overhead of its unsandboxed baseline; a sandbox that materially slows the normal build/test loop violates [FW-TRA6](#fw-tra6).
 
@@ -562,7 +567,9 @@ FidelityReport says `Partial` until the macOS characterization suite (FEP-5 §6.
 
 FEP-5's requirements (`FW-EGR7`–15, `FW-CRED10`–15, `FW-TRA9`–10, `FW-ISO10`–18, `FW-BP9`–15,
 `FW-FID8`–11, `FW-DISC12`, `FW-XR10`–11, `FW-INV13`–14) are defined in `docs/fep-5.md` and traced to
-their tests in `docs/fep-5-plan.md`. The rows below that FEP-5 amended carry its tests too.
+their tests in `docs/fep-5-plan.md`; FEP-6's (`FW-EGR16`–26, `FW-CRED16`–19, `FW-BP16`,
+`FW-FID12`–13, `FW-INV15`) are defined in `docs/fep-6.md` and traced in `docs/fep-6-plan.md`. The
+rows below that FEP-5 amended carry its tests too.
 
 | Requirement | Primary tests | Also covered by |
 |---|---|---|
@@ -656,7 +663,7 @@ their tests in `docs/fep-5-plan.md`. The rows below that FEP-5 amended carry its
 
 **Blueprint serialization format.** TOML is the shipped surface (strict, `deny_unknown_fields` as a security asset), fixed at FEP-2 planning; it fights nesting exactly where Blueprints are deepest. Revisit only with a concrete need for logic, and then by adopting an existing configuration language (§4), never authoring one.
 
-**Linux gateway egress isolation build-vs-buy.** *Narrowed by FEP-5:* the agent's egress is mediated by the connect supervisor, so a network namespace is only an optional hardening path for the gateway's own backends ([FW-GW7](#fw-gw7)). Whether that path reuses `pasta`/`slirp4netns` or drives `unshare`/nftables directly stays open.
+**Linux gateway egress isolation build-vs-buy.** *Narrowed by FEP-5:* the agent's egress is mediated by the connect supervisor, so a network namespace is only an optional hardening path for the gateway's own backends ([FW-GW7](#fw-gw7)). Whether that path reuses `pasta`/`slirp4netns` or drives `unshare`/nftables directly stays open. The egress proxy itself is built, in-process and in Rust (FEP-6 §3).
 
 **Violation streaming.** Host-scoped egress landed with FEP-5 (host rules in `rules`, through the session Gateway). Each refusal is one operator-channel line naming its reproduction ([FW-FID9](docs/fep-5.md#fw-fid9)); a real-time violation stream for embedding hosts ([FW-FID5](docs/fep-1.md#fw-fid5)) stays deferred.
 

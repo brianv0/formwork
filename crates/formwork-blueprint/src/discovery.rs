@@ -207,13 +207,15 @@ fn tag_candidate(
     }
 }
 
-/// A destination the Gateway refused as a policy decision (FW-DISC12): the host and port, and for
-/// a request refused on an inspected host, its method and canonical path.
+/// A destination the Gateway refused as a policy decision (FW-DISC12): the host and port, the
+/// refusal reason (FW-FID12), and for a request refused on an inspected host, its method and
+/// canonical path.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct EgressObservation {
     pub host: String,
     pub port: u16,
+    pub reason: crate::RefusalReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,17 +231,18 @@ pub struct EgressProposal {
 }
 
 /// FW-DISC12: refused destinations -> host rules at the grade the host already has. A host no rule
-/// names is proposed at the tunnel grade (`https:host`); a request refused on an inspected host is
-/// proposed as that method on that exact path. Metadata names and restricted addresses are never
-/// proposed (FW-EGR4), and neither is a host a `deny:` rule names -- lifting an authored deny is
-/// an authoring decision. Deterministic: deduplicated and sorted.
+/// names is proposed inspected (`allow:host`, FEP-6 §9 j); a request refused on an inspected host
+/// is proposed as that method on that exact path. Metadata names, restricted addresses and names
+/// refused for the class of address they resolved to are never proposed (FW-EGR19), and neither
+/// is a host a `deny:` rule names -- lifting an authored deny is an authoring decision.
+/// Deterministic: deduplicated and sorted.
 pub fn propose_host_rules(
     observed: &[EgressObservation],
     table: Option<&crate::HostTable>,
 ) -> EgressProposal {
     use crate::{
-        canonicalize_host, ConnectDecision, Denial, HostRule, HostTable, HttpMethod,
-        DEFAULT_HTTPS_PORT,
+        canonicalize_host, CanonicalPath, ConnectDecision, Denial, HostRule, HostTable, HttpMethod,
+        RefusalReason, DEFAULT_HTTPS_PORT,
     };
     let empty = HostTable::default();
     let table = table.unwrap_or(&empty);
@@ -249,11 +252,11 @@ pub fn propose_host_rules(
             continue;
         };
         let target = format!("{host}:{}", obs.port);
-        if host.is_restricted() {
+        if host.is_restricted() || obs.reason == RefusalReason::AddressClass {
             out.withheld.push((
                 target,
-                "a metadata, private, loopback or link-local destination is never proposed \
-                 (FW-EGR4); name it in a rule by hand if the session truly needs it"
+                "a metadata, private, loopback or special-purpose destination is never proposed \
+                 (FW-EGR19); name it in a rule by hand if the session truly needs it"
                     .to_string(),
             ));
             continue;
@@ -272,7 +275,7 @@ pub fn propose_host_rules(
                 continue;
             }
             ConnectDecision::Deny(Denial { rule: None, .. }) => {
-                HostRule::parse("https", &format!("{host}{port}"))
+                HostRule::parse("allow", &format!("{host}{port}"))
             }
             ConnectDecision::Inspect => {
                 let (Some(method), Some(path)) = (&obs.method, &obs.path) else {
@@ -283,12 +286,12 @@ pub fn propose_host_rules(
                         .push((target, format!("the method {method:?} has no rule atom")));
                     continue;
                 };
-                if !path.starts_with('/') {
+                let Ok(path) = CanonicalPath::parse(path) else {
                     continue;
-                }
+                };
                 // A requested path is a literal; `*` in it would become a glob in the rule and
                 // widen the proposal past what the session asked for.
-                if path.contains('*') {
+                if path.as_str().contains('*') {
                     out.withheld.push((
                         target,
                         format!("the path {path:?} carries `*`, which a rule would read as a glob"),
@@ -297,8 +300,7 @@ pub fn propose_host_rules(
                 }
                 HostRule::parse(method.atom(), &format!("{host}{port}{path}"))
             }
-            // Admitted already: the refusal was not a missing rule (e.g. the name resolved to a
-            // restricted address).
+            // Admitted already: the refusal was not a missing rule.
             ConnectDecision::Tunnel(_) => continue,
         };
         match rule {
@@ -528,6 +530,11 @@ mod tests {
         EgressObservation {
             host: host.into(),
             port,
+            reason: if req.is_some() {
+                crate::RefusalReason::Path
+            } else {
+                crate::RefusalReason::HostNotListed
+            },
             method: req.map(|(m, _)| m.into()),
             path: req.map(|(_, p)| p.into()),
         }
@@ -553,16 +560,20 @@ mod tests {
                 obs("metadata.google.internal", 80, None),
                 obs("evil.test", 443, None),
                 obs("api.github.com", 443, Some(("GET", "/repos/**"))),
+                EgressObservation {
+                    reason: crate::RefusalReason::AddressClass,
+                    ..obs("rebound.test", 443, None)
+                },
             ],
             Some(&table),
         );
         let rules: Vec<String> = out.rules.iter().map(|r| r.to_string()).collect();
         assert!(
-            rules.contains(&"https:blocked.test".to_string()),
+            rules.contains(&"allow:blocked.test".to_string()),
             "{rules:?}"
         );
         assert!(
-            rules.contains(&"https:registry.test:8443".to_string()),
+            rules.contains(&"allow:registry.test:8443".to_string()),
             "{rules:?}"
         );
         assert!(
@@ -577,6 +588,7 @@ mod tests {
             "{withheld:?}"
         );
         assert!(withheld.contains(&"evil.test:443"), "{withheld:?}");
+        assert!(withheld.contains(&"rebound.test:443"), "{withheld:?}");
         assert!(
             out.withheld.iter().any(|(_, why)| why.contains("glob")),
             "a literal `*` in a requested path is never proposed as a glob: {:?}",

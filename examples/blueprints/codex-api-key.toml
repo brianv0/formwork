@@ -1,6 +1,6 @@
 # codex with an API key, brokered (FEP-5 §3.2). The agent's OPENAI_API_KEY is a per-session
-# placeholder; the Gateway terminates TLS for api.openai.com (the `any:` rule inspects it, HTTPS and
-# the WebSocket transport alike), swaps in the real key on that host only, and refuses the
+# placeholder; the Gateway terminates TLS for api.openai.com (every `allow:` rule inspects its host,
+# HTTPS and the WebSocket transport alike), swaps in the real key on that host only, and refuses the
 # placeholder anywhere else. codex reads the session CA through SSL_CERT_FILE, which the Launcher
 # sets (verified with codex 0.157).
 #
@@ -13,8 +13,8 @@
 extends = ["agent-base.toml"]
 
 rules = [
-    "any:api.openai.com",
-    "https:chatgpt.com",
+    "allow:api.openai.com",
+    "allow:chatgpt.com",
 ]
 allow-credentials = ["codex", "broker:openai"]
 

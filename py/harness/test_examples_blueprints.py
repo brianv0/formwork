@@ -53,7 +53,7 @@ def test_rules_demo_compiles(cli):
     caps = json.loads(result.stdout)["per-capability"]
     assert caps["fs-read"]["status"] == "enforced"
     assert caps["exec"]["status"] == "enforced"  # readexec:/bin/** governs exec
-    assert caps["net-default-deny"]["status"] == "enforced"
+    assert caps["net-default-deny"]["status"] == "partial"  # the loopback-callback listener (FW-EGR15, C1)
 
 
 @pytest.mark.macos

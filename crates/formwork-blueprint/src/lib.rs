@@ -28,10 +28,11 @@ pub use discovery::{
     ProposalOutcome, WithheldEntry,
 };
 pub use egress::{
-    canonical_ip, canonicalize_host, canonicalize_request_path, is_restricted_ip, split_host_port,
-    split_url, target_is_host, validate_host_rules, CanonicalHost, ConnectDecision, Denial,
-    HostAccess, HostError, HostPattern, HostRule, HostTable, HttpMethod, PathGlob, RequestDecision,
-    DEFAULT_HTTPS_PORT, DEFAULT_HTTP_PORT, HTTP_ATOMS, METADATA_HOSTNAMES,
+    admit_addresses, canonical_ip, canonicalize_host, classify, is_restricted_ip, split_host_port,
+    split_url, target_is_host, validate_host_rules, AddressClass, CanonicalHost, CanonicalPath,
+    ConnectDecision, Denial, HostAccess, HostError, HostPattern, HostRule, HostTable, HttpMethod,
+    LocalAddresses, Naming, PathGlob, RefusalReason, RequestDecision, DEFAULT_HTTPS_PORT,
+    DEFAULT_HTTP_PORT, HTTP_ATOMS, METADATA_HOSTNAMES,
 };
 pub use launcher::{construct_env, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
@@ -238,7 +239,7 @@ impl EnvPosture {
                 .into_iter()
                 .filter(|(k, _)| names.iter().any(|n| n == k))
                 .collect(),
-            EnvPosture::Scrub(s) => vars.into_iter().filter(|(k, v)| s.keeps(k, v)).collect(),
+            EnvPosture::Scrub(s) => s.scrub(vars).0,
         }
     }
 
@@ -251,11 +252,7 @@ impl EnvPosture {
                 .filter(|(k, _)| !names.iter().any(|n| n == k))
                 .map(|(k, _)| k.clone())
                 .collect(),
-            EnvPosture::Scrub(s) => vars
-                .iter()
-                .filter(|(k, v)| !s.keeps(k, v))
-                .map(|(k, _)| k.clone())
-                .collect(),
+            EnvPosture::Scrub(s) => s.scrub(vars.to_vec()).1,
         }
     }
 
@@ -274,6 +271,97 @@ impl EnvPosture {
 }
 
 impl EnvScrub {
+    /// The pairs kept and the names dropped. Git's environment-supplied configuration
+    /// (`GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`) is judged per
+    /// entry -- by the config key and value, since every `GIT_CONFIG_KEY_<n>` name contains `KEY`
+    /// -- and the surviving entries are renumbered under a matching count. Judged by variable
+    /// name alone, the keys went and the count and values stayed: git refused to start, and a
+    /// value such as an `http.extraheader` credential passed through (found by `FW-E2E-094`).
+    fn scrub(&self, vars: Vec<(String, String)>) -> (Vec<(String, String)>, Vec<String>) {
+        let (git, rest): (Vec<_>, Vec<_>) =
+            vars.into_iter().partition(|(k, _)| is_git_config_env(k));
+        let mut kept = Vec::new();
+        let mut dropped = Vec::new();
+        for (k, v) in rest {
+            if self.keeps(&k, &v) {
+                kept.push((k, v));
+            } else {
+                dropped.push(k);
+            }
+        }
+        if !git.is_empty() {
+            self.scrub_git_config(git, &mut kept, &mut dropped);
+        }
+        (kept, dropped)
+    }
+
+    fn scrub_git_config(
+        &self,
+        git: Vec<(String, String)>,
+        kept: &mut Vec<(String, String)>,
+        dropped: &mut Vec<String>,
+    ) {
+        let vars: BTreeMap<String, String> = git.into_iter().collect();
+        // Without a count git reads none of it, and with an unparseable one it refuses to start.
+        let Some(count) = vars
+            .get("GIT_CONFIG_COUNT")
+            .and_then(|c| c.trim().parse::<usize>().ok())
+        else {
+            dropped.extend(vars.into_keys());
+            return;
+        };
+        let mut entries = Vec::new();
+        let mut judged = std::collections::BTreeSet::from(["GIT_CONFIG_COUNT".to_string()]);
+        for n in 0..count {
+            let (key_name, value_name) = (
+                format!("GIT_CONFIG_KEY_{n}"),
+                format!("GIT_CONFIG_VALUE_{n}"),
+            );
+            let entry = (vars.get(&key_name), vars.get(&value_name));
+            let keep = match entry {
+                (Some(key), Some(value)) => {
+                    self.keeps_git_entry(&key_name, &value_name, key, value)
+                }
+                // git refuses a count its keys do not reach.
+                _ => false,
+            };
+            match entry {
+                (Some(key), Some(value)) if keep => entries.push((key.clone(), value.clone())),
+                _ => dropped.extend(
+                    [&key_name, &value_name]
+                        .into_iter()
+                        .filter(|n| vars.contains_key(n.as_str()))
+                        .cloned(),
+                ),
+            }
+            judged.insert(key_name);
+            judged.insert(value_name);
+        }
+        // Entries past the count, which git ignores.
+        dropped.extend(vars.keys().filter(|k| !judged.contains(*k)).cloned());
+        if entries.is_empty() {
+            dropped.push("GIT_CONFIG_COUNT".into());
+            return;
+        }
+        kept.push(("GIT_CONFIG_COUNT".into(), entries.len().to_string()));
+        for (n, (key, value)) in entries.into_iter().enumerate() {
+            kept.push((format!("GIT_CONFIG_KEY_{n}"), key));
+            kept.push((format!("GIT_CONFIG_VALUE_{n}"), value));
+        }
+    }
+
+    /// One git config entry: the operator's `allow`/`deny` names first, then the entry's own shape.
+    fn keeps_git_entry(&self, key_name: &str, value_name: &str, key: &str, value: &str) -> bool {
+        let named = |list: &[String]| list.iter().any(|n| n == key_name || n == value_name);
+        if named(&self.allow) {
+            true
+        } else if named(&self.deny) {
+            false
+        } else {
+            !git_config_is_secret(key, value)
+        }
+    }
+
     fn keeps(&self, name: &str, value: &str) -> bool {
         if self.allow.iter().any(|n| n == name) {
             true
@@ -320,6 +408,34 @@ fn env_is_secret_shaped(name: &str, value: &str) -> bool {
         return true;
     }
     env_value_is_secret(value)
+}
+
+fn is_git_config_env(name: &str) -> bool {
+    name == "GIT_CONFIG_COUNT"
+        || name.starts_with("GIT_CONFIG_KEY_")
+        || name.starts_with("GIT_CONFIG_VALUE_")
+}
+
+/// A git config entry is secret-shaped by the FW-ENV2 rule applied to the entry: a secret marker
+/// in its config key (`credential.helper`, `http.sslKey`), a secret-shaped value -- plus the two
+/// ways git carries a credential in config: an HTTP header (`http.<url>.extraheader`) and a URL
+/// with a password in it (`url.<base>.insteadOf`).
+fn git_config_is_secret(key: &str, value: &str) -> bool {
+    env_is_secret_shaped(key, value)
+        || key.to_ascii_lowercase().ends_with(".extraheader")
+        || url_has_password(key)
+        || url_has_password(value)
+}
+
+/// `scheme://user:password@host...`: a userinfo with a password part.
+fn url_has_password(v: &str) -> bool {
+    let Some((_, rest)) = v.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| userinfo.contains(':'))
 }
 
 fn env_value_is_secret(v: &str) -> bool {
@@ -889,6 +1005,104 @@ mod tests {
         assert!(dropped.contains(&"AWS_SECRET_ACCESS_KEY".to_string()));
         assert!(dropped.contains(&"DEPLOY".to_string()));
         assert!(dropped.contains(&"EDITOR".to_string()));
+    }
+
+    #[test]
+    fn env_scrub_judges_git_config_per_entry_and_renumbers() {
+        // Found by FW-E2E-094: judged by variable name, every GIT_CONFIG_KEY_<n> went (it contains
+        // KEY) while the count and values stayed, so git refused to start.
+        let scrub = EnvPosture::Scrub(EnvScrub::default());
+        let vars = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let env = vars(&[
+            ("PATH", "/usr/bin"),
+            ("GIT_CONFIG_COUNT", "4"),
+            ("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader"),
+            (
+                "GIT_CONFIG_VALUE_0",
+                "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0",
+            ),
+            ("GIT_CONFIG_KEY_1", "safe.directory"),
+            ("GIT_CONFIG_VALUE_1", "*"),
+            (
+                "GIT_CONFIG_KEY_2",
+                "url.https://bot:hunter2@git.example/.insteadOf",
+            ),
+            ("GIT_CONFIG_VALUE_2", "https://git.example/"),
+            ("GIT_CONFIG_KEY_3", "user.name"),
+            ("GIT_CONFIG_VALUE_3", "Formwork Test"),
+        ]);
+        let mut kept = scrub.apply(env.clone());
+        kept.sort();
+        assert_eq!(
+            kept,
+            vars(&[
+                ("GIT_CONFIG_COUNT", "2"),
+                ("GIT_CONFIG_KEY_0", "safe.directory"),
+                ("GIT_CONFIG_KEY_1", "user.name"),
+                ("GIT_CONFIG_VALUE_0", "*"),
+                ("GIT_CONFIG_VALUE_1", "Formwork Test"),
+                ("PATH", "/usr/bin"),
+            ])
+        );
+        let mut dropped = scrub.dropped_names(&env);
+        dropped.sort();
+        assert_eq!(
+            dropped,
+            [
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_KEY_2",
+                "GIT_CONFIG_VALUE_0",
+                "GIT_CONFIG_VALUE_2"
+            ]
+        );
+
+        // Nothing left: the count goes too. A count git cannot read, or entries without one, go
+        // whole.
+        let all_secret = vars(&[
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "credential.helper"),
+            ("GIT_CONFIG_VALUE_0", "store"),
+        ]);
+        assert!(scrub.apply(all_secret).is_empty());
+        for broken in [
+            vars(&[
+                ("GIT_CONFIG_COUNT", "two"),
+                ("GIT_CONFIG_KEY_0", "user.name"),
+                ("GIT_CONFIG_VALUE_0", "x"),
+            ]),
+            vars(&[
+                ("GIT_CONFIG_KEY_0", "user.name"),
+                ("GIT_CONFIG_VALUE_0", "x"),
+            ]),
+            vars(&[("GIT_CONFIG_COUNT", "2"), ("GIT_CONFIG_KEY_0", "user.name")]),
+        ] {
+            assert!(scrub.apply(broken.clone()).is_empty(), "{broken:?}");
+        }
+
+        // The operator's names still win: an allowed entry is kept whatever it holds.
+        let allowed = EnvPosture::Scrub(EnvScrub {
+            allow: vec!["GIT_CONFIG_KEY_0".into()],
+            deny: vec![],
+        });
+        let mut kept = allowed.apply(vars(&[
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "credential.helper"),
+            ("GIT_CONFIG_VALUE_0", "store"),
+        ]));
+        kept.sort();
+        assert_eq!(
+            kept,
+            vars(&[
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "credential.helper"),
+                ("GIT_CONFIG_VALUE_0", "store"),
+            ])
+        );
     }
 
     #[test]

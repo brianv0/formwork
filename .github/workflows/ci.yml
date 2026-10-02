@@ -1,4 +1,5 @@
-# Continuous integration: format, lint, and test the workspace on every push to main and every PR.
+# Continuous integration: format, lint, and test the workspace on every push to main or an agent
+# branch and every PR.
 # Uses only first-party `actions/*` and the runner's preinstalled rustup — no third-party actions,
 # to keep the supply-chain surface of a sandboxing tool minimal (constitution: enforcement is real,
 # not assumed). Release artifacts are built separately in release.yml.
@@ -6,8 +7,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Agent branches run CI on every push, so platform work (macOS above all, which no agent
+    # container can run) is verified on real runners before a pull request exists.
+    branches: [main, "claude/**"]
   pull_request:
+  workflow_dispatch:
 
 # Least privilege: CI only reads the repo.
 permissions:
@@ -77,6 +81,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y strace dbus libglib2.0-bin xvfb curl
 
+      # The FW-E2E-094 client matrix drives Go and uv clients; Go is in the runner's tool cache but
+      # not on PATH, and uv comes from the runner's preinstalled `pipx` (not a third-party action).
+      - name: Put Go and uv on PATH
+        shell: bash
+        run: |
+          go_bin=$(ls -d "$RUNNER_TOOL_CACHE"/go/*/*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -n "$go_bin" ]; then echo "$go_bin" >> "$GITHUB_PATH"; fi
+          pipx install uv
+
       - name: Build
         run: cargo build --workspace --locked
 
@@ -84,18 +97,47 @@ jobs:
       # fails instead of skipping (FEP-5 §6.1) -- a skipped platform test is a claim, not a
       # verification. It also covers the README quickstart (D1) and the agent examples starting
       # under the baseline (FW-E2E-084).
+      # --no-fail-fast: every test binary runs, so one run reports every failure on the platform;
+      # the summary step repeats each failure at the end of the log, where it is read first.
+      # A hung test fails the step (the summary below then names it) instead of holding the runner.
       - name: Test
-        run: cargo test --workspace --locked
+        shell: bash
+        timeout-minutes: 25
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test.log"
         env:
           FW_REQUIRE_EXERCISED: "1"
 
+      # FW-E2E-094: the client matrix, recorded in the log on each OS (FEP-6 §4.11).
+      - name: Client matrix (recorded)
+        shell: bash
+        run: |
+          cargo test -p formwork-cli --test fep6_run --locked fw_e2e_094 -- --nocapture 2>&1 \
+            | sed -n '/client matrix:/,/^test /p'
+
+      # FW-E2E-096 (the latency budget, FEP-6 §9 f) and FW-E2E-093 (streamed events within 20 ms),
+      # in release, one at a time, on their own. Each decides on a 95% interval for its statistic
+      # against a budget scaled to this runner by a calibration workload (capped at 3x); the
+      # reports print on every run.
+      - name: Latency budgets (FW-E2E-093, FW-E2E-096)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release -p formwork-gateway --test latency --locked -- --ignored --nocapture --test-threads=1 2>&1 \
+            | grep -v -E '^\s+(Compiling|Downloaded|Downloading) '
+
+      - name: Test failure summary
+        if: failure()
+        shell: bash
+        run: grep -E -A20 '^---- |^test .* FAILED$|targets? failed|running for over' "$RUNNER_TEMP/test.log" | head -600
+
       # The Python black-box harness drives the built `formwork` binary at the outermost real
       # boundary; platform-inappropriate tests skip via markers (macOS Seatbelt vs Linux Landlock),
-      # so each OS runs exactly what it can enforce. `uv` comes via the runner's preinstalled `pipx`
-      # (not a third-party action), matching the Dockerfile's uv-managed harness.
-      - name: Install uv
-        run: pipx install uv
-
+      # so each OS runs exactly what it can enforce. `uv`, installed above, matches the
+      # Dockerfile's uv-managed harness.
       - name: Python E2E harness
         working-directory: py
         run: uv run pytest -q
@@ -124,10 +166,15 @@ jobs:
 
   # FW-E2E-084 with real agents: install Claude Code, codex and opencode from npm (network, like
   # mcp-integration) and run each one's non-interactive smoke command under `learn` with its shipped
-  # blueprints; the run must propose nothing the example does not document.
+  # blueprints; the run must propose nothing the example does not document. On macOS the job also
+  # records Claude Code's keychain use (FEP-5 §6.3 C9).
   agent-examples:
-    name: agent examples
-    runs-on: ubuntu-22.04
+    name: agent examples (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v4
 
@@ -135,15 +182,27 @@ jobs:
         with:
           cache-prefix: agents
 
-      - name: Install strace and the agents
-        run: |
-          sudo apt-get update && sudo apt-get install -y strace
-          npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
+      - name: Install strace
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y strace
+
+      - name: Install the agents
+        run: npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
 
       - name: Agent examples under the baseline
+        timeout-minutes: 10
         run: cargo test -p formwork-cli --test fep5_run --locked fw_e2e_084 -- --nocapture
         env:
           FW_REQUIRE_EXERCISED: "1"
+          FW_AGENTS_INSTALLED: "1"
+
+      - name: Claude Code's keychain use (C9)
+        timeout-minutes: 10
+        if: runner.os == 'macOS' && !cancelled()
+        run: cargo test -p formwork-cli --test fep5_macos --locked c9_ -- --nocapture
+        env:
+          FW_REQUIRE_EXERCISED: "1"
+          FW_AGENTS_INSTALLED: "1"
 
   # Enforce the declared MSRV (Cargo.toml `rust-version`). Without this the pin is documentation
   # only: every other job uses stable, so post-1.85 code could merge green while violating it.

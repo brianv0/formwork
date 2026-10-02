@@ -31,3 +31,7 @@ libc = { workspace = true }
 # The black-box gateway test drives the `formwork` binary as an async MCP host; the product CLI
 # itself links no runtime (constitution Layers: tokio lives only in formwork-gateway).
 tokio = { workspace = true }
+# A TLS fixture upstream for the inspected-egress run tests; already in the tree through
+# formwork-gateway, so the test build adds no crate.
+rcgen = { workspace = true }
+rustls = { workspace = true }

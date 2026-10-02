@@ -93,7 +93,7 @@ fn policy(work: &Path, literal_grants: &[&Path]) -> CompiledPolicy {
             .writes
             .push(PathPattern::parse(g.to_str().unwrap()).unwrap());
     }
-    let rule: HostRule = serde_json::from_str("\"https:allowed.test\"").unwrap();
+    let rule: HostRule = serde_json::from_str("\"tunnel:allowed.test\"").unwrap();
     bp.net = NetPosture::AllowHosts(HostTable::new(vec![rule]));
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     formwork_compile::compile(

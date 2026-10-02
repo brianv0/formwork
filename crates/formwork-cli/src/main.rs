@@ -450,6 +450,14 @@ fn main() -> Result<()> {
     if let Some(code) = formwork_confine::isolation_stage() {
         std::process::exit(code);
     }
+    // FW-CRED16 / FW-ISO16 on macOS: a confined workload reads same-uid environments through
+    // kern.procargs2, which Seatbelt does not mediate, and this process's holds the operator's
+    // credentials. Single-threaded here: nothing else has started.
+    #[cfg(target_os = "macos")]
+    // SAFETY: first thing in main, before any thread or environment pointer exists.
+    unsafe {
+        formwork_confine::conceal_environment();
+    }
     take_learning_report_fd();
     init_telemetry();
     let cli = parse_cli();
@@ -750,8 +758,8 @@ fn explain_url(
         formwork_blueprint::split_url(url).map_err(|e| anyhow!("explain: {e}"))?;
     let host =
         formwork_blueprint::canonicalize_host(raw_host).map_err(|e| anyhow!("{url}: {e}"))?;
-    let path = formwork_blueprint::canonicalize_request_path(raw_path)
-        .map_err(|e| anyhow!("{url}: {e}"))?;
+    let path =
+        formwork_blueprint::CanonicalPath::parse(raw_path).map_err(|e| anyhow!("{url}: {e}"))?;
     let empty = formwork_blueprint::HostTable::default();
     let table = blueprint.net.host_table().unwrap_or(&empty);
     let source_of = |rule: Option<&formwork_blueprint::HostRule>| {
@@ -783,7 +791,8 @@ fn explain_url(
             out.source = source_of(Some(rule));
             out.rule = Some(rule.to_string());
             out.reason = Some(
-                "admitted at CONNECT by host and port; the request itself is opaque (FW-EGR5)"
+                "forwarded after the ClientHello's server name matches the host (FW-EGR16); the \
+                 request itself is opaque (FW-EGR5)"
                     .to_string(),
             );
         }
@@ -801,10 +810,14 @@ fn explain_url(
                 });
             }
         }
-        ConnectDecision::Deny(Denial { reason, rule }) => {
+        ConnectDecision::Deny(Denial {
+            reason,
+            detail,
+            rule,
+        }) => {
             out.source = source_of(rule);
             out.rule = rule.map(|r| r.to_string());
-            out.reason = Some(reason);
+            out.reason = Some(format!("{reason}: {detail}"));
         }
     }
     Ok(out)
@@ -814,6 +827,31 @@ fn explain_url(
 fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
     let resolved = args.resolve()?;
     let (blueprint, provenance) = args.load_with_provenance(&resolved.path, &home())?;
+    let upstream = upstream_proxy()?;
+    // FW-EGR26: a name the upstream proxy carries is resolved there, so its addresses are not
+    // classified here.
+    let classification = |host: &formwork_blueprint::HostPattern, tls: bool| {
+        let name = match host {
+            formwork_blueprint::HostPattern::Exact(n)
+            | formwork_blueprint::HostPattern::Wildcard(n) => {
+                formwork_blueprint::CanonicalHost::Name(n.clone())
+            }
+            formwork_blueprint::HostPattern::Ip(_) => {
+                return serde_json::json!({ "verdict": "enforced" })
+            }
+        };
+        match upstream.as_ref().and_then(|u| u.endpoint_for(&name, tls)) {
+            Some(proxy) => serde_json::json!({
+                "verdict": "partial",
+                "reason": format!(
+                    "egress to {host} goes through the upstream proxy {}, which resolves the name; \
+                     its addresses are not classified here (FW-EGR26)",
+                    proxy.describe()
+                ),
+            }),
+            None => serde_json::json!({ "verdict": "enforced" }),
+        }
+    };
     let rules: Vec<serde_json::Value> = blueprint
         .net
         .host_table()
@@ -838,6 +876,7 @@ fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
                         .unwrap_or_else(|| "(all)".into()),
                 ),
             };
+            let tls = r.port != Some(formwork_blueprint::DEFAULT_HTTP_PORT);
             serde_json::json!({
                 "rule": r.to_string(),
                 "host": r.host.to_string(),
@@ -846,13 +885,19 @@ fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
                 "methods": methods,
                 "paths": path,
                 "broker": serde_json::Value::Null,
+                "classification": classification(&r.host, tls),
                 "source": provenance.host_rule_source(r),
                 "layer": provenance.host_rule_source(r).map(render::source),
             })
         })
         .collect();
     if json {
-        let mut value = serde_json::json!({ "net": blueprint.net, "hosts": rules });
+        let mut value = serde_json::json!({
+            "net": blueprint.net,
+            "hosts": rules,
+            "upstream-trust": formwork_gateway::native_roots_source(),
+            "upstream-proxy": upstream.as_ref().map(|u| u.describe()),
+        });
         attach_blueprint_info(&mut value, &resolved);
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
@@ -956,14 +1001,18 @@ struct Session {
     /// Pathname sockets the connect supervisor refused (FW-DISC12).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     refused_sockets: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    /// The tag this session's macOS denies carry into the unified log (FW-DISC2).
+    deny_tag: Option<String>,
 }
 
 /// A host-scoped session's egress door: the in-process Gateway listener and, on Linux, the port
-/// registry the connect supervisor fills (FW-EGR9).
+/// registry the connect supervisor fills, or on macOS the marker its peer check asks for (FW-EGR9).
 struct Egress {
     proxy: formwork_gateway::EgressProxy,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     registry: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>>,
+    /// The marker the session's profile carries for the macOS peer check (FW-EGR9).
+    marker: formwork_compile::SessionMarker,
 }
 
 /// What a session is prepared for: which postures can carry host-scoped egress differs (FEP-5
@@ -1169,10 +1218,21 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
         None => (Vec::new(), None, Vec::new()),
     };
     let egress = start_egress(&blueprint, &host, purpose, inspection, brokers)?;
-    let gateway_port = egress.as_ref().map(|e| e.proxy.addr().port());
-    let policy = formwork_compile::compile_for_session(&blueprint, &host, &catalog, gateway_port);
+    let spec = formwork_compile::SessionSpec {
+        gateway: egress.as_ref().map(|e| formwork_compile::SessionGateway {
+            port: e.proxy.addr().port(),
+            marker: e.marker.clone(),
+        }),
+        // FW-DISC2 on macOS: the unified log carries every sandboxed process's records; the tag
+        // lets `learn` keep this session's.
+        deny_tag: (host.os == formwork_detect::Os::MacOs && purpose == Purpose::Spawn)
+            .then(|| session_nonce().map(|n| format!("fw-session-{}", &n[..16])))
+            .transpose()?,
+    };
+    let policy = formwork_compile::compile_for_session(&blueprint, &host, &catalog, &spec);
     itemize_credential_floor(&policy.report, &catalog);
     Ok(Session {
+        deny_tag: spec.deny_tag,
         blueprint,
         catalog,
         policy,
@@ -1208,7 +1268,7 @@ struct PreparedInspection {
 }
 
 /// Clients that honor one of these read the trust bundle; the list is the common set across
-/// OpenSSL, Node, Python requests, curl, git, and pip (FW-EGR13).
+/// OpenSSL, Node, Python requests, curl, git, pip and cargo (FW-EGR13).
 const TRUST_VARS: &[&str] = &[
     "SSL_CERT_FILE",
     "NODE_EXTRA_CA_CERTS",
@@ -1216,6 +1276,7 @@ const TRUST_VARS: &[&str] = &[
     "CURL_CA_BUNDLE",
     "GIT_SSL_CAINFO",
     "PIP_CERT",
+    "CARGO_HTTP_CAINFO",
 ];
 
 /// FW-EGR13 / FW-CRED11-14: when any host rule is inspected, mint the session CA, write the trust
@@ -1238,8 +1299,15 @@ fn prepare_inspection(
     let plans =
         formwork_blueprint::resolve_brokers(&blueprint.allow_credentials, catalog, Some(table))
             .map_err(|errors| anyhow!("allow-credentials:\n  {}", errors.join("\n  ")))?;
-    let ca = formwork_gateway::SessionCa::generate().context("generating the session CA")?;
+    // FW-EGR25: the CA may certify exactly the hosts the blueprint inspects.
+    let ca = formwork_gateway::SessionCa::generate(&table.inspected_hosts())
+        .context("generating the session CA")?;
     let roots = formwork_gateway::native_roots();
+    tracing::info!(
+        source = %formwork_gateway::native_roots_source(),
+        roots = roots.len(),
+        "upstream trust store (FW-EGR24)"
+    );
     let trust_dir = tmp.sibling("trust")?;
     let file = trust_dir.join("ca-bundle.pem");
     write_launcher_file(&file, ca.trust_bundle(&roots).as_bytes(), 0o400)?;
@@ -1251,6 +1319,11 @@ fn prepare_inspection(
         .collect();
     tracing::info!(bundle = %file, "inspection trust bundle");
 
+    if !plans.is_empty() {
+        // FW-CRED16: this process's environment already holds the credentials it will broker.
+        formwork_confine::deny_inspection_of_self()
+            .context("protecting the brokered credentials")?;
+    }
     let mut brokers = Vec::new();
     for plan in plans {
         let Some((var, secret)) = plan.env_sources.iter().find_map(|v| {
@@ -1267,7 +1340,12 @@ fn prepare_inspection(
                 plan.name
             );
         };
-        let placeholder = format!("fwcred-{}-{}", plan.name, session_nonce()?);
+        let placeholder = format!(
+            "{}{}-{}",
+            formwork_gateway::PLACEHOLDER_PREFIX,
+            plan.name,
+            session_nonce()?
+        );
         tracing::info!(credential = %plan.name, var = %var, "brokered; the session holds a placeholder");
         env.push((var.clone(), placeholder.clone()));
         brokers.push(formwork_gateway::Broker {
@@ -1319,25 +1397,77 @@ fn start_egress(
     }
     let registry = (host.os == formwork_detect::Os::Linux)
         .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())));
+    let marker = formwork_compile::SessionMarker::new(&session_nonce()?);
+    let peer_check = peer_check(&marker);
+    let host_addresses = formwork_detect::interface_addresses().unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            "enumerating the host's interface addresses failed; the other address classes still \
+             apply (FW-EGR19)"
+        );
+        Vec::new()
+    });
     let proxy = formwork_gateway::EgressProxy::start(formwork_gateway::EgressConfig {
         table: table.clone(),
         resolver: formwork_gateway::Resolver::System,
         admission: formwork_gateway::Admission {
             credential: session_nonce()?,
             registry: registry.clone(),
+            peer_check,
         },
         inspection,
         brokers,
+        host_addresses,
+        upstream_proxy: upstream_proxy()?,
     })
     .context("starting the Gateway egress listener")?;
     for rule in &table.rules {
         tracing::info!(rule = %rule, "egress host rule");
     }
-    Ok(Some(Egress { proxy, registry }))
+    Ok(Some(Egress {
+        proxy,
+        registry,
+        marker,
+    }))
 }
 
-/// Variables the Launcher sets after the posture ran (FW-TRA10, FEP-5 §3.1): the session temp
-/// directory and, under host rules, the proxy that reaches the Gateway.
+/// FW-EGR9 on macOS: the listener admits a connection only when a process carrying the session's
+/// marker holds its client end. Linux has the supervisor's registry instead.
+#[cfg(target_os = "macos")]
+fn peer_check(marker: &formwork_compile::SessionMarker) -> Option<formwork_gateway::PeerCheck> {
+    let marker = marker.clone();
+    Some(formwork_gateway::PeerCheck(std::sync::Arc::new(
+        move |peer, local| formwork_confine::session_holds_connection(&marker, peer, local),
+    )))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn peer_check(_marker: &formwork_compile::SessionMarker) -> Option<formwork_gateway::PeerCheck> {
+    None
+}
+
+/// FW-EGR26: the operator's upstream proxy, read from `formwork run`'s own environment -- never
+/// the session's, which the Launcher points at the Gateway. The lowercase spelling wins, as curl
+/// reads it.
+fn upstream_proxy() -> Result<Option<formwork_gateway::UpstreamProxy>> {
+    let var = |lower: &str, upper: &str| {
+        std::env::var(lower)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var(upper).ok())
+    };
+    formwork_gateway::UpstreamProxy::from_values(
+        var("https_proxy", "HTTPS_PROXY").as_deref(),
+        var("http_proxy", "HTTP_PROXY").as_deref(),
+        var("no_proxy", "NO_PROXY").as_deref(),
+    )
+    .map_err(|e| anyhow!("{e}"))
+}
+
+/// Variables the Launcher sets after the posture ran (FW-TRA10, FEP-5 §3.1, FEP-6 §4.11): the
+/// session temp directory and, under host rules, the proxy that reaches the Gateway, in both
+/// spellings (curl reads `http_proxy` only in lowercase), an empty `no_proxy`, and Node's opt-in
+/// to the proxy variables.
 fn session_env(session: &Session) -> Vec<(String, String)> {
     let tmp = session.tmp_dir.path.display().to_string();
     let mut vars: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
@@ -1364,6 +1494,22 @@ fn session_env(session: &Session) -> Vec<(String, String)> {
         }
         for var in ["NO_PROXY", "no_proxy"] {
             vars.push((var.to_string(), String::new()));
+        }
+        vars.push(("NODE_USE_ENV_PROXY".to_string(), "1".to_string()));
+        // npm reads its own config variables, in any case, before the proxy variables; an
+        // inherited one would send npm around the Gateway, where the supervisor refuses it.
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy().into_owned();
+            let value = match name.to_ascii_lowercase().as_str() {
+                "npm_config_proxy" | "npm_config_https_proxy" => url.clone(),
+                "npm_config_noproxy" => String::new(),
+                _ => continue,
+            };
+            tracing::info!(
+                var = %name,
+                "overriding an inherited npm proxy setting with the session Gateway"
+            );
+            vars.push((name, value));
         }
     }
     vars.extend(session.egress_env.iter().cloned());
@@ -1553,6 +1699,11 @@ fn spawn_confined_child(
     let status = child.wait();
     session.tmp_dir.remove();
     let status = status.context("waiting for the confined command")?;
+    // The opener logs each URL from its own thread; let it drain before the session ends, or the
+    // line for a URL handed over just before the workload exited races this process's exit.
+    if let Some(service) = session.opener.as_ref().and_then(|o| o.service.as_ref()) {
+        service.records_within(std::time::Duration::from_millis(500));
+    }
     log_exit("confined command exited", &status);
     if let Some(egress) = &session.egress {
         if !egress.proxy.is_alive() {
@@ -1598,6 +1749,18 @@ fn session_observations(session: &Session) -> learn::SessionObservations {
             .violations()
             .into_iter()
             .filter_map(|v| v.need)
+            .collect();
+        obs.tunnel_candidates = egress
+            .proxy
+            .ca_rejections()
+            .into_iter()
+            .map(|(host, port)| {
+                if port == formwork_blueprint::DEFAULT_HTTPS_PORT {
+                    format!("tunnel:{host}")
+                } else {
+                    format!("tunnel:{host}:{port}")
+                }
+            })
             .collect();
     }
     if let Some(service) = session.opener.as_ref().and_then(|o| o.service.as_ref()) {
@@ -1760,11 +1923,14 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
             tracing::info!(
                 "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
             );
-            let started = std::time::Instant::now();
+            let feed = learn::UnifiedLogFeed::start();
             let (program, args) = argv.split_first().expect("argv is non-empty");
             let status = spawn_confined_child(&mut session, program, args)?;
-            let observations = session_observations(&session);
-            let records = learn::collect_denials_quiescent(started)?;
+            let mut observations = session_observations(&session);
+            let messages =
+                learn::this_session(feed.collect_quiescent()?, session.deny_tag.as_deref());
+            learn::service_observations(&messages, &session.catalog, &mut observations);
+            let records = learn::fs_denials(&messages);
             learn::conclude_learning_run(
                 &session.blueprint,
                 &session.blueprint_path,
