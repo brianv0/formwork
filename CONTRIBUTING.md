@@ -30,6 +30,16 @@ and let CI cover the rest. Docker's own seccomp profile and AppArmor are disable
 container (`just test-linux`) because the default seccomp profile allowlisted the `landlock_*`
 syscalls only recently and AppArmor can shadow a Landlock denial with its own.
 
+`main` is verified once more, on every push and nightly, by `.github/workflows/e2e-verify.yml`:
+the whole suite, the networked MCP test and the latency budgets on every release platform (Linux
+and macOS, x86_64 and arm64), decided by `py/e2e_matrix.py` against `formwork.md`. A §7 test that
+is not on §10's not-yet-implemented list must pass on each OS its title names, and a test that
+skipped at runtime counts as not run. The run summary carries the test × platform matrix. To
+reproduce one column locally, put `formwork explain --json` (as `host.json`), `cargo test
+--workspace -- --show-output` (as `cargo-test.log`) and the harness run with
+`FW_E2E_RESULTS=<dir>/pytest.json` in one directory under `results/`, then run
+`python3 py/e2e_matrix.py --results results`.
+
 ## Making a change
 
 1. Branch from `main`.

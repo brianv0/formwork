@@ -154,8 +154,8 @@ async fn fw_adv_017_traversal_against_an_inspected_rule() {
     assert!(s.up.seen().is_empty(), "{:?}", s.up.seen());
 }
 
-/// FW-EGR10: the Host header and the server name must match the CONNECT target; a mismatched
-/// server name is refused before any certificate is presented (FW-ADV-022's name disagreements).
+/// FW-EGR10 / FW-ADV-022: the Host header and the server name must match the CONNECT target; a
+/// mismatched server name is refused before any certificate is presented.
 #[tokio::test(flavor = "multi_thread")]
 async fn fw_egr10_host_and_sni_must_agree_with_the_target() {
     let s = inspected(&["allow:api.test:{port}"], vec![]).await;
@@ -177,8 +177,8 @@ async fn fw_egr10_host_and_sni_must_agree_with_the_target() {
     );
 }
 
-/// FW-EGR20: an inspected host offers only `http/1.1`; a ClientHello whose ALPN list excludes it
-/// is refused, and one that offers both negotiates HTTP/1.1 (FW-ADV-022's `h2`-only case).
+/// FW-EGR20 / FW-ADV-022: an inspected host offers only `http/1.1`; a ClientHello whose ALPN list
+/// excludes it is refused, and one that offers both negotiates HTTP/1.1.
 #[tokio::test(flavor = "multi_thread")]
 async fn fw_egr20_inspected_hosts_speak_http_1_1_only() {
     let s = inspected(&["allow:api.test:{port}"], vec![]).await;

@@ -1,0 +1,221 @@
+# End-to-end verification of `main` on every platform Formwork ships for, decided against the spec.
+#
+# ci.yml gates each change on the platforms an agent branch can afford. This workflow answers a
+# different question about what is on `main`: does every end-to-end test formwork.md section 7
+# claims is implemented actually run and pass on the OS families its title names? A `cargo test`
+# skip still prints `ok`, so a green job proves only that nothing failed; here each platform keeps
+# its raw results, and the `verdict` job (py/e2e_matrix.py) maps every executed test to its
+# FW-E2E/FW-ADV IDs and fails on:
+#   * a platform that left no results;
+#   * a failed test;
+#   * a test that skipped at runtime (it did not exercise its mechanism);
+#   * a section 7 test, neither retired nor on section 10's not-yet-implemented list, with no
+#     passing test on a family its title names (`(both)` = Linux and macOS).
+# The verdict and the full test x platform matrix land in the run summary and the `verdict`
+# artifact.
+#
+# Platforms: the four release slices (release.yml), so no shipped binary goes unverified -- the
+# seccomp filters and the connect supervisor's audit-arch check are per-architecture -- plus the
+# images whose behaviour differs: ubuntu-24.04 restricts unprivileged user namespaces through
+# AppArmor (the `isolate` refusal path, FEP-5 §6.2), and macos-15 beside macos-14 because Seatbelt
+# service names change across releases.
+#
+# Triggers: every push to main, and nightly, because runner images and kernels change under an
+# unchanged main. Only first-party actions/* are used (ci.yml's supply-chain rule).
+name: E2E verify
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The newest main supersedes an older in-flight verification; its verdict covers both.
+concurrency:
+  group: e2e-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The platform list, stated once: the matrix below and the verdict's expected-results check
+  # both read it, so a platform that never reports cannot pass unnoticed.
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    outputs:
+      platforms: ${{ steps.plan.outputs.platforms }}
+      names: ${{ steps.plan.outputs.names }}
+    steps:
+      - id: plan
+        shell: bash
+        # `agents`: the runners where the agent-examples job of ci.yml installs Claude Code, codex
+        # and opencode; FW-E2E-084 there treats a missing agent as a failure.
+        run: |
+          platforms='[
+            {"name": "linux-x64-22.04",   "runner": "ubuntu-22.04",     "agents": true},
+            {"name": "linux-x64-24.04",   "runner": "ubuntu-24.04",     "agents": false},
+            {"name": "linux-arm64-22.04", "runner": "ubuntu-22.04-arm", "agents": false},
+            {"name": "linux-arm64-24.04", "runner": "ubuntu-24.04-arm", "agents": false},
+            {"name": "macos-arm64-14",    "runner": "macos-14",         "agents": false},
+            {"name": "macos-arm64-15",    "runner": "macos-15",         "agents": true},
+            {"name": "macos-x64-15",      "runner": "macos-15-intel",   "agents": false}
+          ]'
+          echo "platforms=$(jq -c . <<<"$platforms")" >> "$GITHUB_OUTPUT"
+          echo "names=$(jq -r '[.[].name] | join(",")' <<<"$platforms")" >> "$GITHUB_OUTPUT"
+
+  platform:
+    name: ${{ matrix.name }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.platforms) }}
+    env:
+      RESULTS: ${{ github.workspace }}/e2e-results/${{ matrix.name }}
+      # A test that cannot exercise its mechanism fails instead of skipping (FEP-5 §6.1). The Rust
+      # tests that skip without consulting it still print `skipping:`, which the verdict counts.
+      FW_REQUIRE_EXERCISED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-prefix: e2e-${{ matrix.name }}
+
+      # strace: the Linux learn feed. dbus, gdbus and Xvfb: the session-bus and display fixtures
+      # (FW-E2E-082, FW-E2E-087). curl: the egress probes. Same set as ci.yml.
+      - name: Install Linux test fixtures
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y strace dbus libglib2.0-bin xvfb curl
+
+      # Go for the FW-E2E-094 client matrix (in the tool cache, not on PATH; absent clients are
+      # recorded as absent), uv for the harness. The arm64 images may lack pipx.
+      - name: Put Go and uv on PATH
+        shell: bash
+        run: |
+          go_bin=$(ls -d "$RUNNER_TOOL_CACHE"/go/*/*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -n "$go_bin" ]; then echo "$go_bin" >> "$GITHUB_PATH"; fi
+          if command -v pipx >/dev/null; then
+            pipx install uv
+          else
+            python3 -m pip install --user --break-system-packages uv
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install the agents
+        if: matrix.agents
+        run: npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Record the host profile
+        shell: bash
+        run: |
+          mkdir -p "$RESULTS"
+          target/debug/formwork explain --json | tee "$RESULTS/host.json"
+
+      # `--show-output` keeps each passing test's captured output in the log; that is where a
+      # test that returned early says `skipping:`.
+      - name: Rust tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        timeout-minutes: 30
+        env:
+          FW_AGENTS_INSTALLED: ${{ matrix.agents && '1' || '' }}
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked --no-fail-fast -- --show-output 2>&1 \
+            | tee "$RESULTS/cargo-test.log"
+
+      # FW-E2E-068: regex shading against the published @modelcontextprotocol/server-everything,
+      # fetched by npx at test time.
+      - name: Real MCP server
+        if: ${{ !cancelled() }}
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          cargo test --locked -p formwork-gateway --test real_server -- --ignored --show-output 2>&1 \
+            | tee "$RESULTS/cargo-real-server.log"
+
+      # FW-E2E-093 and FW-E2E-096 in release, one at a time, against budgets calibrated to this
+      # runner (capped at 3x).
+      - name: Latency budgets
+        if: ${{ !cancelled() }}
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          cargo test --release --locked -p formwork-gateway --test latency -- --ignored \
+            --show-output --test-threads=1 2>&1 | tee "$RESULTS/cargo-latency.log"
+
+      - name: Python E2E harness
+        if: ${{ !cancelled() }}
+        working-directory: py
+        timeout-minutes: 20
+        env:
+          FW_E2E_RESULTS: ${{ env.RESULTS }}/pytest.json
+        run: uv run pytest -q
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ matrix.name }}
+          path: e2e-results/${{ matrix.name }}
+          if-no-files-found: warn
+          retention-days: 30
+          # A re-run of a failed platform job replaces its results.
+          overwrite: true
+
+  verdict:
+    name: verdict
+    needs: [plan, platform]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: e2e-*
+          path: downloaded
+
+      - name: Decide
+        shell: bash
+        run: |
+          mkdir -p platforms
+          for d in downloaded/e2e-*; do
+            [ -d "$d" ] && mv "$d" "platforms/${d#downloaded/e2e-}"
+          done
+          status=0
+          python3 py/e2e_matrix.py --results platforms \
+            --expect "${{ needs.plan.outputs.names }}" \
+            --title "End-to-end verification of ${GITHUB_SHA::12}" \
+            --markdown e2e-matrix.md --json e2e-matrix.json || status=$?
+          if [ -f e2e-matrix.md ]; then cat e2e-matrix.md >> "$GITHUB_STEP_SUMMARY"; fi
+          exit "$status"
+
+      - name: Upload the matrix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verdict
+          path: |
+            e2e-matrix.md
+            e2e-matrix.json
+          if-no-files-found: ignore
+          retention-days: 90
+          overwrite: true

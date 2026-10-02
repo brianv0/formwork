@@ -1,11 +1,15 @@
 """Fixtures and hooks for the Formwork harness: build the CLI once, provide a scratch workspace,
 skip platform-backend tests off-platform (never a silent pass), and emit a generated FW-ID -> tests
-traceability table at the end of the run."""
+traceability table at the end of the run. With `FW_E2E_RESULTS` set, each test's outcome and FW
+IDs are also written there as JSON for the cross-platform verdict (`py/e2e_matrix.py`)."""
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -61,6 +65,49 @@ def pytest_collection_modifyitems(config, items):
         for fw_id in _fw_ids(item):
             traceability.setdefault(fw_id, []).append(item.nodeid)
     config._fw_traceability = traceability
+
+
+_RESULTS = pytest.StashKey[dict]()
+
+
+def _marker_skip_reasons(item) -> set[str]:
+    reasons = set()
+    for name in ("skip", "skipif"):
+        for marker in item.iter_markers(name):
+            reason = marker.kwargs.get("reason")
+            if reason is None and name == "skip" and marker.args:
+                reason = marker.args[0]
+            if reason:
+                reasons.add(reason)
+    return reasons
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Record one outcome per test. A skip a marker declared (the platform markers, a platform
+    `skipif`) means the test does not apply here; any other skip happened at runtime -- a missing
+    tool or mechanism -- which the verdict counts as a run that did not exercise its test."""
+    report = (yield).get_result()
+    results = item.config.stash.setdefault(_RESULTS, {})
+    entry = results.setdefault(
+        report.nodeid, {"nodeid": report.nodeid, "ids": _fw_ids(item), "outcome": "passed"}
+    )
+    if report.failed:
+        entry["outcome"] = "failed"
+    elif report.skipped and entry["outcome"] != "failed":
+        reason = report.longrepr[2] if isinstance(report.longrepr, tuple) else str(report.longrepr)
+        reason = reason.removeprefix("Skipped: ")
+        entry["outcome"] = "not-applicable" if reason in _marker_skip_reasons(item) else "skipped"
+        entry["reason"] = reason
+
+
+def pytest_sessionfinish(session, exitstatus):
+    path = os.environ.get("FW_E2E_RESULTS")
+    if not path:
+        return
+    results = session.config.stash.get(_RESULTS, {})
+    tests = sorted(results.values(), key=lambda r: r["nodeid"])
+    Path(path).write_text(json.dumps({"tool": "pytest", "tests": tests}, indent=1))
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
