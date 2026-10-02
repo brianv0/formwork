@@ -27,6 +27,20 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     root
 }
 
+/// This host's verdict on the backstop, from the same blueprint `run` would load.
+fn backstop_status(dir: &Path) -> Option<String> {
+    let out = Command::new(env!("CARGO_BIN_EXE_formwork"))
+        .args(["explain", "--json"])
+        .current_dir(dir)
+        .env("HOME", dir)
+        .output()
+        .expect("running formwork");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    value["report"]["credentials"]["backstop"]["status"]
+        .as_str()
+        .map(str::to_string)
+}
+
 #[test]
 fn run_names_the_backstop_on_the_operator_channel() {
     let dir = scratch("backstop-channel");
@@ -36,10 +50,23 @@ fn run_names_the_backstop_on_the_operator_channel() {
         &["run", "--", "/bin/true"],
     );
     // The cause a confined tool's bare EACCES hides (FW-CRED7): named, with the `explain` pointer.
-    assert!(
-        stderr.contains("credential backstop active"),
-        "operator channel must name the active backstop:\n{stderr}"
-    );
+    // Where the host withholds the backstop (Landlock, FW-CRED9) there is no EACCES, and the line
+    // says so instead of claiming the denial (FW-INV5).
+    match backstop_status(&dir).as_deref() {
+        Some("enforced") => assert!(
+            stderr.contains("credential backstop active"),
+            "operator channel must name the active backstop:\n{stderr}"
+        ),
+        Some(status) => {
+            assert!(
+                stderr.contains("credential backstop not enforced on this host"),
+                "operator channel must say the backstop is not enforced:\n{stderr}"
+            );
+            assert!(stderr.contains(status), "{stderr}");
+            assert!(!stderr.contains("credential backstop active"), "{stderr}");
+        }
+        None => panic!("the backstop is not lifted here"),
+    }
     assert!(
         stderr.contains("formwork explain"),
         "the callout must point at `formwork explain`:\n{stderr}"
@@ -57,8 +84,8 @@ fn lifting_the_backstop_silences_the_callout_but_not_the_floor() {
     );
     // Lifted by name -> no callout (telling a user how to lift what they already lifted is noise)...
     assert!(
-        !stderr.contains("credential backstop active"),
-        "a lifted backstop must not be announced as active:\n{stderr}"
+        !stderr.contains("credential backstop"),
+        "a lifted backstop must not be announced:\n{stderr}"
     );
     // ...while the rest of the credential floor is still itemized, now recording the exclusion.
     assert!(

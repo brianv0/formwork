@@ -201,6 +201,19 @@ fn fidelity(f: &Fidelity) -> String {
     }
 }
 
+/// What the backstop does on this host, from its report row (FW-CRED6). Only an `Enforced` row
+/// earns the "denied" wording; otherwise the report's own verdict and reason stand in -- on
+/// Landlock the any-depth rows are withheld (FW-CRED9), and "denied" would be a claim no mechanism
+/// backs (FW-XR1/FW-INV5).
+pub fn backstop(f: &Fidelity) -> String {
+    let shapes = "filename shapes (credentials, id_rsa, id_ed25519, .netrc, …)";
+    if f.is_enforced() {
+        format!("{shapes} denied at any depth, even inside granted directories")
+    } else {
+        format!("{shapes} at any depth: {}", fidelity(f))
+    }
+}
+
 /// The fidelity report as prose: per-capability honesty plus the credential floor's shape. The
 /// full itemization stays in `compile --report-only`; this is the at-a-glance form.
 pub fn report_summary(report: &FidelityReport) -> String {
@@ -265,12 +278,14 @@ pub fn report_summary(report: &FidelityReport) -> String {
         }
     ));
     // The backstop denies inside the operator's own granted set, so it earns its own line with the
-    // lift (FW-CRED6/CRED7); `None` means already lifted.
-    if creds.backstop.is_some() {
-        out.push_str(
-            "backstop: filename shapes (credentials, id_rsa, id_ed25519, .netrc, …) denied at any \
-             depth, even inside granted directories; lift with allow-credentials = [\"backstop\"]\n",
-        );
+    // lift (FW-CRED6/CRED7); `None` means already lifted. A lift is offered only for a denial the
+    // host makes.
+    if let Some(f) = &creds.backstop {
+        out.push_str(&format!("backstop: {}", backstop(f)));
+        if f.is_enforced() {
+            out.push_str("; lift with allow-credentials = [\"backstop\"]");
+        }
+        out.push('\n');
     }
     out.push_str(&format!("note: {}\n", creds.launcher_contingency));
     out
@@ -323,6 +338,38 @@ mod tests {
         );
         assert!(text.contains("write: not granted"), "{text}");
         assert!(text.contains("exec:  allowed by default"), "{text}");
+    }
+
+    /// The summary's backstop line follows the compiled report, not the model: denied with the lift
+    /// where Seatbelt carries the regex, withheld with the reason where Landlock cannot root the
+    /// rows (FW-CRED9), and the backend's own reason where there is no confinement at all.
+    #[test]
+    fn report_summary_backstop_line_follows_the_host() {
+        use formwork_blueprint::{Blueprint, ResolvedCatalog};
+        let catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let backstop_line = |host: &HostProfile| {
+            let report = formwork_compile::compile(&Blueprint::empty(), host, &catalog).report;
+            report_summary(&report)
+                .lines()
+                .find(|l| l.starts_with("backstop: "))
+                .unwrap_or_else(|| panic!("no backstop line for {:?}", host.os))
+                .to_string()
+        };
+
+        let mac = backstop_line(&HostProfile::synthetic_macos());
+        assert!(mac.contains("denied at any depth"), "{mac}");
+        assert!(mac.contains("allow-credentials = [\"backstop\"]"), "{mac}");
+
+        let landlock = backstop_line(&HostProfile::synthetic_linux(Some(6)));
+        assert!(!landlock.contains("denied"), "{landlock}");
+        assert!(landlock.contains("partial (landlock)"), "{landlock}");
+        assert!(landlock.contains("withheld on Linux"), "{landlock}");
+        assert!(landlock.contains("FW-CRED9"), "{landlock}");
+        assert!(!landlock.contains("allow-credentials"), "{landlock}");
+
+        let bare = backstop_line(&HostProfile::synthetic_linux(None));
+        assert!(!bare.contains("denied"), "{bare}");
+        assert!(bare.contains("unenforceable"), "{bare}");
     }
 
     #[test]

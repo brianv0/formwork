@@ -320,11 +320,19 @@ fn credential_report(
     let linux_any_depth_gap = matches!(host.os, Os::Linux) && base_fidelity.is_enforced();
     let path_fidelity_for = |paths: &[PathPattern]| -> Fidelity {
         if linux_any_depth_gap && paths.iter().any(|p| p.is_any_depth()) {
+            // Absolute rows are named only when the set has some: the backstop is any-depth
+            // throughout, and the clause would read as an enforcement claim for it (FW-INV5).
+            let absolute = if paths.iter().all(|p| p.is_any_depth()) {
+                ""
+            } else {
+                "; absolute rows are enforced"
+            };
             Fidelity::Partial {
                 backend: Backend::Landlock,
-                reason: "any-depth (`**/`) rows cannot be rooted Landlock rules and are withheld \
-                         on Linux; absolute rows are enforced (see docs/linux-backend.md)"
-                    .to_string(),
+                reason: format!(
+                    "any-depth (`**/`) rows cannot be rooted Landlock rules and are withheld on \
+                     Linux{absolute} (formwork.md §9, FW-CRED9)"
+                ),
             }
         } else {
             base_fidelity.clone()
@@ -1508,6 +1516,39 @@ mod tests {
                 backend: Backend::Landlock
             })
         ));
+    }
+
+    /// The Partial reason is what `explain` prints for the backstop, so it claims enforcement only
+    /// for absolute rows that exist and cites where the withholding is specified (FW-CRED9).
+    #[test]
+    fn any_depth_partial_reason_names_absolute_rows_only_when_present() {
+        let mut catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let linux = HostProfile::synthetic_linux(Some(6));
+        let reason = |f: &Option<Fidelity>| match f {
+            Some(Fidelity::Partial { reason, .. }) => reason.clone(),
+            other => panic!("expected Partial, got {other:?}"),
+        };
+        let creds = super::compile(&Blueprint::empty(), &linux, &catalog)
+            .report
+            .credentials;
+        let backstop = reason(&creds.backstop);
+        assert!(backstop.contains("withheld on Linux"), "{backstop}");
+        assert!(backstop.contains("FW-CRED9"), "{backstop}");
+        assert!(!backstop.contains("absolute rows"), "{backstop}");
+        assert!(!backstop.contains("linux-backend.md"), "{backstop}");
+
+        // A type mixing an absolute row with its any-depth ones keeps the absolute clause.
+        catalog
+            .types
+            .get_mut("dotenv")
+            .unwrap()
+            .paths
+            .push(pp("/home/x/.config/dotenv/**"));
+        let creds = super::compile(&Blueprint::empty(), &linux, &catalog)
+            .report
+            .credentials;
+        let mixed = reason(&creds.per_type["dotenv"].path);
+        assert!(mixed.contains("absolute rows are enforced"), "{mixed}");
     }
 
     #[test]

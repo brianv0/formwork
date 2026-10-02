@@ -2104,13 +2104,22 @@ fn itemize_credential_floor(report: &formwork_compile::FidelityReport, catalog: 
         "credential catalog floor, itemized"
     );
     // The backstop is the one floor row that denies inside the operator's OWN granted set, so its
-    // bare EACCES (FW-CRED7) has no visible cause -- name it at spawn (`None` means lifted).
-    if creds.backstop.is_some() {
-        tracing::info!(
-            "credential backstop active: filename shapes (credentials, id_rsa, .netrc, …) are \
-             denied at any depth, even inside granted directories, and a confined tool hitting one \
-             sees a bare EACCES -- run `formwork explain <path>` for the shape and the lift"
-        );
+    // bare EACCES (FW-CRED7) has no visible cause -- name it at spawn (`None` means lifted). Where
+    // the host withholds it (FW-CRED9), say that instead: there is no EACCES to explain.
+    if let Some(f) = &creds.backstop {
+        if f.is_enforced() {
+            tracing::info!(
+                "credential backstop active: {}, and a confined tool hitting one sees a bare \
+                 EACCES -- run `formwork explain <path>` for the shape and the lift",
+                render::backstop(f)
+            );
+        } else {
+            tracing::info!(
+                "credential backstop not enforced on this host: {} -- `formwork explain <path>` \
+                 marks the paths it would deny",
+                render::backstop(f)
+            );
+        }
         let shapes: Vec<String> = catalog.backstop.iter().map(|p| p.to_string()).collect();
         tracing::debug!(backstop_shapes = ?shapes, "credential backstop shapes");
     }

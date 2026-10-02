@@ -175,14 +175,38 @@ fn explain_with_no_path_summarizes_host_and_fidelity() {
     assert!(out.stdout.contains("host: "), "{}", out.stdout);
     assert!(out.stdout.contains("capabilities:"), "{}", out.stdout);
     assert!(out.stdout.contains("credential floor:"), "{}", out.stdout);
-    // The active backstop earns its own line in the summary, with the lift (FW-CRED6/CRED7).
-    assert!(out.stdout.contains("backstop:"), "{}", out.stdout);
-    assert!(
-        out.stdout.contains("allow-credentials = [\"backstop\"]"),
-        "{}",
-        out.stdout
-    );
     assert!(out.stdout.contains("(auto-discovered)"), "{}", out.stdout);
+
+    // The active backstop earns its own line (FW-CRED6/CRED7), worded from this host's report:
+    // denied with the lift where the backend roots any-depth rows, withheld with the reason where
+    // Landlock cannot (FW-CRED9) -- never the denied wording over a Partial row (FW-XR1/FW-INV5).
+    let json = formwork(dir.path(), dir.path(), &["explain", "--json"]);
+    assert_eq!(json.code, 0, "{}", json.stderr);
+    let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+    let backstop = &value["report"]["credentials"]["backstop"];
+    let line = out
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("backstop: "))
+        .unwrap_or_else(|| panic!("no backstop line:\n{}", out.stdout));
+    match backstop["status"].as_str() {
+        Some("enforced") => {
+            assert!(line.contains("denied at any depth"), "{line}");
+            assert!(
+                line.contains("allow-credentials = [\"backstop\"]"),
+                "{line}"
+            );
+        }
+        Some(status) => {
+            assert!(!line.contains("denied"), "{line}");
+            assert!(line.contains(status), "{line}");
+            assert!(
+                line.contains(backstop["reason"].as_str().unwrap()),
+                "{line}"
+            );
+        }
+        None => panic!("the backstop is not lifted here: {backstop}"),
+    }
 }
 
 /// A file named `credentials` in a granted working set is denied by the backstop (deny beats
