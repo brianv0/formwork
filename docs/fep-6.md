@@ -1251,8 +1251,13 @@ Draft numbers continue above `FW-E2E-091` and `FW-ADV-020`.
 - <a id="fw-e2e-095"></a>**FW-E2E-095: Upstream reuse (both).** Twenty sequential requests from one client to one
   inspected fixture. Pass: the fixture observes one TLS handshake. Fail: more than one.
 - <a id="fw-e2e-096"></a>**FW-E2E-096: Latency budget (both).** Medians over 1,000 requests against a loopback fixture,
-  compared with the same client connecting directly. Pass: the §9 (f) targets. Fail: any median
-  exceeds its target.
+  compared with the same client connecting directly: each sample pairs the request direct and
+  through the Gateway, in alternating order, and the statistic is the median of the pairs'
+  differences with a distribution-free 95% interval. The budget is the §9 (f) target times the
+  node's speed relative to a reference node -- a calibration workload of TLS handshakes and records
+  on the Gateway's provider, timed between batches -- clamped to [1, 3]. Pass: the interval lies
+  under the budget. Fail: it lies over, or still straddles it after 4,000 pairs. (Amended: a fixed
+  bound on a shared runner is a flaky test, constitution *Testing*.)
 - <a id="fw-e2e-097"></a>**FW-E2E-097: Session CA shape (both).** Pass: the bundle's session certificate is a CA with path
   length 0 and the name constraints `FW-EGR25` lists; no file under the session scratch, `$HOME` or
   the temporary directories contains the CA private key after the session starts; the leaf for an

@@ -488,7 +488,7 @@ Confinement is setup-once plus per-operation overhead. The target keeps interact
 | Egress inspected grade, added time per request on a reused connection | < 1 ms median |
 | Egress inspected grade, first connection to a host (leaf minting included) | < 5 ms median |
 
-The egress rows are measured on a loopback fixture against the same client connecting directly (FEP-6 §9 f, `FW-E2E-096`).
+The egress rows are measured on a loopback fixture against the same client connecting directly (FEP-6 §9 f, `FW-E2E-096`): in release on every CI runner, as a 95% interval for the median added latency, against the targets scaled to the runner's speed (at most 3x).
 
 A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a small bounded overhead of its unsandboxed baseline; a sandbox that materially slows the normal build/test loop violates [FW-TRA6](#fw-tra6).
 
