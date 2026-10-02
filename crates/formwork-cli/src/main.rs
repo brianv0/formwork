@@ -1712,6 +1712,13 @@ fn spawn_confined_child(
         Ok(c) => c,
         Err(e) => {
             session.tmp_dir.remove();
+            #[cfg(target_os = "linux")]
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                let program = std::path::Path::new(program);
+                if let Some(why) = formwork_confine::exec_denial_hint(&session.policy, program) {
+                    return Err(e).context(format!("spawning confined command: {why}"));
+                }
+            }
             return Err(e).context("spawning confined command");
         }
     };

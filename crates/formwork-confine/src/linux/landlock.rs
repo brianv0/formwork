@@ -275,7 +275,18 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
         // Execute only, not ReadFile: macOS `process-exec*` confers no read, so bundling it would
         // make the same `exec:` grant readable on Linux but not macOS (FW-XR6). `readexec`/`allow`
         // carry their own read grant; a binary the loader must re-open needs read on either backend.
-        let exec_paths = expand_all(&paths.iter().map(root_of).collect::<Vec<_>>(), &[]);
+        let roots: Vec<PathBuf> = paths.iter().map(root_of).collect();
+        let mut exec_paths = expand_all(&roots, &[]);
+        // The loader too, or no listed dynamic binary starts; the report says `Partial` (FW-INV5).
+        let loaders = super::loader::loaders_for(&roots);
+        if !loaders.is_empty() {
+            tracing::info!(
+                loaders = ?loaders,
+                "the exec allow-list grants execute on the dynamic loader its binaries need; a \
+                 loader runs any ELF the session can read"
+            );
+        }
+        exec_paths.extend(loaders);
         created = add_path_rules(created, &exec_paths, AccessFs::Execute.into())?;
     }
 

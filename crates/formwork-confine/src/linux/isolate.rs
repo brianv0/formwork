@@ -243,6 +243,8 @@ fn confine_and_exec(spec: StageSpec) -> Result<Infallible, StageError> {
     if let Some(fd) = spec.handoff {
         plan.supervise = Some(supervise::Plan::from_handoff(fd));
     }
+    // Read before `apply`: the allow-list may grant execute on files Landlock then keeps unreadable.
+    let hint = super::loader::denial_hint(&spec.policy, Path::new(&spec.argv[0]));
     super::apply(&mut plan).map_err(setup("applying confinement"))?;
     let err = Command::new(&spec.argv[0]).args(&spec.argv[1..]).exec();
     let code = if err.kind() == io::ErrorKind::NotFound {
@@ -250,7 +252,10 @@ fn confine_and_exec(spec: StageSpec) -> Result<Infallible, StageError> {
     } else {
         126
     };
-    Err((code, format!("running {}: {err}", spec.argv[0])))
+    match hint.filter(|_| err.kind() == io::ErrorKind::PermissionDenied) {
+        Some(why) => Err((code, format!("running {}: {err}: {why}", spec.argv[0]))),
+        None => Err((code, format!("running {}: {err}", spec.argv[0]))),
+    }
 }
 
 /// Signals the stage and the init pass on to their child when a process sent them. Kernel-sent

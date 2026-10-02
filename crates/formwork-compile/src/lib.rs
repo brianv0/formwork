@@ -558,7 +558,23 @@ fn compile_linux(
         ExecPosture::Unrestricted => ExecPlan::Unrestricted,
         ExecPosture::Allowlist(paths) => {
             if has_landlock {
-                caps.insert(Capability::Exec, landlock());
+                // Landlock checks execute on the ELF interpreter an `execve` opens, so the confiner
+                // grants it too, or no dynamically linked binary starts. A loader invoked directly
+                // maps its argument without an exec check, and Landlock cannot tell the two opens
+                // apart (FW-INV5).
+                caps.insert(
+                    Capability::Exec,
+                    Fidelity::Partial {
+                        backend: Backend::Landlock,
+                        reason: "the dynamic loader the allow-listed binaries need is granted \
+                                 execute too (the one each listed file names; this \
+                                 architecture's standard loaders for a listed directory), and a \
+                                 loader runs any ELF the session can read when invoked as \
+                                 `ld.so <file>`, so the allow-list limits which files are exec'd, \
+                                 not which readable binaries run"
+                            .to_string(),
+                    },
+                );
             } else {
                 caps.insert(
                     Capability::Exec,
@@ -1384,6 +1400,34 @@ mod tests {
             other => panic!("expected Linux confiner, got {other:?}"),
         }
         assert!(policy.report.per_capability[&Capability::NetDefaultDeny].is_enforced());
+    }
+
+    /// FW-ISO4/FW-INV5: a Linux exec allow-list is Landlock-carried but `Partial` -- the loader its
+    /// binaries need is granted too, and a loader runs what it is handed -- and `Unenforceable`
+    /// without Landlock. macOS stays `Enforced` (`macos_with_seatbelt_reports_all_caps_enforced`).
+    #[test]
+    fn linux_exec_allowlist_is_partial_for_the_loader() {
+        let blueprint = Blueprint {
+            exec: ExecPosture::Allowlist(vec![pp("/usr/bin/git")]),
+            ..sample_blueprint()
+        };
+        let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(6)));
+        assert!(
+            matches!(
+                &policy.report.per_capability[&Capability::Exec],
+                Fidelity::Partial { backend: Backend::Landlock, reason }
+                    if reason.contains("loader") && reason.contains("ld.so <file>")
+            ),
+            "{:?}",
+            policy.report.per_capability[&Capability::Exec]
+        );
+        let mut host = HostProfile::synthetic_linux(None);
+        host.seccomp = true;
+        let policy = compile(&blueprint, &host);
+        assert!(matches!(
+            policy.report.per_capability[&Capability::Exec],
+            Fidelity::Unenforceable { .. }
+        ));
     }
 
     #[test]
