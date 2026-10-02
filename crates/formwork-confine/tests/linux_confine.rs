@@ -472,11 +472,11 @@ fn fw_inv3_egress_only_via_gateway_fd() {
 }
 
 /// FW-ADV-005 (Linux): fd smuggling. A confined stdio backend cannot manufacture a new egress socket
-/// (the raw material of a smuggled fd) -- only the seam mints egress fds. The probe proves inet
-/// `socket()` is denied while the seam's own AF_UNIX socketpair transport still works, so the deny is
-/// scoped to egress, never the seam (FW-XR7). Net-deny is seccomp-carried, so this runs on any
-/// seccomp host. It asserts the socket-manufacture arm; the SCM_RIGHTS hand-off arm is exercised by
-/// the macOS `seam_confined` suite (FW-E2E-011) and the recursion test (FW-E2E-019).
+/// (the raw material of a smuggled fd) -- only Formwork installs egress descriptors (FW-XR7). The
+/// probe proves inet `socket()` is denied while an AF_UNIX socketpair still works, so the deny is
+/// scoped to egress, never local IPC. Net-deny is seccomp-carried, so this runs on any seccomp host.
+/// It asserts the socket-manufacture arm; backend confinement as a whole is the recursion test
+/// (FW-E2E-019).
 #[test]
 fn fw_adv_005_confined_backend_cannot_manufacture_egress_fd() {
     let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-fdsmuggle-probe"));
@@ -485,8 +485,8 @@ fn fw_adv_005_confined_backend_cannot_manufacture_egress_fd() {
     let code = run(&policy, Command::new(&probe));
     assert_eq!(
         code, 0,
-        "a confined backend must not manufacture an inet egress fd, yet keep its AF_UNIX seam \
-         transport (0 = both hold; 4 = egress fd manufactured; 5 = seam socketpair broken); got {code}"
+        "a confined backend must not manufacture an inet egress fd, yet keep AF_UNIX socketpairs \
+         (0 = both hold; 4 = egress fd manufactured; 5 = socketpair broken); got {code}"
     );
 }
 

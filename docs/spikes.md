@@ -20,7 +20,7 @@ on the inherited fds. Also test whether a fresh `connect()` inside is denied (it
 **Status.** Resolved — the assumption held. The fd seam (Phase 5) was built and its transport is
 verified on macOS *and* Linux ([`FW-E2E-010/011/012`](../formwork.md#fw-e2e-010)); read/write on an
 inherited connected fd works under `(deny network*)`, and a fresh `connect()` inside is denied. The
-seam is not wired into the CLI: FEP-5 carries egress through the Linux connect supervisor and, on
+seam was later retired unwired: FEP-5 carries egress through the Linux connect supervisor and, on
 macOS, an authenticated loopback listener the confined process `connect()`s to (`docs/STATUS.md`).
 
 ## Spike 2 — `sandbox_init` from Rust in a forked child (macOS)

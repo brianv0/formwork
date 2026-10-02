@@ -18,7 +18,7 @@ These two halves are in tension, and the resolution is the third principle: **ho
 
 ## 2. Architecture overview
 
-Formwork has three enforcement arms driven by a single capability compiler, with an fd seam to the agent. The **launcher** runs first — the pre-spawn arm that constructs the confined child's environment, strips catalog credentials (variable absent, not denied), and write-protects its own policy inputs before control transfers. Then the **confiner** (the hard OS boundary) and the **gateway** (the soft boundary: MCP shading and, under host rules, egress) hold for the lifetime of the session.
+Formwork has three enforcement arms driven by a single capability compiler. The **launcher** runs first — the pre-spawn arm that constructs the confined child's environment, strips catalog credentials (variable absent, not denied), and write-protects its own policy inputs before control transfers. Then the **confiner** (the hard OS boundary) and the **gateway** (the soft boundary: MCP shading and, under host rules, egress) hold for the lifetime of the session.
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
@@ -35,17 +35,17 @@ Formwork has three enforcement arms driven by a single capability compiler, with
 │ credential strip      │ + seccomp           │ shades tools/resources/ │
 │ → var absent          │ + connect super-    │ prompts; fronts stdio + │
 │ policy-input write-   │   visor             │ http/sse backends;      │
-│ protect (FW-XR8)      │ macOS: Seatbelt     │ mints fds (SCM_RIGHTS)  │
+│ protect (FW-XR8)      │ macOS: Seatbelt     │ confines its backends;  │
 │ proxy + CA variables, │ fs r/w, net-deny,   │ egress engine: host     │
 │ brokered placeholders │ channel baseline,   │ rules, TLS inspection,  │
 │                       │ descendant inherit  │ credential brokering    │
 └───────────────────────┴──────────┬──────────┴────────────┬────────────┘
-                                   │ confines              │ one control fd
-                                   ▼                       ▼
-                           ┌───────────────┐       ┌───────────────┐
-                           │  AGENT        │◄─fd── │ (no net, no fs│
-                           │  (confined)   │ seam  │ except the fd)│
-                           └───────────────┘       └───────────────┘
+                                   │ confines              │ stdio (MCP); supervised
+                                   ▼                       │ connect or loopback
+                           ┌───────────────┐               │ listener (egress)
+                           │  AGENT        │◄──────────────┘
+                           │  (confined)   │
+                           └───────────────┘
                                    ▲
                                    │ confines (recursion)
                            ┌───────────────┐
@@ -58,9 +58,9 @@ Five things make this hang together:
 
 **The launcher is where non-kernel capabilities are applied.** Landlock and Seatbelt cannot shade an environment variable — it is a string in the process's environment block, not a filesystem object. But Formwork *spawns* the confined process, so it constructs the child's environment: shading a variable is simply not copying it into the spawn. The child comes up having never had it — stronger, in kind, than a path denial (a denied path still announces a wall; a stripped variable is indistinguishable from never-configured, [FW-INV9](#fw-inv9)). The one contingency: it holds only while Formwork is the launching process, which the report must disclose ([FW-CRED8](#fw-cred8)).
 
-**The confiner makes the gateway unavoidable.** Because the confined agent has no network and no filesystem beyond its grant plus one injected fd, every MCP interaction and every byte of egress is *forced* through the gateway. That is what upgrades tool-shading from a suggestion into a control: there is no other door.
+**The confiner makes the gateway unavoidable.** Because the confined agent has no network of its own and no filesystem beyond its grant, every MCP interaction and every byte of egress is *forced* through the gateway. That is what upgrades tool-shading from a suggestion into a control: there is no other door.
 
-**The transport is an injected fd or a connect the gateway completes, never a connect the sandbox completes.** The gateway (outside the sandbox) opens connections and hands the agent a connected file descriptor at spawn, or mints new ones on demand over a control channel via `SCM_RIGHTS`; inside the sandbox that is an inherited fd, which behaves identically on both platforms. Under host rules the confined process's own `connect()` is the request: on Linux a seccomp supervisor outside the sandbox receives it, performs any allowed connect itself, and installs the result ([FW-EGR7](#fw-egr7)); on macOS the profile reaches only the session gateway's loopback listener, which admits a connection only from the session ([FW-EGR8](#fw-egr8), [FW-EGR9](#fw-egr9)). Formwork never relies on the filesystem sandbox to selectively *allow* a socket path — a mechanism that is coarse and bleeding-edge on Linux (section 9).
+**The transport never rests on the filesystem sandbox allowing a socket path.** MCP traffic runs over the stdio of the `formwork gateway` process the MCP host launches, an inherited descriptor that behaves identically on both platforms. Under host rules the confined process's own `connect()` is the request: on Linux a seccomp supervisor outside the sandbox receives it, performs any allowed connect itself, and installs the result ([FW-EGR7](#fw-egr7)); on macOS the profile reaches only the session gateway's loopback listener, which admits a connection only from the session ([FW-EGR8](#fw-egr8), [FW-EGR9](#fw-egr9)). Formwork never relies on the filesystem sandbox to selectively *allow* a socket path — a mechanism that is coarse and bleeding-edge on Linux (section 9). The original design's injected-fd seam, with connections pre-opened at spawn or minted over `SCM_RIGHTS`, was built and verified, then retired unwired once FEP-5 carried egress this way.
 
 **The gateway is also the egress engine.** Under host rules every byte of egress leaves through the gateway's in-process HTTP(S) proxy (FEP-6). It checks each destination against the host rules and the destination classes, terminates TLS for inspected hosts with a per-session, name-constrained CA so it can check each request's method and path, and presents brokered credentials the confined process never holds ([FW-EGR10](#fw-egr10), [FW-EGR25](#fw-egr25), [FW-CRED11](#fw-cred11), [FW-INV13](#fw-inv13)).
 
@@ -74,7 +74,7 @@ Naming note (open, section 11): this document uses **Formwork** for the whole sy
 
 - A confined process (the agent, code it runs, or an MCP backend) reading files outside its granted read scope, including the sensitive set (credentials, SSH/cloud config, keychains, other projects, browser profiles).
 - A confined process writing outside its granted write scope.
-- A confined process making network egress by any means other than the gateway fd — direct `connect()`, raw sockets, direct DNS, ignoring proxy environment variables.
+- A confined process making network egress by any means other than through the gateway — direct `connect()`, raw sockets, direct DNS, ignoring proxy environment variables.
 - A confined process reaching processes outside its domain via abstract or pathname UNIX sockets, or via signals, where the platform supports scoping.
 - The agent invoking or even discovering MCP tools, resources, or prompts that policy does not grant.
 - A descendant process shedding or widening the confinement it inherited.
@@ -162,11 +162,11 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 |---|---|
 | <a id="fw-xr1"></a>**FW-XR1** Fidelity honesty | Every enforcement Formwork claims is backed by a mechanism on the current host, or is reported as Partial/Unenforceable. `enforce()` never silently downgrades a claim made by `compile()`. |
 | <a id="fw-xr2"></a>**FW-XR2** Good-not-perfect boundary | Formwork is a containment boundary against accidental, careless, and prompt-injected overreach and against untrusted code the agent runs — not against kernel/LSM exploitation. Every guarantee in this document is scoped to section 3. |
-| <a id="fw-xr3"></a>**FW-XR3** Fail-closed egress | Absent a working confiner, network defaults to full deny. The agent reaches the world only through the gateway fd. No configuration and no capability-detection failure produces silent open egress. |
+| <a id="fw-xr3"></a>**FW-XR3** Fail-closed egress | Absent a working confiner, network defaults to full deny. The agent reaches the world only through the gateway. No configuration and no capability-detection failure produces silent open egress. |
 | <a id="fw-xr4"></a>**FW-XR4** Descendant inheritance | Confinement applies to the confined process and every descendant. A child cannot shed, relax, or widen it. |
 | <a id="fw-xr5"></a>**FW-XR5** Single privileged broker | Exactly one component (the gateway) holds host network and broad filesystem access. The agent and all stdio MCP backends are confined by the same confiner. |
 | <a id="fw-xr6"></a>**FW-XR6** Behavioral parity | An identical blueprint yields equivalent observable behavior for the enforceable intersection across Linux and macOS. Platform divergence appears only in the FidelityReport, never as a silent behavior change. |
-| <a id="fw-xr7"></a>**FW-XR7** fd-injection transport | The agent reaches the gateway via an inherited fd, or via a `connect()` it issues that the gateway performs on its behalf and installs ([FW-EGR7](#fw-egr7)). Formwork never depends on a `connect()` the confined process completes itself, nor on the filesystem sandbox selectively *allowing* a socket path. *(Amended by FEP-5.)* |
+| <a id="fw-xr7"></a>**FW-XR7** Mediated transport | The agent reaches the gateway via an inherited descriptor (the MCP gateway's stdio), via a `connect()` it issues that the gateway performs on its behalf and installs ([FW-EGR7](#fw-egr7)), or, on macOS, via a `connect()` to the session's authenticated loopback listener ([FW-EGR8](#fw-egr8), [FW-EGR9](#fw-egr9)). Formwork never depends on the filesystem sandbox selectively *allowing* a socket path. *(Amended by FEP-5, and again when the injected-fd seam was retired: the macOS listener takes a `connect()` the confined process completes, which the earlier text excluded.)* |
 | <a id="fw-xr8"></a>**FW-XR8** No agent-influenced escalation | No mechanism lets a confined process — or its instruction stream — disable, weaken, retry-outside, or reconfigure its own confinement. The policy is compiled and installed *before* the process runs ([FW-CAP2](#fw-cap2): narrowing only; widening does not exist). Any escalation a host chooses to offer is an out-of-band action on an unconfined process, never a signal the confined process can emit. |
 | <a id="fw-xr9"></a>**FW-XR9** Surface fail-fast | A subcommand that cannot deliver its promise on the current host fails *before* consuming the user's work (their run, their time), naming the missing mechanism and the nearest alternative. The command-surface sibling of [FW-INV5](#fw-inv5)/[FW-INV6](#fw-inv6): enforcement honesty reports a wall it cannot install, and this refuses up front a *feature* it cannot deliver here — running an entire workload and only then announcing the command was impossible is a silent overpromise even when every byte was logged. [FW-E2E-062](#fw-e2e-062) pins the `learn` instance; the rule governs every future observe/probe/stream surface. |
 | <a id="fw-xr10"></a>**FW-XR10** Wrapper transparency | Wrapper subcommands shall exit with the workload's status and write nothing of their own to stdout. |
@@ -192,7 +192,7 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 |---|---|
 | <a id="fw-iso1"></a>**FW-ISO1** Read confinement | Enforce filesystem read scope (Landlock FS access rights / Seatbelt `file-read*`). |
 | <a id="fw-iso2"></a>**FW-ISO2** Write confinement | Enforce filesystem write scope; write to a read-only-granted path is denied. |
-| <a id="fw-iso3"></a>**FW-ISO3** Net default-deny | Deny all direct network egress by default (no Landlock net grants + scope flags / Seatbelt `network*` deny), except the injected fd. |
+| <a id="fw-iso3"></a>**FW-ISO3** Net default-deny | Deny all direct network egress by default (seccomp inet-socket deny / Seatbelt `network*` deny); the gateway is the only way out. |
 | <a id="fw-iso4"></a>**FW-ISO4** Optional exec restriction | When set, restrict execution to an allowlist (Landlock `FS_EXECUTE` on paths / seccomp on `execve` / Seatbelt `process-exec*`). Off by default (transparency). |
 | <a id="fw-iso5"></a>**FW-ISO5** Optional port tier | When requested, allow direct TCP connect to an explicit port set (Landlock net ABI v4+); report Unenforceable on older kernels. |
 | <a id="fw-iso6"></a>**FW-ISO6** Two postures | Support spawn-confined (launcher confines a child; preferred) and confine-self (process restricts itself; pledge-style). |
@@ -219,7 +219,7 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 | <a id="fw-gw3"></a>**FW-GW3** Full-surface policy | Policy covers resources (list/read/templates), prompts (list/get), `list_changed` re-filtering, and server→client sampling/elicitation. |
 | <a id="fw-gw4"></a>**FW-GW4** Single door | Shading is binding because the confiner removes every alternative path to the backend. |
 | <a id="fw-gw5"></a>**FW-GW5** Backend confinement | stdio backends the gateway spawns are themselves confined by the confiner to their own grant. |
-| <a id="fw-gw6"></a>**FW-GW6** fd minting | The gateway supplies connection fds to the agent (pre-opened at spawn or minted on demand via `SCM_RIGHTS`); the agent never performs an in-sandbox `connect()`. |
+| <a id="fw-gw6"></a>**FW-GW6** fd minting | *(Retired with the injected-fd seam. It required the gateway to supply connection fds to the agent, pre-opened at spawn or minted on demand via `SCM_RIGHTS`; the seam was built and verified but never wired, since FEP-5 carries egress through the connect supervisor and the authenticated loopback listener and MCP runs over stdio. The number stays retired.)* |
 | <a id="fw-gw7"></a>**FW-GW7** Least-privilege gateway | The gateway holds host network only to allowlisted MCP endpoints, and its own filesystem access is scoped to what brokering requires — its policy input and the stdio backends it spawns — not the host at large. |
 | <a id="fw-gw8"></a>**FW-GW8** Transparent passthrough | For *granted* items, the gateway is protocol-transparent: no semantic mangling, so agents behave as if talking to the backend directly. |
 | <a id="fw-gw9"></a>**FW-GW9** Pattern-matched shading | Each shaded axis (tools/prompts by `name`, resources/templates by `uri`/`uriTemplate`, [design §4](#fw-cap4)) carries an **allow** scope and a terminal **deny** list. Entries are exact identifiers or anchored regex written `/…/`, matched against the *whole* identifier (`\A(?:…)\z`), so an allow pattern cannot admit a substring nor a deny over-reach onto an unrelated name. `permits(name)` holds iff the allow scope admits it and no deny matches — deny is terminal, the MCP-surface form of the deny-terminal fs model ([FW-CAP8](#fw-cap8)/[FW-BP4](#fw-bp4)) applied to protocol identities. This is a *userspace* string match in the privileged gateway, never a kernel path boundary, so it does not reopen the "no general glob" fs doctrine ([FW-BP4](#fw-bp4)); the `regex` engine matches in guaranteed linear time, so a hostile blueprint pattern cannot wedge the gateway. A `/…/` that will not compile, and an ambiguous empty policy table, fail loud at parse ([FW-INV6](#fw-inv6)) rather than degrading to a silent deny-all or allow-all; pattern sets canonicalize deterministically ([FW-FID4](#fw-fid4)) and refusals stay oracle-free ([FW-ADV-004](#fw-adv-004)) since a deny-hidden name refuses exactly as a nonexistent one does. |
@@ -376,7 +376,7 @@ These hold for every session under every backend, and are the properties the tes
 
 <a id="fw-inv2"></a>**FW-INV2 — Descendant containment.** No descendant escapes or relaxes the confiner. Re-exec, setuid/setgid execution, and `prctl` attempts to clear `NO_NEW_PRIVS` do not restore access. Fuzzed over random spawn trees.
 
-<a id="fw-inv3"></a>**FW-INV3 — Egress only via the gateway fd.** A confined process has no network path except the injected fd. Direct `connect()`, raw sockets, and direct DNS fail closed. Verified adversarially.
+<a id="fw-inv3"></a>**FW-INV3 — Egress only via the gateway.** A confined process has no network path except through the gateway. Direct `connect()`, raw sockets, and direct DNS fail closed. Verified adversarially.
 
 <a id="fw-inv4"></a>**FW-INV4 — Shading completeness.** No ungranted tool, resource, or prompt is invocable, whether or not it appears in any listing. Fuzzed over guessed names and out-of-band identifiers.
 
@@ -426,7 +426,7 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 ### 7.2 Network / egress
 
-<a id="fw-e2e-006"></a>**FW-E2E-006: Direct egress denied.** With `net: Deny`, the session runs `curl https://example.com`. Pass: the connection fails closed (no route to a network the process can reach). Fail: any bytes leave the host by a path other than the gateway fd.
+<a id="fw-e2e-006"></a>**FW-E2E-006: Direct egress denied.** With `net: Deny`, the session runs `curl https://example.com`. Pass: the connection fails closed (no route to a network the process can reach). Fail: any bytes leave the host by a path other than the gateway.
 
 <a id="fw-e2e-007"></a>**FW-E2E-007: Direct DNS denied.** The session attempts name resolution via the system resolver (UDP/TCP 53). Pass: direct resolution fails; name resolution is available only through the gateway. Fail: the process resolves names via a direct network path.
 
@@ -466,13 +466,15 @@ The egress tests drive the real gateway against loopback fixture upstreams and a
 
 <a id="fw-e2e-097"></a>**FW-E2E-097: Session CA shape (both).** Pass: the bundle's session certificate is a CA with path length 0 and the name constraints [FW-EGR25](#fw-egr25) lists; no file under the session scratch, `$HOME` or the temporary directories contains the CA private key after the session starts; the leaf for an inspected host verifies with `openssl verify` against the bundle. Fail: any of these does not hold.
 
-### 7.3 Transport / fd seam
+### 7.3 Transport / fd seam (retired)
 
-<a id="fw-e2e-010"></a>**FW-E2E-010: MCP over injected fd with zero net.** The agent has `net: Deny` and one injected fd to the gateway. It performs `initialize`, `tools/list`, and a `tools/call` round-trip. Pass: the full MCP exchange completes with no network capability inside the sandbox. Fail: the exchange requires any in-sandbox network or filesystem-socket access.
+The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw-gw6)); the transport that shipped is tested by [FW-E2E-075](#fw-e2e-075), [FW-E2E-076](#fw-e2e-076) and [FW-ADV-018](#fw-adv-018), and the MCP stdio path by §7.4. The numbers stay retired.
 
-<a id="fw-e2e-011"></a>**FW-E2E-011: fd minting via SCM_RIGHTS.** After start, the agent requests a connection to a second backend over its control fd. The gateway opens the backend and passes back a new connected fd. Pass: the agent uses the new fd; no in-sandbox `connect()` occurs; the confiner's net-deny is unchanged. Fail: the agent must `connect()` itself, or net-deny had to be relaxed.
+<a id="fw-e2e-010"></a>**FW-E2E-010: MCP over injected fd with zero net.** *(Retired with the seam.)* An agent under `net: Deny` completed an MCP exchange over one injected fd.
 
-<a id="fw-e2e-012"></a>**FW-E2E-012: No dependence on socket-path gating.** A pathname UNIX socket for the gateway exists on disk. The test runs the full agent workload twice: once with filesystem access to the socket path granted, once denied. Pass: the workload succeeds identically in both cases (the agent uses the injected fd, not the path), and granting the path does not by itself create any egress. Fail: behavior depends on the socket's filesystem grant.
+<a id="fw-e2e-011"></a>**FW-E2E-011: fd minting via SCM_RIGHTS.** *(Retired with the seam.)* The gateway passed the agent a new connected fd over its control fd, with no in-sandbox `connect()`.
+
+<a id="fw-e2e-012"></a>**FW-E2E-012: No dependence on socket-path gating.** *(Retired with the seam.)* The workload behaved identically with the gateway's socket path granted or denied.
 
 ### 7.4 Gateway / MCP shading
 
@@ -598,7 +600,7 @@ The egress tests drive the real gateway against loopback fixture upstreams and a
 
 <a id="fw-adv-002"></a>**FW-ADV-002: TOCTOU / symlink race.** A loop races creating a symlink from a writable path to a sensitive target and accessing it, attempting to win between check and use. Pass: no access to the sensitive target succeeds; enforcement is at the kernel access, not a userspace pre-check. Fail: the race yields out-of-scope access.
 
-<a id="fw-adv-003"></a>**FW-ADV-003: Gateway bypass.** The agent extracts an MCP endpoint host from a granted tool's metadata and tries to reach that host directly. Pass: direct egress is denied; only the gateway fd reaches it. Fail: the agent egresses to the endpoint outside the gateway.
+<a id="fw-adv-003"></a>**FW-ADV-003: Gateway bypass.** The agent extracts an MCP endpoint host from a granted tool's metadata and tries to reach that host directly. Pass: direct egress is denied; only the gateway reaches it. Fail: the agent egresses to the endpoint outside the gateway.
 
 <a id="fw-adv-004"></a>**FW-ADV-004: Shading oracle probe.** The agent enumerates candidate tool names and inspects error messages, response timing, and error codes to detect which hidden tools exist. Pass: refusals for hidden-but-real tools are indistinguishable from refusals for nonexistent tools — no oracle. Fail: any signal distinguishes a blocked-existing tool from a nonexistent one.
 
@@ -618,7 +620,7 @@ The egress tests drive the real gateway against loopback fixture upstreams and a
 
 <a id="fw-adv-008"></a>**FW-ADV-008: DNS-rebinding to a blocked IP.** Under a wildcard rule (`tunnel:*.test`), the resolver returns a blocked address (the metadata literal, an RFC-1918 fixture, or a public address mixed with a private one) for `allowed.test`; under the exact rule `allow:allowed.test` it returns the metadata literal. Pass: the gateway refuses at the *resolved answer* — violation, no socket — even though the name is allowlisted; the name-based allow never overrides the class table ([FW-EGR4](#fw-egr4), [FW-EGR17](#fw-egr17)). Fail: the rebind reaches the blocked address. *(Amended by FEP-6 §9 b.)*
 
-<a id="fw-adv-009"></a>**FW-ADV-009: Confused-deputy against the gateway.** A co-resident *unconfined* host process, and separately a *confined* process, each attempt to drive the gateway's egress (to the `allowed.test` fixture) other than through the sandbox's own injected fd. Pass: neither obtains egress; there is no unauthenticated door ([FW-EGR6](#fw-egr6)). Fail: either reaches the fixture through the gateway without holding the injected fd.
+<a id="fw-adv-009"></a>**FW-ADV-009: Confused-deputy against the gateway.** A co-resident *unconfined* host process, and separately a *confined* process, each attempt to drive the gateway's egress (to the `allowed.test` fixture) other than through the session's own transport ([FW-XR7](#fw-xr7)). Pass: neither obtains egress; there is no unauthenticated door ([FW-EGR6](#fw-egr6)). Fail: either reaches the fixture through the gateway without the session's transport.
 
 <a id="fw-adv-011"></a>**FW-ADV-011: Env exfiltration is defused in depth.** With one host allowlisted for egress and a prompt-injected instruction to POST the environment to it, the agent attempts the exfiltration. Pass: the secret-shaped vars are not present to send (the now-shipped [FW-ENV2](#fw-env2) scrub), demonstrating the compose of env-scrub with host-scoped egress — neither layer alone is trusted. Fail: a secret-shaped var is both present and egressable.
 
@@ -851,7 +853,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 - Exec restriction: Landlock `FS_EXECUTE` on allowed paths, or seccomp on `execve`. Optional ([FW-ISO4](#fw-iso4)).
 - Net default-deny: seccomp denies inet `socket(2)` creation by family (TCP, UDP and raw) at every Landlock ABI, because Landlock net governs TCP only; Landlock net carries the port tier alone (`docs/linux-backend.md`).
 - Net port allowlist: Landlock `ACCESS_NET_CONNECT_TCP` (ABI v4+, port-only, no host filtering). Reported Unenforceable below v4.
-- Cross-domain socket scoping: `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` and `LANDLOCK_SCOPE_SIGNAL` (ABI v6) are recent and coarse (they block abstract sockets and signals toward processes outside the domain by parent/child relationship, not per-path allowlisting). Pathname UNIX sockets are not scoped by any Landlock ABI, so a confined process can `connect()` to a socket file it can reach. `/proc/<pid>/environ` of processes outside the domain is refused, because Landlock denies ptrace-class access across the domain boundary, unless the confined process holds `CAP_SYS_ADMIN` or `CAP_PERFMON`, as in a root container (FEP-5 D9, [FW-ISO16](#fw-iso16)). Formwork uses the scopes where present for [FW-ADV-006](#fw-adv-006) and reports the gap otherwise — and does *not* rely on them for the transport (that is the injected fd, [FW-XR7](#fw-xr7)).
+- Cross-domain socket scoping: `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` and `LANDLOCK_SCOPE_SIGNAL` (ABI v6) are recent and coarse (they block abstract sockets and signals toward processes outside the domain by parent/child relationship, not per-path allowlisting). Pathname UNIX sockets are not scoped by any Landlock ABI, so a confined process can `connect()` to a socket file it can reach. `/proc/<pid>/environ` of processes outside the domain is refused, because Landlock denies ptrace-class access across the domain boundary, unless the confined process holds `CAP_SYS_ADMIN` or `CAP_PERFMON`, as in a root container (FEP-5 D9, [FW-ISO16](#fw-iso16)). Formwork uses the scopes where present for [FW-ADV-006](#fw-adv-006) and reports the gap otherwise — and does *not* rely on them for the transport ([FW-XR7](#fw-xr7)).
 - Anti-shedding: `NO_NEW_PRIVS` + seccomp baseline ([FW-ISO8](#fw-iso8)).
 - Datagram and raw closure: seccomp denies AF_INET/AF_INET6 `SOCK_DGRAM` and `SOCK_RAW` under every net posture ([FW-ISO11](#fw-iso11)), so under the port tier nothing resolves names.
 - Connect supervisor (FEP-5): under host rules, seccomp user notification routes every `connect()` and addressed `sendto()` to the `formwork` process, which copies the address once, takes the target's socket with `pidfd_getfd`, and performs the operation itself: to the Gateway egress listener, or to a pathname socket that is granted or bound in the session ([FW-EGR7](#fw-egr7), [FW-ISO12](#fw-iso12)). Needs Linux 5.6+ and Yama `ptrace_scope` 0 or 1; `run` refuses host rules without it.
@@ -866,7 +868,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 - Channel baseline (FEP-5): `appleevent-send`, `lsopen`, `job-creation`, and the Mach services behind the pasteboard, WindowServer and screen capture, the camera and audio services, and the keychain (until `os-keyring` or a typed exclusion lifts it) are denied, as are `mach-priv-host-port` and `mach-priv-task-port` ([FW-ISO13](#fw-iso13), [FW-ISO14](#fw-iso14)); the service names were characterized on macOS 14 and 15 (C3, C4; `docs/macos-characterization.md`). IOKit stays open (C8). Seatbelt does not mediate `kern.procargs2`, so other same-uid processes' exec-time environments stay readable; `formwork` zeroes its own (C5, [FW-ISO16](#fw-iso16)).
 - Host-scoped egress (FEP-5): the profile allows TCP only to the session gateway's loopback port, and the listener admits a connection only when it carries the per-session credential and a session process holds its client end ([FW-EGR8](#fw-egr8), [FW-EGR9](#fw-egr9); C2).
 
-**Both.** The injected-fd transport behaves identically, since it is an inherited descriptor, not a mediated `connect()`. This is why [FW-XR6](#fw-xr6)/[FW-XR7](#fw-xr7) hold across platforms rather than diverging on socket semantics.
+**Both.** MCP runs over the gateway's stdio, an inherited descriptor that behaves identically on both platforms. Egress differs in mechanism (the Linux supervisor, the macOS authenticated listener) but not in what a session can reach, which is why [FW-XR6](#fw-xr6)/[FW-XR7](#fw-xr7) hold across platforms.
 
 **Fidelity summary (typical modern host).**
 
@@ -928,9 +930,9 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-XR2](#fw-xr2) Good-not-perfect boundary | (whole §3, §7.10) | ADV-001..006, 012..015 |
 | [FW-XR3](#fw-xr3) Fail-closed egress | [FW-E2E-006](#fw-e2e-006), 025 | 007, 008, ADV-003 |
 | [FW-XR4](#fw-xr4) Descendant inheritance | [FW-E2E-005](#fw-e2e-005) | ADV-001, 005, INV2 |
-| [FW-XR5](#fw-xr5) Single privileged broker | [FW-E2E-019](#fw-e2e-019) | 010, ADV-005 |
+| [FW-XR5](#fw-xr5) Single privileged broker | [FW-E2E-019](#fw-e2e-019) | ADV-005 |
 | [FW-XR6](#fw-xr6) Behavioral parity | [FW-E2E-028](#fw-e2e-028) | 024, 071 |
-| [FW-XR7](#fw-xr7) fd-injection transport | [FW-E2E-010](#fw-e2e-010), 012, [FW-E2E-075](#fw-e2e-075) | 011, ADV-006, [FW-ADV-018](#fw-adv-018) |
+| [FW-XR7](#fw-xr7) Mediated transport | [FW-E2E-075](#fw-e2e-075), 076 | ADV-005, ADV-006, [FW-ADV-018](#fw-adv-018), 091 |
 | [FW-XR8](#fw-xr8) No agent-influenced escalation | [FW-ADV-001](#fw-adv-001) | [FW-E2E-005](#fw-e2e-005), INV1 |
 | [FW-XR9](#fw-xr9) Surface fail-fast | [FW-E2E-062](#fw-e2e-062) | INV5, INV6 |
 | [FW-XR10](#fw-xr10) Wrapper transparency | [FW-E2E-086](#fw-e2e-086) | — |
@@ -961,12 +963,12 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-ISO16](#fw-iso16) Process-environment disclosure | [FW-E2E-083](#fw-e2e-083) | ADV-025 |
 | [FW-ISO17](#fw-iso17) Opener shim | [FW-E2E-090](#fw-e2e-090) | ADV-020 |
 | [FW-ISO18](#fw-iso18) Brokered URL open | [FW-E2E-090](#fw-e2e-090) | — |
-| [FW-GW1](#fw-gw1) Transport-agnostic backends | [FW-E2E-010](#fw-e2e-010) | 019 |
+| [FW-GW1](#fw-gw1) Transport-agnostic backends | [FW-E2E-013](#fw-e2e-013) (stdio only; http/SSE backends not built) | 019 |
 | [FW-GW2](#fw-gw2) Tool shading | [FW-E2E-013](#fw-e2e-013), 014 | ADV-004, 016 |
 | [FW-GW3](#fw-gw3) Full-surface policy | [FW-E2E-015](#fw-e2e-015), 016, 017 | — |
-| [FW-GW4](#fw-gw4) Single door | [FW-E2E-012](#fw-e2e-012) | ADV-003 |
+| [FW-GW4](#fw-gw4) Single door | [FW-E2E-075](#fw-e2e-075) | 006, ADV-003 |
 | [FW-GW5](#fw-gw5) Backend confinement | [FW-E2E-019](#fw-e2e-019) | ADV-005 |
-| [FW-GW6](#fw-gw6) fd minting | [FW-E2E-011](#fw-e2e-011) | 010 |
+| [FW-GW6](#fw-gw6) fd minting | retired with the seam | — |
 | [FW-GW7](#fw-gw7) Least-privilege gateway | [FW-E2E-019](#fw-e2e-019) | ADV-003 |
 | [FW-GW8](#fw-gw8) Transparent passthrough | [FW-E2E-018](#fw-e2e-018) | 020, 021 |
 | [FW-GW9](#fw-gw9) Pattern-matched shading | [FW-E2E-065](#fw-e2e-065), 066, 067 | 068, 069, ADV-004 |
@@ -1071,7 +1073,7 @@ Each row names the tests that discharge a requirement; where a requirement is di
 
 **Exec restriction in v1.** *Closed:* exec restriction ships enabled-optional, as the `exec`/`readexec` verbs ([FW-ISO4](#fw-iso4), [FW-ISO9](#fw-iso9)), off by default.
 
-**fd-minting default.** *Closed by FEP-5.* On Linux connections are minted on demand through the connect supervisor ([FW-EGR7](#fw-egr7)); on macOS the session reaches a static, credentialed Gateway endpoint.
+**fd-minting default.** *Closed by FEP-5.* On Linux connections are minted on demand through the connect supervisor ([FW-EGR7](#fw-egr7)); on macOS the session reaches a static, credentialed Gateway endpoint. The injected-fd seam that pre-opened or minted fds was retired unwired ([FW-GW6](#fw-gw6)).
 
 **Credential brokering.** *Closed by FEP-5 §3.2.* Excluding a type ([FW-CRED5](#fw-cred5)) exposes the file/var to the agent; `broker:<type>` instead keeps the floor and has the Gateway present the credential on inspected hosts, with a per-session placeholder in the agent's environment ([FW-CRED11](#fw-cred11)–[FW-CRED14](#fw-cred14), [FW-INV13](#fw-inv13)). *(The older sensitive-set-discovery question — auto-detect vs configure the subtracted set — was resolved by the typed catalog + backstop, §5.9, deny-the-superset by default, and observe-then-widen discovery, §5.10.)*
 
@@ -1081,9 +1083,9 @@ Each row names the tests that discharge a requirement; where a requirement is di
 
 **Violation streaming.** Host-scoped egress landed with FEP-5 (host rules in `rules`, through the session Gateway). Each refusal is one operator-channel line naming its reproduction ([FW-FID9](#fw-fid9)); a real-time violation stream for embedding hosts ([FW-FID5](docs/fep-1.md#fw-fid5)) stays deferred.
 
-**Egress-specific questions.** FEP-5 §9 and FEP-6 §11 hold the questions the egress engine left open: a D-Bus filtering proxy to separate `os-keyring` from `run-outside` on Linux, HTTP/2 on inspected hosts, in-session loopback servers ([FW-E2E-106](#fw-e2e-106)), request-signing credentials, per-process trust on macOS, and portable fs groups for `unveil` mode.
+**Egress-specific questions.** FEP-5 §9 and FEP-6 §11 hold the questions the egress engine left open: a D-Bus filtering proxy to separate `os-keyring` from `run-outside` on Linux, HTTP/2 on inspected hosts, in-session loopback servers ([FW-E2E-106](#fw-e2e-106)), non-HTTP TCP such as SSH and database protocols, request-signing credentials, per-process trust on macOS, and portable fs groups for `unveil` mode.
 
-**Windows.** Out of scope for this proposal. If needed later, the analogous primitives (AppContainer, Restricted Tokens, Named Pipes for the fd seam) would be a third backend behind the same compiler.
+**Windows.** Out of scope for this proposal. If needed later, the analogous primitives (AppContainer, Restricted Tokens, Named Pipes for the transport) would be a third backend behind the same compiler.
 
 ## 12. Implementation order
 
@@ -1093,7 +1095,7 @@ Kernel-mechanism-first, honesty-first, reuse-validated-early:
 2. **Linux confiner** (Landlock fs + seccomp baseline + net-deny), spawn-confined posture, with the filesystem, descendant, and anti-shedding tests ([FW-E2E-001](#fw-e2e-001)..005, ADV-001, 002) and report-soundness ([FW-E2E-024](#fw-e2e-024)).
 3. **macOS confiner** (Seatbelt), same test set, then cross-platform equivalence ([FW-E2E-028](#fw-e2e-028)).
 4. **Reuse validation** against real toolchains ([FW-E2E-020](#fw-e2e-020)..023) — early, because if the default profile is not transparent enough to reuse the environment, the philosophy has failed and the profile needs rework before anything else is built on it.
-5. **fd-injection transport** and the seam tests ([FW-E2E-010](#fw-e2e-010), 011, 012), establishing that the agent never depends on in-sandbox connect or socket-path gating.
+5. **fd-injection transport** and the seam tests ([FW-E2E-010](#fw-e2e-010), 011, 012), establishing that the agent never depends on in-sandbox connect or socket-path gating — built and verified on both platforms, then retired unwired once FEP-5 (step 11) carried egress through the connect supervisor and the authenticated listener; the crate is in git history.
 6. **Gateway** (transport-agnostic backends, shading, full-surface policy, transparent passthrough, backend-confinement recursion) with [FW-E2E-013](#fw-e2e-013)..019 and ADV-003, 004, 005.
 7. **Degraded-host honesty and optional tiers** ([FW-E2E-009](#fw-e2e-009), 025, ADV-006), confirming Formwork reports rather than pretends when a kernel cannot enforce a requested capability.
 8. **Capability-model hardening** (FEP-1): the env axis ([FW-ENV1](#fw-env1)/2), execution-vector write-subtract ([FW-TRA7](#fw-tra7)), sensitive-set metadata denial ([FW-CAP7](#fw-cap7)), any-depth patterns ([FW-CAP6](#fw-cap6)), extended sensitive set ([FW-TRA8](#fw-tra8)), and the anti-escalation guarantee ([FW-XR8](#fw-xr8)) — landed and compiled/enforced on both backends. The fs additions are real-Seatbelt verified ([FW-E2E-037](#fw-e2e-037)..039); the env axis (a CLI-shell spawn transform, not a kernel capability) by unit tests plus the FidelityReport. Host-scoped egress landed with steps 11–12; the violation stream ([FW-FID5](docs/fep-1.md#fw-fid5)) remains deferred in `docs/fep-1.md`.

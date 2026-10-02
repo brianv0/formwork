@@ -178,7 +178,7 @@ rules.insert(libc::SYS_socket, vec![
     SeccompRule::new(vec![SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, AF_INET as u64)?])?,
     // ... INET6, PACKET ...
 ]);
-// AF_UNIX / socketpair are absent from the list -> allowed (the injected-fd seam is untouched).
+// AF_UNIX / socketpair are absent from the list -> allowed (local IPC is not egress).
 ```
 
 ### Connect supervision and the isolation tier (FEP-5)

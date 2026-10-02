@@ -1292,7 +1292,8 @@ the default.** Replace the host-rule atoms `any` and `https` with `allow` and `t
   test.
 - **Non-HTTP TCP.** SSH to a Git host and database protocols need a rule form for a port-scoped fd
   (FEP-1, [FW-GW6](../formwork.md#fw-gw6)). A grammar proposal belongs with FEP-5's `rules`; this FEP
-  proposes no `tcp:` verb (§10).
+  proposes no `tcp:` verb (§10). *(Since: FW-GW6 was retired with the injected-fd seam; a
+  port-scoped grant would now be a supervised `connect()` to a named host and port.)*
 - **Encrypted Client Hello.** Refused today as a server-name mismatch. If an agent toolchain enables
   ECH by default, tunnel grade needs a policy for the outer name.
 - **Post-quantum key exchange upstream.** With `ring`, the engine's upstream TLS from inspected

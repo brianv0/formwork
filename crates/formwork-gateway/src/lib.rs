@@ -32,8 +32,7 @@ pub use opener::{OpenRecord, OpenerService};
 pub use upstream::{ProxyEndpoint, UpstreamProxy};
 
 // Bounds a single frame so a peer that never sends a newline can't make the gateway buffer without
-// limit; overflow closes the connection. A stability bound (design §3), not a DoS-resistance claim --
-// the seam bounds its control channel the same way (`MAX_CONTROL_LINE`).
+// limit; overflow closes the connection. A stability bound (design §3), not a DoS-resistance claim.
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]

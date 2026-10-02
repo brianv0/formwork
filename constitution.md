@@ -49,8 +49,11 @@ This system has exactly these concepts, each with one name and one Rust type:
   Seatbelt) applied to a process and every descendant.
 - **Gateway** (`formwork-gateway`) — the single privileged broker; the one door
   for MCP and egress.
-- **Seam** (`formwork-seam`) — the injected-fd transport (socketpair-at-spawn +
-  `SCM_RIGHTS`); never an in-sandbox `connect()`.
+- **Seam** — the transport between a confined process and the Gateway: the MCP
+  gateway's stdio, and for egress the supervised `connect()` (Linux) or the
+  authenticated loopback listener (macOS); never a socket path the fs sandbox
+  allows ([FW-XR7](formwork.md#fw-xr7)). (The injected-fd crate, `formwork-seam`,
+  was retired unwired.)
 - **Session** — a confined process tree: the agent, its descendants, and stdio
   MCP backends the gateway spawns, all under the same Confiner.
 - **Posture** — `spawn-confined` (preferred) or `confine-self` (pledge-style).
@@ -292,7 +295,7 @@ pass.)* Named boundaries where failure is handled:
 the CLI shell (`formwork-cli`), the `enforce` install, and the Gateway
 connection. In Rust terms:
 - typed errors (`thiserror`) at the library/domain layers — `PathError`,
-  `ConfineError`, `SeamError`, `GatewayError`; opaque errors (`anyhow`) only in
+  `ConfineError`, `GatewayError`; opaque errors (`anyhow`) only in
   the `formwork-cli` shell. The boundary between them is the crate boundary.
   Typed-error variants are API surface — Growth applies.
 - panics are program bugs, never control flow, and are especially forbidden on
@@ -330,7 +333,7 @@ Dependencies point one way, from pure core toward the impure shell:
 decisions, discovery reverse-compile, narrowing)
 → `formwork-detect` (the only kernel-probing input)
 → `formwork-compile` (pure compiler: Blueprint + HostProfile → CompiledPolicy + report)
-→ `formwork-confine` · `formwork-seam` (kernel mechanisms)
+→ `formwork-confine` (kernel mechanisms)
 → `formwork-gateway` (the broker; the async layer)
 → `formwork-cli` (application shell; `anyhow`, entrypoint, subscriber)
 

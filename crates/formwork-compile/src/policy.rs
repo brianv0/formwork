@@ -25,9 +25,8 @@ pub enum ConfinerPolicy {
     Linux(Box<LinuxPolicy>),
     Macos(MacosPolicy),
     /// No usable confiner on this host (no Landlock, no seccomp): fs scope and net default-deny are
-    /// both reported `Unenforceable`, never silently assumed (FW-INV6). Egress containment then rests
-    /// on the seam alone -- the agent reaches the network only through the injected gateway fd
-    /// (FW-XR7) -- which this policy does not itself enforce.
+    /// both reported `Unenforceable`, never silently assumed (FW-INV6). Enforcing it fails
+    /// (`ConfineError::Unavailable`), so no workload runs unconfined (FW-XR3).
     Unavailable {
         reason: String,
     },
@@ -70,7 +69,7 @@ pub struct LinuxPolicy {
 pub enum LinuxNetPlan {
     /// Full inet default-deny: block inet `socket(2)` creation via seccomp -- TCP, UDP, and raw. Used
     /// for any outright net-deny (Landlock net governs only TCP), not just a sub-ABI-v4 fallback.
-    /// Inherited connected fds still work -- that is the seam (FW-XR7).
+    /// Inherited connected fds still work, so descriptors Formwork installs keep working (FW-XR7).
     SeccompDenyInet,
     /// The per-port TCP allow-list -- the port tier (ABI v4+). Landlock net governs *only* TCP, so
     /// this plan pairs it with a seccomp deny of inet DGRAM/RAW `socket(2)` (FW-ISO11, D4): Landlock

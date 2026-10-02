@@ -64,7 +64,7 @@ pub fn seccomp_plan(inet_deny: InetSeccompDeny, supervise_connect: bool) -> Secc
         "BASELINE_DENY must stay sorted"
     );
 
-    // AF_UNIX and socketpair are never listed, so the injected-fd seam is untouched (FW-XR7).
+    // AF_UNIX and socketpair are never listed: local IPC is not egress (FW-XR7).
     let (deny_socket_families, deny_inet_dgram_raw) = match inet_deny {
         InetSeccompDeny::FullInet => (
             vec![
@@ -98,7 +98,7 @@ pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, InetSecc
     let abi = host.landlock_abi.unwrap_or(0);
     match net {
         // Deny ALL inet egress via seccomp (TCP, UDP and raw at the socket-family level), matching
-        // macOS `(deny network*)`. AF_UNIX (the injected-fd seam) stays allowed.
+        // macOS `(deny network*)`. AF_UNIX (local IPC) stays allowed.
         NetPosture::Deny => (
             LinuxNetPlan::SeccompDenyInet,
             InetSeccompDeny::FullInet,
