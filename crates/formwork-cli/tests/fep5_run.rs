@@ -21,6 +21,29 @@ fn landlock_host(dir: &Path) -> bool {
 const QUICKSTART: &str = "extends = [\"builtin:default\"]\nnet = { ports = [443] }\n\
                           rules = [\"readwrite:$CWD/**\"]\n";
 
+/// A host whose kernel carries the filesystem walls: Landlock on Linux, Seatbelt on macOS.
+fn fs_wall_host(dir: &Path) -> bool {
+    let host = host_profile(dir);
+    if cfg!(target_os = "macos") {
+        host["seatbelt"].as_bool() == Some(true)
+    } else {
+        host["landlock-abi"].as_u64().is_some()
+    }
+}
+
+/// `formwork run` with `$HOME` at `home` and the launch directory at `cwd`.
+fn run_in(home: &Path, cwd: &Path, args: &[&str]) -> Output {
+    let out = formwork_command(home, args, &[], &[])
+        .current_dir(cwd)
+        .output()
+        .expect("running formwork");
+    Output {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
 /// The README's `toml` blocks, verbatim, in order; the first is the quickstart.
 fn readme_blueprints() -> Vec<String> {
     let readme =
@@ -265,6 +288,40 @@ fn dotdir_blueprint_is_discovered() {
         .as_str()
         .unwrap()
         .ends_with(".formwork/blueprint.toml"));
+}
+
+/// FW-XR8: a blueprint named through a symlinked directory stays write-protected. The hole is
+/// resolved like every grant, so it matches the path the kernel checks.
+#[test]
+fn a_blueprint_named_through_a_symlink_stays_write_protected() {
+    let dir = Scratch::new("symlinked-blueprint");
+    if !fs_wall_host(dir.path()) {
+        not_exercised("no filesystem wall on this host");
+        return;
+    }
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("FORMWORK.toml"), QUICKSTART).unwrap();
+    std::os::unix::fs::symlink(&project, dir.path().join("link")).unwrap();
+    let named = dir.path().join("link/FORMWORK.toml");
+    let run = run_in(
+        dir.path(),
+        &project,
+        &[
+            "run",
+            "--blueprint",
+            named.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo tampered >> FORMWORK.toml",
+        ],
+    );
+    assert_ne!(run.code, 0, "the blueprint was writable:\n{}", run.stderr);
+    assert_eq!(
+        std::fs::read_to_string(project.join("FORMWORK.toml")).unwrap(),
+        QUICKSTART
+    );
 }
 
 /// FW-FID11 (channel half): `explain <channel>` and `explain <group>` print each member's verdict,

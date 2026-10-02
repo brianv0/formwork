@@ -670,6 +670,9 @@ pub fn canonicalize_for_enforcement(blueprint: &Blueprint) -> Result<Blueprint> 
     out.fs.reads = map(&blueprint.fs.reads)?;
     out.fs.writes = map(&blueprint.fs.writes)?;
     out.fs.subtract = map(&blueprint.fs.subtract)?;
+    // A write-subtract row is a hole too: the policy inputs (FW-XR8) named through a symlink
+    // would otherwise miss the resolved path and stay writable.
+    out.fs.write_subtract = map(&blueprint.fs.write_subtract)?;
     if let ExecPosture::Allowlist(paths) = &blueprint.exec {
         out.exec = ExecPosture::Allowlist(map(paths)?);
     }
@@ -1281,6 +1284,37 @@ mod tests {
         };
         let out = canonicalize_for_enforcement(&blueprint).unwrap();
         assert_eq!(out.fs.subtract, blueprint.fs.subtract);
+    }
+
+    /// FW-XR8: a blueprint named through a symlink is write-protected at the path the kernel
+    /// resolves, like every other hole, including the not-yet-existing derived layers beside it.
+    #[test]
+    fn policy_inputs_named_through_a_symlink_resolve_for_enforcement() {
+        let dir = Scratch::new("symlinked-input");
+        let real = std::fs::canonicalize(dir.path()).unwrap().join("proj");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("FORMWORK.toml"), "").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut blueprint = Blueprint::empty();
+        protect_policy_inputs(&mut blueprint, &link.join("FORMWORK.toml")).unwrap();
+        let out = canonicalize_for_enforcement(&blueprint).unwrap();
+        let protected: Vec<PathBuf> = out
+            .fs
+            .write_subtract
+            .iter()
+            .map(|p| p.base().to_path_buf())
+            .collect();
+        for name in [
+            "FORMWORK.toml",
+            "FORMWORK.toml.discovered.toml",
+            "FORMWORK.toml.proposal.toml",
+        ] {
+            assert!(
+                protected.contains(&real.join(name)),
+                "{name}: {protected:?}"
+            );
+        }
     }
 
     #[test]
