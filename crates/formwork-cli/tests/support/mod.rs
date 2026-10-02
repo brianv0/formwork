@@ -47,6 +47,23 @@ pub fn formwork(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
 /// As [`formwork`], without the named variables, or any variable whose name starts with one of
 /// them followed by `_`.
 pub fn formwork_env(dir: &Path, args: &[&str], env: &[(&str, &str)], without: &[&str]) -> Output {
+    let out = formwork_command(dir, args, env, without)
+        .output()
+        .expect("running formwork");
+    Output {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// The command [`formwork_env`] runs, for a test that spawns it and watches it while it runs.
+pub fn formwork_command(
+    dir: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    without: &[&str],
+) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_formwork"));
     for (name, _) in std::env::vars_os() {
         let name = name.to_string_lossy().into_owned();
@@ -73,13 +90,38 @@ pub fn formwork_env(dir: &Path, args: &[&str], env: &[(&str, &str)], without: &[
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("running formwork");
-    Output {
-        code: out.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    cmd
+}
+
+/// A process's resident memory in KiB: `/proc` on Linux, `ps` on macOS. `None` once it is gone.
+pub fn resident_kib(pid: u32) -> Option<u64> {
+    if cfg!(target_os = "linux") {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    } else {
+        let out = Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
     }
 }
+
+/// FNV-1a, 64-bit: what the fixture's `/sink` reports for a body, so a test can compare without
+/// holding it.
+pub fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// A test that cannot exercise its mechanism on this host says so; on a CI runner, where
 /// `FW_REQUIRE_EXERCISED=1`, that is a failure rather than a skip.
@@ -243,8 +285,8 @@ pub fn fixture_cert(dir: &Path, names: &[&str]) -> FixtureCert {
 }
 
 /// A TLS upstream on `127.0.0.1` that records every request head and answers one request per
-/// connection: `/reflect` echoes the request head in the body, anything else answers
-/// `ok:<path>`.
+/// connection: `/reflect` echoes the request head in the body, `/sink` streams the body away and
+/// answers its length and FNV-1a hash, anything else answers `ok:<path>`.
 pub struct TlsFixture {
     pub port: u16,
     pub seen: Arc<Mutex<Vec<Seen>>>,
@@ -279,7 +321,7 @@ fn serve_tls(tcp: TcpStream, config: Arc<rustls::ServerConfig>, log: Arc<Mutex<V
     };
     let mut tls = rustls::StreamOwned::new(conn, tcp);
     let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
+    let mut chunk = [0u8; 64 * 1024];
     let end = loop {
         if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break end;
@@ -295,6 +337,31 @@ fn serve_tls(tcp: TcpStream, config: Arc<rustls::ServerConfig>, log: Arc<Mutex<V
         .header("content-length")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    if seen.path().starts_with("/sink") {
+        // Streamed, never held: the body's length and hash are all the test needs.
+        let mut hash = fnv1a(FNV_OFFSET, &buf[end + 4..]);
+        let mut got = buf.len() - (end + 4);
+        while got < length {
+            match tls.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    hash = fnv1a(hash, &chunk[..n]);
+                    got += n;
+                }
+            }
+        }
+        log.lock().unwrap().push(seen);
+        let body = format!("{got} {hash:016x}\n");
+        let _ = write!(
+            tls,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = tls.flush();
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+        return;
+    }
     while buf.len() < end + 4 + length {
         match tls.read(&mut chunk) {
             Ok(0) | Err(_) => break,

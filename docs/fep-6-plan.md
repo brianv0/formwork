@@ -132,6 +132,15 @@ rather than silently deviated.
   target times the runner's speed factor -- a calibration workload of in-memory TLS handshakes and
   records, timed between batches, over its time on the reference `ubuntu-24.04` runner, clamped to
   [1, 3]. An interval that straddles the budget takes more pairs, up to 4,000.
+- **`FW-E2E-093` decides on the 99th percentile (FEP-6 §8 amended).** "Every event within 20 ms"
+  is a maximum, the statistic a shared runner's noise reaches first, and a 200 ms cadence over 30 s
+  gives 150 events, too few for an interval. Events come every 20 ms, 1,000 at a time; the 95%
+  interval for their delays' 99th percentile is held to 20 ms times `FW-E2E-096`'s node factor, and
+  the maximum is reported. Measured at a 99th percentile of 0.6 ms locally.
+- **`FW-E2E-092` measures the `formwork` process.** The Gateway runs in it; the workload waits for
+  the test to sample the idle baseline, then streams 256 MiB with `curl -T` to a fixture that
+  hashes the body without holding it. Growth was 3 MiB of the 16 MiB bound; a Gateway that held a
+  length-framed body before forwarding it grew 259 MiB and failed.
 - **The pool waited a timer tick per reused request (found by `FW-E2E-096`).** Its idle-connection
   check was `timeout(Duration::ZERO, ..)`, which tokio resolves on the timer's next 1 ms tick, so
   every request on a reused connection added about 1.3 ms. One poll replaces it (0.06-0.11 ms
@@ -154,8 +163,8 @@ clients, loopback fixtures, and the operator's `SSL_CERT_FILE` naming the fixtur
 
 | ID | Where | Runs on | Coverage |
 |---|---|---|---|
-| `FW-E2E-092` | `formwork-gateway/tests/inspect.rs` (`fw_egr21_…`) | both | 3 MiB chunked and length-framed uploads byte-identical; the memory bound and `git push` are owed |
-| `FW-E2E-093` | `formwork-gateway/tests/inspect.rs` | both | ordering, not the 20 ms bound (§5 register) |
+| `FW-E2E-092` | `fep6_run.rs` (`fw_e2e_092_…`: a 256 MiB curl upload through `run`, the `formwork` process's resident memory sampled), `formwork-gateway/tests/inspect.rs` (`fw_egr21_…`: 3 MiB chunked and length-framed) | both | the `git push` half is owed with the integrated forms' git fixture |
+| `FW-E2E-093` | `formwork-gateway/tests/latency.rs` (the 20 ms bound, in release with `FW-E2E-096`), `formwork-gateway/tests/inspect.rs` (ordering through the guard) | both | as amended: a 95% interval for the 99th percentile delay against 20 ms scaled to the runner |
 | `FW-E2E-094` | `formwork-cli/tests/fep6_run.rs`; CI records it per OS | both | the matrices below |
 | `FW-E2E-095` | `formwork-gateway/tests/inspect.rs` | both | full |
 | `FW-E2E-096` | `formwork-gateway/tests/latency.rs`, in release in its own CI step | both | as amended: a 95% interval for the median added latency against the target scaled to the runner (below) |
@@ -214,5 +223,5 @@ it when the reference was set (every factor 1.00):
   paths (§7.1). Their mechanisms are covered by the gateway tests above; the integrated flows are
   not.
 - **`FW-E2E-106`** stays blocked on FEP-6 §11 (in-session loopback).
-- **Test-method exceptions**, in `docs/STATUS.md`'s register: `FW-E2E-092`'s memory bound and
-  `FW-E2E-093`'s 20 ms bound are asserted by ordering and byte identity instead of measurement.
+- **`FW-E2E-092`'s `git push` half** (a pack over 1 MiB, chunked) needs the integrated forms' `git
+  http-backend` fixture; chunked uploads are covered at the gateway level (`fw_egr21_…`).

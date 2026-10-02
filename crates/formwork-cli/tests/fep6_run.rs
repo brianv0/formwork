@@ -406,6 +406,101 @@ fn fw_e2e_094_client_matrix() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n---\n"));
 }
 
+/// FW-E2E-092 (both; the 256 MiB half): a 256 MiB upload from curl through an inspected host
+/// reaches the fixture byte-identical, and the Gateway's resident memory -- the `formwork` process
+/// it runs in -- grows by less than 16 MiB during it: bodies stream, holding at most
+/// **body-buffer** bytes per direction (FW-EGR21). The workload waits for the test to sample the
+/// idle baseline before it starts; the `git push` half needs the integrated forms' git fixture.
+#[test]
+fn fw_e2e_092_a_large_upload_streams_in_bounded_memory() {
+    use std::io::Write;
+    use std::process::Stdio;
+    const MIB: usize = 1024 * 1024;
+    const SIZE: usize = 256 * MIB;
+    const BOUND_KIB: u64 = 16 * 1024;
+    let dir = Scratch::new("fep6-upload");
+    if !session_host(dir.path(), &["curl"]) {
+        return;
+    }
+    let cert = fixture_cert(dir.path(), &["127.0.0.1"]);
+    let up = TlsFixture::start(&cert);
+    let root = cert.root.to_str().unwrap().to_string();
+    blueprint(dir.path(), &[format!("allow:127.0.0.1:{}", up.port)], "");
+    // The body: a pattern that differs block to block, hashed as it is written.
+    let mut hash = FNV_OFFSET;
+    {
+        let file = std::fs::File::create(dir.path().join("body.bin")).unwrap();
+        let mut file = std::io::BufWriter::new(file);
+        let mut block = vec![0u8; MIB];
+        for n in 0..SIZE / MIB {
+            for (i, b) in block.iter_mut().enumerate() {
+                *b = ((i * 7 + n * 13) % 251) as u8;
+            }
+            hash = fnv1a(hash, &block);
+            file.write_all(&block).unwrap();
+        }
+    }
+    // The handshake files live below the launch directory, which here is also `$HOME`: the
+    // default profile keeps the home directory's own entries.
+    std::fs::create_dir_all(dir.path().join("sync")).unwrap();
+    let script = format!(
+        "touch sync/ready; while [ ! -f sync/go ]; do sleep 0.05; done; \
+         curl -sS -m 600 -T body.bin -X POST https://127.0.0.1:{}/sink",
+        up.port
+    );
+    let mut child = formwork_command(
+        dir.path(),
+        &["run", "--", "/bin/sh", "-c", &script],
+        &[("SSL_CERT_FILE", root.as_str())],
+        &[],
+    )
+    .stdout(std::fs::File::create(dir.path().join("stdout.log")).unwrap())
+    .stderr(std::fs::File::create(dir.path().join("stderr.log")).unwrap())
+    .stdin(Stdio::null())
+    .spawn()
+    .unwrap();
+    let pid = child.id();
+    let tick = std::time::Duration::from_millis(20);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !dir.path().join("sync/ready").exists() && child.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the workload never started"
+        );
+        std::thread::sleep(tick);
+    }
+    // The idle baseline: the session is up and the Gateway has served nothing yet.
+    let mut baseline = 0;
+    for _ in 0..10 {
+        baseline = baseline.max(resident_kib(pid).unwrap_or(0));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::fs::write(dir.path().join("sync/go"), "").unwrap();
+    let (mut peak, mut samples) = (baseline, 0);
+    while child.try_wait().unwrap().is_none() {
+        if let Some(kib) = resident_kib(pid) {
+            peak = peak.max(kib);
+            samples += 1;
+        }
+        std::thread::sleep(tick);
+    }
+    let status = child.wait().unwrap();
+    let stdout = std::fs::read_to_string(dir.path().join("stdout.log")).unwrap();
+    let stderr = std::fs::read_to_string(dir.path().join("stderr.log")).unwrap();
+    assert!(status.success(), "{stderr}");
+    assert_eq!(stdout, format!("{SIZE} {hash:016x}\n"), "{stderr}");
+    let growth = peak.saturating_sub(baseline);
+    eprintln!(
+        "FW-E2E-092: formwork resident {baseline} KiB idle, {peak} KiB at peak over {samples} \
+         samples during the upload: +{growth} KiB (bound {BOUND_KIB} KiB)"
+    );
+    assert!(baseline > 0 && samples > 0, "no resident-memory samples");
+    assert!(
+        growth < BOUND_KIB,
+        "the Gateway's resident memory grew by {growth} KiB during a {SIZE}-byte upload"
+    );
+}
+
 /// FW-ENV2 (found by `FW-E2E-094`): git configuration supplied through the environment survives the
 /// scrub entry by entry. A credential entry (an `http.extraheader`) is dropped, a benign one is
 /// kept under a matching count, and git starts and reads it. Judged by variable name alone, every

@@ -165,12 +165,16 @@ impl Seen {
 /// - `/ws`: `101 Switching Protocols` to an upgrade, then echoes every byte;
 /// - `/sum`: answers with the body's length and checksum;
 /// - `/bye`: answers as keep-alive, then closes the connection;
+/// - `/events?n=N&gap_ms=G`: a server-sent-event stream of `N` events `G` ms apart, each written
+///   as its own chunk and its write time recorded in [`Upstream::events`];
 /// - anything else: `ok:<path>`.
 #[derive(Clone)]
 pub struct Upstream {
     pub port: u16,
     pub handshakes: Arc<AtomicUsize>,
     pub seen: Arc<Mutex<Vec<Seen>>>,
+    /// When `/events` wrote each event, in order.
+    pub events: Arc<Mutex<Vec<std::time::Instant>>>,
     ack: Arc<AtomicBool>,
     acked: Arc<AtomicBool>,
 }
@@ -196,6 +200,7 @@ pub async fn upstream(tls: Option<FixtureTls>) -> Upstream {
         port: listener.local_addr().unwrap().port(),
         handshakes: Arc::new(AtomicUsize::new(0)),
         seen: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::new(Mutex::new(Vec::new())),
         ack: Arc::new(AtomicBool::new(false)),
         acked: Arc::new(AtomicBool::new(false)),
     };
@@ -387,6 +392,38 @@ async fn serve_fixture<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, fixture: Ups
                 s.write_all(respond("", &format!("{} {sum}", body.len())).as_bytes())
                     .await
                     .is_ok()
+            }
+            "/events" => {
+                let param = |name: &str, default: u64| {
+                    query
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+                        .unwrap_or(default)
+                };
+                let (n, gap) = (param("n", 10), param("gap_ms", 20));
+                let mut ok = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                          Transfer-Encoding: chunked\r\n\r\n",
+                    )
+                    .await
+                    .is_ok()
+                    && s.flush().await.is_ok();
+                for i in 0..n {
+                    if !ok {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(gap)).await;
+                    let event = format!("data: {i}\n\n");
+                    let frame = format!("{:x}\r\n{event}\r\n", event.len());
+                    fixture
+                        .events
+                        .lock()
+                        .unwrap()
+                        .push(std::time::Instant::now());
+                    ok = s.write_all(frame.as_bytes()).await.is_ok() && s.flush().await.is_ok();
+                }
+                ok && s.write_all(b"0\r\n\r\n").await.is_ok()
             }
             "/bye" => {
                 // Answered as keep-alive, then closed: the Gateway pools a connection the

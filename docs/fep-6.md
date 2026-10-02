@@ -1240,9 +1240,13 @@ Draft numbers continue above `FW-E2E-091` and `FW-ADV-020`.
   pack larger than 1 MiB, and a 256 MiB `POST` from curl. Pass: the fixture receives both bodies
   byte-identical, and the Gateway's resident memory grows by less than 16 MiB during the upload.
   Fail: either body differs or stalls, or memory grows past the bound.
-- <a id="fw-e2e-093"></a>**FW-E2E-093: Streaming (both).** A fixture emits one server-sent event every 200 ms for 30 s on
-  an inspected host with a brokered credential. Pass: every event reaches the client within 20 ms of
-  the fixture writing it. Fail: any event is later.
+- <a id="fw-e2e-093"></a>**FW-E2E-093: Streaming (both).** A fixture emits server-sent events, one every 20 ms, on an
+  inspected host with a brokered credential, in streams of 250, until at least 1,000 events are
+  measured. Pass: the 95% interval for the 99th percentile of the events' delays -- from the
+  fixture writing an event to the client reading it -- lies under 20 ms times the node factor of
+  `FW-E2E-096`. Fail: it lies over, or still straddles the budget after 4,000 events. (Amended:
+  "every event" is the maximum, the most noise-sensitive statistic on a shared runner; a 200 ms
+  cadence over 30 s yields too few events for an interval.)
 - <a id="fw-e2e-094"></a>**FW-E2E-094: Client matrix (both).** curl, git, Python `requests`, Python `urllib`, pip, Node
   `fetch` and `https` with the Launcher's variables, npm, Go `net/http`, uv, cargo and rustup each
   fetch from a tunnel fixture and an inspected fixture. Pass: the results match the matrix recorded
