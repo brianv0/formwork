@@ -3,15 +3,16 @@
 # spurious denials, the confinement is transparent enough for real work.
 #
 # This is a TEMPLATE. `just dev-confined` renders it to a gitignored .dev-session.toml, substituting
-# @REPO@ with your actual checkout path. Blueprints are absolute-path only and the CLI does not yet
-# fold the child's cwd into the read grant (docs/spikes.md Spike 2), so the repo path must be named
-# explicitly — the recipe does that for you regardless of where you cloned.
+# @REPO@ with your actual checkout path. The repo is named explicitly rather than as `$CWD`, so the
+# grant does not depend on the directory `claude` starts in — the recipe does that for you
+# regardless of where you cloned.
 #
 # It is examples/blueprints/agent-base.toml plus the port tier, widened to what a Rust build touches.
 
 # crates.io + git-over-HTTPS (cargo fetch) and the model API. Port-scoped = any HTTPS host; the fs
-# wall, not an egress allowlist, is what stops exfiltration. (Once host-scoped egress lands, prefer
-# naming crates.io + the model host so egress is host-scoped and the SSRF/metadata block applies.)
+# wall, not an egress allowlist, is what stops exfiltration. Host rules (`allow:`/`tunnel:`, see
+# examples/README.md) would scope egress and apply the SSRF/metadata block; this profile keeps the
+# port tier so the dev loop needs no host list.
 # DNS still resolves: on macOS it goes through the system resolver (mDNSResponder), not a socket the
 # confined process opens, so :443 egress is enough for cargo to reach the network.
 net = { ports = [443] }
