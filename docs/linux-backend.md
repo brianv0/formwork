@@ -159,8 +159,11 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
    and the blueprint beside it (or `.formwork/` below it) always hold the same rights. `WriteFile`
    for one is `WriteFile` for the other, and `Make*`/`Remove*` on the root would let the session
    replace the blueprint, move `.formwork/` aside, or create the absent discovered layer. Only a
-   blueprint outside the grant keeps the root whole. `run` and `explain` name the split directories
-   and that layout (FEP-5 D3, amended in `docs/fep-5-plan.md` §3).
+   blueprint outside the grant keeps the root whole, and the split is load-bearing: a launch
+   directory the session can create in is one it can leave a blueprint in for the next run's
+   discovery walk. `run` and `explain` name the split directories, and name `--blueprint` with a
+   file outside the grant as the way to a whole root, with that residual (FEP-5 D3, amended in
+   `docs/fep-5-plan.md` §3; the open shape is in its §5).
 
 ## seccomp baseline (`seccompiler`) — and its hazards
 

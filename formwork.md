@@ -424,6 +424,8 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-039"></a>**FW-E2E-039: Tamper vectors are read-through, write-denied.** Under a writable project grant, a `write-subtract` set masks execution/policy-tampering vectors (`.git/hooks/**`, `.git/config`, `.mcp.json`, `.vscode/**`, shell rc). Pass: writing `<proj>/.git/config` is denied though the surrounding tree is writable, while reading it still succeeds so git and tooling keep working. Fail: any tamper path is writable under a normal project grant ([FW-TRA7](#fw-tra7)).
 
+<a id="fw-e2e-107"></a>**FW-E2E-107: The project root under the quickstart ([FW-TRA5](#fw-tra5), [FW-XR8](#fw-xr8)).** The README quickstart runs a workload that creates a file and a directory in the project root, with the blueprint (a) as `FORMWORK.toml` in the project, (b) as `.formwork/blueprint.toml`, and (c) outside the project, named with `--blueprint`. Pass: in every case the blueprint is unchanged. On macOS every case creates both. On Linux (c) creates both, while (a) and (b) refuse the create, since the write-protected blueprint splits the root's grant (Landlock cannot carve a file out of a directory's grant, `docs/linux-backend.md`), and both `run` and `explain` name the split directories and `--blueprint` from outside the grant as the way to a creatable root. A root that took the create is never reported split. Fail: a refused create without that report, a split reported for a whole root, or a changed blueprint.
+
 ### 7.2 Network / egress
 
 <a id="fw-e2e-006"></a>**FW-E2E-006: Direct egress denied.** With `net: Deny`, the session runs `curl https://example.com`. Pass: the connection fails closed (no route to a network the process can reach). Fail: any bytes leave the host by a path other than the gateway.
@@ -641,6 +643,8 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 <a id="fw-adv-023"></a>**FW-ADV-023: Address classes.** Under `allow:*.test`, the resolver fixture answers `127.0.0.1`, `10.0.0.1`, `100.100.100.200`, `168.63.129.16`, `::ffff:169.254.169.254`, `64:ff9b::a9fe:a9fe`, `2002:a9fe:a9fe::1`, `fe80::1`, a public address mixed with `10.0.0.1`, an address of the runner's own interfaces, and the Gateway's own listener address. Then, under the exact rule `allow:allowed.test`, it answers `127.0.0.1` and then `169.254.169.254`. Pass: every wildcard case and the exact-name metadata case are refused with `address-class`, and the exact-name loopback case is admitted. Fail: any other outcome.
 
 <a id="fw-adv-024"></a>**FW-ADV-024: Parser battery ([FW-INV15](#fw-inv15)).** Heads carrying both `Content-Length` and `Transfer-Encoding`, two differing `Content-Length` values, obsolete line folding, a bare LF, a NUL in a header value, an invalid method token, a head over **head-limit**, CONNECT authorities with userinfo, a path, a zone identifier, a percent-encoded dot, or a numeric spelling (`2130706433`, `0x7f.1`, `127.1`), and a truncated ClientHello. Pass: the fixture upstream receives no byte from any of them. Fail: any byte arrives.
+
+<a id="fw-adv-026"></a>**FW-ADV-026: Policy-input tamper ([FW-XR8](#fw-xr8)).** With its blueprint in the project, as `FORMWORK.toml`, as `.formwork/blueprint.toml`, and named through a symlinked directory, the confined session tries to change the inputs of its next run: it appends to the blueprint, deletes it, renames it aside, and creates the absent discovered layer and proposal beside it. Pass: every attempt is refused, the blueprint is unchanged, and the derived files are still absent. Fail: an input changes, disappears or appears. A nearer blueprint left in a directory the session can write, for a later discovery walk to find first, is outside this test and open (`docs/fep-5-plan.md` §5).
 
 ### 7.11 Host-service channels & isolation
 
@@ -933,7 +937,7 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-XR5](#fw-xr5) Single privileged broker | [FW-E2E-019](#fw-e2e-019) | ADV-005 |
 | [FW-XR6](#fw-xr6) Behavioral parity | [FW-E2E-028](#fw-e2e-028) | 024, 071 |
 | [FW-XR7](#fw-xr7) Mediated transport | [FW-E2E-075](#fw-e2e-075), 076 | ADV-005, ADV-006, [FW-ADV-018](#fw-adv-018), 091 |
-| [FW-XR8](#fw-xr8) No agent-influenced escalation | [FW-ADV-001](#fw-adv-001) | [FW-E2E-005](#fw-e2e-005), INV1 |
+| [FW-XR8](#fw-xr8) No agent-influenced escalation | [FW-ADV-001](#fw-adv-001), [FW-ADV-026](#fw-adv-026) | [FW-E2E-005](#fw-e2e-005), [FW-E2E-107](#fw-e2e-107), INV1 |
 | [FW-XR9](#fw-xr9) Surface fail-fast | [FW-E2E-062](#fw-e2e-062) | INV5, INV6 |
 | [FW-XR10](#fw-xr10) Wrapper transparency | [FW-E2E-086](#fw-e2e-086) | — |
 | [FW-XR11](#fw-xr11) Failure attribution | [FW-E2E-086](#fw-e2e-086) (first half; the second is not reachable black-box) | — |
@@ -976,7 +980,7 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-TRA2](#fw-tra2) Toolchains run clean | [FW-E2E-020](#fw-e2e-020), 021, 022 | 023 |
 | [FW-TRA3](#fw-tra3) Sensitive-set subtraction | [FW-E2E-003](#fw-e2e-003) | 004 |
 | [FW-TRA4](#fw-tra4) Graceful denial | [FW-E2E-023](#fw-e2e-023) | 020, 021 |
-| [FW-TRA5](#fw-tra5) Writable working set | [FW-E2E-002](#fw-e2e-002), 022 | 020 |
+| [FW-TRA5](#fw-tra5) Writable working set | [FW-E2E-002](#fw-e2e-002), 022, [FW-E2E-107](#fw-e2e-107) | 020 |
 | [FW-TRA6](#fw-tra6) Low overhead | §8 targets | 020, 021 |
 | [FW-TRA7](#fw-tra7) Execution-vector write protection | [FW-E2E-039](#fw-e2e-039) | — |
 | [FW-TRA8](#fw-tra8) Agent-state & local-secret coverage | [FW-E2E-038](#fw-e2e-038) | [FW-E2E-003](#fw-e2e-003) |

@@ -290,14 +290,14 @@ fn dotdir_blueprint_is_discovered() {
         .ends_with(".formwork/blueprint.toml"));
 }
 
-/// FEP-5 D3, run half: under the README quickstart the session creates a file and a directory in
-/// the project root, and the blueprint stays write-protected (FW-XR8), in every layout -- except
-/// that on Linux a blueprint inside the project, as `FORMWORK.toml` or `.formwork/blueprint.toml`,
+/// FW-E2E-107 (FEP-5 D3, run half): under the README quickstart the session creates a file and a
+/// directory in the project root, and the blueprint stays write-protected (FW-XR8) -- except that
+/// on Linux a blueprint inside the project, as `FORMWORK.toml` or `.formwork/blueprint.toml`,
 /// splits the root's grant (Landlock cannot carve a file out of a directory's grant). There the
-/// run must refuse the create and say so, naming the layout that works, and `explain` must say
-/// the same. A blueprint above the project, which discovery finds, keeps the root whole.
+/// run must refuse the create and say so, naming `--blueprint` from outside the grant, and
+/// `explain` must say the same. A blueprint named that way keeps the root whole.
 #[test]
-fn quickstart_creates_in_the_project_root_or_says_why_not() {
+fn fw_e2e_107_quickstart_creates_in_the_project_root_or_says_why_not() {
     let probe = Scratch::new("root-create");
     if !fs_wall_host(probe.path()) {
         not_exercised("no filesystem wall on this host");
@@ -305,25 +305,32 @@ fn quickstart_creates_in_the_project_root_or_says_why_not() {
     }
     let quickstart = readme_quickstart();
     for (tag, layout) in [
-        ("above", "../FORMWORK.toml"),
         ("root", "FORMWORK.toml"),
         ("dotdir", ".formwork/blueprint.toml"),
+        ("flag", "../blueprints/proj.toml"),
     ] {
         let dir = Scratch::new(&format!("root-create-{tag}"));
         let project = dir.path().join("proj");
         std::fs::create_dir_all(project.join(".formwork")).unwrap();
+        std::fs::create_dir_all(dir.path().join("blueprints")).unwrap();
         let blueprint = project.join(layout);
         std::fs::write(&blueprint, &quickstart).unwrap();
+        let named = blueprint.display().to_string();
+        let flag: &[&str] = if tag == "flag" {
+            &["--blueprint", &named]
+        } else {
+            &[]
+        };
         let script = format!("touch newfile; mkdir newdir; echo tampered >> {layout}; exit 0");
-        let out = formwork_command(
-            dir.path(),
-            &["run", "--", "/bin/sh", "-c", &script],
-            &[("RUST_LOG", "warn")],
-            &[],
-        )
-        .current_dir(&project)
-        .output()
-        .unwrap();
+        let run_args: Vec<&str> = ["run"]
+            .into_iter()
+            .chain(flag.iter().copied())
+            .chain(["--", "/bin/sh", "-c", &script])
+            .collect();
+        let out = formwork_command(dir.path(), &run_args, &[("RUST_LOG", "warn")], &[])
+            .current_dir(&project)
+            .output()
+            .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(0), "{tag}: {stderr}");
         assert_eq!(
@@ -332,11 +339,15 @@ fn quickstart_creates_in_the_project_root_or_says_why_not() {
             "{tag}: the blueprint was writable"
         );
         let created = project.join("newfile").is_file() && project.join("newdir").is_dir();
-        let explain = run_in(dir.path(), &project, &["explain"]);
+        let explain_args: Vec<&str> = ["explain"]
+            .into_iter()
+            .chain(flag.iter().copied())
+            .collect();
+        let explain = run_in(dir.path(), &project, &explain_args);
         assert_eq!(explain.code, 0, "{tag}: {}", explain.stderr);
         // The split note, from the run's operator channel and from `explain`. Under a scratch
-        // directory inside the default profile's writable temp root, a blueprint above the project
-        // still splits the directories above the project, never the project itself.
+        // directory inside the default profile's writable temp root, a blueprint outside the
+        // project still splits the directories above it, never the project itself.
         let notes: Vec<&str> = [stderr.as_ref(), explain.stdout.as_str()]
             .into_iter()
             .filter_map(|said| {
@@ -350,13 +361,13 @@ fn quickstart_creates_in_the_project_root_or_says_why_not() {
             dirs.ends_with(&project.display().to_string())
                 || dirs.ends_with(&project.join(".formwork").display().to_string())
         };
-        if cfg!(target_os = "linux") && tag != "above" {
+        if cfg!(target_os = "linux") && tag != "flag" {
             assert!(!created, "{tag}: the split root took a create");
             assert_eq!(notes.len(), 2, "{tag}: run and explain must both say so");
             for note in notes {
                 assert!(
                     splits_root(note) && note.contains("--blueprint"),
-                    "{tag}: the split is not named with the layout that works:\n{note}"
+                    "{tag}: the split is not named with the way to a whole root:\n{note}"
                 );
             }
         } else {
@@ -372,38 +383,57 @@ fn quickstart_creates_in_the_project_root_or_says_why_not() {
     }
 }
 
-/// FW-XR8: a blueprint named through a symlinked directory stays write-protected. The hole is
-/// resolved like every grant, so it matches the path the kernel checks.
+/// FW-ADV-026: with its blueprint in the project -- as `FORMWORK.toml`, as
+/// `.formwork/blueprint.toml`, and named through a symlinked directory, whose protection must be
+/// resolved like every grant to match the path the kernel checks -- the session cannot append to
+/// the blueprint, delete it, rename it aside, or create the absent discovered layer and proposal.
 #[test]
-fn a_blueprint_named_through_a_symlink_stays_write_protected() {
-    let dir = Scratch::new("symlinked-blueprint");
-    if !fs_wall_host(dir.path()) {
+fn fw_adv_026_policy_input_tamper() {
+    let probe = Scratch::new("tamper");
+    if !fs_wall_host(probe.path()) {
         not_exercised("no filesystem wall on this host");
         return;
     }
-    let project = dir.path().join("proj");
-    std::fs::create_dir_all(&project).unwrap();
-    std::fs::write(project.join("FORMWORK.toml"), QUICKSTART).unwrap();
-    std::os::unix::fs::symlink(&project, dir.path().join("link")).unwrap();
-    let named = dir.path().join("link/FORMWORK.toml");
-    let run = run_in(
-        dir.path(),
-        &project,
-        &[
-            "run",
-            "--blueprint",
-            named.to_str().unwrap(),
-            "--",
-            "/bin/sh",
-            "-c",
-            "echo tampered >> FORMWORK.toml",
-        ],
-    );
-    assert_ne!(run.code, 0, "the blueprint was writable:\n{}", run.stderr);
-    assert_eq!(
-        std::fs::read_to_string(project.join("FORMWORK.toml")).unwrap(),
-        QUICKSTART
-    );
+    for (tag, layout) in [
+        ("root", "FORMWORK.toml"),
+        ("dotdir", ".formwork/blueprint.toml"),
+        ("symlink", "FORMWORK.toml"),
+    ] {
+        let dir = Scratch::new(&format!("tamper-{tag}"));
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join(".formwork")).unwrap();
+        let blueprint = project.join(layout);
+        std::fs::write(&blueprint, QUICKSTART).unwrap();
+        std::os::unix::fs::symlink(&project, dir.path().join("link")).unwrap();
+        let named = dir.path().join("link").join(layout).display().to_string();
+        let flag: &[&str] = if tag == "symlink" {
+            &["--blueprint", &named]
+        } else {
+            &[]
+        };
+        let script = format!(
+            "echo tampered >> {layout}; rm -f {layout}; mv {layout} {layout}.aside; \
+             touch {layout}.discovered.toml {layout}.proposal.toml; exit 0"
+        );
+        let args: Vec<&str> = ["run"]
+            .into_iter()
+            .chain(flag.iter().copied())
+            .chain(["--", "/bin/sh", "-c", &script])
+            .collect();
+        let run = run_in(dir.path(), &project, &args);
+        assert_eq!(run.code, 0, "{tag}: {}", run.stderr);
+        assert_eq!(
+            std::fs::read_to_string(&blueprint).ok().as_deref(),
+            Some(QUICKSTART),
+            "{tag}: the blueprint changed or disappeared"
+        );
+        for derived in [".aside", ".discovered.toml", ".proposal.toml"] {
+            assert!(
+                !Path::new(&format!("{}{derived}", blueprint.display())).exists(),
+                "{tag}: the session created {layout}{derived}"
+            );
+        }
+    }
 }
 
 /// FW-FID11 (channel half): `explain <channel>` and `explain <group>` print each member's verdict,

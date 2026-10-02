@@ -1582,8 +1582,10 @@ fn refuse_unavailable_isolation(
 /// FEP-5 D3: the policy inputs are write-protected during a run (FW-XR8), and on Linux a protected
 /// path inside a write grant splits the grant: Landlock cannot carve a path out of a directory's
 /// grant, so the grant goes to the entries around it. Neither discovery location avoids that
-/// inside the project. Names the directories that lose create, delete and rename, and the layout
-/// that keeps them whole; `None` when nothing is split.
+/// inside the project, and the split is load-bearing: a launch directory the session can create
+/// in is one it can leave a blueprint in for discovery's next walk. Names the directories that
+/// lose create, delete and rename, and `--blueprint` from outside the grant as the way to a whole
+/// root, with that residual; `None` when nothing is split.
 fn split_root_note(
     blueprint: &Blueprint,
     blueprint_path: &std::path::Path,
@@ -1612,9 +1614,10 @@ fn split_root_note(
          inside a write grant is carved out by granting the entries around it, never the \
          directory holding it: nothing can be created, deleted or renamed directly in {dirs}, \
          while the rest of what exists at launch stays writable. {} and {} both do this inside \
-         the grant. Keep the blueprint outside every write grant to avoid it: for a project \
-         granted as $CWD/**, in a directory above the project (discovery looks there, up to \
-         $HOME) or anywhere via --blueprint",
+         the grant, and it also keeps the session from leaving a blueprint there for discovery \
+         to find next time. For a creatable project root, pass --blueprint with a file outside \
+         every write grant, and keep passing it: the session can then leave a FORMWORK.toml in \
+         the project that a run without --blueprint would use",
         blueprint_path.display(),
         blueprint_load::DEFAULT_BLUEPRINT_NAME,
         blueprint_load::DOTDIR_BLUEPRINT,

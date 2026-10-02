@@ -176,13 +176,18 @@ here rather than silently deviated.
   directory reaches everything beneath it, and stacked layers only intersect, so a file created in
   the root holds exactly the rights of the protected file beside it, or of `.formwork/` below it.
   `Make*` on the root, the §9 alternative, would let the session create the absent discovered
-  layer, and without `WriteFile` a new file is not writable anyway. *Resolved:* `.formwork/` stays
-  as the one-directory layout. `run` warns, and `explain` notes, which directories lose create,
-  delete and rename, and they name the layout that keeps the root whole: a blueprint outside the
-  write grant, in a directory above the project (discovery finds it) or via `--blueprint`. The
-  README documents the limitation, and a run-level test checks all three layouts on both OSes.
-  The same work found the policy inputs' write-subtract rows unresolved at enforcement, so a
-  blueprint named through a symlinked directory stayed writable (fixed; `FW-XR8`).
+  layer, and without `WriteFile` a new file is not writable anyway. The split is also
+  load-bearing: with the blueprint in a directory above the project, the root is whole, and a
+  session that wrote `FORMWORK.toml` there governed the next run from the project, widening its
+  own grant (reproduced). *Resolved:* `.formwork/` stays as the one-directory layout. `run` warns,
+  and `explain` notes, which directories lose create, delete and rename, and they name
+  `--blueprint` with a file outside every write grant as the way to a creatable root, with its
+  residual: the session can then leave a `FORMWORK.toml` that a run without the flag would use.
+  The README says to keep the blueprint in the project and launch from its root, and documents
+  the Linux cost. `FW-E2E-107` runs the quickstart in both discovery layouts and with the flag;
+  `FW-ADV-026` tries to change the inputs themselves. The same work found the policy inputs'
+  write-subtract rows unresolved at enforcement, so a blueprint named through a symlinked
+  directory stayed writable (fixed; `FW-ADV-026` covers it).
 
 ## 4. Tests
 
@@ -218,6 +223,18 @@ instead of skipping. The README quickstart is read verbatim from `README.md` and
 
 ## 5. Still owed
 
-Nothing in FEP-5's scope. The macOS answers come from GitHub's virtual runners, which run with
-System Integrity Protection off; `docs/macos-characterization.md` asks for a repeat on a
+- **A nearer blueprint left for discovery.** The Launcher write-protects the inputs a run was
+  built from, not the discovery candidates that would shadow them. A session that can create
+  entries in a directory between a later launch directory and the blueprint can leave a
+  `FORMWORK.toml` (or `.formwork/blueprint.toml`) there, and the next run started at or below it
+  is governed by it: a blueprint above the project, a run launched from a subdirectory of the
+  project (subdirectories stay writable), or `--blueprint` followed by a run without it. Not yet
+  characterized on macOS: renaming `.formwork/` aside, which Seatbelt's path-based deny on the
+  file inside may not refuse, then writing `FORMWORK.toml`. The options are write-protecting the
+  absent candidates from the launch directory up to the blueprint (exact on Seatbelt; on Linux it
+  splits each of those directories, as D3 does), or a record of operator-accepted blueprints that
+  discovery checks. Either changes what the Launcher guarantees, so it is left for review.
+
+Otherwise nothing in FEP-5's scope. The macOS answers come from GitHub's virtual runners, which
+run with System Integrity Protection off; `docs/macos-characterization.md` asks for a repeat on a
 SIP-enabled Mac before a release that changes a verdict.

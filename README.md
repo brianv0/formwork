@@ -37,9 +37,9 @@ Or build from source (Rust 1.85+ and a C compiler): `cargo install --path crates
 
 ## Quickstart
 
-Drop a `FORMWORK.toml` in your project or in a directory above it (or `.formwork/blueprint.toml`,
-which keeps Formwork's own files in one directory) — every subcommand finds it automatically
-(current directory, then parents up to `$HOME`) and announces which file it used:
+Drop a `FORMWORK.toml` in your project (or `.formwork/blueprint.toml`, which keeps Formwork's own
+files in one directory) — every subcommand finds it automatically (current directory, then parents
+up to `$HOME`) and announces which file it used:
 
 ```toml
 # FORMWORK.toml — extend the built-in default profile (broad reads, credentials denied, other
@@ -49,15 +49,19 @@ net = { ports = [443] }              # TCP to port 443 on any host; omit for no 
 rules = ["readwrite:$CWD/**"]        # the project directory is the writable working set
 ```
 
-On Linux, put the blueprint in a directory above the project rather than inside it, or pass
-`--blueprint` with a file outside the project. `$CWD` is the directory you launch from, so
-`readwrite:$CWD/**` still means the project. A run write-protects the blueprint and its learned
-layers so the agent cannot rewrite its own next session, and Linux's Landlock can only allow
-access: it cannot carve one file out of a writable directory. A blueprint inside the project
-(`FORMWORK.toml` or `.formwork/blueprint.toml`) is therefore protected by granting each entry
-beside it instead of the project root as a whole, so nothing can be created, deleted or renamed
-directly in the project root or in `.formwork/`. Existing files and subdirectories stay writable,
-and `run` and `explain` say when this happens. macOS is unaffected.
+A run write-protects the blueprint and its learned layers so the agent cannot rewrite its own next
+session. Keep the blueprint in the project, not in a directory above it, and launch from the
+project root: the agent can write elsewhere in the project, and a `FORMWORK.toml` it leaves there
+would be found first by the next run started at or below it.
+
+On Linux that protection has a cost: nothing can be created, deleted or renamed directly in the
+project root (or in `.formwork/`). Existing files and subdirectories stay writable, and `run` and
+`explain` say when this applies. Landlock can only allow access, so it cannot carve one file out
+of a writable directory. It grants each entry beside the blueprint instead of the root as a
+whole, which is also what stops the agent from leaving a blueprint in the root. If the agent must
+create files at the top of the project, pass `--blueprint` with a file outside the project, and
+keep passing it: the agent can then leave a `FORMWORK.toml` in the project that a run without
+`--blueprint` would use. On macOS the project root stays writable.
 
 On Linux the port tier closes UDP too, so hostnames do not resolve inside the sandbox; host rules
 (below) resolve them through the Gateway. See [`examples/`](examples/README.md).
