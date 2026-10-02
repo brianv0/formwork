@@ -116,6 +116,18 @@ jobs:
           cargo test -p formwork-cli --test fep6_run --locked fw_e2e_094 -- --nocapture 2>&1 \
             | sed -n '/client matrix:/,/^test /p'
 
+      # FW-E2E-096: the latency budget, in release and on its own (FEP-6 §9 f). It decides on a
+      # 95% interval for the median added latency, against a budget scaled to this runner by a
+      # calibration workload (capped at 3x); the report prints on every run.
+      - name: Latency budget (FW-E2E-096)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release -p formwork-gateway --test latency --locked -- --ignored --nocapture 2>&1 \
+            | grep -v -E '^\s+(Compiling|Downloaded|Downloading) '
+
       - name: Test failure summary
         if: failure()
         shell: bash

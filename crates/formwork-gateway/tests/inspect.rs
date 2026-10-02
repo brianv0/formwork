@@ -473,6 +473,26 @@ async fn fw_egr21_bodies_stream_byte_identical() {
     assert!(out.ends_with(&format!("{} {sum}", body.len())), "{out}");
 }
 
+/// FEP-6 §4.4: a pooled upstream connection the upstream closed while it sat idle is not reused --
+/// checked with a request whose body the Gateway cannot replay on a fresh connection, so a stale
+/// connection would answer `502`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pooled_connection_the_upstream_closed_is_not_reused() {
+    let s = inspected(&["allow:api.test:{port}"], vec![]).await;
+    let host = s.host_header("api.test");
+    let mut tls = s.tunnel("api.test").await;
+    let out = request(&mut tls, &format!("GET /bye HTTP/1.1\r\n{host}\r\n")).await;
+    assert!(out.ends_with("bye"), "{out}");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let out = request(
+        &mut tls,
+        &format!("POST /sum HTTP/1.1\r\n{host}Content-Length: 3\r\n\r\nabc"),
+    )
+    .await;
+    assert!(out.ends_with("3 294"), "{out}");
+    assert_eq!(s.up.handshakes.load(Ordering::SeqCst), 2);
+}
+
 /// FW-E2E-095: twenty sequential requests, each on its own client connection, reuse one upstream
 /// connection: the fixture observes one TLS handshake.
 #[tokio::test(flavor = "multi_thread")]

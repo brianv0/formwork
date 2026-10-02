@@ -164,6 +164,7 @@ impl Seen {
 ///   [`Upstream::ack`] (or after five seconds, which [`Upstream::acked`] then reports);
 /// - `/ws`: `101 Switching Protocols` to an upgrade, then echoes every byte;
 /// - `/sum`: answers with the body's length and checksum;
+/// - `/bye`: answers as keep-alive, then closes the connection;
 /// - anything else: `ok:<path>`.
 #[derive(Clone)]
 pub struct Upstream {
@@ -204,6 +205,7 @@ pub async fn upstream(tls: Option<FixtureTls>) -> Upstream {
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
+            let _ = tcp.set_nodelay(true);
             let fixture = fixture.clone();
             let tls = tls.clone();
             tokio::spawn(async move {
@@ -385,6 +387,13 @@ async fn serve_fixture<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, fixture: Ups
                 s.write_all(respond("", &format!("{} {sum}", body.len())).as_bytes())
                     .await
                     .is_ok()
+            }
+            "/bye" => {
+                // Answered as keep-alive, then closed: the Gateway pools a connection the
+                // upstream has already left.
+                let _ = s.write_all(respond("", "bye").as_bytes()).await;
+                let _ = s.flush().await;
+                return;
             }
             _ => s
                 .write_all(respond("", &format!("ok:{path}")).as_bytes())

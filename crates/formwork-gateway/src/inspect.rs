@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -901,10 +901,18 @@ impl Pool {
                 continue;
             }
             // A connection the upstream closed while idle reads EOF at once; a live one blocks.
-            if tokio::time::timeout(Duration::ZERO, conn.fill())
+            // One poll, not `timeout(Duration::ZERO, ..)`: a zero timeout still waits for the
+            // timer's next 1 ms tick, which every reused request paid (found by FW-E2E-096).
+            let pending = {
+                let mut fill = std::pin::pin!(conn.fill());
+                std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(
+                        std::future::Future::poll(fill.as_mut(), cx).is_pending(),
+                    )
+                })
                 .await
-                .is_err()
-            {
+            };
+            if pending {
                 return Some(conn);
             }
         }
