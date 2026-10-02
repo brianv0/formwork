@@ -340,10 +340,7 @@ fn fw_e2e_094_client_matrix() {
                     // A refused row shows the Gateway's side too (handshakes log at debug).
                     ("RUST_LOG", "info,formwork_gateway=debug"),
                 ],
-                // The operator's environment may configure git through GIT_CONFIG_COUNT and
-                // GIT_CONFIG_KEY_n/VALUE_n; the FW-ENV2 scrub strips the KEY_n names alone, which
-                // leaves git unable to start. That is the Launcher's defect, not a client result.
-                &["GIT_CONFIG_COUNT"],
+                &[],
             );
             let reached = fixture.seen().iter().any(|s| s.path().starts_with(&path));
             // A refusal records the client's last error line (else its last line), so the matrix
@@ -407,6 +404,49 @@ fn fw_e2e_094_client_matrix() {
     }
     eprintln!("FW-E2E-094 client matrix:\n  {}", matrix.join("\n  "));
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n---\n"));
+}
+
+/// FW-ENV2 (found by `FW-E2E-094`): git configuration supplied through the environment survives the
+/// scrub entry by entry. A credential entry (an `http.extraheader`) is dropped, a benign one is
+/// kept under a matching count, and git starts and reads it. Judged by variable name alone, every
+/// `GIT_CONFIG_KEY_<n>` went while the count stayed, and git refused to start.
+#[test]
+fn the_scrub_keeps_git_config_consistent() {
+    let dir = Scratch::new("env-git");
+    if !session_host(dir.path(), &["git"]) {
+        return;
+    }
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\"]\n",
+    )
+    .unwrap();
+    let secret = "Zm9ybXdvcms6c2VjcmV0";
+    let header = format!("AUTHORIZATION: basic {secret}");
+    let out = formwork_env(
+        dir.path(),
+        &[
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!(
+                "git config --get formwork.kept && echo count=$GIT_CONFIG_COUNT && \
+                 env | grep -c {secret} || true"
+            ),
+        ],
+        &[
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "http.https://example.test/.extraheader"),
+            ("GIT_CONFIG_VALUE_0", &header),
+            ("GIT_CONFIG_KEY_1", "formwork.kept"),
+            ("GIT_CONFIG_VALUE_1", "yes"),
+        ],
+        // The operator's own git environment, if any, is replaced by the test's.
+        &["GIT_CONFIG"],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stdout, "yes\ncount=1\n0\n", "{}", out.stderr);
 }
 
 /// FW-E2E-099 (both; FEP-6 S2 through `run`): a brokered credential end to end. The session holds

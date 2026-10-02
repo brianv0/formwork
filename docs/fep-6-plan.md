@@ -136,6 +136,12 @@ rather than silently deviated.
   check was `timeout(Duration::ZERO, ..)`, which tokio resolves on the timer's next 1 ms tick, so
   every request on a reused connection added about 1.3 ms. One poll replaces it (0.06-0.11 ms
   added), and a test covers a pooled connection the upstream closed while idle.
+- **The FW-ENV2 scrub judges git's environment config per entry (found by `FW-E2E-094`).** By
+  variable name, every `GIT_CONFIG_KEY_<n>` went (it contains `KEY`) while `GIT_CONFIG_COUNT` and
+  the values stayed, so git refused to start, and an `http.extraheader` credential in a value
+  passed through. Each entry is now judged by its config key and value, dropped entries are
+  removed and the rest renumbered under a matching count (`formwork.md` FW-ENV2 amended); the
+  matrix no longer clears the operator's git environment.
 - **`fw-egress-probe` is not built.** The gateway tests drive rustls clients and raw sockets
   directly, which produce every case the probe was for (a mismatched server name, a mismatched
   `Host`, a non-TLS first byte, an `h2`-only ALPN offer, the raw heads of `FW-ADV-024`).
@@ -203,10 +209,6 @@ it when the reference was set (every factor 1.00):
 
 ## 5. Still owed
 
-- **A Launcher defect `FW-E2E-094` found, outside this FEP.** The FW-ENV2 scrub drops
-  `GIT_CONFIG_KEY_<n>` (the name contains `KEY`) while keeping `GIT_CONFIG_COUNT` and
-  `GIT_CONFIG_VALUE_<n>`, so git refuses to start in a session whose operator configures git through
-  the environment. The matrix clears those variables; the scrub is not changed here.
 - **The integrated scenario forms `FW-E2E-100`, `101`, `102`, `105` and `FW-ADV-025`** need fixture
   `git http-backend`, npm and pip registries and a second network namespace for wildcard success
   paths (§7.1). Their mechanisms are covered by the gateway tests above; the integrated flows are
