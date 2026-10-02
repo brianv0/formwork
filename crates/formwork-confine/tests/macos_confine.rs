@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use formwork_blueprint::{
-    Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
+    Blueprint, ExecPosture, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
 };
 use formwork_detect::detect;
 
@@ -72,7 +72,15 @@ fn confined(
     writes: Vec<PathPattern>,
     subtract: Vec<PathPattern>,
 ) -> formwork_compile::CompiledPolicy {
-    let blueprint = Blueprint {
+    compile(&closed_blueprint(reads, writes, subtract), &detect())
+}
+
+fn closed_blueprint(
+    reads: Vec<PathPattern>,
+    writes: Vec<PathPattern>,
+    subtract: Vec<PathPattern>,
+) -> Blueprint {
+    Blueprint {
         fs: FsBlueprint {
             read_mode: ReadMode::Closed,
             reads,
@@ -82,8 +90,7 @@ fn confined(
             write_subtract: Vec::new(),
         },
         ..Blueprint::empty()
-    };
-    compile(&blueprint, &detect())
+    }
 }
 
 /// Outcome of a direct-connect probe. Distinguishing these matters: a probe that failed to *start*,
@@ -437,6 +444,71 @@ fn fw_e2e_024_report_soundness_probes() {
             _ => {}
         }
     }
+}
+
+/// The child's exit code, or the errno of an `execve` the kernel refused.
+fn exec_outcome(policy: &formwork_compile::CompiledPolicy, mut cmd: Command) -> Result<i32, i32> {
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    formwork_confine::spawn_confined(&mut cmd, policy).expect("confinement applies");
+    match cmd.status() {
+        Ok(status) => Ok(status.code().unwrap_or(-1)),
+        Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
+    }
+}
+
+/// FW-ISO4/FW-INV5 (Seatbelt): the exec allow-list's paired probe, the counterpart of the Linux
+/// test of the same name. A listed binary runs and an unlisted, readable one is refused at
+/// `execve`, for a listed file and for a listed directory; the report says `Enforced`.
+#[test]
+fn fw_iso4_exec_allowlist_runs_listed_and_refuses_unlisted() {
+    use formwork_compile::{Backend, Capability, Fidelity};
+    let fx = Fixture::new("iso4");
+    let exec_policy = |exec: &str| {
+        let blueprint = Blueprint {
+            exec: ExecPosture::Allowlist(vec![PathPattern::parse(exec).unwrap()]),
+            ..closed_blueprint(vec![pp(&fx.granted())], vec![], vec![])
+        };
+        compile(&blueprint, &detect())
+    };
+    let cat = || {
+        let mut c = Command::new("/bin/cat");
+        c.arg(fx.granted().join("ok.txt"));
+        c
+    };
+    let refused = |outcome: Result<i32, i32>| matches!(outcome, Err(errno) if errno == libc::EPERM || errno == libc::EACCES);
+
+    let policy = exec_policy("/bin/cat");
+    assert_eq!(
+        policy.report.per_capability[&Capability::Exec],
+        Fidelity::Enforced {
+            backend: Backend::Seatbelt
+        }
+    );
+    assert_eq!(
+        exec_outcome(&policy, cat()),
+        Ok(0),
+        "a listed binary must run"
+    );
+    let mut ls = Command::new("/bin/ls");
+    ls.arg(fx.granted());
+    let outcome = exec_outcome(&policy, ls);
+    assert!(
+        refused(outcome),
+        "an unlisted binary must be refused at execve, got {outcome:?}"
+    );
+
+    let policy = exec_policy("/bin/**");
+    assert_eq!(
+        exec_outcome(&policy, cat()),
+        Ok(0),
+        "a binary in a listed directory must run"
+    );
+    let outcome = exec_outcome(&policy, Command::new("/usr/bin/true"));
+    assert!(
+        refused(outcome),
+        "a readable binary outside the listed directory must be refused at execve, got {outcome:?}"
+    );
 }
 
 /// FW-E2E-001 (confine-self): a process that confines itself in place is then denied an out-of-scope

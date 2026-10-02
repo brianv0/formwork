@@ -56,6 +56,29 @@ def test_rules_demo_compiles(cli):
     assert caps["net-default-deny"]["status"] == "partial"  # the loopback-callback listener (FW-EGR15, C1)
 
 
+@pytest.mark.linux
+@pytest.mark.fw_e2e("FW-E2E-024")
+def test_exec_allowlist_starts_dynamic_binaries_on_linux(cli, tmp_path):
+    """An exec allow-list on Linux runs the dynamically linked binaries it lists -- the confiner
+    grants the loader they name -- for a listed file over the agent base and for rules-demo's
+    listed directory, and an unlisted program fails naming the grant it lacks."""
+    if json.loads(cli("explain", "--json").stdout)["host"].get("landlock-abi") is None:
+        pytest.skip("no Landlock on this kernel (the allow-list is not enforced)")
+    base = BLUEPRINTS / "agent-base.toml"
+    listed = cli("run", "--blueprint", base, "--rule", "exec:/bin/true", "--", "/bin/true", cwd=tmp_path)
+    assert listed.code == 0, listed.stderr
+    demo = cli("run", "--blueprint", BLUEPRINTS / "rules-demo.toml", "--", "/bin/true", cwd=tmp_path)
+    assert demo.code == 0, demo.stderr
+
+    unlisted = cli("run", "--blueprint", base, "--rule", "exec:/bin/true", "--", "/bin/ls", cwd=tmp_path)
+    assert unlisted.code != 0, "an unlisted program must not run"
+    assert "/bin/ls is not on the exec allow-list" in unlisted.stderr, unlisted.stderr
+
+    report = json.loads(cli("compile", "--blueprint", base, "--rule", "exec:/bin/true", "--report-only").stdout)
+    assert report["per-capability"]["exec"]["status"] == "partial"
+    assert "loader" in report["per-capability"]["exec"]["reason"]
+
+
 @pytest.mark.macos
 @pytest.mark.fw_e2e("FW-E2E-024")
 def test_agent_port_fallback_enforced_on_macos(cli):

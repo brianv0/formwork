@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use formwork_blueprint::{
-    Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
+    Blueprint, ExecPosture, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
 };
-use formwork_compile::{CompiledPolicy, ConfinerPolicy};
+use formwork_compile::{Backend, Capability, CompiledPolicy, ConfinerPolicy, Fidelity};
 use formwork_detect::detect;
 
 /// Integration tests enforce what the product enforces: the builtin catalog resolved for the
@@ -43,7 +43,15 @@ fn closed_policy(
     writes: Vec<PathPattern>,
     subtract: Vec<PathPattern>,
 ) -> CompiledPolicy {
-    let blueprint = Blueprint {
+    compile(&closed_blueprint(reads, writes, subtract), &detect())
+}
+
+fn closed_blueprint(
+    reads: Vec<PathPattern>,
+    writes: Vec<PathPattern>,
+    subtract: Vec<PathPattern>,
+) -> Blueprint {
+    Blueprint {
         fs: FsBlueprint {
             read_mode: ReadMode::Closed,
             reads,
@@ -53,8 +61,7 @@ fn closed_policy(
             write_subtract: Vec::new(),
         },
         ..Blueprint::empty()
-    };
-    compile(&blueprint, &detect())
+    }
 }
 
 fn run(policy: &CompiledPolicy, mut cmd: Command) -> i32 {
@@ -369,6 +376,106 @@ fn baseline_is_transparent_to_fork_and_exec() {
         run(&policy, sh("/bin/echo hi | /bin/cat >/dev/null")),
         0,
         "an ordinary fork+exec pipeline must run under essentials alone"
+    );
+}
+
+// --- exec allow-list (Landlock FS_EXECUTE) ---
+
+/// A Closed-mode policy whose exec posture is the allow-list `exec`; `reads` adds to essentials.
+fn exec_policy(reads: Vec<PathPattern>, exec: Vec<PathPattern>) -> CompiledPolicy {
+    let blueprint = Blueprint {
+        exec: ExecPosture::Allowlist(exec),
+        ..closed_blueprint(reads, Vec::new(), Vec::new())
+    };
+    compile(&blueprint, &detect())
+}
+
+/// The child's exit code, or the errno of an `execve` the kernel refused.
+fn exec_outcome(policy: &CompiledPolicy, mut cmd: Command) -> Result<i32, i32> {
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    formwork_confine::spawn_confined(&mut cmd, policy).expect("confinement applies");
+    match cmd.status() {
+        Ok(status) => Ok(status.code().unwrap_or(-1)),
+        Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
+    }
+}
+
+/// FW-ISO4/FW-INV5 (Linux/Landlock): the exec allow-list's paired probe. A listed dynamically
+/// linked binary runs -- the confiner grants the loader it names -- and an unlisted one is refused
+/// at `execve`, for a listed file and for a listed directory. The verdict is `Partial`, and the
+/// gap it names is real: the granted loader runs an unlisted binary handed to it. Should that
+/// half fail, the kernel closed the gap and the verdict can rise to `Enforced`.
+#[test]
+fn fw_iso4_exec_allowlist_runs_listed_and_refuses_unlisted() {
+    if !have_landlock() {
+        eprintln!("skipping: no Landlock on this host");
+        return;
+    }
+    let fx = Fixture::new("iso4");
+    let ls = || {
+        let mut c = Command::new("/bin/ls");
+        c.arg(fx.granted());
+        c
+    };
+
+    // A listed directory: its binaries run with the standard loader, and a binary outside it is
+    // refused although its directory is readable.
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-connect-probe"));
+    let probe_dir = probe.parent().unwrap();
+    let cat_dir = fs::canonicalize("/bin/cat").unwrap();
+    let policy = exec_policy(
+        vec![pp(&fx.granted()), pp(probe_dir)],
+        vec![pp(cat_dir.parent().unwrap())],
+    );
+    assert_eq!(
+        exec_outcome(&policy, cat(&fx.granted_file())),
+        Ok(0),
+        "a binary in a listed directory must run"
+    );
+    assert_eq!(
+        exec_outcome(&policy, Command::new(&probe)),
+        Err(libc::EACCES),
+        "a readable binary outside the listed directory must be refused at execve"
+    );
+
+    let policy = exec_policy(
+        vec![pp(&fx.granted())],
+        vec![PathPattern::parse("/bin/cat").unwrap()],
+    );
+    assert!(
+        matches!(
+            &policy.report.per_capability[&Capability::Exec],
+            Fidelity::Partial { backend: Backend::Landlock, reason } if reason.contains("loader")
+        ),
+        "{:?}",
+        policy.report.per_capability[&Capability::Exec]
+    );
+    assert_eq!(
+        exec_outcome(&policy, cat(&fx.granted_file())),
+        Ok(0),
+        "a listed dynamic binary must run: the confiner grants the loader it names"
+    );
+    assert_eq!(
+        exec_outcome(&policy, ls()),
+        Err(libc::EACCES),
+        "an unlisted binary must be refused at execve"
+    );
+
+    // The gap the report names: `ld.so <file>` maps an unlisted, readable binary with no exec check.
+    let Some(loader) = ["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .map(Path::new)
+        .find(|l| l.exists())
+    else {
+        eprintln!("skipping the loader half: no glibc loader at its standard path");
+        return;
+    };
+    let mut via_loader = Command::new(loader);
+    via_loader.arg("/bin/ls").arg(fx.granted());
+    assert_eq!(
+        exec_outcome(&policy, via_loader),
+        Ok(0),
+        "the granted loader runs the unlisted /bin/ls, as the Partial verdict says"
     );
 }
 
