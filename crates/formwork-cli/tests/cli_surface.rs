@@ -179,7 +179,8 @@ fn explain_with_no_path_summarizes_host_and_fidelity() {
 
     // The active backstop earns its own line (FW-CRED6/CRED7), worded from this host's report:
     // denied with the lift where the backend roots any-depth rows, withheld with the reason where
-    // Landlock cannot (FW-CRED9) -- never the denied wording over a Partial row (FW-XR1/FW-INV5).
+    // Landlock cannot (FW-CRED9/FW-E2E-050) -- never the denied wording over a Partial row
+    // (FW-XR1/FW-INV5).
     let json = formwork(dir.path(), dir.path(), &["explain", "--json"]);
     assert_eq!(json.code, 0, "{}", json.stderr);
     let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();

@@ -1519,7 +1519,8 @@ mod tests {
     }
 
     /// The Partial reason is what `explain` prints for the backstop, so it claims enforcement only
-    /// for absolute rows that exist and cites where the withholding is specified (FW-CRED9).
+    /// for absolute rows that exist and cites where the withholding is specified (FW-CRED9,
+    /// FW-E2E-050).
     #[test]
     fn any_depth_partial_reason_names_absolute_rows_only_when_present() {
         let mut catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
