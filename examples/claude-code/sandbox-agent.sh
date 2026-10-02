@@ -25,7 +25,7 @@ printf '  '; printf '%q ' "${CMD[@]}"; echo; echo
 
 if command -v claude >/dev/null 2>&1; then
     echo "Launching Claude Code confined. It can write ~/project and reach only the hosts its blueprint names,"
-    echo "but cannot read ~/.ssh, ~/.aws, keychains, or other projects — whatever it's prompted to do."
+    echo "but cannot read ~/.ssh, ~/.aws or keychains, or write other projects — whatever it's prompted to do."
     exec "${CMD[@]}" "$@"
 else
     echo "claude is not on PATH, so skipping the real launch. Install Claude Code, then re-run —"

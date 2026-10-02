@@ -4,13 +4,16 @@
 (fetched from upstream repos on `main`), vendor docs, and disclosed advisories.
 Formwork claims are traced to this repo's code with `file:line` citations.*
 
-> **Update (2026-07): two of the three "real gaps" below have since closed.** Linux enforcement
-> is real (Landlock + seccomp, kernel-verified — see [`docs/linux-backend.md`](linux-backend.md)
-> and [STATUS.md](STATUS.md)), and the tamper-vector write-protection (`.git/hooks`, agent config
-> dirs) now ships in `profiles/default.toml`. Only the domain-level egress gap (gap #1) remains
-> open (deferred to [FEP-1](fep-1.md) Part A). The competitor findings are a 2026-07-06 snapshot
-> and are not re-verified here; treat the Formwork rows as the current source of truth and the rest
-> as dated.
+> **Historical record (2026-07-06 snapshot).** All three "real gaps" below have since closed:
+> Linux enforcement is real (Landlock + seccomp, kernel-verified — see
+> [`docs/linux-backend.md`](linux-backend.md)), the tamper-vector write-protection ships in
+> `profiles/default.toml`, and domain-level egress (gap #1) landed with FEP-5 and FEP-6 as host
+> rules through the session Gateway, with TLS inspection, destination classes and credential
+> brokering. The credential holes listed below (env scrub, `.env`, metadata addresses, agent
+> directories) are closed too. The Formwork-side claims and every `file:line` citation describe the
+> July tree, including files since removed (`IMPLEMENTATION_PLAN.md`,
+> `profiles/sensitive-set.toml`, `examples/blueprints/agent-session.toml`); current status is
+> [`STATUS.md`](STATUS.md). The competitor findings are not re-verified.
 
 ## TL;DR
 

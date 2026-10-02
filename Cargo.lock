@@ -304,19 +304,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "formwork-seam"
-version = "0.1.0"
-dependencies = [
- "formwork-blueprint",
- "formwork-compile",
- "formwork-confine",
- "formwork-detect",
- "libc",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

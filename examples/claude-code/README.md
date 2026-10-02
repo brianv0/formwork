@@ -27,7 +27,9 @@ Notes:
   meant for.
 - Egress is host-scoped: a host the blueprint does not name is refused, and `formwork learn`
   proposes the rule a run needed. On a Linux host without connect supervision, host rules are
-  refused before the run starts. Fall back to the port tier there (any HTTPS host):
+  refused before the run starts, and the port-tier fallback resolves no names on Linux (UDP is
+  closed), so Claude cannot reach its API there; enable connect supervision (Linux 5.6+, Yama
+  `ptrace_scope` 0 or 1). On macOS the port tier works (any HTTPS host):
   `formwork run --blueprint ./examples/blueprints/agent-base.toml --net ports:443 --allow-cred claude --rule "readwrite:~/.claude/**" -- claude`.
 
 ## Axis B — stage an MCP config that routes servers through the gateway
@@ -75,8 +77,10 @@ claude mcp add files -- formwork gateway \
 
 To see the gateway shading a backend end to end without installing anything, run
 [`../gateway-demo.sh`](../gateway-demo.sh) (it wraps the repo's built-in fixture instead of the npx
-server). For the `npx` server specifically, pre-install it or widen the blueprint's `net`, since a
-confined backend with `net = "deny"` cannot fetch the package on first run.
+server). For the `npx` server specifically, pre-install it: a confined backend with `net = "deny"`
+cannot fetch the package on first run, `formwork gateway` takes no host rules (only `net = "deny"`
+or a port tier, which resolves no names on Linux), and `mcp-gateway.toml` grants the backend no
+writes for npm's cache.
 
 ## Both at once
 

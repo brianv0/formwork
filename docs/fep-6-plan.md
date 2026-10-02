@@ -2,7 +2,8 @@
 
 Companion to `fep-6.md` (what and why). This records how FEP-6 was built on the engine FEP-5 landed,
 where the build departed from the proposal and why, and what is still owed. Requirement and test IDs
-are defined in `fep-6.md`, anchored there, and cited bare in code.
+are defined in `formwork.md`, where FEP-6's were folded after landing, anchored there, and cited
+bare in code.
 
 ## 1. What landed
 

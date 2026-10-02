@@ -1,12 +1,13 @@
-# Linux confiner backend — design + hardening notes (Phase 2)
+# Linux confiner backend — design + hardening notes
 
 Status: **implemented and kernel-verified** (Landlock fs+net+scope, seccomp baseline, subtractive
 expansion), verified against a real ABI-v6 kernel. This note keeps the researched design and crate
 APIs, and now records the **hardening decisions** that closed real escape/transparency gaps found by
 review on the kernel. Per [FW-XR1](../formwork.md#fw-xr1)/[FW-INV5](../formwork.md#fw-inv5), Formwork never claims containment it has not verified.
 
-Verify against: the `formwork-linux-dev` Docker image on an ABI-v6 kernel, `--security-opt
-seccomp=unconfined --security-opt apparmor=unconfined` so only Formwork's sandbox is under test.
+Verify against: the `formwork-linux-test` Docker image (`just test-linux`) on an ABI-v6 kernel,
+`--security-opt seccomp=unconfined --security-opt apparmor=unconfined` so only Formwork's sandbox is
+under test.
 
 ## Hardening decisions (verified on the kernel)
 
@@ -20,7 +21,7 @@ seccomp=unconfined --security-opt apparmor=unconfined` so only Formwork's sandbo
   `/proc/self/{maps,exe,status}`. `/proc` is granted read in every mode instead. Other processes'
   `/proc/<pid>/environ` stays closed: `ptrace_may_access` decides it, and Landlock refuses a
   confined process ptrace-class access outside its domain. A process holding `CAP_SYS_ADMIN` or
-  `CAP_PERFMON` (a root container) gets past that refusal; `detect` records those capabilities and
+  `CAP_PERFMON` (a root container) gets past that refusal; host detection records those capabilities and
   `CAP_SYS_PTRACE`, and the report says `Partial` then. `isolate = ["processes"]` closes it
   regardless, with a fresh procfs.
 - **Net-deny is carried by seccomp, not Landlock.** Landlock net governs only TCP; carrying deny with
@@ -29,7 +30,7 @@ seccomp=unconfined --security-opt apparmor=unconfined` so only Formwork's sandbo
   where per-port TCP *allow* is required -- but even there seccomp still denies inet DGRAM/RAW
   `socket(2)` (type masked to `SOCK_TYPE_MASK`, STREAM allowed), so the TCP-only Landlock grant
   cannot be sidestepped with a UDP/raw socket ([FW-ISO3](../formwork.md#fw-iso3),
-  [FW-INV3](../formwork.md#fw-inv3), [FW-ISO11](fep-5.md#fw-iso11)). Nothing inside the sandbox
+  [FW-INV3](../formwork.md#fw-inv3), [FW-ISO11](../formwork.md#fw-iso11)). Nothing inside the sandbox
   resolves names under the port tier; host rules restore resolution through the Gateway.
 - **Abstract-UNIX-socket + signal scoping is enforced at ABI v6+** via the `Scope` handle — closing a
   pathless escape the fs rules cannot reach — matching the compiler's CrossDomainSocket = Partial.
@@ -177,29 +178,47 @@ rules.insert(libc::SYS_socket, vec![
     SeccompRule::new(vec![SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, AF_INET as u64)?])?,
     // ... INET6, PACKET ...
 ]);
-// AF_UNIX / socketpair are absent from the list -> allowed (the injected-fd seam is untouched).
+// AF_UNIX / socketpair are absent from the list -> allowed (local IPC is not egress).
 ```
 
 ### Connect supervision and the isolation tier (FEP-5)
 
-- **Supervised connect (`FW-EGR7`, `FW-ISO12`).** Under host rules a second seccomp filter returns
-  `SECCOMP_RET_USER_NOTIF` for `connect` and for `sendto` with a non-null destination (x32 numbers are
-  refused outright). The listener is handed to the `formwork` process over a socketpair; the
-  supervisor copies the `sockaddr` once, re-checks the notification id, takes the socket with
-  `pidfd_getfd` and performs the call itself, so a thread rewriting the address after the check
-  changes nothing (`FW-ADV-018`). Inet goes to the Gateway only; a pathname socket is admitted when a
-  literal write grant names it or a session process bound it, which is decided from `sock_diag` or,
-  on kernels without `CONFIG_UNIX_DIAG`, `/proc/net/unix`. Addressed `sendmsg`/`sendmmsg` on an
-  AF_UNIX datagram socket is not mediated (its destination sits in memory seccomp cannot read), and
-  the report says so. Requires 5.6+ (`pidfd_getfd`) and Yama `ptrace_scope` 0 or 1; `detect` probes
-  all three.
-- **The isolation tier (`FW-ISO10`).** User, PID, mount and UTS namespaces (plus IPC for `ipc`) are
-  created by the `formwork` binary re-executed as a single-threaded stage: the parent is
-  multi-threaded and cannot `unshare(CLONE_NEWUSER)`, and Landlock rules must be built after the
-  fresh `/proc` and the tmpfs over the session temp directory are mounted, which allocates. A
-  minimal PID-1 init reaps orphans and relays user-sent signals. The seccomp baseline installed
-  afterwards still denies `CLONE_NEWUSER` and the mount family. `detect` probes the whole tier,
-  `/proc` mount included, so Ubuntu 24.04's AppArmor restriction is refused before spawn.
+- **Supervised connect ([FW-EGR7](../formwork.md#fw-egr7), [FW-ISO12](../formwork.md#fw-iso12)).**
+  Under host rules a second seccomp filter returns `SECCOMP_RET_USER_NOTIF` for `connect` and for
+  `sendto` with a non-null destination (x32 numbers are refused outright). The listener is handed to
+  the `formwork` process over a socketpair; the supervisor copies the `sockaddr` once, re-checks the
+  notification id, takes the socket with `pidfd_getfd` and performs the call itself, so a thread
+  rewriting the address after the check changes nothing ([FW-ADV-018](../formwork.md#fw-adv-018)).
+  Inet goes to the Gateway only, from a source port the supervisor registers first, so the Gateway
+  listener admits exactly the connections the supervisor made ([FW-EGR9](../formwork.md#fw-egr9));
+  this is the Linux counterpart of the macOS peer check. A pathname socket is admitted when a
+  literal write grant names it, when a lifted channel's facility owns it (the session bus and user
+  manager for `run-outside`, the display socket for `clipboard` and `screen`, the audio socket for
+  `microphone`; the keyring sockets and the session bus when `os-keyring` is lifted), or when a
+  session process bound it, which is decided from `sock_diag` or, on kernels without
+  `CONFIG_UNIX_DIAG`, `/proc/net/unix`. An abstract socket is refused. Addressed
+  `sendmsg`/`sendmmsg` on an AF_UNIX datagram socket is not mediated (its destination sits in memory
+  seccomp cannot read), and the report says so. A loopback server the session itself starts is
+  refused too, because the supervisor admits inet only to the Gateway (FEP-6 §11, "In-session
+  loopback"; [FW-E2E-106](../formwork.md#fw-e2e-106) waits on it). Requires 5.6+ (`pidfd_getfd`) and
+  Yama `ptrace_scope` 0 or 1; host detection probes all three.
+- **Channels.** Without host rules nothing mediates a pathname `connect()`, so the socket-shaped
+  channels (`run-outside`, `open-url` through the desktop portal, `clipboard`, `screen`) are
+  `Partial`: the Launcher strips their locator variables ([FW-BP11](../formwork.md#fw-bp11)), which
+  hides the sockets from well-behaved clients but does not close them. Under host rules the
+  supervisor closes them ([FW-ISO13](../formwork.md#fw-iso13)). Camera device nodes are withheld by
+  Landlock in either case.
+- **Broker custody ([FW-CRED16](../formwork.md#fw-cred16)).** When a blueprint brokers a credential,
+  the `formwork` process that hosts the Gateway sets `PR_SET_DUMPABLE` to 0 before it spawns the
+  workload, so the session cannot read its memory or environment through `/proc`.
+- **The isolation tier ([FW-ISO10](../formwork.md#fw-iso10)).** User, PID, mount and UTS namespaces
+  (plus IPC for `ipc`) are created by the `formwork` binary re-executed as a single-threaded stage:
+  the parent is multi-threaded and cannot `unshare(CLONE_NEWUSER)`, and Landlock rules must be built
+  after the fresh `/proc` and the tmpfs over the session temp directory are mounted, which
+  allocates. A minimal PID-1 init reaps orphans and relays user-sent signals. The seccomp baseline
+  installed afterwards still denies `CLONE_NEWUSER` and the mount family. Host detection probes the
+  whole tier, `/proc` mount included, so Ubuntu 24.04's AppArmor restriction is refused before
+  spawn.
 
 **Hazards (status after kernel validation):**
 
@@ -217,7 +236,7 @@ rules.insert(libc::SYS_socket, vec![
 - **`CLONE_NEWUSER` flag test** (`SeccompCmpOp::MaskedEq`, arg0) — verified on aarch64; the arch guard
   (`TargetArch::try_from`) rejects any arch where `clone`'s flags are not arg0.
 - **Syscall coverage — fail-loud.** `syscall_number` is an explicit match; an unresolved baseline name
-  aborts the build (`FW-INV6`) rather than silently dropping a rule. All baseline names resolve on
+  aborts the build ([FW-INV6](../formwork.md#fw-inv6)) rather than silently dropping a rule. All baseline names resolve on
   x86_64/aarch64, including the hardening additions (`io_uring_*`, `pidfd_getfd`, `process_vm_*`).
 
 Still owed: the Phase-4 reuse workloads (pytest/npm/cargo) under the baseline on a real kernel to

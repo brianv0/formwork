@@ -12,8 +12,8 @@ pub enum Os {
     MacOs,
 }
 
-/// Serializable so it can be captured on one machine (`formwork detect > host.json`) and fed to
-/// `compile --host host.json` on another.
+/// Serializable so it can be captured on one machine (the `host` field of `formwork explain --json`)
+/// and fed to `compile --host host.json` on another.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct HostProfile {

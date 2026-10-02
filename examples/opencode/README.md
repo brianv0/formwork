@@ -21,6 +21,11 @@ The blueprint grants writes to `~/project` + scratch, subtracts credentials/keyc
 and reaches only the model providers it names, through the session Gateway. Add an `allow:` rule
 per provider you use, or let `formwork learn` propose them. Narrow `writes` to your repo.
 
+Before the first run: set `ANTHROPIC_API_KEY` (it is brokered, and the run is refused when it is
+unset), and create opencode's state directories outside the sandbox, since the session cannot
+create them: `mkdir -p ~/.local/share/opencode ~/.local/state/opencode ~/.cache/opencode
+~/.config/opencode`. `opencode.json` takes effect from the project root.
+
 ## Axis B — route MCP servers through the gateway
 
 opencode declares MCP servers under the top-level `mcp` key. A `type: "local"` server takes a

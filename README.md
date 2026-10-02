@@ -16,7 +16,7 @@ reported as a gap; Formwork never silently claims containment it cannot deliver.
 Prebuilt `formwork` binaries (macOS and Linux, arm64 and x86_64) are published on
 [GitHub Releases](https://github.com/brianv0/formwork/releases): every merge to `main` updates the
 rolling [`canary`](https://github.com/brianv0/formwork/releases/tag/canary) prerelease, and version
-tags (`v*`) cut stable releases. Each asset ships with a `SHA256SUMS` file. For example:
+tags (`v*`) cut stable releases. Each release carries a `SHA256SUMS` file. For example:
 
 ```sh
 curl -fsSLO https://github.com/brianv0/formwork/releases/download/canary/formwork-canary-aarch64-apple-darwin.tar.gz
@@ -33,7 +33,7 @@ tar -xzf formwork-canary-aarch64-apple-darwin.tar.gz
 > xattr -d com.apple.quarantine formwork-canary-*.tar.gz && tar -xzf formwork-canary-*.tar.gz
 > ```
 
-Or build from source: `cargo install --path crates/formwork-cli`.
+Or build from source (Rust 1.85+ and a C compiler): `cargo install --path crates/formwork-cli`.
 
 ## Quickstart
 
@@ -42,10 +42,10 @@ files in one directory) — every subcommand finds it automatically (current dir
 up to `$HOME`) and announces which file it used:
 
 ```toml
-# FORMWORK.toml — extend the built-in default profile (broad reads, credentials and other
-# projects denied, secret-shaped env vars scrubbed), then open what this project needs:
+# FORMWORK.toml — extend the built-in default profile (broad reads, credentials denied, other
+# projects read-only, secret-shaped env vars scrubbed), then open what this project needs:
 extends = ["builtin:default"]
-net = { ports = [443] }              # HTTPS egress only; omit for no network at all
+net = { ports = [443] }              # TCP to port 443 on any host; omit for no network at all
 rules = ["readwrite:$CWD/**"]        # the project directory is the writable working set
 ```
 
@@ -53,8 +53,12 @@ On Linux the port tier closes UDP too, so hostnames do not resolve inside the sa
 (below) resolve them through the Gateway. See [`examples/`](examples/README.md).
 
 ```sh
-# Run your agent behind the kernel wall — its in-app permission prompts stop being what protects you:
-formwork run -- claude --dangerously-skip-permissions
+# Run a command, and everything it spawns, behind the kernel wall:
+formwork run -- npm test
+
+# Run your agent the same way, with a blueprint that also grants its own state and model API
+# (examples/ has them) — its in-app permission prompts stop being what protects you:
+formwork run --blueprint claude-code.toml -- claude --dangerously-skip-permissions
 
 # What does this host enforce, and what would this session's policy be?
 formwork explain
@@ -64,10 +68,13 @@ formwork explain ~/.ssh/id_ed25519 '$CWD/src/main.rs'
 ```
 
 The sandbox holds for the whole process tree — a `git` or `python` the agent spawns hits the same
-walls. Denials surface as ordinary `EACCES`/`EPERM`, credentials stay unreadable even under broad
-read grants, and a deny always beats an allow, from any layer. Host services that could act for
+walls. Denials surface as ordinary `EACCES`/`EPERM`, credentials at their known locations stay
+unreadable even under broad read grants, and a deny always beats an allow, from any layer. (On
+Linux, credential-shaped *names* inside a granted tree, such as a project's `.env`, cannot be
+denied by the kernel; `formwork explain` lists them as withheld.) Host services that could act for
 the agent outside the sandbox — the clipboard, opening URLs, the session bus, AppleEvents — are
-closed unless the blueprint lifts them with `channels`.
+closed unless the blueprint lifts them with `channels` (on Linux without host rules they are hidden
+from clients rather than closed).
 
 To reach named hosts only, write host rules instead of the port tier. Every connection then goes
 through a Gateway that Formwork runs outside the sandbox, and an API key can be *brokered*: the
@@ -79,6 +86,15 @@ rules = ["readwrite:$CWD/**", "allow:api.anthropic.com"] # this host only, throu
 allow-credentials = ["broker:anthropic"]                 # the agent sees a placeholder, never the key
 ```
 
+Host rules come in two grades. `allow:host`, and method rules such as
+`get,post:api.github.com/repos/acme/**`, are *inspected*: the Gateway terminates TLS with a
+per-session CA, held in memory and limited to the hosts you named, and checks each request's host,
+method and path; Formwork points common clients (curl, git, Python, Node, npm, pip, uv, cargo) at
+that CA. `tunnel:host` forwards the client's own TLS unopened after checking the server name — for
+clients that cannot trust an added CA, such as Go programs and rustup on macOS. Inspected hosts
+speak HTTP/1.1. Private and loopback addresses are reached only through a rule naming the exact
+host, and an `https_proxy` in Formwork's own environment carries the Gateway's upstream traffic.
+
 `formwork learn` runs a workload enforced while recording what the kernel denied, then
 proposes grants for review — nothing is widened until you accept it:
 
@@ -89,8 +105,9 @@ formwork learn --accept 1         # accept by number or pattern; applies from th
 ```
 
 Beyond paths, `learn` proposes the hosts a run was refused and the channels it tried to use, such
-as opening a login URL. On Linux it sees those only when the blueprint already has host rules or
-`isolate`; with no host rules at all it proposes paths alone.
+as opening a login URL. It proposes hosts only when the blueprint already has a host rule (egress
+then goes through the Gateway, which sees each refusal); on Linux it proposes channels only with
+host rules or `isolate`.
 
 See [`examples/`](examples/README.md) for complete blueprints, the rule vocabulary, CLI recipes,
 and wiring for Claude Code, codex, and opencode.
@@ -100,14 +117,15 @@ and wiring for Claude Code, codex, and opencode.
 | Capability | macOS | Linux |
 |---|---|---|
 | Filesystem read/write walls (`run`, `gateway`) | ✅ Seatbelt | ✅ Landlock + seccomp (kernel 5.13+) |
-| Default-deny network, port tier | ✅ | ✅ (best on kernel 6.7+) |
-| Host-scoped egress through the Gateway, TLS inspection, credential brokering | ✅ | ✅ (kernel 5.6+, Yama `ptrace_scope` 0 or 1) |
+| Default-deny network | ✅ (a login flow's loopback listener also accepts on the host's other addresses) | ✅ |
+| Port tier (direct TCP to listed ports) | ✅ | ✅ on kernel 6.7+ (elsewhere egress fails closed); names do not resolve |
+| Host-scoped egress through the Gateway, TLS inspection, credential brokering | ✅ (clients that verify through the macOS keychain need `tunnel:`) | ✅ (kernel 5.6+, Yama `ptrace_scope` 0 or 1) |
 | Host-service channels closed by default (`channels`) | ✅ | ✅ (sockets closed under host rules; hidden otherwise) |
 | Process isolation (`isolate = ["processes", "ipc"]`) | partial (sandbox filters) | ✅ where unprivileged user namespaces are allowed |
-| Exec allow-lists | ✅ | ✅ |
+| Exec allow-lists | ✅ | ✅ (list the dynamic loader too, e.g. `/lib64/ld-linux-x86-64.so.2`) |
 | MCP gateway shading | ✅ | ✅ |
-| `learn` (denial observation) | ✅ unified-log feed | ✅ ptrace feed (needs `strace` installed; fails fast with the reason otherwise) |
-| `compile` / `explain` dry-run | ✅ any host | ✅ any host, cross-platform (compile a Linux policy on a Mac) |
+| `learn` (denial observation) | ✅ unified-log feed | ✅ ptrace feed (needs `strace` and Landlock; fails fast with the reason otherwise) |
+| `compile` / `explain` dry-run | ✅ any host | ✅ any host; `compile --target` builds a Linux policy on a Mac |
 
 On a host that can't carry a capability (an older kernel, a missing mechanism), Formwork reports
 the gap in its fidelity report and refuses to pretend — it fails closed, never silently open.
@@ -119,7 +137,7 @@ the gap in its fidelity report and refuses to pretend — it fails closed, never
 formwork run      [--blueprint …] -- <cmd> …   confine a command and every child it spawns
 formwork learn    [--blueprint …] -- <cmd> …   enforced run + denial observation → proposal
 formwork learn    --list | --accept <n|pat>    review / accept proposed grants
-formwork explain  [--blueprint …] [path …]     host capabilities, policy summary, per-path verdicts
+formwork explain  [--blueprint …] [--hosts] [path | url | channel …]   host capabilities, policy summary, verdicts
 formwork compile  [--blueprint …] [--target …] compiled policy + fidelity report as JSON (for CI)
 formwork gateway  [--blueprint …] --server <name> -- <mcp server cmd>   MCP policy proxy
 ```
@@ -134,13 +152,13 @@ overrides (`--rule`, `--set`, sugar flags) merge into one model where deny alway
 `just test` (or `cargo test --workspace`) runs the pure + native-OS-backend tests on any host;
 `cd py && uv run pytest` runs the black-box end-to-end harness. Linux enforcement is tested
 first-line in Docker (`just test-linux`) with Docker's own seccomp/AppArmor disabled so only
-Formwork's sandbox is under test; `just test-linux-full` falls back to a Lima VM with a pinned
-6.12+ kernel.
+Formwork's sandbox is under test; `just test-linux-full` runs the suite in a Lima VM you create
+(an instance named `formwork` with a 6.12+ kernel). [`CONTRIBUTING.md`](CONTRIBUTING.md) has the
+details.
 
 - [`formwork.md`](formwork.md) — the design and end-to-end test spec (with the requirement
   identifiers cited throughout code and tests).
-- [`docs/STATUS.md`](docs/STATUS.md) — implementation status by phase.
-- [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — how it is being built.
+- [`docs/STATUS.md`](docs/STATUS.md) — implementation status by phase, and the work still owed.
 - [`constitution.md`](constitution.md) — project doctrine, including the honesty rules.
 
 ## License

@@ -35,8 +35,9 @@ pub fn build(plan: &SeccompPlan) -> Result<BpfProgram, ConfineError> {
     }
 
     // Seccomp-carried net default-deny (Landlock net is TCP-only, so seccomp carries at least the
-    // UDP/raw half). AF_UNIX and socketpair are never listed -> allowed, so the injected-fd seam is
-    // untouched (FW-XR7). Multiple rules on `socket()` are ORed; each rule's conditions are ANDed.
+    // UDP/raw half). AF_UNIX and socketpair are never listed -> allowed: local IPC, the gateway's
+    // stdio, and the supervisor's listener hand-off are not egress (FW-XR7). Multiple rules on
+    // `socket()` are ORed; each rule's conditions are ANDed.
     let mut socket_rules = Vec::new();
     // Domain-level denies (arg0): the full inet deny lists inet/inet6 here; the port tier lists only
     // packet + non-route netlink and pushes the inet DGRAM/RAW deny below instead.

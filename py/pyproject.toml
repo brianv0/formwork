@@ -5,8 +5,7 @@ description = "End-to-end / adversarial test harness for Formwork (dev-only; nev
 requires-python = ">=3.11"
 dependencies = [
     "pytest>=8",
-    # MCP fixture servers (the official `mcp` SDK) arrive with the gateway work in Phase 6.
-    # Left out for now so the harness install is fast and dependency-light.
+    # The MCP fixture backend is a Rust bin (`fw-mcp-fixture`), so the harness needs no MCP SDK.
 ]
 
 [tool.uv]
