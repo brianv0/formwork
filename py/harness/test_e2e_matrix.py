@@ -120,8 +120,22 @@ def test_cargo_log_outcomes_come_from_libtest_lists():
         "failed"
     )
     assert rows[("linux_confine", "later_test")][0] == "ignored"
-    assert rows[("latency", "fw_e2e_096_latency_budget")][0] == "passed", "output between name and ok"
+    assert rows[("latency", "fw_e2e_096_latency_budget")][0] == "passed", (
+        "output between name and ok"
+    )
     assert not any(binary is None or "doc" in test for binary, test in rows)
+
+
+def test_cargo_colour_codes_do_not_hide_results():
+    """CI sets CARGO_TERM_COLOR=always, which colours cargo's `Running` lines."""
+    log = (
+        "\x1b[1m\x1b[92m     Running\x1b[0m tests/egress.rs (target/debug/deps/egress-0a1b2c3d)\n"
+        "\nrunning 1 test\ntest fw_adv_007_hostname_battery ... ok\n\nsuccesses:\n"
+        "    fw_adv_007_hostname_battery\n\ntest result: ok. 1 passed; 0 failed\n"
+    )
+    assert m.parse_cargo_log(log) == [
+        ("egress", "tests/egress.rs", "fw_adv_007_hostname_battery", "passed", "")
+    ]
 
 
 def _platform(name, family, outcomes):
@@ -148,12 +162,18 @@ def test_verdict_blocks_on_missing_platforms_failures_and_runtime_skips():
     ran = _platform(
         "linux-x",
         "linux",
-        [("a", {"FW-E2E-001"}, "failed"), ("b", set(), "skipped"), ("c", {"FW-E2E-008"}, "passed")],
+        [
+            ("a", {"FW-E2E-001"}, "failed"),
+            ("b", {"FW-E2E-002"}, "skipped"),
+            ("c", {"FW-E2E-008"}, "passed"),
+            ("d", set(), "skipped"),
+        ],
     )
     v = m.decide(spec, [ran], ["linux-x", "macos-x"])
     assert v.missing == ["macos-x"]
     assert [o.test for _, o in v.failures] == ["a"]
-    assert [o.test for _, o in v.skips] == ["b"]
+    assert [o.test for _, o in v.skips] == ["b"], "a skipped test that claims an ID blocks"
+    assert [o.test for _, o in v.unclaimed_skips] == ["d"], "one with no ID is a note"
     assert v.drift == ["FW-E2E-008"], "an owed test that passes is drift, not a failure"
     assert not v.passed
 

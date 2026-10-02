@@ -14,8 +14,10 @@ cross-reference, not a claim. Harness tests discharge their `fw_e2e`/`fw_adv` ma
 Blocking, in the order reported:
   1. an expected platform left no results;
   2. a test failed;
-  3. a test skipped at runtime (a Rust `skipping:` line, a harness skip no marker declared) --
-     the run did not exercise it, which `FW_REQUIRE_EXERCISED` promises never happens;
+  3. a test that discharges an FW ID skipped at runtime (a Rust `skipping:` line, a harness skip
+     no marker declared) -- the run did not exercise it, which `FW_REQUIRE_EXERCISED` promises
+     never happens; a test with no ID that skips (a deliberate per-host arm, such as the
+     isolation tier on an image without user namespaces) is listed as a note;
   4. a section 7 test that is neither retired nor on the section 10 not-yet-implemented list has
      no passing test on an OS family its title names (`(both)` = Linux and macOS; no marker = at
      least one platform).
@@ -227,6 +229,7 @@ class Outcome:
     reason: str = ""
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")  # CARGO_TERM_COLOR=always colours cargo's own lines
 RUNNING = re.compile(r"^\s+Running (?:unittests )?(\S+) \((\S+)\)")
 SAME_LINE = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)\b")
 OUTPUT_HEAD = re.compile(r"^---- (\S+) stdout ----$")
@@ -246,7 +249,7 @@ def parse_cargo_log(text: str) -> list[tuple[str, str, str, str]]:
     binary = source = None
     mode = None  # None | "await" | "output" | "list"
     kind = capture = None
-    for raw in text.splitlines():
+    for raw in ANSI.sub("", text).splitlines():
         line = raw.rstrip("\n")
         if m := RUNNING.match(line):
             source, binary = m.group(1), Path(m.group(2)).name.rsplit("-", 1)[0]
@@ -379,6 +382,7 @@ class Verdict:
     missing: list[str]
     failures: list[tuple[str, Outcome]]
     skips: list[tuple[str, Outcome]]
+    unclaimed_skips: list[tuple[str, Outcome]]
     uncovered: list[tuple[str, list[str]]]  # (test id, families with no pass)
     drift: list[str]
     matrix: dict[str, dict[str, str]]  # test id -> platform -> cell
@@ -394,13 +398,19 @@ def decide(spec: Spec, platforms: list[Platform], expected: list[str]) -> Verdic
     order = {name: i for i, name in enumerate(expected)}
     platforms = sorted(platforms, key=lambda p: (order.get(p.name, len(order)), p.name))
     by_name = {p.name: p for p in platforms}
-    missing = [n for n in expected if n not in by_name or not by_name[n].cargo_logs]
+    missing = [
+        n
+        for n in expected
+        if n not in by_name or not any(o.tool == "cargo" for o in by_name[n].outcomes)
+    ]
     missing += [p.name for p in platforms if not p.pytest_ran and p.name not in missing]
     for p in platforms:
         p.outcomes = _merge_outcomes(p.outcomes)
 
     failures = [(p.name, o) for p in platforms for o in p.outcomes if o.outcome == "failed"]
-    skips = [(p.name, o) for p in platforms for o in p.outcomes if o.outcome == "skipped"]
+    skipped = [(p.name, o) for p in platforms for o in p.outcomes if o.outcome == "skipped"]
+    skips = [(n, o) for n, o in skipped if o.ids]
+    unclaimed_skips = [(n, o) for n, o in skipped if not o.ids]
 
     matrix: dict[str, dict[str, str]] = {}
     status: dict[str, str] = {}
@@ -439,6 +449,7 @@ def decide(spec: Spec, platforms: list[Platform], expected: list[str]) -> Verdic
         missing,
         failures,
         skips,
+        unclaimed_skips,
         uncovered,
         drift,
         matrix,
@@ -475,7 +486,10 @@ def render_markdown(v: Verdict, title: str) -> str:
         )
     out.append("")
 
-    blocking = [f"- `{n}` left no results (a cargo log and `pytest.json`)" for n in v.missing]
+    blocking = [
+        f"- `{n}` left no results (a cargo log with parsable tests, and `pytest.json`)"
+        for n in v.missing
+    ]
     blocking += [f"- **failed** on `{n}`: `{o.test}` {_ids(o)}" for n, o in v.failures]
     blocking += [
         f"- **skipped at runtime** on `{n}`: `{o.test}` {_ids(o)}: {o.reason}" for n, o in v.skips
@@ -492,6 +506,10 @@ def render_markdown(v: Verdict, title: str) -> str:
         f"- `{tid}` is on the §10 not-yet-implemented list but passed; update §10 and "
         "docs/STATUS.md"
         for tid in v.drift
+    ]
+    notes += [
+        f"- skipped at runtime on `{n}` (no FW ID, not blocking): `{o.test}`: {o.reason}"
+        for n, o in v.unclaimed_skips
     ]
     partial = sorted(v.spec.partial)
     notes += [f"- `{t}` is partial per §10 ({v.spec.tests[t].title})" for t in partial]
@@ -553,6 +571,9 @@ def to_json(v: Verdict) -> dict:
         "skips": [
             {"platform": n, "test": o.test, "ids": sorted(o.ids), "reason": o.reason}
             for n, o in v.skips
+        ],
+        "unclaimed_skips": [
+            {"platform": n, "test": o.test, "reason": o.reason} for n, o in v.unclaimed_skips
         ],
         "uncovered": [{"test": t, "families": f} for t, f in v.uncovered],
         "drift": v.drift,

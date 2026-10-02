@@ -8,7 +8,7 @@
 # FW-E2E/FW-ADV IDs and fails on:
 #   * a platform that left no results;
 #   * a failed test;
-#   * a test that skipped at runtime (it did not exercise its mechanism);
+#   * a test that claims an FW ID and skipped at runtime (it did not exercise its mechanism);
 #   * a section 7 test, neither retired nor on section 10's not-yet-implemented list, with no
 #     passing test on a family its title names (`(both)` = Linux and macOS).
 # The verdict and the full test x platform matrix land in the run summary and the `verdict`
