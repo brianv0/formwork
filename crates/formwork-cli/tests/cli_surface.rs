@@ -207,6 +207,29 @@ fn explain_with_no_path_summarizes_host_and_fidelity() {
         }
         None => panic!("the backstop is not lifted here: {backstop}"),
     }
+
+    // The floor's "denied" total is the types this host enforces, not every type with a path
+    // arm: one whose any-depth rows are withheld is named apart (FW-CRED9/FW-INV5).
+    let per_type = value["report"]["credentials"]["per-type"]
+        .as_object()
+        .unwrap();
+    let statuses: Vec<(&str, &str)> = per_type
+        .iter()
+        .filter_map(|(name, t)| Some((name.as_str(), t["path"]["status"].as_str()?)))
+        .collect();
+    let enforced = statuses.iter().filter(|(_, s)| *s == "enforced").count();
+    let line = out
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("credential floor: "))
+        .unwrap();
+    assert!(
+        line.contains(&format!("-- {enforced} path types denied")),
+        "{line}"
+    );
+    for (name, _) in statuses.iter().filter(|(_, s)| *s == "partial") {
+        assert!(line.contains(name), "partial type {name} not named: {line}");
+    }
 }
 
 #[test]
@@ -263,6 +286,33 @@ fn explain_backstop_denial_names_shape_and_lift() {
         "{}",
         out.stdout
     );
+    // The hint agrees with the host note above it: where this host withholds the row (Landlock,
+    // FW-CRED9) it claims no denial here; elsewhere it names the any-depth surprise (FW-INV5).
+    let json = formwork(
+        dir.path(),
+        dir.path(),
+        &[
+            "explain",
+            "--blueprint",
+            "bp.toml",
+            "--json",
+            "/srv/app/credentials",
+        ],
+    );
+    let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+    let hint = out
+        .stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("hint: "))
+        .unwrap_or_else(|| panic!("no hint:\n{}", out.stdout));
+    match value["explanations"][0]["host_note"].as_str() {
+        Some(note) => {
+            assert!(note.starts_with("withheld on this host"), "{note}");
+            assert!(hint.contains("no denial here to lift"), "{hint}");
+            assert!(!hint.contains("-- fires at any depth"), "{hint}");
+        }
+        None => assert!(hint.contains("-- fires at any depth"), "{hint}"),
+    }
 
     // The path a user actually types when diagnosing the failure is relative -- it must resolve
     // against cwd, not error on "must be absolute".

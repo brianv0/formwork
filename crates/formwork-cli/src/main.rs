@@ -671,13 +671,16 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
             });
         let mut explanation = provenance.explain(&blueprint, target.base(), floor.clone());
         // D2: on Linux a floor or tamper row that exists only in any-depth form is withheld, so
-        // the model verdict above is not what this kernel enforces.
+        // the model verdict above is not what this kernel enforces. The floor hint below follows
+        // it: a withheld row has no denial here to lift.
+        let mut floor_withheld = false;
         if landlock_withholds {
             let absolute_floor_hit = catalog
                 .denied_paths(&blueprint.exposed_credentials())
                 .iter()
                 .any(|p| !p.is_any_depth() && p.matches_path(target.base()));
             if floor.is_some() && !absolute_floor_hit {
+                floor_withheld = true;
                 explanation.host_note = Some(
                     "withheld on this host -- Landlock cannot root the any-depth floor row, so \
                      this path is not denied by the kernel here (see `withheld` in the report)"
@@ -691,10 +694,10 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
                 );
             }
         }
-        rows.push((explanation, floor, shape));
+        rows.push((explanation, floor, shape, floor_withheld));
     }
     if json {
-        let explanations: Vec<_> = rows.iter().map(|(e, _, _)| e).collect();
+        let explanations: Vec<_> = rows.iter().map(|(e, ..)| e).collect();
         let mut value = serde_json::json!({ "explanations": explanations });
         if !channel_rows.is_empty() {
             value["channels"] = serde_json::to_value(&channel_rows)?;
@@ -710,10 +713,13 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
             resolved.path.display(),
             resolved.source.as_str()
         );
-        for (explanation, floor, shape) in &rows {
+        for (explanation, floor, shape, withheld) in &rows {
             print!("{}", render::explanation(explanation));
             if let Some(floor_type) = floor {
-                print!("{}", render::floor_remedy(floor_type, shape.as_deref()));
+                print!(
+                    "{}",
+                    render::floor_remedy(floor_type, shape.as_deref(), *withheld)
+                );
             }
         }
         for channel in &channel_rows {
@@ -2102,8 +2108,17 @@ fn itemize_credential_floor(report: &formwork_compile::FidelityReport, catalog: 
         allowed = ?creds.allowed,
         "credential floor active (RUST_LOG=debug itemizes per type)"
     );
+    // `denied` is what this host's kernel denies: a type whose any-depth rows are withheld
+    // (FW-CRED9) is itemized apart, never as denied (FW-INV5).
+    let (denied, not_denied): (Vec<&str>, Vec<&str>) = path_types.iter().partition(|name| {
+        creds.per_type[**name]
+            .path
+            .as_ref()
+            .is_some_and(|f| f.is_enforced())
+    });
     tracing::debug!(
-        denied_path_types = ?path_types,
+        denied_path_types = ?denied,
+        not_fully_denied_path_types = ?not_denied,
         stripped_env_types = ?env_types,
         "credential catalog floor, itemized"
     );

@@ -159,8 +159,8 @@ and any-depth `write-subtract` rows. It lists each one under `withheld` in the f
 marks the affected credential types, the backstop and `tamper-vectors` Partial
 ([FW-CRED9](../formwork.md#fw-cred9), [FW-INV5](../formwork.md#fw-inv5)). A confined process on
 Linux can therefore read a `credentials` file inside a granted directory, where Seatbelt denies it
-with a regex. `formwork explain` says so in its backstop line, and `formwork explain <path>` marks
-such a path "withheld on this host". `formwork-confine` rejects an any-depth hole, so a row the
+with a regex. `formwork explain` says so in its backstop line and names the affected types apart
+from the denied count, and `formwork explain <path>` marks such a path "withheld on this host". `formwork-confine` rejects an any-depth hole, so a row the
 compiler failed to withhold fails the run instead of going missing.
 
 ## seccomp baseline (`seccompiler`) — and its hazards

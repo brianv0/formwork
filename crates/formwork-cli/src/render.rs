@@ -162,19 +162,36 @@ pub fn channel_explanation(e: &ChannelExplanation, report: &FidelityReport) -> S
 /// The floor is the one deny `explain` can never show a grant for (FW-CAP8), so naming the lever
 /// is the operator channel (FW-CRED7) the confined tool's bare EACCES lacks. The backstop also
 /// names its `shape`, since that is the surprise: it fires even inside a granted directory.
-pub fn floor_remedy(floor_type: &str, shape: Option<&str>) -> String {
-    if floor_type == "backstop" {
+/// `withheld` is a row this host cannot install (FW-CRED9): there is no denial here, so the hint
+/// says so and keeps the lift for the hosts that do enforce it (FW-INV5).
+pub fn floor_remedy(floor_type: &str, shape: Option<&str>, withheld: bool) -> String {
+    let backstop = floor_type == formwork_blueprint::BACKSTOP;
+    let label = if backstop {
         format!(
-            "  hint: credential backstop (shape {}) -- fires at any depth, even inside a granted \
-             directory. Lift with allow-credentials = [\"backstop\"] (coarse: un-denies every \
-             backstop shape everywhere; prefer narrowing a real type when one fits).\n",
+            "credential backstop (shape {})",
             shape.unwrap_or("**/<name>")
         )
     } else {
+        format!("credential floor (type {floor_type})")
+    };
+    if withheld {
+        let fires = if backstop {
+            " it fires at any depth, even inside a granted directory, and"
+        } else {
+            ""
+        };
         format!(
-            "  hint: credential floor (type {floor_type}) -- lift with \
-             allow-credentials = [\"{floor_type}\"].\n"
+            "  hint: {label} -- withheld on this host, so there is no denial here to lift. Where \
+             the row is enforced,{fires} allow-credentials = [\"{floor_type}\"] lifts it.\n"
         )
+    } else if backstop {
+        format!(
+            "  hint: {label} -- fires at any depth, even inside a granted directory. Lift with \
+             allow-credentials = [\"backstop\"] (coarse: un-denies every backstop shape \
+             everywhere; prefer narrowing a real type when one fits).\n"
+        )
+    } else {
+        format!("  hint: {label} -- lift with allow-credentials = [\"{floor_type}\"].\n")
     }
 }
 
@@ -212,6 +229,39 @@ pub fn backstop(f: &Fidelity) -> String {
     } else {
         format!("{shapes} at any depth: {}", fidelity(f))
     }
+}
+
+/// One arm of the credential floor, counted by this host's verdict: only `Enforced` types count as
+/// `verb` (denied, stripped); `Partial` ones are named and `Unenforceable` ones counted after it,
+/// so a withheld any-depth type (FW-CRED9) is never folded into the denied total (FW-INV5).
+fn arm_tally<'a>(
+    kind: &str,
+    verb: &str,
+    arms: impl Iterator<Item = (&'a str, &'a Fidelity)>,
+) -> String {
+    let (mut enforced, mut partial, mut unenforceable) = (0, Vec::new(), 0);
+    for (name, f) in arms {
+        match f {
+            Fidelity::Enforced { .. } => enforced += 1,
+            Fidelity::Partial { .. } => partial.push(name),
+            Fidelity::Unenforceable { .. } => unenforceable += 1,
+        }
+    }
+    let mut out = format!(
+        "{enforced} {kind} type{} {verb}",
+        if enforced == 1 { "" } else { "s" }
+    );
+    if !partial.is_empty() {
+        out.push_str(&format!(
+            ", {} partial on this host ({})",
+            partial.len(),
+            partial.join(", ")
+        ));
+    }
+    if unenforceable > 0 {
+        out.push_str(&format!(", {unenforceable} unenforceable on this host"));
+    }
+    out
 }
 
 /// The fidelity report as prose: per-capability honesty plus the credential floor's shape. The
@@ -263,14 +313,19 @@ pub fn report_summary(report: &FidelityReport) -> String {
         }
     }
     let creds = &report.credentials;
-    let path_types = creds.per_type.values().filter(|f| f.path.is_some()).count();
-    let env_types = creds.per_type.values().filter(|f| f.env.is_some()).count();
+    let path_arms = creds
+        .per_type
+        .iter()
+        .filter_map(|(name, f)| f.path.as_ref().map(|p| (name.as_str(), p)));
+    let env_arms = creds
+        .per_type
+        .iter()
+        .filter_map(|(name, f)| f.env.as_ref().map(|e| (name.as_str(), e)));
     out.push_str(&format!(
-        "credential floor: catalog v{} -- {path_types} path type{} denied, {env_types} env \
-         type{} stripped; allowed through: {}\n",
+        "credential floor: catalog v{} -- {}, {}; allowed through: {}\n",
         creds.catalog_version,
-        if path_types == 1 { "" } else { "s" },
-        if env_types == 1 { "" } else { "s" },
+        arm_tally("path", "denied", path_arms),
+        arm_tally("env", "stripped", env_arms),
         if creds.allowed.is_empty() {
             "(none)".to_string()
         } else {
@@ -375,13 +430,83 @@ mod tests {
     #[test]
     fn floor_remedy_names_the_shape_and_the_lift() {
         // The backstop remedy names the surprising shape and the coarse lift...
-        let bs = floor_remedy("backstop", Some("**/credentials"));
+        let bs = floor_remedy("backstop", Some("**/credentials"), false);
         assert!(bs.contains("**/credentials"), "{bs}");
         assert!(bs.contains("allow-credentials = [\"backstop\"]"), "{bs}");
-        assert!(bs.contains("any depth"), "{bs}");
+        assert!(bs.contains("-- fires at any depth"), "{bs}");
         // ...a curated type names itself as the lift instead.
-        let ssh = floor_remedy("ssh", None);
+        let ssh = floor_remedy("ssh", None, false);
         assert!(ssh.contains("allow-credentials = [\"ssh\"]"), "{ssh}");
         assert!(!ssh.contains("backstop"), "{ssh}");
+    }
+
+    /// Under a "withheld on this host" note the hint must not say the row fires here (FW-CRED9,
+    /// FW-INV5); it keeps the shape and the lift for the hosts that do enforce it.
+    #[test]
+    fn floor_remedy_on_a_withheld_row_claims_no_denial() {
+        let bs = floor_remedy("backstop", Some("**/credentials"), true);
+        assert!(bs.contains("**/credentials"), "{bs}");
+        assert!(bs.contains("withheld on this host"), "{bs}");
+        assert!(bs.contains("no denial here to lift"), "{bs}");
+        assert!(!bs.contains("-- fires at any depth"), "{bs}");
+        assert!(bs.contains("Where the row is enforced, it fires"), "{bs}");
+        assert!(bs.contains("allow-credentials = [\"backstop\"]"), "{bs}");
+
+        let dotenv = floor_remedy("dotenv", None, true);
+        assert!(dotenv.contains("withheld on this host"), "{dotenv}");
+        assert!(
+            dotenv.contains("Where the row is enforced, allow-credentials = [\"dotenv\"]"),
+            "{dotenv}"
+        );
+    }
+
+    /// The floor's "denied" total counts only types this host enforces: on Landlock the any-depth
+    /// `dotenv` type is Partial (FW-CRED9) and is named apart, and with no confinement nothing is
+    /// counted as denied (FW-INV5).
+    #[test]
+    fn report_summary_counts_only_enforced_types_as_denied() {
+        use formwork_blueprint::{Blueprint, ResolvedCatalog};
+        let catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let floor_line = |host: &HostProfile| {
+            let report = formwork_compile::compile(&Blueprint::empty(), host, &catalog).report;
+            let paths = report
+                .credentials
+                .per_type
+                .values()
+                .filter(|f| f.path.is_some())
+                .count();
+            let line = report_summary(&report)
+                .lines()
+                .find(|l| l.starts_with("credential floor: "))
+                .unwrap()
+                .to_string();
+            (paths, line)
+        };
+
+        let (paths, mac) = floor_line(&HostProfile::synthetic_macos());
+        assert!(
+            mac.contains(&format!("-- {paths} path types denied, ")),
+            "{mac}"
+        );
+        assert!(!mac.contains("on this host"), "{mac}");
+
+        let (paths, landlock) = floor_line(&HostProfile::synthetic_linux(Some(6)));
+        assert!(
+            landlock.contains(&format!(
+                "-- {} path types denied, 1 partial on this host (dotenv), ",
+                paths - 1
+            )),
+            "{landlock}"
+        );
+
+        let (paths, bare) = floor_line(&HostProfile::synthetic_linux(None));
+        assert!(
+            bare.contains(&format!(
+                "-- 0 path types denied, {paths} unenforceable on this host, "
+            )),
+            "{bare}"
+        );
+        // The env arm is the launcher's on every host.
+        assert!(bare.contains("env types stripped"), "{bare}");
     }
 }

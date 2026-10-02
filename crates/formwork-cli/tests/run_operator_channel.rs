@@ -10,11 +10,16 @@ use std::process::Command;
 /// exit status is deliberately ignored: the operator line under test is written before the
 /// confiner/exec, so a host without a backend (or a missing workload) still carries it.
 fn run_stderr(dir: &Path, formwork_toml: &str, args: &[&str]) -> String {
+    run_stderr_at(dir, formwork_toml, args, "info")
+}
+
+fn run_stderr_at(dir: &Path, formwork_toml: &str, args: &[&str], level: &str) -> String {
     std::fs::write(dir.join("FORMWORK.toml"), formwork_toml).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_formwork"))
         .args(args)
         .current_dir(dir)
         .env("HOME", dir)
+        .env("RUST_LOG", level)
         .output()
         .expect("running formwork");
     String::from_utf8_lossy(&out.stderr).into_owned()
@@ -27,8 +32,8 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     root
 }
 
-/// This host's verdict on the backstop, from the same blueprint `run` would load.
-fn backstop_status(dir: &Path) -> Option<String> {
+/// This host's credential report, from the same blueprint `run` would load.
+fn credentials_report(dir: &Path) -> serde_json::Value {
     let out = Command::new(env!("CARGO_BIN_EXE_formwork"))
         .args(["explain", "--json"])
         .current_dir(dir)
@@ -36,7 +41,12 @@ fn backstop_status(dir: &Path) -> Option<String> {
         .output()
         .expect("running formwork");
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    value["report"]["credentials"]["backstop"]["status"]
+    value["report"]["credentials"].clone()
+}
+
+/// This host's verdict on the backstop.
+fn backstop_status(dir: &Path) -> Option<String> {
+    credentials_report(dir)["backstop"]["status"]
         .as_str()
         .map(str::to_string)
 }
@@ -92,5 +102,51 @@ fn lifting_the_backstop_silences_the_callout_but_not_the_floor() {
         stderr.contains("credential floor active"),
         "the floor summary stays even with the backstop lifted:\n{stderr}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The debug itemization's `denied_path_types` is what this host denies: a type the report marks
+/// Partial (Landlock withholds its any-depth rows, FW-CRED9) is itemized apart (FW-INV5).
+#[test]
+fn debug_itemization_lists_only_enforced_types_as_denied() {
+    let dir = scratch("itemized");
+    let stderr = run_stderr_at(
+        &dir,
+        "extends = [\"builtin:default\"]\nnet = \"deny\"\n",
+        &["run", "--", "/bin/true"],
+        "debug",
+    );
+    let field = |name: &str| -> Vec<String> {
+        let line = stderr
+            .lines()
+            .find(|l| l.contains("credential catalog floor, itemized"))
+            .unwrap_or_else(|| panic!("no itemization:\n{stderr}"));
+        let start = line
+            .find(&format!(" {name}=["))
+            .unwrap_or_else(|| panic!("no {name}: {line}"))
+            + name.len()
+            + 3;
+        let end = start + line[start..].find(']').unwrap();
+        line[start..end]
+            .split(", ")
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_matches('"').to_string())
+            .collect()
+    };
+    let (denied, apart) = (
+        field("denied_path_types"),
+        field("not_fully_denied_path_types"),
+    );
+    let report = credentials_report(&dir);
+    for (name, t) in report["per-type"].as_object().unwrap() {
+        match t["path"]["status"].as_str() {
+            Some("enforced") => assert!(denied.contains(name), "{name}: {denied:?}"),
+            Some(_) => {
+                assert!(!denied.contains(name), "{name}: {denied:?}");
+                assert!(apart.contains(name), "{name}: {apart:?}");
+            }
+            None => {}
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
