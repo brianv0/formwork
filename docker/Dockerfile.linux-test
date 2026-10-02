@@ -1,4 +1,4 @@
-# First-line local Linux test image (plan §5). The kernel is the Docker VM's, not this image's, so
+# First-line local Linux test image (CONTRIBUTING.md). The kernel is the Docker VM's, not this image's, so
 # the harness gates on `formwork explain --json` and skips tiers the kernel can't carry. Run the container
 # with `--security-opt seccomp=unconfined --security-opt apparmor=unconfined` (see the justfile) so
 # Docker's own sandbox never masks the sandbox under test.

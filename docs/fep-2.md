@@ -34,8 +34,8 @@ observe-then-widen; curated catalog + backstop; auto-widen empty by default) —
 
 - **Credential brokering** (interacts with [FW-CRED5](../formwork.md#fw-cred5)): whether the gateway should broker
   a credential's *use* without the agent ever seeing the bytes, instead of exclusion
-  exposing the file/var. Safer, fits the single-privileged-broker shape, presupposes a
-  secret-handling path through the broker — deferred to a later FEP and tracked as an
-  open question in `formwork.md` §11.
+  exposing the file/var. *Landed with FEP-5 and FEP-6:* `broker:<type>` keeps the floor
+  and the gateway presents the credential on its bound hosts
+  ([FW-CRED10](../formwork.md#fw-cred10)–[FW-CRED19](../formwork.md#fw-cred19)).
 - **Live interactive discovery prompting** (`SECCOMP_USER_NOTIF`/`ptrace`): a documented
   Linux-only future option; observe-then-widen is the shipped posture.

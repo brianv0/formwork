@@ -1,7 +1,7 @@
 # Phase 0 spike notes
 
 Short programs answering the questions the whole design leans on, run before building on the
-assumptions (plan §4, Phase 0). Each entry records the question, the finding, and any design
+assumptions (Phase 0, `docs/STATUS.md`). Each entry records the question, the finding, and any design
 amendment. macOS spikes run natively here. The Linux spikes (3 and 4) have since been implemented and
 kernel-verified (Docker, ABI-v6); their status notes below record what actually remains.
 
@@ -17,9 +17,11 @@ the seam needs a scoped allowance and we must find that out now, not in Phase 5.
 pair; forks; child applies a `(deny network*)` profile via `sandbox_init`; child then `read`/`write`
 on the inherited fds. Also test whether a fresh `connect()` inside is denied (it must be).
 
-**Status.** Resolved — the assumption held. The fd seam (Phase 5) shipped and its transport is
+**Status.** Resolved — the assumption held. The fd seam (Phase 5) was built and its transport is
 verified on macOS *and* Linux ([`FW-E2E-010/011/012`](../formwork.md#fw-e2e-010)); read/write on an
-inherited connected fd works under `(deny network*)`, and a fresh `connect()` inside is denied.
+inherited connected fd works under `(deny network*)`, and a fresh `connect()` inside is denied. The
+seam is not wired into the CLI: FEP-5 carries egress through the Linux connect supervisor and, on
+macOS, an authenticated loopback listener the confined process `connect()`s to (`docs/STATUS.md`).
 
 ## Spike 2 — `sandbox_init` from Rust in a forked child (macOS)
 
@@ -33,7 +35,7 @@ profile once to confirm the error string round-trips.
 
 **Finding (resolved, macOS 26.5 / darwin 25.5).** `sandbox_init(profile, 0, &err)` compiles and
 applies an SBPL *string* directly (flags = 0; the `sandbox-exec -p` / older-Chromium path). It is
-callable from Rust with a three-symbol extern block against libSystem — no crate needed. The
+callable from Rust with a two-symbol extern block (`sandbox_init`, `sandbox_free_error`) against libSystem — no crate needed. The
 profile survives `execve` and is inherited by descendants: `FW-E2E-005` (a `sh -> cat` grandchild)
 is denied an out-of-scope read. The error path round-trips a readable string via the out-pointer.
 
@@ -94,7 +96,7 @@ kernel is `5.10.104-linuxkit`, which predates Landlock (5.13). Running the `form
   `Enforced` via seccomp. The report does not lie, and net fails closed rather than silently open.
 
 This is the honesty invariant proven on a real degraded host, not just in synthetic-profile tests.
-The Landlock *enforcement* still needs a 5.13+ kernel (Lima) to verify — see docs/linux-backend.md.
+Landlock *enforcement* has since been verified on capable kernels — see docs/linux-backend.md.
 
 ## Spike 4 — Landlock subtractive-expansion cost (Linux)
 

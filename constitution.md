@@ -142,7 +142,7 @@ test — carries a stable unique identifier: `FW-<FAMILY><n>` for requirements
 EGR — a new family is a Concepts-grade amendment), `FW-INV<n>` for invariants,
 `FW-E2E-<nnn>` / `FW-ADV-<nnn>` for tests. The rules:
 - **Minted once, in the defining document.** `formwork.md` once landed; an
-  FEP's remainder document until then (`docs/fep-1.md` holds FW-EGR1–6 and FW-FID5
+  FEP's remainder document until then (`docs/fep-1.md` holds FW-FID5 and FW-E2E-040
   today). Exactly one definition per ID, and each definition site carries an
   HTML anchor named for the lowercase ID (`<a id="fw-cap2">`).
 - **Never renumbered, never reused.** Sequences are monotonic and shared
@@ -351,8 +351,9 @@ concept, function, or module that already expresses it, then show
 that it can't. The Blueprint vocabulary is a *closed* enumeration ([FW-CAP1](formwork.md#fw-cap1)); adding a
 capability axis is a Concepts amendment, not a casual field. Dependencies get
 the hardest no: this is a sandboxing tool, so every crate added widens its trust
-base — the CI uses only first-party actions for the same reason, and the Phase-2
-Landlock crates stay unwired until a real kernel verifies them. An abstraction
+base — the CI uses only first-party actions for the same reason, and the Linux
+backend's `landlock` and `seccompiler` crates were wired only once a real kernel
+verified them. An abstraction
 with one implementation and no second consumer is a Growth violation; typed-error
 variants are API surface and count. Pruning is event-triggered: at each release /
 version bump, not calendar-driven.
@@ -427,9 +428,9 @@ same rail**: a compat shim (a hidden alias, a kept flag) is an exception to the
 command-surface rule it violates, so it records its removal event and is
 pruned at that event like any exception — otherwise hidden surface accretes
 invisibly, the exact failure Growth exists to stop. The live register is the
-deprecations table in `docs/STATUS.md` (today: the hidden `detect` /
-`enforce-self` / `accept` aliases and `--spec`, expiring at the first tagged
-release). *(Amended from the unstated-requirements pass.)*
+deprecations table in `docs/STATUS.md` (empty today: the hidden `detect` /
+`enforce-self` / `accept` aliases and `--spec` were removed before the first
+tagged release). *(Amended from the unstated-requirements pass.)*
 Rationale: a constitution with no lawful exception teaches its
 users to invent illegal ones; a tracked, expiring exception keeps
 every deviation visible and temporary.

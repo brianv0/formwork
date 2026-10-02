@@ -98,7 +98,7 @@ async fn fw_e2e_030_empty_allowlist_is_full_deny() {
 }
 
 /// FW-EGR16: a tunnel forwards only a ClientHello whose server name is the CONNECT host, and only
-/// TLS.
+/// TLS. With the two tests named for FW-EGR10 and FW-EGR20 in `inspect.rs`, this is FW-ADV-022.
 #[tokio::test(flavor = "multi_thread")]
 async fn fw_egr16_a_tunnel_checks_the_server_name_and_carries_tls_only() {
     let tls = fixture_tls(&["allowed.test", "blocked.test"]);

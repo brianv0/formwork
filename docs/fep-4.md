@@ -16,6 +16,13 @@ sit above the highest landed number (`FW-E2E-071` today) so no landed or drafted
 see §4 and §6 (they are now `FW-E2E-072`..074, having been bumped off `065`..067 and then `070`..071
 as PRs #19 and #22 landed tests at those numbers).
 
+**Since drafted.** FEP-5 and FEP-6 landed and continued the sequences above these reserved numbers
+(to `FW-E2E-106` and `FW-ADV-025`), so `FW-E2E-072`..074 stay FEP-4's. Linux gained a denial feed
+after this draft: `learn` traces the confined run with an unconfined `strace`
+([FW-E2E-071](../formwork.md#fw-e2e-071)), and `crates/formwork-cli/tests/record_trace.rs` already
+synthesizes a Blueprint from a strace trace. The `trace-feed: none` Linux gap assumed below is to be
+revisited when the mechanism is built.
+
 ---
 
 ## 1. Problem

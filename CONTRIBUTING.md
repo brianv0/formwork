@@ -23,8 +23,12 @@ just test-integration-mcp        # gateway shading against a real published MCP 
 ```
 
 Platform-backend tests skip-with-reason off their platform (macOS Seatbelt vs. Linux
-Landlock/seccomp) — they never silently pass. Run what your machine can enforce and let CI cover the
-rest.
+Landlock/seccomp). A skip still reports `ok` under `cargo test`, so CI sets
+`FW_REQUIRE_EXERCISED=1`, which turns a test that cannot exercise its mechanism into a failure; set
+it locally to check that your machine ran what you think it ran. Run what your machine can enforce
+and let CI cover the rest. Docker's own seccomp profile and AppArmor are disabled for the Linux
+container (`just test-linux`) because the default seccomp profile allowlisted the `landlock_*`
+syscalls only recently and AppArmor can shadow a Landlock denial with its own.
 
 ## Making a change
 
@@ -42,10 +46,15 @@ rest.
 
 ## Where things live
 
-- [`formwork.md`](formwork.md) — the design and end-to-end test spec; the FW-* definitions.
-- [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — how it is built (layout, phases, decisions).
-- [`docs/STATUS.md`](docs/STATUS.md) — implementation status by phase.
-- [`docs/`](docs/) — enhancement proposals (`fep-*.md`) and supporting design notes.
+- [`formwork.md`](formwork.md) — the design and end-to-end test spec; the FW-* definitions, and
+  the build order (§12).
+- [`constitution.md`](constitution.md) — doctrine, including the crate layers and what each crate
+  may depend on (*Layers*).
+- [`docs/STATUS.md`](docs/STATUS.md) — implementation status by phase, and the work still owed.
+- [`docs/`](docs/) — enhancement proposals (`fep-*.md`), their execution records (`fep-*-plan.md`),
+  and supporting design notes ([`linux-backend.md`](docs/linux-backend.md),
+  [`macos-characterization.md`](docs/macos-characterization.md)).
+- [`examples/`](examples/README.md) — blueprints and agent wiring, checked by the harness.
 
 ## Security
 

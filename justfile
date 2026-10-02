@@ -3,11 +3,13 @@
 
 set shell := ["bash", "-uc"]
 
-# Docker image used for first-line local Linux testing (plan §5). The kernel is the Docker VM's,
+# Docker image used for first-line local Linux testing (CONTRIBUTING.md). The kernel is the Docker VM's,
 # not the image's, so the harness gates on `formwork explain --json` (the host profile) and skips
 # tiers the kernel can't carry.
 linux_image := "formwork-linux-test"
-# Unconfined so Docker's own seccomp/AppArmor never masks the sandbox under test (plan §5).
+# Unconfined so Docker's own seccomp/AppArmor never masks the sandbox under test: Docker's default
+# seccomp profile allowlisted the landlock_* syscalls only recently, and AppArmor can shadow a
+# Landlock denial with its own.
 docker_test_flags := "--security-opt seccomp=unconfined --security-opt apparmor=unconfined"
 
 default:
@@ -82,7 +84,8 @@ check:
 # Self-host: run Claude Code confined by Formwork against THIS checkout — prompts off, kernel wall
 # on. Renders examples/blueprints/dev-session.toml.tpl (with your checkout path) into a gitignored
 # .dev-session.toml, prints the enforced-capability report, then launches Claude confined.
-# macOS-only today (the Linux confiner is a stub). This is the VERIFICATION wall, not the Docker
+# macOS-only today: the template uses the port tier, under which Linux closes UDP and nothing
+# resolves (host rules would resolve through the Gateway). This is the VERIFICATION wall, not the Docker
 # loop: the dev blueprint subtracts ~/.docker/** so the host-root docker socket is unreachable, so
 # you cannot drive Docker from in here — run `just test-linux` from an unconfined shell for that.
 dev-confined *ARGS: build

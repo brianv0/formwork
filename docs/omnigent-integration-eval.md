@@ -1,6 +1,9 @@
 # Evaluation: integrating Formwork into Omnigent
 
-Status: research note, 2026-09-25. Omnigent at `omnigent-ai/omnigent@8ff455b` (2026-09-24);
+Status: research note, 2026-09-25; **historical record**. The Formwork-side findings are
+superseded: §5's defects became FEP-5's D1–D11 and landed, and FEP-5 and FEP-6 added host rules,
+TLS inspection, credential brokering, the channel baseline, UDP closure under every posture and the
+`isolate` tier. `docs/STATUS.md` is the current status. Omnigent at `omnigent-ai/omnigent@8ff455b` (2026-09-24);
 Formwork at `8a340c4`. Claims are from reading both codebases, plus live probes on a Linux 6.18 host
 (Landlock ABI 7, bubblewrap 0.x). macOS claims come from the code only and were not run.
 

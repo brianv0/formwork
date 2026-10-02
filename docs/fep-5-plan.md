@@ -2,7 +2,7 @@
 
 Companion to `fep-5.md` (what and why). This records how FEP-5 was built, where the build departed
 from the proposal and why, and what is still owed. Requirement and test IDs are defined in
-`fep-5.md`, anchored there, and cited bare in code.
+`formwork.md`, where FEP-5's were folded after landing, anchored there, and cited bare in code.
 
 ## 1. What landed, by phase
 

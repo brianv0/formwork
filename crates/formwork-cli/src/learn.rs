@@ -1,4 +1,4 @@
-//! `formwork learn` and `formwork accept` -- observe-then-widen discovery (FEP-2 Part D).
+//! `formwork learn` and its `--list`/`--accept` review -- observe-then-widen discovery (FEP-2 Part D).
 //!
 //! A learning run is an ENFORCED run plus observation: the policy is compiled and installed
 //! exactly as `run` would (FW-INV10 -- observation never weakens the live session), and the
@@ -900,7 +900,7 @@ fn merge_all_into_discovered(
     Ok(accepted.len() + rules.len() + channels.len())
 }
 
-/// `formwork learn --list`/`--accept` (and the hidden `accept` alias): per-entry,
+/// `formwork learn --list`/`--accept`: per-entry,
 /// human-in-the-loop acceptance (FW-DISC5). With no selection it
 /// lists the candidates by number instead of erroring, so the review loop is self-describing.
 /// A selection names an entry by its 1-based number or by its exact pattern. The credential
@@ -1288,7 +1288,7 @@ mod tests {
 
     #[test]
     fn parses_real_sandbox_messages() {
-        // Shape captured live from `log show` on macOS 15 (see docs/fep2-plan.md §4).
+        // Shape captured live from `log show` on macOS 15 (see docs/fep-2-plan.md §4).
         let record = parse_sandbox_denial(
             "Sandbox: cat(29810) deny(1) file-read-data /private/tmp/fw-spike/home/.aws/credentials",
         )

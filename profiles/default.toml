@@ -3,7 +3,8 @@
 # The philosophy (design §1): start from the real ambient environment and *subtract* a sensitive
 # set, rather than build a grant up from empty. Under this profile a well-behaved agent runs
 # pytest / npm / git / a C build with zero denials in the common case (FW-TRA2), while credentials,
-# keys, other projects, and browser profiles stay denied even though reads are broad (FW-TRA3).
+# keys, and browser profiles stay denied even though reads are broad (FW-TRA3). Other projects stay
+# readable and are not writable: this profile cannot know where they live; subtract them by path.
 #
 # `~` is expanded against $HOME when the CLI loads this file. Callers are expected to narrow this
 # (e.g. point writes at their actual project) — narrowing is always safe (FW-CAP2); widening is not.
@@ -21,7 +22,7 @@ env = { scrub = {} }
 
 # Reads: broadly allowed over the ambient environment, minus the compiled-in credential floor. On macOS this
 # is native `(allow default)` + deny holes; on Linux it is an enumerate-and-grant expansion at
-# enforce time (Landlock is allow-list only). See the plan §3.2. The ambient universe is a property
+# enforce time (Landlock is allow-list only; docs/linux-backend.md). The ambient universe is a property
 # of `read-mode`, not a row: there is no `/**` read grant here, so a blueprint that extends this
 # profile and switches to `mode = "unveil"` gets a closed universe (FEP-5 D10).
 [fs]

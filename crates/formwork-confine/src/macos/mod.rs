@@ -16,7 +16,9 @@ use formwork_compile::ConfinerPolicy;
 pub mod peer;
 
 // From <sandbox.h>, via libSystem. flags = 0 treats `profile` as a literal SBPL string to compile
-// and apply (the path `sandbox-exec -p` and older Chromium use).
+// and apply (the path `sandbox-exec -p` and older Chromium use). The private
+// `sandbox_init_with_parameters` is not used: the compiler renders a complete SBPL text per spawn,
+// so nothing is parameterized at install time.
 extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
     fn sandbox_free_error(errorbuf: *mut c_char);

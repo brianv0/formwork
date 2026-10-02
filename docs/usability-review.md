@@ -1,10 +1,13 @@
 # Usability review: CLI surface, parity, defaults, docs
 
-> **Status:** implemented — P1, P2, P4, P5–P12 landed with the original branch, and P3 landed
-> afterwards via a different mechanism than proposed: a ptrace feed (an unconfined `strace`
-> tracing the confined run, [`FW-E2E-071`](../formwork.md#fw-e2e-071)) rather than Landlock
-> audit, which needs kernel 6.15+ and remains a future alternative tap. Only P4b (the
-> sentinel-bracketed `log stream` variant of the macOS feed) remains future work.
+> **Historical record. Status:** implemented — P1, P2, P4, P5–P12 landed with the original
+> branch, and P3 landed afterwards via a different mechanism than proposed: a ptrace feed (an
+> unconfined `strace` tracing the confined run, [`FW-E2E-071`](../formwork.md#fw-e2e-071)) rather
+> than Landlock audit, which needs kernel 6.15+ and remains a future alternative tap. P4b's opening
+> sentinel landed too: `learn` reads the macOS feed live with `log stream`, which counts as attached
+> once it reports a probe denial; collection still closes with a post-hoc `log show`. The hidden
+> back-compat aliases this review proposed keeping were removed before the first tagged release
+> (`STATUS.md`, *Deprecations*).
 
 An evaluation of the current `formwork` CLI against seven usability criteria — platform
 parity, honest promises, CLI simplicity, documentation, examples, explainability, and good
