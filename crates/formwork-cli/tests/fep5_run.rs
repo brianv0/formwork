@@ -290,6 +290,88 @@ fn dotdir_blueprint_is_discovered() {
         .ends_with(".formwork/blueprint.toml"));
 }
 
+/// FEP-5 D3, run half: under the README quickstart the session creates a file and a directory in
+/// the project root, and the blueprint stays write-protected (FW-XR8), in every layout -- except
+/// that on Linux a blueprint inside the project, as `FORMWORK.toml` or `.formwork/blueprint.toml`,
+/// splits the root's grant (Landlock cannot carve a file out of a directory's grant). There the
+/// run must refuse the create and say so, naming the layout that works, and `explain` must say
+/// the same. A blueprint above the project, which discovery finds, keeps the root whole.
+#[test]
+fn quickstart_creates_in_the_project_root_or_says_why_not() {
+    let probe = Scratch::new("root-create");
+    if !fs_wall_host(probe.path()) {
+        not_exercised("no filesystem wall on this host");
+        return;
+    }
+    let quickstart = readme_quickstart();
+    for (tag, layout) in [
+        ("above", "../FORMWORK.toml"),
+        ("root", "FORMWORK.toml"),
+        ("dotdir", ".formwork/blueprint.toml"),
+    ] {
+        let dir = Scratch::new(&format!("root-create-{tag}"));
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join(".formwork")).unwrap();
+        let blueprint = project.join(layout);
+        std::fs::write(&blueprint, &quickstart).unwrap();
+        let script = format!("touch newfile; mkdir newdir; echo tampered >> {layout}; exit 0");
+        let out = formwork_command(
+            dir.path(),
+            &["run", "--", "/bin/sh", "-c", &script],
+            &[("RUST_LOG", "warn")],
+            &[],
+        )
+        .current_dir(&project)
+        .output()
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{tag}: {stderr}");
+        assert_eq!(
+            std::fs::read_to_string(&blueprint).unwrap(),
+            quickstart,
+            "{tag}: the blueprint was writable"
+        );
+        let created = project.join("newfile").is_file() && project.join("newdir").is_dir();
+        let explain = run_in(dir.path(), &project, &["explain"]);
+        assert_eq!(explain.code, 0, "{tag}: {}", explain.stderr);
+        // The split note, from the run's operator channel and from `explain`. Under a scratch
+        // directory inside the default profile's writable temp root, a blueprint above the project
+        // still splits the directories above the project, never the project itself.
+        let notes: Vec<&str> = [stderr.as_ref(), explain.stdout.as_str()]
+            .into_iter()
+            .filter_map(|said| {
+                said.lines()
+                    .find(|l| l.contains("outside every write grant"))
+            })
+            .collect();
+        let splits_root = |note: &str| {
+            let dirs = note.split("directly in ").nth(1).unwrap_or("");
+            let dirs = &dirs[..dirs.find(", while").unwrap_or(dirs.len())];
+            dirs.ends_with(&project.display().to_string())
+                || dirs.ends_with(&project.join(".formwork").display().to_string())
+        };
+        if cfg!(target_os = "linux") && tag != "above" {
+            assert!(!created, "{tag}: the split root took a create");
+            assert_eq!(notes.len(), 2, "{tag}: run and explain must both say so");
+            for note in notes {
+                assert!(
+                    splits_root(note) && note.contains("--blueprint"),
+                    "{tag}: the split is not named with the layout that works:\n{note}"
+                );
+            }
+        } else {
+            assert!(
+                created,
+                "{tag}: the project root refused a create:\n{stderr}"
+            );
+            assert!(
+                !notes.iter().any(|n| splits_root(n)),
+                "{tag}: a split was reported for a whole root: {notes:?}"
+            );
+        }
+    }
+}
+
 /// FW-XR8: a blueprint named through a symlinked directory stays write-protected. The hole is
 /// resolved like every grant, so it matches the path the kernel checks.
 #[test]

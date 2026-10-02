@@ -149,6 +149,19 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
    `mode = "unveil"`, the behavior matches unveil exactly: ancestors of a grant are traversable, not
    listable.) Decided in FEP-5 review; `docs/fep-5-plan.md` §3.
 
+   A third consequence: the policy inputs the Launcher write-protects
+   ([FW-XR8](../formwork.md#fw-xr8): the blueprint, its discovered layer and its proposal) are write
+   holes like any other. A blueprint inside a write grant, whether `FORMWORK.toml` or
+   `.formwork/blueprint.toml` under a `$CWD/**` project grant, splits every directory from the
+   grant's root down to the blueprint's own, so nothing can be created, removed or renamed directly
+   in the project root. No Landlock ruleset avoids this. A right on a directory reaches everything
+   beneath it, and stacked layers only intersect, so a file created in the root during the session
+   and the blueprint beside it (or `.formwork/` below it) always hold the same rights. `WriteFile`
+   for one is `WriteFile` for the other, and `Make*`/`Remove*` on the root would let the session
+   replace the blueprint, move `.formwork/` aside, or create the absent discovered layer. Only a
+   blueprint outside the grant keeps the root whole. `run` and `explain` name the split directories
+   and that layout (FEP-5 D3, amended in `docs/fep-5-plan.md` §3).
+
 ## seccomp baseline (`seccompiler`) — and its hazards
 
 Researched API (`seccompiler` 0.4):

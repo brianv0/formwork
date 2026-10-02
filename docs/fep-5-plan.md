@@ -168,6 +168,22 @@ here rather than silently deviated.
   `Enforced` without them and `Partial` with them. `FW-E2E-083` checks both directions; the whole
   suite was also run as an unprivileged user before the push.
 
+- **D3: `.formwork/` does not keep the root whole on Linux.** The discovery test checked only that
+  `.formwork/blueprint.toml` is found. A run under the quickstart could still create nothing in
+  the project root. The protected files sit inside the `$CWD/**` grant either way, so the root
+  and `.formwork/` are split, and `run` printed advice to move the blueprint into `.formwork/`
+  (or nothing, once it was there). Landlock cannot express the intended carve-out. A right on a
+  directory reaches everything beneath it, and stacked layers only intersect, so a file created in
+  the root holds exactly the rights of the protected file beside it, or of `.formwork/` below it.
+  `Make*` on the root, the §9 alternative, would let the session create the absent discovered
+  layer, and without `WriteFile` a new file is not writable anyway. *Resolved:* `.formwork/` stays
+  as the one-directory layout. `run` warns, and `explain` notes, which directories lose create,
+  delete and rename, and they name the layout that keeps the root whole: a blueprint outside the
+  write grant, in a directory above the project (discovery finds it) or via `--blueprint`. The
+  README documents the limitation, and a run-level test checks all three layouts on both OSes.
+  The same work found the policy inputs' write-subtract rows unresolved at enforcement, so a
+  blueprint named through a symlinked directory stayed writable (fixed; `FW-XR8`).
+
 ## 4. Tests
 
 | ID | Where | Runs on |

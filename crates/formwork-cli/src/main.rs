@@ -962,6 +962,9 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
             render::host_summary(&host, learn::find_strace().is_some())
         );
         print!("{}", render::report_summary(&policy.report));
+        if let Some(note) = split_root_note(&blueprint, &resolved.path, &host)? {
+            println!("\nnote: {note}");
+        }
     }
     Ok(())
 }
@@ -1187,7 +1190,9 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
     // own NEXT run (FW-XR8 / FW-INV8). Keys off the RESOLVED path, so a discovered FORMWORK.toml
     // is protected exactly like an explicit one.
     blueprint_load::protect_policy_inputs(&mut blueprint, &resolved.path)?;
-    announce_split_root(&blueprint, &resolved.path, &host);
+    if let Some(note) = split_root_note(&blueprint, &resolved.path, &host)? {
+        tracing::warn!("{note}");
+    }
     // FW-TRA9/FW-TRA10: the Launcher-owned temporary directory is a write grant in every read mode.
     let tmp_dir = SessionTmp::create()?;
     let tmp_rendered = tmp_dir
@@ -1574,35 +1579,46 @@ fn refuse_unavailable_isolation(
     }
 }
 
-/// FEP-5 D3: a FORMWORK.toml inside a writable grant is write-protected, which splits the grant
-/// around it; on Linux the split directory cannot be granted whole, so new files cannot be created
-/// directly in it. Say so, and name the layout that avoids it.
-fn announce_split_root(
+/// FEP-5 D3: the policy inputs are write-protected during a run (FW-XR8), and on Linux a protected
+/// path inside a write grant splits the grant: Landlock cannot carve a path out of a directory's
+/// grant, so the grant goes to the entries around it. Neither discovery location avoids that
+/// inside the project. Names the directories that lose create, delete and rename, and the layout
+/// that keeps them whole; `None` when nothing is split.
+fn split_root_note(
     blueprint: &Blueprint,
     blueprint_path: &std::path::Path,
     host: &HostProfile,
-) {
-    if host.os != formwork_detect::Os::Linux {
-        return;
+) -> Result<Option<String>> {
+    if host.os != formwork_detect::Os::Linux || host.landlock_abi.unwrap_or(0) < 1 {
+        return Ok(None);
     }
-    let Some(dir) = blueprint_path.parent() else {
-        return;
+    let split = blueprint_load::dirs_split_by_policy_inputs(blueprint, blueprint_path)?;
+    // The split directories are one chain, from the outermost grant root down to the inputs' own.
+    let (Some(outer), Some(inner)) = (split.first(), split.last()) else {
+        return Ok(None);
     };
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    if dir.ends_with(".formwork") {
-        return;
-    }
-    let probe = dir.join(".formwork-split-probe");
-    if blueprint.fs.writes.iter().any(|w| w.matches_path(&probe)) {
-        tracing::info!(
-            dir = %dir.display(),
-            "the blueprint is write-protected inside a writable grant, which splits {} on Linux: \
-             files that exist stay writable, but new files cannot be created directly in it. \
-             Move the blueprint to {} to keep the root whole",
-            dir.display(),
-            blueprint_load::DOTDIR_BLUEPRINT
-        );
-    }
+    let dirs = if outer == inner {
+        outer.display().to_string()
+    } else {
+        format!(
+            "any directory from {} down to {}",
+            outer.display(),
+            inner.display()
+        )
+    };
+    Ok(Some(format!(
+        "{} and its learned and proposed layers are write-protected during a run, so the session \
+         cannot rewrite its own next one. Landlock can only allow, so on Linux a protected file \
+         inside a write grant is carved out by granting the entries around it, never the \
+         directory holding it: nothing can be created, deleted or renamed directly in {dirs}, \
+         while the rest of what exists at launch stays writable. {} and {} both do this inside \
+         the grant. Keep the blueprint outside every write grant to avoid it: for a project \
+         granted as $CWD/**, in a directory above the project (discovery looks there, up to \
+         $HOME) or anywhere via --blueprint",
+        blueprint_path.display(),
+        blueprint_load::DEFAULT_BLUEPRINT_NAME,
+        blueprint_load::DOTDIR_BLUEPRINT,
+    )))
 }
 
 fn spawn_confined_child(

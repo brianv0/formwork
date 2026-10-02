@@ -17,9 +17,8 @@ use formwork_blueprint::{
 pub const DEFAULT_BLUEPRINT_NAME: &str = "FORMWORK.toml";
 
 /// The second discovery location (FEP-5 D3): a blueprint inside `.formwork/`, so the file and its
-/// derived proposal/discovered layers sit in one directory. Write-protecting them then protects
-/// one directory instead of splitting the project root, where Landlock would lose the right to
-/// create files directly in the root.
+/// derived proposal/discovered layers sit in one directory. On Linux it splits a writable project
+/// root as `FORMWORK.toml` does (see [`dirs_split_by_policy_inputs`]).
 pub const DOTDIR_BLUEPRINT: &str = ".formwork/blueprint.toml";
 
 /// Profiles compiled into the binary, addressable as `extends = ["builtin:<name>"]` -- so a
@@ -760,11 +759,9 @@ fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer
     Ok(layer)
 }
 
-/// Write-deny the session's own policy inputs -- the blueprint, its discovered layer, and its
-/// proposal -- inside the confined tree. A confined agent must not shape its own NEXT run by
-/// editing the files this run was built from (FW-XR8 / FW-INV8). Readable stays fine (FW-TRA7
-/// semantics); only writes are denied.
-pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -> Result<()> {
+/// The session's own policy inputs -- the blueprint, its discovered layer, and its proposal -- as
+/// absolute paths.
+fn policy_inputs(blueprint_path: &Path) -> Result<Vec<PathBuf>> {
     let cwd = std::env::current_dir().context("resolving cwd to protect policy inputs")?;
     let absolute = |p: &Path| -> PathBuf {
         if p.is_absolute() {
@@ -773,10 +770,18 @@ pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -
             cwd.join(p)
         }
     };
-    let mut inputs = vec![absolute(blueprint_path)];
-    inputs.push(absolute(&crate::learn::discovered_path(blueprint_path)));
-    inputs.push(absolute(&crate::learn::proposal_path(blueprint_path)));
-    for input in inputs {
+    Ok(vec![
+        absolute(blueprint_path),
+        absolute(&crate::learn::discovered_path(blueprint_path)),
+        absolute(&crate::learn::proposal_path(blueprint_path)),
+    ])
+}
+
+/// Write-deny the session's own policy inputs inside the confined tree. A confined agent must not
+/// shape its own NEXT run by editing the files this run was built from (FW-XR8 / FW-INV8).
+/// Readable stays fine (FW-TRA7 semantics); only writes are denied.
+pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -> Result<()> {
+    for input in policy_inputs(blueprint_path)? {
         let rendered = input.to_str().ok_or_else(|| {
             anyhow!("policy input path is not valid UTF-8; cannot write-protect it (FW-INV6)")
         })?;
@@ -786,6 +791,49 @@ pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -
             .push(PathPattern::parse(rendered).with_context(|| format!("protecting {rendered}"))?);
     }
     Ok(())
+}
+
+/// FEP-5 D3, on Linux: the directories a run splits to write-protect the policy inputs, outermost
+/// first; empty when the blueprint lies outside every write grant. Landlock only allows, and a
+/// rule on a directory reaches everything beneath it, so a write grant holding a protected input
+/// is granted around it (docs/linux-backend.md): every directory from the grant's root down to the
+/// input's own is left without a rule of its own, and nothing can be created, removed or renamed
+/// directly in it. Both discovery locations put the inputs under a `$CWD/**` grant; only a
+/// blueprint outside the grant keeps the root whole.
+pub fn dirs_split_by_policy_inputs(
+    blueprint: &Blueprint,
+    blueprint_path: &Path,
+) -> Result<Vec<PathBuf>> {
+    let roots: Vec<PathBuf> = blueprint
+        .fs
+        .writes
+        .iter()
+        .chain(&blueprint.fs.writes_no_create)
+        .filter(|w| !w.is_any_depth())
+        .map(|w| canonicalize_existing_prefix(w.base()))
+        .collect();
+    let inputs: Vec<PathBuf> = policy_inputs(blueprint_path)?
+        .iter()
+        .map(|p| canonicalize_existing_prefix(p))
+        .collect();
+    Ok(split_dirs(&roots, &inputs))
+}
+
+/// The confiner's split rule over resolved paths: a root with a hole strictly beneath it is split,
+/// and so is every directory between the root and the hole.
+fn split_dirs(roots: &[PathBuf], holes: &[PathBuf]) -> Vec<PathBuf> {
+    let mut split = std::collections::BTreeSet::new();
+    for root in roots {
+        for hole in holes.iter().filter(|h| *h != root && h.starts_with(root)) {
+            split.extend(
+                hole.ancestors()
+                    .skip(1)
+                    .take_while(|a| a.starts_with(root))
+                    .map(Path::to_path_buf),
+            );
+        }
+    }
+    split.into_iter().collect()
 }
 
 /// FW-CRED3: an enforced env-points-to-file credential (`GOOGLE_APPLICATION_CREDENTIALS`,
@@ -1428,6 +1476,37 @@ mod tests {
         std::fs::write(project.join(DEFAULT_BLUEPRINT_NAME), "").unwrap();
         let err = find_default_blueprint(&project, home_str).unwrap_err();
         assert!(format!("{err}").contains("both"), "{err}");
+    }
+
+    /// FEP-5 D3: either discovery location inside a writable project splits the root, and
+    /// `.formwork/` too; a blueprint above the project splits nothing.
+    #[test]
+    fn policy_inputs_inside_a_write_grant_split_every_directory_down_to_them() {
+        let dir = Scratch::new("split");
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let project = home.join("proj");
+        std::fs::create_dir_all(project.join(".formwork")).unwrap();
+        let mut blueprint = Blueprint::empty();
+        blueprint.fs.writes = vec![pp(&format!("{}/**", project.display()))];
+        let split = |blueprint: &Blueprint, at: &Path| {
+            std::fs::write(at, "").unwrap();
+            let dirs = dirs_split_by_policy_inputs(blueprint, at).unwrap();
+            std::fs::remove_file(at).unwrap();
+            dirs
+        };
+        assert_eq!(
+            split(&blueprint, &project.join(DEFAULT_BLUEPRINT_NAME)),
+            vec![project.clone()]
+        );
+        assert_eq!(
+            split(&blueprint, &project.join(DOTDIR_BLUEPRINT)),
+            vec![project.clone(), project.join(".formwork")]
+        );
+        assert!(split(&blueprint, &home.join(DEFAULT_BLUEPRINT_NAME)).is_empty());
+        // A grant on the input itself is dropped, not split; an any-depth grant has no root.
+        assert!(split_dirs(&[project.join("a")], &[project.join("a")]).is_empty());
+        blueprint.fs.writes = vec![pp("**/proj/**")];
+        assert!(split(&blueprint, &project.join(DEFAULT_BLUEPRINT_NAME)).is_empty());
     }
 
     /// FEP-5 D10: `/**` under the closed read mode is refused, naming the layer; the same row is
