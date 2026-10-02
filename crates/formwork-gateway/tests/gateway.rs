@@ -470,6 +470,100 @@ async fn fw_e2e_017_sampling_allowed_passes_through() {
     );
 }
 
+/// FW-E2E-107 / FW-GW10: server->client requests are a closed set. An unknown method, a
+/// client->server method sent the wrong way, and a null-id request are answered `-32601` to the
+/// backend and never reach the agent; `ping` and `roots/list` round-trip through the agent;
+/// notifications forward unchanged; a batch and an id-less sampling request under the default deny
+/// never reach the agent either. The fixture reports every answer it receives as a `note/answered`,
+/// so the next frame the agent sees shows whether a request reached it.
+#[tokio::test]
+async fn fw_e2e_107_unknown_server_requests_refused() {
+    let mut agent = start(McpPolicy::default());
+
+    for (id, method) in [
+        (json!("srv-1"), "frobnicate/now"),
+        (json!(7), "tools/call"),
+        (Value::Null, "frobnicate/later"),
+    ] {
+        agent
+            .notify(
+                "trigger/server_request",
+                json!({"method": method, "id": id}),
+            )
+            .await;
+        let note = agent.recv().await;
+        assert_eq!(
+            note["method"], "note/answered",
+            "{method} must not reach the agent: got {note}"
+        );
+        assert_eq!(note["params"]["id"], id);
+        assert_eq!(note["params"]["error"]["code"], -32601);
+    }
+
+    for (id, method, answer) in [
+        ("srv-2", "ping", json!({})),
+        ("srv-3", "roots/list", json!({"roots": []})),
+    ] {
+        agent
+            .notify(
+                "trigger/server_request",
+                json!({"method": method, "id": id}),
+            )
+            .await;
+        let request = agent.recv().await;
+        assert_eq!(request["method"], method, "{method} reaches the agent");
+        assert_eq!(request["id"], id);
+        agent
+            .send(json!({"jsonrpc": "2.0", "id": id, "result": answer}))
+            .await;
+        let note = agent.recv().await;
+        assert_eq!(note["method"], "note/answered");
+        assert_eq!(note["params"]["id"], id);
+        assert_eq!(note["params"]["result"], answer);
+    }
+
+    agent
+        .notify(
+            "trigger/server_request",
+            json!({"method": "notifications/frobnicated"}),
+        )
+        .await;
+    assert_eq!(
+        agent.recv().await,
+        json!({"jsonrpc": "2.0", "method": "notifications/frobnicated", "params": {}}),
+        "an unknown notification forwards unchanged"
+    );
+
+    agent
+        .notify(
+            "trigger/server_request",
+            json!({"method": "ping", "id": "srv-4", "batch": true}),
+        )
+        .await;
+    let note = agent.recv().await;
+    assert_eq!(
+        note["method"], "note/answered",
+        "a batch must not reach the agent: got {note}"
+    );
+    assert_eq!(note["params"]["id"], Value::Null);
+    assert_eq!(note["params"]["error"]["code"], -32600);
+
+    // The id-less sampling request has no answer to observe, so the next request's reply being the
+    // first frame back shows it was dropped.
+    agent
+        .notify(
+            "trigger/server_request",
+            json!({"method": "sampling/createMessage"}),
+        )
+        .await;
+    agent.request(9, "ping", json!({})).await;
+    let next = agent.recv().await;
+    assert_eq!(
+        next["id"], 9,
+        "an id-less sampling request must not reach the agent: got {next}"
+    );
+}
+
 /// A tools policy from parsed allow/deny pattern lists (exact names or `/re/`).
 fn tools_policy(allow: &[&str], deny: &[&str]) -> McpPolicy {
     let to_vec = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();

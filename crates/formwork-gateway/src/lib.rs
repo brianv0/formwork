@@ -3,9 +3,11 @@
 //! network, no filesystem past the injected fd (FW-GW4). Refusals are oracle-free by construction
 //! (FW-ADV-004): a hidden-but-real name and a nonexistent one take the same local path and yield the
 //! same error, so nothing tells "blocked" from "absent". `*/list` responses are filtered statelessly,
-//! so a runtime `list_changed` re-filters for free. Granted traffic forwards as the exact bytes
-//! received (FW-GW8); any `AsyncRead`/`AsyncWrite` pair works, so an http/sse backend needs only a
-//! framing adapter.
+//! so a runtime `list_changed` re-filters for free. Server->client requests are a closed set: one a
+//! backend sends outside it is answered locally and never reaches the agent (FW-GW10), so a request
+//! type a later MCP revision adds is refused until it is named. Granted traffic forwards as the
+//! exact bytes received (FW-GW8); any `AsyncRead`/`AsyncWrite` pair works, so an http/sse backend
+//! needs only a framing adapter.
 
 use std::collections::HashMap;
 use std::io;
@@ -36,6 +38,11 @@ pub use upstream::{ProxyEndpoint, UpstreamProxy};
 // the seam bounds its control channel the same way (`MAX_CONTROL_LINE`).
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// The server->client requests forwarded ungated (FW-GW10): `ping` is liveness, and the agent answers
+/// `roots/list` from its own configuration to a backend confined to its own grant (FW-GW5).
+/// `sampling/createMessage` and `elicitation/create` are gated by policy instead (FW-GW3).
+const FORWARDED_SERVER_REQUESTS: &[&str] = &["ping", "roots/list"];
+
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
     #[error(transparent)]
@@ -54,8 +61,9 @@ enum ListKind {
 
 /// One JSON-RPC frame reduced to what the gateway routes on. `raw` is the exact received bytes, kept
 /// so granted traffic forwards byte-for-byte (FW-GW8) with no re-serialization. [`Frame::parse`]
-/// classifies each frame so the pumps route on the variant, never on `Value`; the one other place raw
-/// JSON is parsed is `filter_list`, which prunes ungranted items from `*/list` responses.
+/// classifies the agent's frames and [`Frame::parse_backend`] a backend's, each against its
+/// direction's vocabulary, so the pumps route on the variant, never on `Value`; the one other place
+/// raw JSON is parsed is `filter_list`, which prunes ungranted items from `*/list` responses.
 enum Frame {
     ToolCall {
         id: Value,
@@ -91,12 +99,22 @@ enum Frame {
         kind: ListKind,
         raw: Vec<u8>,
     },
+    /// `sampling/createMessage` from a backend, gated by policy (FW-GW3). Without an `id` it is a
+    /// notification; a denied one has no one to answer, so it is dropped (D6).
     Sampling {
-        id: Value,
+        id: Option<Value>,
         raw: Vec<u8>,
     },
+    /// `elicitation/create` from a backend, gated like [`Frame::Sampling`].
     Elicitation {
+        id: Option<Value>,
+        raw: Vec<u8>,
+    },
+    /// Any other request from a backend: forwarded when its method is in
+    /// [`FORWARDED_SERVER_REQUESTS`], answered `-32601` locally otherwise (FW-GW10).
+    Request {
         id: Value,
+        method: String,
         raw: Vec<u8>,
     },
     Response {
@@ -111,7 +129,8 @@ enum Frame {
         raw: Vec<u8>,
     },
     /// A JSON-RPC batch array. MCP 2025-06-18 removed batching, and a batch would carry gated
-    /// calls past per-frame policy, so it is refused whole (D6).
+    /// calls (or server->client requests) past per-frame policy, so it is refused whole to the side
+    /// that sent it (D6, FW-GW10).
     Batch,
     /// Not JSON at all. From the agent it closes the connection (D6); from a backend it forwards,
     /// since backend output is not a door into anything.
@@ -137,18 +156,23 @@ enum CompletionRef {
 }
 
 impl Frame {
-    fn parse(raw: Vec<u8>) -> Frame {
-        let value: Value = match serde_json::from_slice(&raw) {
-            Ok(v) => v,
-            Err(_) => return Frame::NotJson(raw),
-        };
-        if value.is_array() {
-            return Frame::Batch;
+    /// One JSON-RPC message and its bytes, or the frame for a shape neither direction routes by
+    /// method: not JSON, or a batch array.
+    fn decode(raw: Vec<u8>) -> Result<(Value, Vec<u8>), Frame> {
+        match serde_json::from_slice::<Value>(&raw) {
+            Err(_) => Err(Frame::NotJson(raw)),
+            Ok(value) if value.is_array() => Err(Frame::Batch),
+            Ok(value) => Ok((value, raw)),
         }
-        let method = value
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+    }
+
+    /// Classify a frame the agent sent, against MCP's client->server vocabulary.
+    fn parse(raw: Vec<u8>) -> Frame {
+        let (value, raw) = match Frame::decode(raw) {
+            Ok(decoded) => decoded,
+            Err(frame) => return frame,
+        };
+        let method = value.get("method").and_then(Value::as_str);
         let id = value.get("id").filter(|v| !v.is_null()).cloned();
         let pointer_str = |ptr: &str| {
             value
@@ -157,7 +181,7 @@ impl Frame {
                 .unwrap_or("")
                 .to_owned()
         };
-        match (method.as_deref(), id) {
+        match (method, id) {
             (Some("tools/call"), Some(id)) => Frame::ToolCall {
                 id,
                 target: pointer_str("/params/name"),
@@ -208,8 +232,6 @@ impl Frame {
                 kind: ListKind::Prompts,
                 raw,
             },
-            (Some("sampling/createMessage"), Some(id)) => Frame::Sampling { id, raw },
-            (Some("elicitation/create"), Some(id)) => Frame::Elicitation { id, raw },
             (Some("tools/call"), None) => Frame::GatedNotification {
                 axis: Axis::Tool,
                 target: pointer_str("/params/name"),
@@ -245,6 +267,30 @@ impl Frame {
         }
     }
 
+    /// Classify a frame a backend sent, against MCP's server->client vocabulary: every request but
+    /// sampling and elicitation is a [`Frame::Request`], checked by method (FW-GW10).
+    fn parse_backend(raw: Vec<u8>) -> Frame {
+        let (value, raw) = match Frame::decode(raw) {
+            Ok(decoded) => decoded,
+            Err(frame) => return frame,
+        };
+        let method = value.get("method").and_then(Value::as_str);
+        // A null `id` still makes a request here: MCP forbids one, and a client that keys on the
+        // member's presence would answer it.
+        let id = value.get("id").cloned();
+        match (method, id) {
+            (Some("sampling/createMessage"), id) => Frame::Sampling { id, raw },
+            (Some("elicitation/create"), id) => Frame::Elicitation { id, raw },
+            (Some(method), Some(id)) => Frame::Request {
+                id,
+                method: method.to_owned(),
+                raw,
+            },
+            (None, Some(id)) => Frame::Response { id, raw },
+            _ => Frame::Passthrough(raw),
+        }
+    }
+
     fn into_raw(self) -> Vec<u8> {
         match self {
             Frame::ToolCall { raw, .. }
@@ -255,6 +301,7 @@ impl Frame {
             | Frame::ListRequest { raw, .. }
             | Frame::Sampling { raw, .. }
             | Frame::Elicitation { raw, .. }
+            | Frame::Request { raw, .. }
             | Frame::Response { raw, .. }
             | Frame::GatedNotification { raw, .. }
             | Frame::NotJson(raw)
@@ -488,20 +535,35 @@ where
 {
     let mut reader = BufReader::new(reader);
     while let Some(raw) = read_frame(&mut reader, MAX_FRAME_BYTES).await? {
-        match Frame::parse(raw) {
+        match Frame::parse_backend(raw) {
             Frame::Sampling { id, raw } => {
                 if policy.sampling == Gate::Allow {
                     write_frame(&agent_w, &raw).await?;
                 } else {
-                    police(&backend_w, &id, "sampling/createMessage").await?;
+                    police(&backend_w, id.as_ref(), "sampling/createMessage").await?;
                 }
             }
             Frame::Elicitation { id, raw } => {
                 if policy.elicitation == Gate::Allow {
                     write_frame(&agent_w, &raw).await?;
                 } else {
-                    police(&backend_w, &id, "elicitation/create").await?;
+                    police(&backend_w, id.as_ref(), "elicitation/create").await?;
                 }
+            }
+            Frame::Request { id, method, raw } => {
+                if FORWARDED_SERVER_REQUESTS.contains(&method.as_str()) {
+                    write_frame(&agent_w, &raw).await?;
+                } else {
+                    police(&backend_w, Some(&id), &method).await?;
+                }
+            }
+            Frame::Batch => {
+                tracing::info!("gateway refused a JSON-RPC batch from the backend");
+                write_frame(
+                    &backend_w,
+                    error(&Value::Null, -32600, "Invalid Request").as_bytes(),
+                )
+                .await?;
             }
             Frame::Response { id, raw } => {
                 let kind = pending.lock().await.remove(&id_key(&id));
@@ -595,13 +657,18 @@ async fn refuse<W: AsyncWrite + Unpin>(
     write_frame(agent_w, error(id, code, &message).as_bytes()).await
 }
 
-/// Refuse a server->client request the policy gates off, answering the backend locally so the request
-/// never reaches the agent or model (FW-GW3).
+/// Refuse a server->client request the policy gates off or the protocol vocabulary does not name,
+/// answering the backend locally so the request never reaches the agent or model (FW-GW3, FW-GW10).
+/// One sent without an `id` has no one to answer, so it is dropped (D6).
 async fn police<W: AsyncWrite + Unpin>(
     backend_w: &Arc<Mutex<W>>,
-    id: &Value,
+    id: Option<&Value>,
     method: &str,
 ) -> io::Result<()> {
+    let Some(id) = id else {
+        tracing::info!(method, "gateway dropped an id-less server->client request");
+        return Ok(());
+    };
     tracing::info!(method, "gateway policed server->client request");
     write_frame(
         backend_w,
@@ -766,6 +833,38 @@ mod tests {
         assert!(matches!(
             Frame::parse(br#"[{"id":1,"method":"tools/call"}]"#.to_vec()),
             Frame::Batch
+        ));
+    }
+
+    #[test]
+    fn frame_parse_backend_classifies_server_requests() {
+        assert!(matches!(
+            Frame::parse_backend(br#"{"id":1,"method":"sampling/createMessage"}"#.to_vec()),
+            Frame::Sampling { id: Some(_), .. }
+        ));
+        assert!(matches!(
+            Frame::parse_backend(br#"{"method":"elicitation/create"}"#.to_vec()),
+            Frame::Elicitation { id: None, .. }
+        ));
+        // A client->server method sent the wrong way is a request like any unknown one.
+        assert!(matches!(
+            Frame::parse_backend(br#"{"id":2,"method":"tools/call"}"#.to_vec()),
+            Frame::Request { method, .. } if method == "tools/call"
+        ));
+        assert!(matches!(
+            Frame::parse_backend(br#"{"id":null,"method":"x/y"}"#.to_vec()),
+            Frame::Request {
+                id: Value::Null,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Frame::parse_backend(br#"{"method":"notifications/x"}"#.to_vec()),
+            Frame::Passthrough(_)
+        ));
+        assert!(matches!(
+            Frame::parse_backend(br#"{"id":3,"result":{}}"#.to_vec()),
+            Frame::Response { .. }
         ));
     }
 }

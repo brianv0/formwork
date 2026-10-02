@@ -7,6 +7,9 @@
 //!   `note/sampling_refused` or `note/sampling_ok` (FW-E2E-017).
 //! - `trigger/probe`        -> attempt an out-of-scope read and a direct TCP connect, reporting both
 //!   in a `note/probe` (FW-E2E-019 backend confinement).
+//! - `trigger/server_request` -> issue a server->client frame with method `params.method`, carrying
+//!   `params.id` when given (a notification when not), wrapped in a batch array when `params.batch`
+//!   is true; every response that comes back surfaces as a `note/answered` (FW-E2E-107).
 
 use std::io::{self, BufRead, Write};
 use std::net::TcpStream;
@@ -168,6 +171,20 @@ fn main() {
                     &json!({"jsonrpc": "2.0", "method": "note/probe", "params": {"read_ok": read_ok, "net_ok": net_ok}}),
                 );
             }
+            Some("trigger/server_request") => {
+                let mut frame = json!({
+                    "jsonrpc": "2.0",
+                    "method": v.pointer("/params/method").cloned().unwrap_or(Value::Null),
+                    "params": {}
+                });
+                if let Some(id) = v.pointer("/params/id") {
+                    frame["id"] = id.clone();
+                }
+                if v.pointer("/params/batch") == Some(&json!(true)) {
+                    frame = json!([frame]);
+                }
+                emit(&frame);
+            }
             // A response to our own sampling request (has an id, no method).
             None if id.as_ref() == Some(&json!("s1")) => {
                 let note = if v.get("error").is_some() {
@@ -177,6 +194,12 @@ fn main() {
                 };
                 emit(&json!({"jsonrpc": "2.0", "method": note}));
             }
+            // A response to a `trigger/server_request` request, from the gateway or the agent.
+            None => emit(&json!({
+                "jsonrpc": "2.0",
+                "method": "note/answered",
+                "params": {"id": id, "error": v.get("error"), "result": v.get("result")}
+            })),
             _ => {}
         }
     }
