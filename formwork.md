@@ -850,7 +850,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 **Linux — Landlock + seccomp (+ optional netns for the gateway side).**
 
 - Filesystem read/write scope: Landlock filesystem access rights (available since ABI v1). Clean.
-- Exec restriction: Landlock `FS_EXECUTE` on allowed paths, or seccomp on `execve`. Optional ([FW-ISO4](#fw-iso4)).
+- Exec restriction: Landlock `FS_EXECUTE` on allowed paths, or seccomp on `execve`. Optional ([FW-ISO4](#fw-iso4)). `execve` of a dynamically linked binary opens its ELF interpreter for execute, so the confiner also grants the loader each listed file names (this architecture's standard loaders for a listed directory). A loader invoked as `ld.so <file>` maps any ELF the session can read without an exec check, so the allow-list is reported Partial.
 - Net default-deny: seccomp denies inet `socket(2)` creation by family (TCP, UDP and raw) at every Landlock ABI, because Landlock net governs TCP only; Landlock net carries the port tier alone (`docs/linux-backend.md`).
 - Net port allowlist: Landlock `ACCESS_NET_CONNECT_TCP` (ABI v4+, port-only, no host filtering). Reported Unenforceable below v4.
 - Cross-domain socket scoping: `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` and `LANDLOCK_SCOPE_SIGNAL` (ABI v6) are recent and coarse (they block abstract sockets and signals toward processes outside the domain by parent/child relationship, not per-path allowlisting). Pathname UNIX sockets are not scoped by any Landlock ABI, so a confined process can `connect()` to a socket file it can reach. `/proc/<pid>/environ` of processes outside the domain is refused, because Landlock denies ptrace-class access across the domain boundary, unless the confined process holds `CAP_SYS_ADMIN` or `CAP_PERFMON`, as in a root container (FEP-5 D9, [FW-ISO16](#fw-iso16)). Formwork uses the scopes where present for [FW-ADV-006](#fw-adv-006) and reports the gap otherwise — and does *not* rely on them for the transport ([FW-XR7](#fw-xr7)).
@@ -888,7 +888,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | private temporary directory | directory form; tmpfs under `isolate` | directory form |
 | net port allowlist (direct) | Enforced (ABI v4+) / else Reported | Enforced |
 | fs write vs create split ([FW-CAP9](#fw-cap9)) | Enforced (Landlock drops `Make*`) | Enforced (deny `file-write-create`) |
-| exec allowlist | Enforced (optional) | Enforced (optional) |
+| exec allowlist | Partial (optional; the granted loader runs any readable ELF) | Enforced (optional) |
 | MCP tool/resource/prompt shading | Enforced (gateway) | Enforced (gateway) |
 | cross-domain UNIX socket block | Partial (recent, coarse) | Enforced (path-gated) |
 | filesystem invisibility (ENOENT) | Not provided (EACCES) | Not provided (EPERM/EACCES) |
@@ -949,7 +949,7 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-ISO1](#fw-iso1) Read confinement | [FW-E2E-001](#fw-e2e-001) | 003, 004 |
 | [FW-ISO2](#fw-iso2) Write confinement | [FW-E2E-002](#fw-e2e-002) | 004 |
 | [FW-ISO3](#fw-iso3) Net default-deny | [FW-E2E-006](#fw-e2e-006) | 007, 008, INV3 |
-| [FW-ISO4](#fw-iso4) Optional exec restriction | [FW-ADV-001](#fw-adv-001) | — |
+| [FW-ISO4](#fw-iso4) Optional exec restriction | [FW-E2E-024](#fw-e2e-024), [FW-ADV-001](#fw-adv-001) | 060 |
 | [FW-ISO5](#fw-iso5) Optional port tier | [FW-E2E-009](#fw-e2e-009) | 025 |
 | [FW-ISO6](#fw-iso6) Two postures | [FW-E2E-001](#fw-e2e-001) | — |
 | [FW-ISO7](#fw-iso7) Capability detection | [FW-E2E-025](#fw-e2e-025), 026 | INV6 |
