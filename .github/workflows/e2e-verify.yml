@@ -26,7 +26,9 @@ name: E2E verify
 
 on:
   push:
-    branches: [main]
+    # TEMPORARY: the trial branch, so the workflow runs on real runners before it reaches main.
+    # Remove before merging.
+    branches: [main, claude/e2e-verify-main]
   schedule:
     - cron: "41 5 * * *"
   workflow_dispatch:
