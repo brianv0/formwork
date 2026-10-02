@@ -400,13 +400,13 @@ fn exec_outcome(policy: &CompiledPolicy, mut cmd: Command) -> Result<i32, i32> {
     }
 }
 
-/// FW-ISO4/FW-INV5 (Linux/Landlock): the exec allow-list's paired probe. A listed dynamically
-/// linked binary runs -- the confiner grants the loader it names -- and an unlisted one is refused
-/// at `execve`, for a listed file and for a listed directory. The verdict is `Partial`, and the
-/// gap it names is real: the granted loader runs an unlisted binary handed to it. Should that
-/// half fail, the kernel closed the gap and the verdict can rise to `Enforced`.
+/// FW-E2E-107 (Linux/Landlock; FW-ISO4/FW-INV5): the exec allow-list's paired probe. A listed
+/// dynamically linked binary runs -- the confiner grants the loader it names -- and an unlisted
+/// one is refused at `execve`, for a listed file and for a listed directory. The verdict is
+/// `Partial`, and the gap it names is real: the granted loader runs an unlisted binary handed to
+/// it. Should that half fail, the kernel closed the gap and the verdict can rise to `Enforced`.
 #[test]
-fn fw_iso4_exec_allowlist_runs_listed_and_refuses_unlisted() {
+fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
     if !have_landlock() {
         eprintln!("skipping: no Landlock on this host");
         return;

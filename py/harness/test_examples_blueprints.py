@@ -57,7 +57,7 @@ def test_rules_demo_compiles(cli):
 
 
 @pytest.mark.linux
-@pytest.mark.fw_e2e("FW-E2E-024")
+@pytest.mark.fw_e2e("FW-E2E-107")
 def test_exec_allowlist_starts_dynamic_binaries_on_linux(cli, tmp_path):
     """An exec allow-list on Linux runs the dynamically linked binaries it lists -- the confiner
     grants the loader they name -- for a listed file over the agent base and for rules-demo's

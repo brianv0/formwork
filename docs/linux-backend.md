@@ -89,8 +89,8 @@ Key decisions:
   access that isn't granted, so if `AccessFs::Execute` is in `handled_fs`, only explicitly-granted
   paths are executable. For the transparent default, exclude `Execute` from `handled_fs` entirely so
   `execve` is never checked. (When the blueprint requests an exec allow-list ([FW-ISO4](../formwork.md#fw-iso4)), `Execute` is
-  governed and granted on the allow-list and its loaders, below; the paired probe is
-  `fw_iso4_exec_allowlist_runs_listed_and_refuses_unlisted` on both backends.)
+  governed and granted on the allow-list and its loaders, below; the paired probe on both
+  backends is [FW-E2E-107](../formwork.md#fw-e2e-107).)
 - **An exec allow-list grants the dynamic loader too.** `execve` of a dynamically linked ELF makes
   the kernel open its interpreter (`PT_INTERP`) for execute, and Landlock checks that open, so a
   listed binary whose loader is ungranted fails with EACCES before `main`, where macOS runs it

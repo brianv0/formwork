@@ -457,11 +457,11 @@ fn exec_outcome(policy: &formwork_compile::CompiledPolicy, mut cmd: Command) -> 
     }
 }
 
-/// FW-ISO4/FW-INV5 (Seatbelt): the exec allow-list's paired probe, the counterpart of the Linux
-/// test of the same name. A listed binary runs and an unlisted, readable one is refused at
+/// FW-E2E-107 (Seatbelt; FW-ISO4/FW-INV5): the exec allow-list's paired probe, counterpart of the
+/// Linux test of the same name. A listed binary runs and an unlisted, readable one is refused at
 /// `execve`, for a listed file and for a listed directory; the report says `Enforced`.
 #[test]
-fn fw_iso4_exec_allowlist_runs_listed_and_refuses_unlisted() {
+fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
     use formwork_compile::{Backend, Capability, Fidelity};
     let fx = Fixture::new("iso4");
     let exec_policy = |exec: &str| {
