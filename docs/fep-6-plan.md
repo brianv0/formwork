@@ -126,6 +126,16 @@ rather than silently deviated.
   `CARGO_HTTP_CAINFO` and not `SSL_CERT_FILE`; the Launcher sets it with the other trust variables.
 - **macOS: the Gateway conceals its environment** (custody, above), and the peer check
   authenticates the listener's connections (FEP-5 §3.1 as amended; `net-host-scope` `Enforced`).
+- **`FW-E2E-096` decides on an interval against a calibrated budget (FEP-6 §8 amended).** A fixed
+  millisecond bound on a shared runner is a flaky test. Each sample pairs the request direct and
+  through the Gateway; a row passes when the 95% interval for the median difference lies under the
+  target times the runner's speed factor -- a calibration workload of in-memory TLS handshakes and
+  records, timed between batches, over its time on the reference `ubuntu-24.04` runner, clamped to
+  [1, 3]. An interval that straddles the budget takes more pairs, up to 4,000.
+- **The pool waited a timer tick per reused request (found by `FW-E2E-096`).** Its idle-connection
+  check was `timeout(Duration::ZERO, ..)`, which tokio resolves on the timer's next 1 ms tick, so
+  every request on a reused connection added about 1.3 ms. One poll replaces it (0.06-0.11 ms
+  added), and a test covers a pooled connection the upstream closed while idle.
 - **`fw-egress-probe` is not built.** The gateway tests drive rustls clients and raw sockets
   directly, which produce every case the probe was for (a mismatched server name, a mismatched
   `Host`, a non-TLS first byte, an `h2`-only ALPN offer, the raw heads of `FW-ADV-024`).
@@ -142,6 +152,7 @@ clients, loopback fixtures, and the operator's `SSL_CERT_FILE` naming the fixtur
 | `FW-E2E-093` | `formwork-gateway/tests/inspect.rs` | both | ordering, not the 20 ms bound (§5 register) |
 | `FW-E2E-094` | `formwork-cli/tests/fep6_run.rs`; CI records it per OS | both | the matrices below |
 | `FW-E2E-095` | `formwork-gateway/tests/inspect.rs` | both | full |
+| `FW-E2E-096` | `formwork-gateway/tests/latency.rs`, in release in its own CI step | both | as amended: a 95% interval for the median added latency against the target scaled to the runner (below) |
 | `FW-E2E-097` | `formwork-gateway/tests/inspect.rs` (`fw_egr25_…`), `src/ca.rs`, `fep6_run.rs` (`FW-E2E-098`, `FW-E2E-094`: OpenSSL, LibreSSL, GnuTLS, Node, Go and Python verify constrained leaves) | both | the constraints' effect, not an `openssl verify` transcript |
 | `FW-E2E-098` | `fep6_run.rs` (rows 1, 8, 9, and an upstream the Gateway cannot verify), `formwork-gateway/tests/{egress,inspect}.rs` (rows 2, 6, 7) | both | rows 3–5 are FEP-5's `FW-E2E-075` |
 | `FW-E2E-099` | `fep6_run.rs` (every row through `run`), `formwork-gateway/tests/inspect.rs` (`fw_e2e_078_…`) | both | row 4's 20 ms bound is `FW-E2E-093`'s |
@@ -181,10 +192,17 @@ fails on the session CA, the tunnel row on a root the keychain does not hold; ag
 origin, whose root the keychain holds, the tunnel row reaches. Swift's `URLSession` never reaches
 the Gateway: it ignores the proxy variables and connects directly, which the session refuses.
 
+The latency budget (`FW-E2E-096`), median added latency over 1,000 pairs, as the runners measured
+it when the reference was set (every factor 1.00):
+
+| Row (target) | ubuntu-22.04 | ubuntu-24.04 | macos-14 | macos-15 |
+|---|---|---|---|---|
+| Tunnel grade, new connection, to first byte (2 ms) | 0.25 ms | 0.23 ms | 0.38 ms | 0.23 ms |
+| Inspected grade, reused connection, per request (1 ms) | 0.090 ms | 0.114 ms | 0.106 ms | 0.059 ms |
+| Inspected grade, first connection to a host (5 ms) | 0.82 ms | 0.82 ms | 1.07 ms | 0.59 ms |
+
 ## 5. Still owed
 
-- **`FW-E2E-096` (latency budget).** It does not run yet; the §8 performance rows in `formwork.md`
-  are targets until it measures them.
 - **A Launcher defect `FW-E2E-094` found, outside this FEP.** The FW-ENV2 scrub drops
   `GIT_CONFIG_KEY_<n>` (the name contains `KEY`) while keeping `GIT_CONFIG_COUNT` and
   `GIT_CONFIG_VALUE_<n>`, so git refuses to start in a session whose operator configures git through

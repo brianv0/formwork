@@ -36,9 +36,10 @@ use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// The calibration workload's median round on the reference node (GitHub-hosted `ubuntu-24.04`),
-/// re-measured whenever the workload changes.
-const REFERENCE_ROUND: Duration = Duration::from_micros(12_000);
+/// The calibration workload's median round on the reference node (GitHub-hosted `ubuntu-24.04`:
+/// 8.18-8.25 ms across the three rows when this was set), re-measured whenever the workload
+/// changes.
+const REFERENCE_ROUND: Duration = Duration::from_micros(8_200);
 /// The most the budget stretches on a slow node.
 const FACTOR_CAP: f64 = 3.0;
 const CALIBRATION_HANDSHAKES: usize = 20;

@@ -319,6 +319,7 @@ fn fw_e2e_094_client_matrix() {
             }
             let path = format!("/{grade}/{client}");
             let url = format!("https://{host}:{}{path}", fixture.port);
+            let row_started = std::time::Instant::now();
             let out = formwork_env(
                 dir.path(),
                 &[
@@ -381,8 +382,18 @@ fn fw_e2e_094_client_matrix() {
             let expected = if macos { on_macos } else { on_linux };
             if let Some(expected) = expected {
                 if reached != expected {
+                    // On macOS, whether Seatbelt refused the session's network: seen on macos-14,
+                    // a client that could not connect to its own Gateway listener.
+                    let records = if macos {
+                        sandbox_records(row_started, |m| {
+                            m.contains(" deny(") && m.contains("network")
+                        })
+                    } else {
+                        Vec::new()
+                    };
                     mismatches.push(format!(
-                        "{client} ({grade}): expected {}, got {}\n{}\n{}",
+                        "{client} ({grade}): expected {}, got {}\n{}\n{}\nSandbox network records: \
+                         {records:#?}",
                         if expected { "reached" } else { "refused" },
                         if reached { "reached" } else { "refused" },
                         out.stdout,
