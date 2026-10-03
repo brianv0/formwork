@@ -111,7 +111,7 @@ pub fn violation_for<'a>(v: &'a [Violation], host: &str) -> Option<&'a Violation
 #[derive(Clone)]
 pub struct FixtureTls {
     pub root: CertificateDer<'static>,
-    config: Arc<rustls::ServerConfig>,
+    pub config: Arc<rustls::ServerConfig>,
 }
 
 pub fn fixture_tls(names: &[&str]) -> FixtureTls {
