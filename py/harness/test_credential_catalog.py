@@ -219,3 +219,70 @@ def test_report_labels_mechanism_per_type(cli, fake_home, tmp_path):
     linux_creds = json.loads(linux.stdout)["credentials"]
     assert linux_creds["per-type"]["aws"]["path"]["backend"] == "landlock"
     assert linux_creds["per-type"]["aws"]["env"]["backend"] == "launcher"
+
+    # FW-CRED9: Seatbelt carries any-depth floor rows as a regex, Landlock cannot root them. The
+    # all-any-depth backstop and dotenv are Partial on Linux, with a reason that cites FW-CRED9 and
+    # claims no absolute rows they do not have; a type with absolute rows stays Enforced.
+    assert creds["backstop"]["status"] == "enforced"
+    assert creds["per-type"]["dotenv"]["path"]["status"] == "enforced"
+    assert linux_creds["per-type"]["ssh"]["path"]["status"] == "enforced"
+    for partial in (linux_creds["backstop"], linux_creds["per-type"]["dotenv"]["path"]):
+        assert partial["status"] == "partial", partial
+        assert "withheld on Linux" in partial["reason"], partial
+        assert "FW-CRED9" in partial["reason"], partial
+        assert "absolute rows" not in partial["reason"], partial
+    assert "credential-floor **/credentials" in json.loads(linux.stdout)["withheld"]
+
+
+@pytest.mark.fw_e2e("FW-E2E-050")
+@pytest.mark.linux
+def test_withheld_backstop_is_readable_and_never_claimed_denied(cli, fake_home, tmp_path):
+    """FW-CRED9's Linux half at the real boundary: the report's Partial backstop matches what the
+    kernel does -- a backstop-shaped file under a broad grant is readable while an absolute floor
+    row still denies -- and no human surface claims the withheld denial (FW-INV5/FW-XR1). If Linux
+    ever roots any-depth rows, this fails until the report and the wording catch up."""
+    bp = _blueprint_for(fake_home, tmp_path)
+    env = {"HOME": str(fake_home)}
+    novel = fake_home / ".someprovider/credentials"
+
+    summary_json = cli("explain", "--blueprint", bp, "--json", env=env)
+    assert summary_json.code == 0, summary_json.stderr
+    summary_value = json.loads(summary_json.stdout)
+    if summary_value["host"].get("landlock-abi") is None:
+        pytest.skip("no Landlock on this host: the floor is unenforceable, not withheld")
+    # On Landlock the backstop is Partial; an Enforced claim here is the overclaim this guards.
+    report = summary_value["report"]
+    assert report["credentials"]["backstop"]["status"] == "partial", report["credentials"]
+
+    # The paired probe: the absolute aws row is denied, the any-depth backstop row is not.
+    aws = cli("run", "--blueprint", bp, "--", "/bin/cat", fake_home / ".aws/credentials",
+              cwd=fake_home, env=env)
+    assert aws.code != 0, "an absolute floor row must still deny on Linux"
+    assert "FAKE" not in aws.stdout, aws.stdout
+    assert "permission denied" in _agent_lines(aws.stderr).lower(), aws.stderr
+    withheld = cli("run", "--blueprint", bp, "--", "/bin/cat", novel, cwd=fake_home, env=env)
+    assert withheld.code == 0, withheld.stderr
+    assert "novel-provider-secret" in withheld.stdout
+    operator = _operator_lines(withheld.stderr)
+    assert "credential backstop not enforced on this host" in operator, operator
+    assert "credential backstop active" not in operator, operator
+
+    # The summary: the backstop line carries the report's verdict, and the denied total counts
+    # only the types this host enforces.
+    summary = cli("explain", "--blueprint", bp, env=env)
+    assert summary.code == 0, summary.stderr
+    lines = summary.stdout.splitlines()
+    backstop = next(l for l in lines if l.startswith("backstop: "))
+    assert "denied" not in backstop and "withheld on Linux" in backstop, backstop
+    floor = next(l for l in lines if l.startswith("credential floor: "))
+    per_type = report["credentials"]["per-type"].values()
+    enforced = sum(1 for t in per_type if t.get("path", {}).get("status") == "enforced")
+    assert f"-- {enforced} path types denied, " in floor, floor
+    assert "partial on this host (dotenv)" in floor, floor
+
+    # The per-path verdict: the model's deny, the host note, and a hint that claims no denial.
+    path = cli("explain", "--blueprint", bp, novel, env=env)
+    assert path.code == 0, path.stderr
+    assert "withheld on this host" in path.stdout, path.stdout
+    hint = next(l for l in path.stdout.splitlines() if l.strip().startswith("hint: "))
+    assert "no denial here to lift" in hint and "-- fires at any depth" not in hint, hint

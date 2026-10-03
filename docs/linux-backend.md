@@ -149,6 +149,20 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
    `mode = "unveil"`, the behavior matches unveil exactly: ancestors of a grant are traversable, not
    listable.) Decided in FEP-5 review; `docs/fep-5-plan.md` §3.
 
+### Any-depth rows are withheld
+
+The expansion needs a rooted hole. An any-depth row (`**/.env`, `**/credentials`, the anchored
+`<prefix>/**/<suffix>`) names a file wherever it appears, and Landlock rules attach to opened
+files and directories, so such a row has nothing to attach to. The compiler withholds these rows
+from the Linux policy: the credential floor's any-depth rows (the generic backstop is all of them)
+and any-depth `write-subtract` rows. It lists each one under `withheld` in the fidelity report and
+marks the affected credential types, the backstop and `tamper-vectors` Partial
+([FW-CRED9](../formwork.md#fw-cred9), [FW-INV5](../formwork.md#fw-inv5)). A confined process on
+Linux can therefore read a `credentials` file inside a granted directory, where Seatbelt denies it
+with a regex. `formwork explain` says so in its backstop line and names the affected types apart
+from the denied count, and `formwork explain <path>` marks such a path "withheld on this host". `formwork-confine` rejects an any-depth hole, so a row the
+compiler failed to withhold fails the run instead of going missing.
+
 ## seccomp baseline (`seccompiler`) — and its hazards
 
 Researched API (`seccompiler` 0.4):
