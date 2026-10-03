@@ -300,6 +300,7 @@ fn explain_backstop_denial_names_shape_and_lift() {
             "/srv/app/credentials",
         ],
     );
+    assert_eq!(json.code, 0, "{}", json.stderr);
     let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
     let hint = out
         .stdout
@@ -328,6 +329,84 @@ fn explain_backstop_denial_names_shape_and_lift() {
         "{}",
         rel.stdout
     );
+}
+
+/// The "withheld on this host" note claims the kernel lets the path through, so it appears only
+/// where that is true: not under a user's own absolute `subtract` hole, not where nothing grants
+/// the path, and not for a subtree whose floored rows the kernel roots (FW-CRED9/FW-INV5). Each
+/// of those was denied by a confined `cat` while `explain` called it withheld.
+#[test]
+fn explain_withheld_note_only_where_the_kernel_lets_the_path_through() {
+    let dir = Scratch::new("explain-withheld");
+    let root = dir.path().display().to_string();
+    let broad =
+        "net = \"deny\"\n[fs]\nread-mode = \"ambient-minus-subtract\"\nwrites = [\"/**\"]\n";
+    let blueprints = [
+        ("broad.toml", broad.to_string()),
+        (
+            "subtract.toml",
+            format!("{broad}subtract = [\"{root}/proj/.env\"]\n"),
+        ),
+        (
+            "unveil.toml",
+            format!("net = \"deny\"\nmode = \"unveil\"\nrules = [\"read:{root}/other/**\"]\n"),
+        ),
+    ];
+    for (name, body) in &blueprints {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
+    let note = |blueprint: &str, path: &str| -> (Option<String>, String) {
+        let json = formwork(
+            dir.path(),
+            dir.path(),
+            &["explain", "--blueprint", blueprint, "--json", path],
+        );
+        assert_eq!(json.code, 0, "{}", json.stderr);
+        let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+        let human = formwork(
+            dir.path(),
+            dir.path(),
+            &["explain", "--blueprint", blueprint, path],
+        );
+        assert_eq!(human.code, 0, "{}", human.stderr);
+        (
+            value["explanations"][0]["host_note"]
+                .as_str()
+                .map(str::to_string),
+            human.stdout,
+        )
+    };
+    let env_file = format!("{root}/proj/.env");
+    for (blueprint, path) in [
+        ("subtract.toml", env_file.as_str()),
+        ("unveil.toml", env_file.as_str()),
+        ("broad.toml", &format!("{root}/**")),
+    ] {
+        let (host_note, human) = note(blueprint, path);
+        assert_eq!(host_note, None, "{blueprint} {path}: {human}");
+        assert!(
+            !human.contains("no denial here to lift"),
+            "{blueprint} {path}: {human}"
+        );
+    }
+
+    // The positive control: under a broad grant with no hole of its own, a Landlock host does let
+    // the `.env` through, and says so.
+    let summary = formwork(
+        dir.path(),
+        dir.path(),
+        &["explain", "--blueprint", "broad.toml", "--json"],
+    );
+    assert_eq!(summary.code, 0, "{}", summary.stderr);
+    let report: serde_json::Value = serde_json::from_str(&summary.stdout).unwrap();
+    if report["report"]["credentials"]["backstop"]["status"] == "partial" {
+        let (host_note, human) = note("broad.toml", &env_file);
+        assert!(
+            host_note.is_some_and(|n| n.starts_with("withheld on this host")),
+            "{human}"
+        );
+        assert!(human.contains("no denial here to lift"), "{human}");
+    }
 }
 
 #[test]

@@ -40,6 +40,11 @@ fn credentials_report(dir: &Path) -> serde_json::Value {
         .env("HOME", dir)
         .output()
         .expect("running formwork");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     value["report"]["credentials"].clone()
 }
@@ -106,7 +111,8 @@ fn lifting_the_backstop_silences_the_callout_but_not_the_floor() {
 }
 
 /// The debug itemization's `denied_path_types` is what this host denies: a type the report marks
-/// Partial (Landlock withholds its any-depth rows, FW-CRED9) is itemized apart (FW-INV5).
+/// Partial (Landlock withholds its any-depth rows, FW-CRED9) or Unenforceable is itemized under
+/// its own verdict, never as denied (FW-INV5).
 #[test]
 fn debug_itemization_lists_only_enforced_types_as_denied() {
     let dir = scratch("itemized");
@@ -133,19 +139,22 @@ fn debug_itemization_lists_only_enforced_types_as_denied() {
             .map(|s| s.trim_matches('"').to_string())
             .collect()
     };
-    let (denied, apart) = (
-        field("denied_path_types"),
-        field("not_fully_denied_path_types"),
-    );
+    let listed = [
+        ("enforced", field("denied_path_types")),
+        ("partial", field("partial_path_types")),
+        ("unenforceable", field("unenforceable_path_types")),
+    ];
     let report = credentials_report(&dir);
     for (name, t) in report["per-type"].as_object().unwrap() {
-        match t["path"]["status"].as_str() {
-            Some("enforced") => assert!(denied.contains(name), "{name}: {denied:?}"),
-            Some(_) => {
-                assert!(!denied.contains(name), "{name}: {denied:?}");
-                assert!(apart.contains(name), "{name}: {apart:?}");
-            }
-            None => {}
+        let Some(status) = t["path"]["status"].as_str() else {
+            continue;
+        };
+        for (verdict, names) in &listed {
+            assert_eq!(
+                names.contains(name),
+                *verdict == status,
+                "{name} is {status}: {listed:?}"
+            );
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

@@ -4,7 +4,7 @@
 //! at a terminal, so wording favors "what can I do about it" over field names.
 
 use formwork_blueprint::{ChannelExplanation, Explanation, RuleSource, Verdict};
-use formwork_compile::{Backend, Capability, Fidelity, FidelityReport};
+use formwork_compile::{Backend, Capability, CredentialReport, Fidelity, FidelityReport};
 use formwork_detect::{HostProfile, Os};
 
 /// One line answering "will this machine enforce, and can `learn` observe?".
@@ -158,13 +158,23 @@ pub fn channel_explanation(e: &ChannelExplanation, report: &FidelityReport) -> S
     out
 }
 
+/// What this host's kernel does with the floor row a path hits, beside the model's verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloorOnHost {
+    Denied,
+    /// Landlock cannot root the any-depth row and nothing else stops the path (FW-CRED9).
+    Withheld,
+    /// The host confines no filesystem access at all.
+    Unconfined,
+}
+
 /// The remedy line under a credential-floor denial: the `allow-credentials` entry that lifts it.
 /// The floor is the one deny `explain` can never show a grant for (FW-CAP8), so naming the lever
 /// is the operator channel (FW-CRED7) the confined tool's bare EACCES lacks. The backstop also
-/// names its `shape`, since that is the surprise: it fires even inside a granted directory.
-/// `withheld` is a row this host cannot install (FW-CRED9): there is no denial here, so the hint
-/// says so and keeps the lift for the hosts that do enforce it (FW-INV5).
-pub fn floor_remedy(floor_type: &str, shape: Option<&str>, withheld: bool) -> String {
+/// names its `shape`, since that is the surprise: it fires even inside a granted directory. Where
+/// this host does not deny the path, the hint says so and keeps the lift for the hosts that do
+/// (FW-INV5).
+pub fn floor_remedy(floor_type: &str, shape: Option<&str>, here: FloorOnHost) -> String {
     let backstop = floor_type == formwork_blueprint::BACKSTOP;
     let label = if backstop {
         format!(
@@ -174,25 +184,33 @@ pub fn floor_remedy(floor_type: &str, shape: Option<&str>, withheld: bool) -> St
     } else {
         format!("credential floor (type {floor_type})")
     };
-    if withheld {
-        let fires = if backstop {
-            " it fires at any depth, even inside a granted directory, and"
-        } else {
-            ""
-        };
-        format!(
-            "  hint: {label} -- withheld on this host, so there is no denial here to lift. Where \
-             the row is enforced,{fires} allow-credentials = [\"{floor_type}\"] lifts it.\n"
-        )
-    } else if backstop {
-        format!(
-            "  hint: {label} -- fires at any depth, even inside a granted directory. Lift with \
-             allow-credentials = [\"backstop\"] (coarse: un-denies every backstop shape \
-             everywhere; prefer narrowing a real type when one fits).\n"
-        )
+    let lift = if backstop {
+        "allow-credentials = [\"backstop\"] (coarse: un-denies every backstop shape everywhere; \
+         prefer narrowing a real type when one fits)"
+            .to_string()
     } else {
-        format!("  hint: {label} -- lift with allow-credentials = [\"{floor_type}\"].\n")
-    }
+        format!("allow-credentials = [\"{floor_type}\"]")
+    };
+    let not_here = match here {
+        FloorOnHost::Denied if backstop => {
+            return format!(
+                "  hint: {label} -- fires at any depth, even inside a granted directory. Lift with \
+                 {lift}.\n"
+            )
+        }
+        FloorOnHost::Denied => return format!("  hint: {label} -- lift with {lift}.\n"),
+        FloorOnHost::Withheld => "withheld on this host",
+        FloorOnHost::Unconfined => "not enforced on this host (no filesystem confinement)",
+    };
+    let fires = if backstop {
+        " it fires at any depth, even inside a granted directory, and"
+    } else {
+        ""
+    };
+    format!(
+        "  hint: {label} -- {not_here}, so there is no denial here to lift. Where the row is \
+         enforced,{fires} {lift} lifts it.\n"
+    )
 }
 
 fn backend(b: Backend) -> &'static str {
@@ -231,37 +249,71 @@ pub fn backstop(f: &Fidelity) -> String {
     }
 }
 
-/// One arm of the credential floor, counted by this host's verdict: only `Enforced` types count as
-/// `verb` (denied, stripped); `Partial` ones are named and `Unenforceable` ones counted after it,
-/// so a withheld any-depth type (FW-CRED9) is never folded into the denied total (FW-INV5).
-fn arm_tally<'a>(
-    kind: &str,
-    verb: &str,
-    arms: impl Iterator<Item = (&'a str, &'a Fidelity)>,
-) -> String {
-    let (mut enforced, mut partial, mut unenforceable) = (0, Vec::new(), 0);
-    for (name, f) in arms {
-        match f {
-            Fidelity::Enforced { .. } => enforced += 1,
-            Fidelity::Partial { .. } => partial.push(name),
-            Fidelity::Unenforceable { .. } => unenforceable += 1,
+/// One arm of the credential floor split by this host's verdict, so only `Enforced` types are ever
+/// called denied or stripped and a withheld any-depth type (FW-CRED9) is never folded into that
+/// total (FW-INV5). `explain`'s summary and `run`'s itemization both read it.
+#[derive(Debug, Default)]
+pub struct FloorArm<'a> {
+    pub enforced: Vec<&'a str>,
+    pub partial: Vec<&'a str>,
+    pub unenforceable: Vec<&'a str>,
+}
+
+impl<'a> FloorArm<'a> {
+    fn of(arms: impl Iterator<Item = (&'a str, &'a Fidelity)>) -> Self {
+        let mut arm = FloorArm::default();
+        for (name, f) in arms {
+            match f {
+                Fidelity::Enforced { .. } => arm.enforced.push(name),
+                Fidelity::Partial { .. } => arm.partial.push(name),
+                Fidelity::Unenforceable { .. } => arm.unenforceable.push(name),
+            }
         }
+        arm
     }
-    let mut out = format!(
-        "{enforced} {kind} type{} {verb}",
-        if enforced == 1 { "" } else { "s" }
-    );
-    if !partial.is_empty() {
-        out.push_str(&format!(
-            ", {} partial on this host ({})",
-            partial.len(),
-            partial.join(", ")
-        ));
+
+    /// The path arm (OS sandbox) of every type that has one.
+    pub fn paths(creds: &'a CredentialReport) -> Self {
+        Self::of(
+            creds
+                .per_type
+                .iter()
+                .filter_map(|(name, f)| f.path.as_ref().map(|p| (name.as_str(), p))),
+        )
     }
-    if unenforceable > 0 {
-        out.push_str(&format!(", {unenforceable} unenforceable on this host"));
+
+    /// The env arm (launcher strip) of every type that has one.
+    pub fn envs(creds: &'a CredentialReport) -> Self {
+        Self::of(
+            creds
+                .per_type
+                .iter()
+                .filter_map(|(name, f)| f.env.as_ref().map(|e| (name.as_str(), e))),
+        )
     }
-    out
+
+    /// `kind` and `verb` name the arm, e.g. "path" types "denied".
+    fn tally(&self, kind: &str, verb: &str) -> String {
+        let enforced = self.enforced.len();
+        let mut out = format!(
+            "{enforced} {kind} type{} {verb}",
+            if enforced == 1 { "" } else { "s" }
+        );
+        if !self.partial.is_empty() {
+            out.push_str(&format!(
+                ", {} partial on this host ({})",
+                self.partial.len(),
+                self.partial.join(", ")
+            ));
+        }
+        if !self.unenforceable.is_empty() {
+            out.push_str(&format!(
+                ", {} unenforceable on this host",
+                self.unenforceable.len()
+            ));
+        }
+        out
+    }
 }
 
 /// The fidelity report as prose: per-capability honesty plus the credential floor's shape. The
@@ -313,19 +365,11 @@ pub fn report_summary(report: &FidelityReport) -> String {
         }
     }
     let creds = &report.credentials;
-    let path_arms = creds
-        .per_type
-        .iter()
-        .filter_map(|(name, f)| f.path.as_ref().map(|p| (name.as_str(), p)));
-    let env_arms = creds
-        .per_type
-        .iter()
-        .filter_map(|(name, f)| f.env.as_ref().map(|e| (name.as_str(), e)));
     out.push_str(&format!(
         "credential floor: catalog v{} -- {}, {}; allowed through: {}\n",
         creds.catalog_version,
-        arm_tally("path", "denied", path_arms),
-        arm_tally("env", "stripped", env_arms),
+        FloorArm::paths(creds).tally("path", "denied"),
+        FloorArm::envs(creds).tally("env", "stripped"),
         if creds.allowed.is_empty() {
             "(none)".to_string()
         } else {
@@ -430,34 +474,41 @@ mod tests {
     #[test]
     fn floor_remedy_names_the_shape_and_the_lift() {
         // The backstop remedy names the surprising shape and the coarse lift...
-        let bs = floor_remedy("backstop", Some("**/credentials"), false);
+        let bs = floor_remedy("backstop", Some("**/credentials"), FloorOnHost::Denied);
         assert!(bs.contains("**/credentials"), "{bs}");
         assert!(bs.contains("allow-credentials = [\"backstop\"]"), "{bs}");
         assert!(bs.contains("-- fires at any depth"), "{bs}");
         // ...a curated type names itself as the lift instead.
-        let ssh = floor_remedy("ssh", None, false);
+        let ssh = floor_remedy("ssh", None, FloorOnHost::Denied);
         assert!(ssh.contains("allow-credentials = [\"ssh\"]"), "{ssh}");
         assert!(!ssh.contains("backstop"), "{ssh}");
     }
 
-    /// Under a "withheld on this host" note the hint must not say the row fires here (FW-CRED9,
-    /// FW-INV5); it keeps the shape and the lift for the hosts that do enforce it.
+    /// Where this host does not deny the path -- the row is withheld (FW-CRED9) or nothing is
+    /// confined -- the hint must not say the row fires here (FW-INV5); it keeps the shape, the lift
+    /// and the lift's coarseness warning for the hosts that do enforce it.
     #[test]
-    fn floor_remedy_on_a_withheld_row_claims_no_denial() {
-        let bs = floor_remedy("backstop", Some("**/credentials"), true);
-        assert!(bs.contains("**/credentials"), "{bs}");
-        assert!(bs.contains("withheld on this host"), "{bs}");
-        assert!(bs.contains("no denial here to lift"), "{bs}");
-        assert!(!bs.contains("-- fires at any depth"), "{bs}");
-        assert!(bs.contains("Where the row is enforced, it fires"), "{bs}");
-        assert!(bs.contains("allow-credentials = [\"backstop\"]"), "{bs}");
+    fn floor_remedy_claims_no_denial_the_host_does_not_make() {
+        for (here, why) in [
+            (FloorOnHost::Withheld, "withheld on this host"),
+            (FloorOnHost::Unconfined, "not enforced on this host"),
+        ] {
+            let bs = floor_remedy("backstop", Some("**/credentials"), here);
+            assert!(bs.contains("**/credentials"), "{bs}");
+            assert!(bs.contains(why), "{bs}");
+            assert!(bs.contains("no denial here to lift"), "{bs}");
+            assert!(!bs.contains("-- fires at any depth"), "{bs}");
+            assert!(bs.contains("Where the row is enforced, it fires"), "{bs}");
+            assert!(bs.contains("allow-credentials = [\"backstop\"]"), "{bs}");
+            assert!(bs.contains("coarse"), "{bs}");
 
-        let dotenv = floor_remedy("dotenv", None, true);
-        assert!(dotenv.contains("withheld on this host"), "{dotenv}");
-        assert!(
-            dotenv.contains("Where the row is enforced, allow-credentials = [\"dotenv\"]"),
-            "{dotenv}"
-        );
+            let dotenv = floor_remedy("dotenv", None, here);
+            assert!(dotenv.contains(why), "{dotenv}");
+            assert!(
+                dotenv.contains("Where the row is enforced, allow-credentials = [\"dotenv\"]"),
+                "{dotenv}"
+            );
+        }
     }
 
     /// The floor's "denied" total counts only types this host enforces: on Landlock the any-depth

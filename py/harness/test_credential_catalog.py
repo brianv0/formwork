@@ -247,14 +247,19 @@ def test_withheld_backstop_is_readable_and_never_claimed_denied(cli, fake_home, 
 
     summary_json = cli("explain", "--blueprint", bp, "--json", env=env)
     assert summary_json.code == 0, summary_json.stderr
-    report = json.loads(summary_json.stdout)["report"]
-    if report["credentials"]["backstop"]["status"] != "partial":
-        pytest.skip(f"backstop is {report['credentials']['backstop']['status']} on this host")
+    summary_value = json.loads(summary_json.stdout)
+    if summary_value["host"].get("landlock-abi") is None:
+        pytest.skip("no Landlock on this host: the floor is unenforceable, not withheld")
+    # On Landlock the backstop is Partial; an Enforced claim here is the overclaim this guards.
+    report = summary_value["report"]
+    assert report["credentials"]["backstop"]["status"] == "partial", report["credentials"]
 
     # The paired probe: the absolute aws row is denied, the any-depth backstop row is not.
     aws = cli("run", "--blueprint", bp, "--", "/bin/cat", fake_home / ".aws/credentials",
               cwd=fake_home, env=env)
     assert aws.code != 0, "an absolute floor row must still deny on Linux"
+    assert "FAKE" not in aws.stdout, aws.stdout
+    assert "permission denied" in _agent_lines(aws.stderr).lower(), aws.stderr
     withheld = cli("run", "--blueprint", bp, "--", "/bin/cat", novel, cwd=fake_home, env=env)
     assert withheld.code == 0, withheld.stderr
     assert "novel-provider-secret" in withheld.stdout
