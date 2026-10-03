@@ -112,6 +112,15 @@ fn fw_e2e_098_inspected_https_through_run() {
     assert_eq!(tunneled.stdout, "ok:/ok\n");
 }
 
+/// The port of the session Gateway's egress listener, from `formwork run`'s operator log.
+fn gateway_port(stderr: &str) -> Option<u16> {
+    let rest = stderr.split("listener=127.0.0.1:").nth(1)?;
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// Node reads the proxy variables only with `NODE_USE_ENV_PROXY`, from 22.21 on the 22 line and
 /// 24.5 on the 24 line (FEP-6 §4.11); older Node connects directly and is refused.
 fn node_uses_env_proxy() -> bool {
@@ -319,30 +328,55 @@ fn fw_e2e_094_client_matrix() {
             }
             let path = format!("/{grade}/{client}");
             let url = format!("https://{host}:{}{path}", fixture.port);
-            let row_started = std::time::Instant::now();
-            let out = formwork_env(
-                dir.path(),
-                &[
-                    "run",
-                    "--",
-                    "/bin/sh",
-                    "-c",
-                    &format!("{} 2>&1", command(&url)),
-                ],
-                // An operator's npm proxy setting, which npm prefers to `https_proxy`; the
-                // Launcher must override it too (FEP-6 §4.11).
-                &[
-                    ("SSL_CERT_FILE", &root),
-                    ("https_proxy", &proxy_url),
-                    ("npm_config_https_proxy", "http://127.0.0.1:1"),
-                    // A Rust client's error, not its backtrace.
-                    ("RUST_BACKTRACE", "0"),
-                    // A refused row shows the Gateway's side too (handshakes log at debug).
-                    ("RUST_LOG", "info,formwork_gateway=debug"),
-                ],
-                &[],
-            );
-            let reached = fixture.seen().iter().any(|s| s.path().starts_with(&path));
+            let run_row = || {
+                formwork_env(
+                    dir.path(),
+                    &[
+                        "run",
+                        "--",
+                        "/bin/sh",
+                        "-c",
+                        &format!("{} 2>&1", command(&url)),
+                    ],
+                    // An operator's npm proxy setting, which npm prefers to `https_proxy`; the
+                    // Launcher must override it too (FEP-6 §4.11).
+                    &[
+                        ("SSL_CERT_FILE", &root),
+                        ("https_proxy", &proxy_url),
+                        ("npm_config_https_proxy", "http://127.0.0.1:1"),
+                        // A Rust client's error, not its backtrace.
+                        ("RUST_BACKTRACE", "0"),
+                        // A refused row shows the Gateway's side too (handshakes log at debug).
+                        ("RUST_LOG", "info,formwork_gateway=debug"),
+                    ],
+                    &[],
+                )
+            };
+            let expected = if macos { on_macos } else { on_linux };
+            let mut row_started = std::time::Instant::now();
+            let mut out = run_row();
+            let mut reached = fixture.seen().iter().any(|s| s.path().starts_with(&path));
+            if macos && expected == Some(true) && !reached {
+                // The macOS 14 loopback window (docs/macos-characterization.md): Seatbelt refuses
+                // the session's own Gateway port for a few milliseconds every 15 s. Only a row
+                // whose own Sandbox record shows that refusal runs once more.
+                if let Some(port) = gateway_port(&out.stderr) {
+                    let own_port = format!("network-outbound remote:*:{port}");
+                    if !sandbox_records(row_started, |m| {
+                        m.contains(" deny(") && m.contains(&own_port)
+                    })
+                    .is_empty()
+                    {
+                        eprintln!(
+                            "{client} ({grade}): Seatbelt refused the session's own Gateway port \
+                             {port} (the macOS 14 loopback window); the row runs once more"
+                        );
+                        row_started = std::time::Instant::now();
+                        out = run_row();
+                        reached = fixture.seen().iter().any(|s| s.path().starts_with(&path));
+                    }
+                }
+            }
             // A refusal records the client's last error line (else its last line), so the matrix
             // says why.
             let why = if reached {
@@ -376,7 +410,6 @@ fn fw_e2e_094_client_matrix() {
             // the inspected row is refused for the session CA, the tunnel row for the fixture
             // root the keychain does not hold. Swift's URLSession also ignores the proxy
             // variables, so it never reaches the Gateway.
-            let expected = if macos { on_macos } else { on_linux };
             if let Some(expected) = expected {
                 if reached != expected {
                     // On macOS, whether Seatbelt refused the session's network: seen on macos-14,

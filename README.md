@@ -119,7 +119,7 @@ and wiring for Claude Code, codex, and opencode.
 | Filesystem read/write walls (`run`, `gateway`) | ✅ Seatbelt | ✅ Landlock + seccomp (kernel 5.13+) |
 | Default-deny network | ✅ (a login flow's loopback listener also accepts on the host's other addresses) | ✅ |
 | Port tier (direct TCP to listed ports) | ✅ | ✅ on kernel 6.7+ (elsewhere egress fails closed); names do not resolve |
-| Host-scoped egress through the Gateway, TLS inspection, credential brokering | ✅ (clients that verify through the macOS keychain need `tunnel:`) | ✅ (kernel 5.6+, Yama `ptrace_scope` 0 or 1) |
+| Host-scoped egress through the Gateway, TLS inspection, credential brokering | ✅ (clients that verify through the macOS keychain need `tunnel:`; on macOS 14 the sandbox can refuse a connection to the Gateway during a window of a few milliseconds every 15 seconds, observed on GitHub's macOS 14 runners, which the client sees as a failed connect) | ✅ (kernel 5.6+, Yama `ptrace_scope` 0 or 1) |
 | Host-service channels closed by default (`channels`) | ✅ | ✅ (sockets closed under host rules; hidden otherwise) |
 | Process isolation (`isolate = ["processes", "ipc"]`) | partial (sandbox filters) | ✅ where unprivileged user namespaces are allowed |
 | Exec allow-lists | ✅ | ✅ (list the dynamic loader too, e.g. `/lib64/ld-linux-x86-64.so.2`) |
