@@ -61,13 +61,15 @@ jobs:
         # FEP-5 §6.2: ubuntu-24.04 restricts unprivileged user namespaces through AppArmor, so the
         # `isolate` refusal path runs on a real runner beside 22.04's working tier; macos-15 beside
         # macos-14 because Seatbelt service names and sysctl behavior change across releases.
-        os: [ubuntu-22.04, ubuntu-24.04, macos-14, macos-15]
+        # macos-15-intel because x86_64-apple-darwin is a release slice, and its image ships other
+        # clients first on PATH (Homebrew's curl on OpenSSL) than the arm64 images do.
+        os: [ubuntu-22.04, ubuntu-24.04, macos-14, macos-15, macos-15-intel]
     steps:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-rust
         with:
-          cache-prefix: test
+          cache-prefix: test-${{ runner.arch }}
 
       # The Linux learn feed (FW-E2E-071) traces the workload with strace; installing it here is
       # what lets the ubuntu job EXECUTE the ptrace-feed tests instead of skipping them -- a
