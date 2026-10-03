@@ -670,13 +670,10 @@ pub(crate) async fn respond<W: AsyncWrite + Unpin>(
     }
 }
 
-/// An upstream reader that also watches the client the exchange answers: when the client ends its
-/// side -- a reset, an end of stream, or a half-close, as Envoy's connection manager treats one --
-/// a read fails with [`client_gone`], so the exchange ends and its upstream connection is dropped
-/// instead of held for as long as the upstream holds it (a response has no timeout, FEP-6 §4.9).
-/// Bytes the client sends meanwhile, a pipelined request, are kept in `spill`; with the `held`
-/// bytes its buffer already holds they stay within **head-limit**, and once there the client is no
-/// longer read until the exchange ends.
+/// An upstream reader that fails with [`client_gone`] once the client resets, ends or half-closes
+/// its side, as Envoy's connection manager does: a response has no timeout (FEP-6 §4.9), so only
+/// the client leaving frees its upstream connection. Pipelined client bytes go to `spill`, read only
+/// while `held + spill` stays within **head-limit**.
 pub(crate) struct Watched<'a, U, C> {
     pub(crate) upstream: &'a mut U,
     pub(crate) client: &'a mut C,
@@ -727,7 +724,6 @@ pub(crate) fn client_gone() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, ClientGone)
 }
 
-/// Whether a read failed because the client left, not the upstream.
 pub(crate) fn is_client_gone(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<ClientGone>())
 }
@@ -736,8 +732,8 @@ pub(crate) fn is_client_gone(e: &io::Error) -> bool {
 mod tests {
     use super::*;
 
-    /// A client that keeps pipelining while the upstream answers is read only until what its buffer
-    /// already holds and what this exchange spilled reach head-limit, across exchanges.
+    /// The bytes already held count against head-limit, so pipelining cannot grow the buffer
+    /// across exchanges.
     #[tokio::test]
     async fn a_watched_client_is_buffered_within_head_limit() {
         let (mut client_far, mut client) = tokio::io::duplex(1024 * 1024);

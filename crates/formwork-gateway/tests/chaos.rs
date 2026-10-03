@@ -1,14 +1,9 @@
-//! Fault matrix for the egress engine (FEP-6 §4.4, §4.9): the real Gateway listener between a real
-//! client and a scripted upstream that misbehaves at a chosen point -- at connect, in the TLS
-//! handshake, in the response head or body, on a pooled connection, inside a tunnel -- and a client
-//! that misbehaves the same ways. Every scenario holds the session to the same properties: no
-//! panic, the listener still serves (FW-XR11), the client gets a refusal or a truncated stream and
-//! never a fabricated success, a non-idempotent request is never sent twice, and an upstream
-//! connection the exchange no longer needs is released. Each fault is named and deterministic, so a
-//! failure reproduces from the test's name.
+//! Fault matrix for the egress engine (FEP-6 §4.4, §4.9): the real listener between a client and a
+//! scripted upstream, either of which fails at a named point. Every scenario ends on the same
+//! properties: no panic, the listener serves (FW-XR11), never a fabricated success, a request with a
+//! body never sent twice, and no upstream connection held past its exchange.
 //!
-//! Linux only: the error a reset surfaces as (reset, broken pipe, end of stream) differs by
-//! platform, and the engine under test is the same on both.
+//! Linux only: the error a reset surfaces as differs by platform; the engine is the same on both.
 
 #![cfg(target_os = "linux")]
 
@@ -47,41 +42,28 @@ fn count_panics() {
     });
 }
 
-/// What the upstream does with one accepted connection.
+/// What the upstream does with one accepted connection, after reading the request unless the name
+/// says otherwise.
 #[derive(Clone, Copy, Debug)]
 enum Fault {
-    /// Answer every request `200 ok:<path>`, keep-alive.
+    /// `200 ok:<path>` to every request, keep-alive.
     Serve,
-    /// Reset the connection as soon as it is accepted.
     ResetOnAccept,
-    /// Read the ClientHello, then close without answering it.
     CloseInHandshake,
-    /// Read the request, send half a response head, reset.
     ResetMidHead,
-    /// Read the request, send half a response head, close cleanly.
     EndMidHead,
-    /// Read the request, answer with bytes that are not HTTP.
     Garbage,
-    /// Read the request, answer with a head larger than any head the Gateway reads.
     HugeHead,
-    /// Read the request, promise 100 bytes, send 10, close cleanly.
     ShortBody,
-    /// Read the request, send one chunk, reset.
     ResetMidChunked,
-    /// Read the request, send one chunk, close cleanly.
     EndMidChunked,
-    /// Read the request, send a chunk whose size is not hexadecimal.
     BadChunk,
-    /// Read the request and never answer; the connection is released when the Gateway drops it.
     StallBeforeHead,
-    /// Read the request, send the head and 10 of 100 bytes, then wait for the Gateway to drop it.
     StallMidBody,
-    /// Serve one request, then reset the idle connection.
     ServeOnceThenReset,
 }
 
-/// A TLS upstream whose connections take their behaviour from a script, in accept order; once the
-/// script is spent, every connection is served.
+/// A TLS upstream whose connections take their faults from a script in accept order, then serve.
 #[derive(Clone)]
 struct Upstream {
     port: u16,
@@ -209,8 +191,7 @@ impl Upstream {
         }
     }
 
-    /// Read one request head (and its `Content-Length` body); `None` when the connection ends
-    /// first. A request is recorded only once read in full.
+    /// A request is recorded only once read in full.
     async fn read_request<S: AsyncRead + Unpin>(
         &self,
         s: &mut S,
@@ -255,7 +236,6 @@ impl Upstream {
         self.seen.lock().unwrap().clone()
     }
 
-    /// Whether at least `least` connections are open within `STEP`.
     async fn open_at_least(&self, least: isize) -> bool {
         let deadline = tokio::time::Instant::now() + STEP;
         while tokio::time::Instant::now() < deadline {
@@ -267,7 +247,6 @@ impl Upstream {
         false
     }
 
-    /// Whether the open connections fall to at most `most` within `STEP`.
     async fn open_at_most(&self, most: isize) -> bool {
         let deadline = tokio::time::Instant::now() + STEP;
         while tokio::time::Instant::now() < deadline {
@@ -280,13 +259,11 @@ impl Upstream {
     }
 }
 
-/// A session that inspects `api.test` on the upstream's port, the upstream scripted with `script`.
 struct Rig {
     up: Upstream,
     proxy: EgressProxy,
-    /// The session CA, for a rule the Gateway inspects.
     ca: Option<Arc<SessionCa>>,
-    /// The root the fixture upstream's certificate chains to, for a tunnel client.
+    /// The fixture's root, for a tunnel client.
     root: rustls::pki_types::CertificateDer<'static>,
 }
 
@@ -319,7 +296,6 @@ impl Rig {
         format!("GET {path} HTTP/1.1\r\nHost: {}\r\n\r\n", self.target())
     }
 
-    /// CONNECT and complete TLS with the session CA, as a client that trusts it.
     async fn inspected(&self) -> Tls {
         tokio::time::timeout(
             STEP,
@@ -335,8 +311,7 @@ impl Rig {
         .expect("an inspected tunnel")
     }
 
-    /// The properties every scenario ends on: no panic anywhere, the listener alive, and a fresh
-    /// connection served end to end.
+    /// The properties every scenario ends on.
     async fn still_serves(&self) {
         assert_eq!(PANICS.load(Ordering::SeqCst), 0, "a panic in the process");
         assert!(self.proxy.is_alive(), "the listener died (FW-XR11)");
@@ -349,7 +324,6 @@ impl Rig {
     }
 }
 
-/// Everything the client reads until the Gateway ends the stream, bounded by `STEP`.
 async fn read_to_end<S: AsyncRead + Unpin>(s: &mut S) -> String {
     let mut out = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
@@ -366,8 +340,7 @@ async fn read_to_end<S: AsyncRead + Unpin>(s: &mut S) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Upstream faults before a usable response head: the client gets `502` and nothing the upstream
-/// sent, the connection ends, and the session serves the next request.
+/// Upstream faults before a usable head: a `502`, none of the upstream's bytes.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_that_fails_before_its_head_is_a_502() {
     for fault in [
@@ -420,8 +393,7 @@ async fn an_upstream_that_refuses_the_connection_is_a_502() {
     assert!(proxy.is_alive());
 }
 
-/// Upstream faults inside the body: the client gets the head and the bytes that came, then the
-/// stream ends short of what the head promised -- never a completed response -- and no grant
+/// Upstream faults inside the body: the stream ends short of what the head promised, and no grant
 /// records it as served.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upstream_that_fails_inside_its_body_ends_the_response_short() {
@@ -451,22 +423,17 @@ async fn an_upstream_that_fails_inside_its_body_ends_the_response_short() {
     }
 }
 
-/// How a client leaves an exchange.
 #[derive(Clone, Copy, Debug)]
 enum Exit {
     /// Closes the socket: TCP FIN, no `close_notify`.
     Close,
-    /// Resets the connection.
     Reset,
-    /// Shuts down its sending side and keeps reading, which Envoy's connection manager also treats
-    /// as leaving.
+    /// Envoy's connection manager treats a half-close as leaving too.
     HalfClose,
 }
 
-/// An upstream that never answers is waited for -- a response has no timeout (FEP-6 §4.9) -- but
-/// once the client leaves, however it leaves, the Gateway drops the upstream connection instead of
-/// holding it for as long as the upstream does, before the response head and in the middle of the
-/// body alike.
+/// A response has no timeout (FEP-6 §4.9), so a stalled upstream is waited for until the client
+/// leaves; then its connection is dropped, before the head and mid-body alike.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_that_leaves_a_stalled_upstream_releases_it() {
     for fault in [Fault::StallBeforeHead, Fault::StallMidBody] {
@@ -510,8 +477,8 @@ async fn a_client_that_leaves_a_stalled_upstream_releases_it() {
     }
 }
 
-/// A pooled connection the upstream reset while idle: a bodiless request is retried once on a
-/// fresh connection; a request with a body is never sent a second time.
+/// A pooled connection reset while idle: a bodiless request is retried on a fresh connection; one
+/// with a body is never sent twice.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pooled_connection_reset_while_idle() {
     let rig = Rig::new(&[Fault::ServeOnceThenReset], "allow").await;
@@ -583,8 +550,8 @@ async fn a_tunnel_whose_upstream_resets_ends_for_the_client() {
     assert!(ok.ends_with("ok:/after"), "{ok}");
 }
 
-/// Client faults mid-request and mid-response: a request whose body the client abandoned never
-/// reaches the upstream as a request, and an upstream connection left mid-response is not reused.
+/// An abandoned request body never reaches the upstream as a request, and an upstream connection
+/// left mid-response is not reused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_that_vanishes_mid_exchange() {
     let rig = Rig::new(&[], "get,post").await;
@@ -627,8 +594,7 @@ async fn a_client_that_vanishes_mid_exchange() {
     rig.still_serves().await;
 }
 
-/// Two requests a client pipelines in one write get two responses, in order: the bytes the
-/// Gateway reads from the client while it watches it during the first exchange are kept for the
+/// Bytes read from the client while it is watched during the first exchange are kept for the
 /// second.
 #[tokio::test(flavor = "multi_thread")]
 async fn pipelined_requests_are_answered_in_order() {

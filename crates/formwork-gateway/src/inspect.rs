@@ -807,8 +807,7 @@ async fn exchange(
     Ok(Next::KeepAlive)
 }
 
-/// The upstream's next response head, read while the client is watched (`Watched`): a client that
-/// leaves first ends the wait. Bytes it pipelined meanwhile stay in its buffer.
+/// A client that leaves before the head arrives ends the wait.
 async fn upstream_head(
     up: &mut Buffered<BoxIo>,
     client: &mut Buffered<BoxIo>,
