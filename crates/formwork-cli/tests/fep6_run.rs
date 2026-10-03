@@ -650,6 +650,21 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// Whether the curl that printed `{label}=<status>` was refused by the Gateway's `CONNECT` answer,
+/// not by a failed connection: curl names the 403 and exits 56, or 7 from the curl 8.21 that
+/// Homebrew puts first on the Intel macOS runner's PATH (curl 8.7.1, the macOS system curl, still
+/// exits 56).
+fn curl_refused_at_connect(out: &Output, label: &str) -> bool {
+    let status = ["56", "7"]
+        .iter()
+        .any(|code| out.stdout.contains(&format!("{label}={code}\n")));
+    let named = out
+        .stderr
+        .lines()
+        .any(|l| l.starts_with("curl: (") && l.contains("403"));
+    status && named
+}
+
 /// FW-EGR17 / FW-EGR19 (both): the production resolver. An exact-name rule reaches a loopback
 /// answer of the host's own resolver; a name that does not resolve is refused as `resolution`
 /// before any upstream socket.
@@ -685,7 +700,12 @@ fn fw_egr17_the_host_resolver_decides_through_run() {
         out.stdout,
         out.stderr
     );
-    assert!(out.stdout.contains("invalid=56"), "{}", out.stdout);
+    assert!(
+        curl_refused_at_connect(&out, "invalid"),
+        "{}\n{}",
+        out.stdout,
+        out.stderr
+    );
     assert!(
         out.stderr.contains("reason=\"resolution\""),
         "{}",
@@ -733,7 +753,12 @@ fn fw_e2e_103_the_operators_upstream_proxy_through_run() {
         out.stdout,
         out.stderr
     );
-    assert!(out.stdout.contains("corp=56"), "{}", out.stdout);
+    assert!(
+        curl_refused_at_connect(&out, "corp"),
+        "{}\n{}",
+        out.stdout,
+        out.stderr
+    );
     assert_eq!(
         proxy.lines(),
         vec![format!("CONNECT model.test:{} HTTP/1.1", up.port)],

@@ -8,6 +8,7 @@ mod support;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use formwork_blueprint::{BrokerScheme, CanonicalHost, HostPattern, RefusalReason};
 use formwork_gateway::{Broker, EgressProxy, SessionCa};
@@ -593,4 +594,75 @@ async fn a_websocket_upgrade_is_spliced_after_101() {
     assert_eq!(&echoed, b"frame-bytes");
     let seen = &s.up.seen()[0];
     assert_eq!(seen.header("upgrade").as_deref(), Some("websocket"));
+}
+
+/// The inspected hosts a client was recorded rejecting the session CA for, once the connection's
+/// handler has had `wait` to run.
+async fn ca_rejections_after(s: &Inspected, wait: Duration) -> Vec<(CanonicalHost, u16)> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let got = s.proxy.ca_rejections();
+        if !got.is_empty() || tokio::time::Instant::now() >= deadline {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// FW-FID9: a client that rejects the session CA is named, whichever way it rejects. One that
+/// verifies in the handshake sends `unknown_ca`; one that verifies after it (curl 8.x on OpenSSL)
+/// completes the handshake and aborts -- a reset, or an end without `close_notify` -- before
+/// sending a byte. A client that closes with `close_notify`, or sends a request, is not counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn fw_fid9_a_client_rejecting_the_session_ca_is_named() {
+    let host = |s: &Inspected| vec![(CanonicalHost::Name("api.test".into()), s.up.port)];
+
+    let s = inspected(&["get:api.test:{port}/**"], vec![]).await;
+    let other = fixture_tls(&["api.test"]);
+    let refused = tunnel(&s.proxy, &[other.root], &s.target("api.test"), "api.test").await;
+    assert!(refused.is_none(), "the client trusts another root");
+    assert_eq!(
+        ca_rejections_after(&s, Duration::from_secs(5)).await,
+        host(&s),
+        "an unknown_ca alert in the handshake"
+    );
+
+    let s = inspected(&["get:api.test:{port}/**"], vec![]).await;
+    let tls = s.tunnel("api.test").await;
+    tls.get_ref().0.set_zero_linger().unwrap();
+    drop(tls);
+    assert_eq!(
+        ca_rejections_after(&s, Duration::from_secs(5)).await,
+        host(&s),
+        "a reset after the handshake"
+    );
+
+    let s = inspected(&["get:api.test:{port}/**"], vec![]).await;
+    let mut tls = s.tunnel("api.test").await;
+    tls.get_mut().0.shutdown().await.unwrap();
+    assert_eq!(
+        ca_rejections_after(&s, Duration::from_secs(5)).await,
+        host(&s),
+        "an end without close_notify after the handshake"
+    );
+
+    let s = inspected(&["get:api.test:{port}/**"], vec![]).await;
+    let mut tls = s.tunnel("api.test").await;
+    tls.shutdown().await.unwrap();
+    let mut rest = Vec::new();
+    let _ = tls.read_to_end(&mut rest).await;
+    let mut tls = s.tunnel("api.test").await;
+    let ok = request(
+        &mut tls,
+        &format!("GET /x HTTP/1.1\r\n{}\r\n", s.host_header("api.test")),
+    )
+    .await;
+    assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+    drop(tls);
+    assert!(
+        ca_rejections_after(&s, Duration::from_millis(500))
+            .await
+            .is_empty(),
+        "a close_notify or a served request is not a rejection"
+    );
 }

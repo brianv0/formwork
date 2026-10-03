@@ -106,10 +106,18 @@ fn basic_decoded(value: &str) -> Option<String> {
         .map(|raw| String::from_utf8_lossy(&raw).into_owned())
 }
 
-/// Is this TLS failure a client rejecting the session CA? (FW-FID9's `unknown_ca` line.)
+/// Is this TLS failure a client rejecting the session CA? (FW-FID9's `unknown_ca` line.) A client
+/// that verifies in the handshake sends `unknown_ca` or a sibling alert. One that verifies after
+/// its side of the handshake (curl 8.x on OpenSSL) sends no alert: having seen the leaf, it aborts
+/// before a byte of request -- a reset, or an end without `close_notify` -- which the Gateway sees
+/// while reading the client's last flight or the first request. A client that closes with
+/// `close_notify` ended the session on purpose and is not counted.
 fn rejected_our_ca(e: &io::Error) -> bool {
     use rustls::AlertDescription as A;
     matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+    ) || matches!(
         e.get_ref()
             .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
         Some(rustls::Error::AlertReceived(
@@ -181,18 +189,22 @@ pub(crate) async fn serve_inspected(
         tokio_rustls::TlsAcceptor::from(server).accept(replay),
     )
     .await;
+    let ca_rejected = |shared: &Shared| {
+        // FW-FID9: the one line that turns an opaque x509 error into a diagnosis.
+        shared.note_ca_rejection(&host, port);
+        tracing::warn!(
+            host = %host,
+            "formwork: a client rejected the session CA for inspected host {host}: it does not \
+             read SSL_CERT_FILE (on macOS, Security.framework clients such as Go and Swift never \
+             do), or it was given its own CA file. Options: make the host a tunnel \
+             (`{tunnel_rule}`), or use a client that honors the variable; reproduce: formwork \
+             explain https://{host}:{port}/"
+        );
+    };
     let tls = match accepted {
         Ok(Ok(t)) => t,
         Ok(Err(e)) if rejected_our_ca(&e) => {
-            // FW-FID9: the one line that turns an opaque x509 error into a diagnosis.
-            shared.note_ca_rejection(&host, port);
-            tracing::warn!(
-                host = %host,
-                "formwork: a client rejected the session CA for inspected host {host}: it does not \
-                 read SSL_CERT_FILE (on macOS, Security.framework clients such as Go and Swift \
-                 never do). Options: make the host a tunnel (`{tunnel_rule}`), or use a client \
-                 that honors the variable; reproduce: formwork explain https://{host}:{port}/"
-            );
+            ca_rejected(&shared);
             return Ok(());
         }
         Ok(Err(e)) => {
@@ -201,14 +213,17 @@ pub(crate) async fn serve_inspected(
         }
         Err(_) => return Ok(()),
     };
-    let scope = Scope::Tls(dest);
-    relay(
-        Buffered::new(Box::new(tls), Vec::new()),
-        scope,
-        None,
-        &shared,
-    )
-    .await
+    let mut client = Buffered::new(Box::new(tls) as BoxIo, Vec::new());
+    match tokio::time::timeout(HEAD_TIMEOUT, client.fill()).await {
+        Ok(Ok(0)) | Err(_) => return Ok(()),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) if rejected_our_ca(&e) => {
+            ca_rejected(&shared);
+            return Ok(());
+        }
+        Ok(Err(e)) => return Err(e),
+    }
+    relay(client, Scope::Tls(dest), None, &shared).await
 }
 
 /// A plain-HTTP proxy connection (FEP-6 §4.8): the inspected request pipeline without TLS, each
