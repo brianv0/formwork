@@ -9,12 +9,12 @@ jobs:
   trace:
     name: trace (${{ matrix.os }} ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15, macos-15-intel]
-        shard: [a]
+        os: [macos-14, macos-15]
+        shard: [a, b, c]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust

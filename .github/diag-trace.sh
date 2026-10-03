@@ -11,27 +11,27 @@ cat > conn.c <<'C'
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-static int try(int port, unsigned char fill) {
+static int try4(int port) {
   int s = socket(AF_INET, SOCK_STREAM, 0);
-  struct sockaddr_in a;
-  memset(&a, fill, sizeof a);
-  a.sin_len = sizeof a;
-  a.sin_family = AF_INET;
-  a.sin_port = htons(port);
+  struct sockaddr_in a; memset(&a, 0, sizeof a);
+  a.sin_len = sizeof a; a.sin_family = AF_INET; a.sin_port = htons(port);
   inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
-  int r = connect(s, (struct sockaddr *)&a, sizeof a);
-  int e = r ? errno : 0;
-  close(s);
-  return e;
+  int r = connect(s, (struct sockaddr *)&a, sizeof a); int e = r ? errno : 0; close(s); return e;
+}
+static int try6(int port) {
+  int s = socket(AF_INET6, SOCK_STREAM, 0);
+  struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+  a.sin6_len = sizeof a; a.sin6_family = AF_INET6; a.sin6_port = htons(port);
+  inet_pton(AF_INET6, "::1", &a.sin6_addr);
+  int r = connect(s, (struct sockaddr *)&a, sizeof a); int e = r ? errno : 0; close(s); return e;
 }
 int main(int argc, char **argv) {
-  int port = atoi(argv[1]);
-  unsigned char fills[] = {0x00, 0x01, 0xa4, 0xff};
-  for (int i = 0; i < 4; i++) {
-    int fails = 0, last = 0;
-    for (int n = 0; n < 20; n++) { int e = try(port, fills[i]); if (e) { fails++; last = e; } }
-    printf("sin_zero=0x%02x: %d/20 refused (errno %d)\n", fills[i], fails, last);
-  }
+  int port = atoi(argv[1]), n = atoi(argv[2]);
+  int c4[128] = {0}, c6[128] = {0};
+  for (int i = 0; i < n; i++) { int e = try4(port); c4[e < 128 ? e : 127]++; }
+  for (int i = 0; i < n; i++) { int e = try6(port); c6[e < 128 ? e : 127]++; }
+  for (int e = 0; e < 128; e++) if (c4[e]) printf("sin_zero=v4 127.0.0.1 errno %d: %d/%d\n", e, c4[e], n);
+  for (int e = 0; e < 128; e++) if (c6[e]) printf("sin_zero=v6 ::1 errno %d: %d/%d\n", e, c6[e], n);
   return 0;
 }
 C
@@ -43,6 +43,6 @@ T
 cat > probe.sh <<'P'
 p=${HTTP_PROXY##*:}; p=${p%/}
 echo "gateway port $p"
-./conn "$p"
+./conn "$p" 20000
 P
 "$GITHUB_WORKSPACE/target/debug/formwork" run -- /bin/sh probe.sh 2>&1 | grep -E "gateway port|sin_zero="
