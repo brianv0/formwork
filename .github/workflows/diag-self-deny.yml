@@ -13,8 +13,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14]
-        shard: [a, b, c]
+        os: [macos-14, macos-15, macos-15-intel]
+        shard: [a]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
@@ -27,7 +27,7 @@ jobs:
           if [ -n "$go_bin" ]; then echo "$go_bin" >> "$GITHUB_PATH"; fi
           pipx install uv
       - name: Build
-        run: cargo build --workspace --locked && cargo test --no-run -q -p formwork-cli --test fep6_run --locked
-      - name: Trace until it reproduces
+        run: cargo build --workspace --locked
+      - name: sin_zero probe
         shell: bash
         run: bash .github/diag-trace.sh
