@@ -747,12 +747,14 @@ async fn exchange(
     }
     let copied = {
         let mut spill = Vec::new();
+        let held = client.buf.len();
         let (mut client_r, mut client_w) = tokio::io::split(&mut client.s);
         let mut watched = Buffered::new(
             Watched {
                 upstream: &mut up.s,
                 client: &mut client_r,
                 spill: &mut spill,
+                held,
             },
             std::mem::take(&mut up.buf),
         );
@@ -817,6 +819,7 @@ async fn upstream_head(
             upstream: &mut up.s,
             client: &mut client.s,
             spill: &mut spill,
+            held: client.buf.len(),
         },
         std::mem::take(&mut up.buf),
     );
