@@ -150,8 +150,8 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
    listable.) Decided in FEP-5 review; `docs/fep-5-plan.md` §3.
 
    A third consequence: the policy inputs the Launcher write-protects
-   ([FW-XR8](../formwork.md#fw-xr8): the blueprint, its discovered layer and its proposal) are write
-   holes like any other. A blueprint inside a write grant, whether `FORMWORK.toml` or
+   ([FW-XR8](../formwork.md#fw-xr8): the blueprint, its discovered layer and its proposal, and the
+   other discovery candidate beside the blueprint) are write holes like any other. A blueprint inside a write grant, whether `FORMWORK.toml` or
    `.formwork/blueprint.toml` under a `$CWD/**` project grant, splits every directory from the
    grant's root down to the blueprint's own, so nothing can be created, removed or renamed directly
    in the project root. No Landlock ruleset avoids this. A right on a directory reaches everything

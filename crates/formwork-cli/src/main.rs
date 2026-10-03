@@ -962,7 +962,9 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
             render::host_summary(&host, learn::find_strace().is_some())
         );
         print!("{}", render::report_summary(&policy.report));
-        if let Some(note) = split_root_note(&blueprint, &resolved.path, &host)? {
+        // Advisory: the summary above is the command's result, so a note that cannot be worked
+        // out (an unreadable launch directory) is left out rather than failing it.
+        if let Ok(Some(note)) = split_root_note(&blueprint, &resolved.path, &host) {
             println!("\nnote: {note}");
         }
     }
@@ -1191,7 +1193,7 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
     // is protected exactly like an explicit one.
     blueprint_load::protect_policy_inputs(&mut blueprint, &resolved.path)?;
     if let Some(note) = split_root_note(&blueprint, &resolved.path, &host)? {
-        tracing::warn!("{note}");
+        tracing::info!("{note}");
     }
     // FW-TRA9/FW-TRA10: the Launcher-owned temporary directory is a write grant in every read mode.
     let tmp_dir = SessionTmp::create()?;
@@ -1581,17 +1583,17 @@ fn refuse_unavailable_isolation(
 
 /// FEP-5 D3: the policy inputs are write-protected during a run (FW-XR8), and on Linux a protected
 /// path inside a write grant splits the grant: Landlock cannot carve a path out of a directory's
-/// grant, so the grant goes to the entries around it. Neither discovery location avoids that
-/// inside the project, and the split is load-bearing: a launch directory the session can create
-/// in is one it can leave a blueprint in for discovery's next walk. Names the directories that
-/// lose create, delete and rename, and `--blueprint` from outside the grant as the way to a whole
-/// root, with that residual; `None` when nothing is split.
+/// grant, so the grant goes to the entries around it. Names the directories that lose create,
+/// delete and rename; `None` when nothing is split. When the launch directory is among them, the
+/// split is load-bearing (a launch directory the session can create in is one it can leave a
+/// blueprint in for the next discovery walk), and the note names `--blueprint` from outside every
+/// write grant as the way to a whole root, with that residual.
 fn split_root_note(
     blueprint: &Blueprint,
     blueprint_path: &std::path::Path,
     host: &HostProfile,
 ) -> Result<Option<String>> {
-    if host.os != formwork_detect::Os::Linux || host.landlock_abi.unwrap_or(0) < 1 {
+    if host.os != formwork_detect::Os::Linux || host.landlock_abi.is_none() {
         return Ok(None);
     }
     let split = blueprint_load::dirs_split_by_policy_inputs(blueprint, blueprint_path)?;
@@ -1608,20 +1610,24 @@ fn split_root_note(
             inner.display()
         )
     };
-    Ok(Some(format!(
+    let mut note = format!(
         "{} and its learned and proposed layers are write-protected during a run, so the session \
          cannot rewrite its own next one. Landlock can only allow, so on Linux a protected file \
-         inside a write grant is carved out by granting the entries around it, never the \
-         directory holding it: nothing can be created, deleted or renamed directly in {dirs}, \
-         while the rest of what exists at launch stays writable. {} and {} both do this inside \
-         the grant, and it also keeps the session from leaving a blueprint there for discovery \
-         to find next time. For a creatable project root, pass --blueprint with a file outside \
-         every write grant, and keep passing it: the session can then leave a FORMWORK.toml in \
-         the project that a run without --blueprint would use",
-        blueprint_path.display(),
-        blueprint_load::DEFAULT_BLUEPRINT_NAME,
-        blueprint_load::DOTDIR_BLUEPRINT,
-    )))
+         inside a write grant is carved out by granting the entries around it: nothing can be \
+         created, deleted or renamed directly in {dirs}, while the rest of what exists at launch \
+         stays writable",
+        blueprint_path.display()
+    );
+    let launch = std::env::current_dir().and_then(std::fs::canonicalize).ok();
+    if launch.is_some_and(|d| split.contains(&d)) {
+        note.push_str(
+            ". That also keeps the session from leaving a blueprint there for discovery to find. \
+             For a creatable project root, pass --blueprint with a file outside every write \
+             grant, and keep passing it: the session can then leave a FORMWORK.toml in the \
+             project that a run without --blueprint would use",
+        );
+    }
+    Ok(Some(note))
 }
 
 fn spawn_confined_child(

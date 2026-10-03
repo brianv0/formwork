@@ -59,9 +59,10 @@ project root (or in `.formwork/`). Existing files and subdirectories stay writab
 `explain` say when this applies. Landlock can only allow access, so it cannot carve one file out
 of a writable directory. It grants each entry beside the blueprint instead of the root as a
 whole, which is also what stops the agent from leaving a blueprint in the root. If the agent must
-create files at the top of the project, pass `--blueprint` with a file outside the project, and
-keep passing it: the agent can then leave a `FORMWORK.toml` in the project that a run without
-`--blueprint` would use. On macOS the project root stays writable.
+create files at the top of the project, pass `--blueprint` with a file outside every directory
+the blueprint makes writable (with `builtin:default`, that includes `/tmp`), and keep passing it:
+the agent can then leave a `FORMWORK.toml` in the project that a run without `--blueprint` would
+use. On macOS the project root stays writable.
 
 On Linux the port tier closes UDP too, so hostnames do not resolve inside the sandbox; host rules
 (below) resolve them through the Gateway. See [`examples/`](examples/README.md).

@@ -187,7 +187,12 @@ here rather than silently deviated.
   the Linux cost. `FW-E2E-107` runs the quickstart in both discovery layouts and with the flag;
   `FW-ADV-026` tries to change the inputs themselves. The same work found the policy inputs'
   write-subtract rows unresolved at enforcement, so a blueprint named through a symlinked
-  directory stayed writable (fixed; `FW-ADV-026` covers it).
+  directory stayed writable. The fix resolves each protected path as the kernel does, both as
+  named with its directory resolved and through every symlink, so a blueprint that is itself a
+  symlink keeps a hole on the link and `lnk/..` resolves through the link. `modify` grants are
+  resolved too, or a hole resolved inside one named through a symlink would miss it. The other
+  discovery candidate beside the blueprint is protected as well, so the session cannot plant
+  one there. `FW-ADV-026` covers each case.
 
 ## 4. Tests
 
@@ -210,11 +215,13 @@ here rather than silently deviated.
 | `FW-E2E-089` | `fep5_run.rs` (Linux), `fep5_macos.rs` (macOS) | both |
 | `FW-E2E-090` | `fep5_run.rs` (Linux), `fep5_macos.rs` (macOS) | both |
 | `FW-E2E-091` | `fep5_macos.rs`, under `net = "deny"`, a port tier and a host rule, and from the host's network address | macOS |
+| `FW-E2E-107` | `fep5_run.rs`: the quickstart with `FORMWORK.toml`, `.formwork/blueprint.toml` and `--blueprint` from outside the project | both |
 | `FW-ADV-016` | `formwork-gateway/tests/gateway.rs` | both |
 | `FW-ADV-017` | `formwork-gateway/tests/{egress,inspect}.rs` | both |
 | `FW-ADV-018` | `formwork-confine/tests/linux_supervise.rs` | Linux |
 | `FW-ADV-019` | `fep5_macos.rs` (an unconfined process with the session's credential), `formwork-gateway/tests/egress.rs` (the gate) | macOS |
 | `FW-ADV-020` | `fep5_run.rs` (Linux, the opener route; the bus route is `FW-E2E-082`, the direct route `FW-E2E-075`), `fep5_macos.rs` (macOS: the opener, LaunchServices, an AppleEvent and the clipboard) | both |
+| `FW-ADV-026` | `fep5_run.rs`: each discovery layout, the blueprint named through a symlinked directory and through `lnk/..`, the blueprint as a symlink, and a `modify` grant named through a symlink | both |
 | C1–C8 | `formwork-confine/tests/macos_characterize.rs` (§6.3; answers in `docs/macos-characterization.md`) | macOS |
 | C9 | `fep5_macos.rs` (`c9_…`), in the macOS `agent-examples` job: Claude Code's `security` calls through a shim, reaching the keychain under `claude-code.toml` and denied without the lift | macOS |
 
@@ -224,7 +231,8 @@ instead of skipping. The README quickstart is read verbatim from `README.md` and
 ## 5. Still owed
 
 - **A nearer blueprint left for discovery.** The Launcher write-protects the inputs a run was
-  built from, not the discovery candidates that would shadow them. A session that can create
+  built from and the other discovery candidate beside the blueprint, not the candidates in other
+  directories that would shadow them. A session that can create
   entries in a directory between a later launch directory and the blueprint can leave a
   `FORMWORK.toml` (or `.formwork/blueprint.toml`) there, and the next run started at or below it
   is governed by it: a blueprint above the project, a run launched from a subdirectory of the

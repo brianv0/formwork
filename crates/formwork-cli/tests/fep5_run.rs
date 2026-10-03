@@ -31,9 +31,9 @@ fn fs_wall_host(dir: &Path) -> bool {
     }
 }
 
-/// `formwork run` with `$HOME` at `home` and the launch directory at `cwd`.
-fn run_in(home: &Path, cwd: &Path, args: &[&str]) -> Output {
-    let out = formwork_command(home, args, &[], &[])
+/// `formwork` with `$HOME` at `home` and the launch directory at `cwd`.
+fn run_in(home: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let out = formwork_command(home, args, env, &[])
         .current_dir(cwd)
         .output()
         .expect("running formwork");
@@ -327,12 +327,9 @@ fn fw_e2e_107_quickstart_creates_in_the_project_root_or_says_why_not() {
             .chain(flag.iter().copied())
             .chain(["--", "/bin/sh", "-c", &script])
             .collect();
-        let out = formwork_command(dir.path(), &run_args, &[("RUST_LOG", "warn")], &[])
-            .current_dir(&project)
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(0), "{tag}: {stderr}");
+        let run = run_in(dir.path(), &project, &run_args, &[]);
+        let stderr = run.stderr.as_str();
+        assert_eq!(run.code, 0, "{tag}: {stderr}");
         assert_eq!(
             std::fs::read_to_string(&blueprint).unwrap(),
             quickstart,
@@ -343,12 +340,12 @@ fn fw_e2e_107_quickstart_creates_in_the_project_root_or_says_why_not() {
             .into_iter()
             .chain(flag.iter().copied())
             .collect();
-        let explain = run_in(dir.path(), &project, &explain_args);
+        let explain = run_in(dir.path(), &project, &explain_args, &[]);
         assert_eq!(explain.code, 0, "{tag}: {}", explain.stderr);
         // The split note, from the run's operator channel and from `explain`. Under a scratch
         // directory inside the default profile's writable temp root, a blueprint outside the
         // project still splits the directories above it, never the project itself.
-        let notes: Vec<&str> = [stderr.as_ref(), explain.stdout.as_str()]
+        let notes: Vec<&str> = [stderr, explain.stdout.as_str()]
             .into_iter()
             .filter_map(|said| {
                 said.lines()
@@ -383,10 +380,13 @@ fn fw_e2e_107_quickstart_creates_in_the_project_root_or_says_why_not() {
     }
 }
 
-/// FW-ADV-026: with its blueprint in the project -- as `FORMWORK.toml`, as
-/// `.formwork/blueprint.toml`, and named through a symlinked directory, whose protection must be
-/// resolved like every grant to match the path the kernel checks -- the session cannot append to
-/// the blueprint, delete it, rename it aside, or create the absent discovered layer and proposal.
+/// FW-ADV-026: the session cannot change the inputs of its next run. With the blueprint as
+/// `FORMWORK.toml`, as `.formwork/blueprint.toml`, named through a symlinked directory, and as a
+/// symlink in the project to a file outside it, the session appends to the blueprint, deletes it,
+/// renames it aside, creates the absent discovered layer and proposal, and creates the other
+/// discovery candidate beside it. Every protection is resolved the way the kernel resolves the
+/// path, so a `..` after a symlink and a `modify` grant named through a symlink protect the file
+/// too.
 #[test]
 fn fw_adv_026_policy_input_tamper() {
     let probe = Scratch::new("tamper");
@@ -394,46 +394,142 @@ fn fw_adv_026_policy_input_tamper() {
         not_exercised("no filesystem wall on this host");
         return;
     }
-    for (tag, layout) in [
-        ("root", "FORMWORK.toml"),
-        ("dotdir", ".formwork/blueprint.toml"),
-        ("symlink", "FORMWORK.toml"),
+    // (tag, the blueprint as the project sees it, the other discovery candidate beside it)
+    for (tag, sees, other) in [
+        ("root", "FORMWORK.toml", ".formwork/blueprint.toml"),
+        ("dotdir", ".formwork/blueprint.toml", "FORMWORK.toml"),
+        ("dir-link", "FORMWORK.toml", ".formwork/blueprint.toml"),
+        ("file-link", "FORMWORK.toml", ".formwork/blueprint.toml"),
+        (
+            "dotdir-file-link",
+            ".formwork/blueprint.toml",
+            "FORMWORK.toml",
+        ),
     ] {
         let dir = Scratch::new(&format!("tamper-{tag}"));
         let project = dir.path().join("proj");
         std::fs::create_dir_all(project.join(".formwork")).unwrap();
-        let blueprint = project.join(layout);
-        std::fs::write(&blueprint, QUICKSTART).unwrap();
+        let linked = tag.ends_with("file-link");
+        let real = if linked {
+            let target = dir.path().join("blueprints/proj.toml");
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&target, project.join(sees)).unwrap();
+            target
+        } else {
+            project.join(sees)
+        };
+        std::fs::write(&real, QUICKSTART).unwrap();
         std::os::unix::fs::symlink(&project, dir.path().join("link")).unwrap();
-        let named = dir.path().join("link").join(layout).display().to_string();
-        let flag: &[&str] = if tag == "symlink" {
+        let named = dir.path().join("link").join(sees).display().to_string();
+        let flag: &[&str] = if tag == "dir-link" {
             &["--blueprint", &named]
         } else {
             &[]
         };
+        let real_s = real.display();
         let script = format!(
-            "echo tampered >> {layout}; rm -f {layout}; mv {layout} {layout}.aside; \
-             touch {layout}.discovered.toml {layout}.proposal.toml; exit 0"
+            "echo tampered >> {sees}; rm -f {sees}; mv {sees} {sees}.aside; \
+             touch {real_s}.discovered.toml {real_s}.proposal.toml; echo forged > {other}; exit 0"
         );
         let args: Vec<&str> = ["run"]
             .into_iter()
             .chain(flag.iter().copied())
             .chain(["--", "/bin/sh", "-c", &script])
             .collect();
-        let run = run_in(dir.path(), &project, &args);
+        let run = run_in(dir.path(), &project, &args, &[]);
         assert_eq!(run.code, 0, "{tag}: {}", run.stderr);
-        assert_eq!(
-            std::fs::read_to_string(&blueprint).ok().as_deref(),
-            Some(QUICKSTART),
-            "{tag}: the blueprint changed or disappeared"
-        );
-        for derived in [".aside", ".discovered.toml", ".proposal.toml"] {
+        for path in [&real, &project.join(sees)] {
+            assert_eq!(
+                std::fs::read_to_string(path).ok().as_deref(),
+                Some(QUICKSTART),
+                "{tag}: {} changed or disappeared",
+                path.display()
+            );
+        }
+        if linked {
+            assert_eq!(
+                std::fs::read_link(project.join(sees)).ok(),
+                Some(real.clone()),
+                "{tag}: the link was replaced"
+            );
+        }
+        for created in [
+            format!("{}.aside", project.join(sees).display()),
+            format!("{real_s}.discovered.toml"),
+            format!("{real_s}.proposal.toml"),
+            project.join(other).display().to_string(),
+        ] {
             assert!(
-                !Path::new(&format!("{}{derived}", blueprint.display())).exists(),
-                "{tag}: the session created {layout}{derived}"
+                !Path::new(&created).exists(),
+                "{tag}: the session created {created}"
             );
         }
     }
+
+    // A `..` after a symlink: the kernel resolves `lnk/..` through the link, not textually.
+    let dir = Scratch::new("tamper-dotdot");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(project.join("sub/deep")).unwrap();
+    std::os::unix::fs::symlink(project.join("sub/deep"), project.join("lnk")).unwrap();
+    std::fs::write(project.join("sub/bp.toml"), QUICKSTART).unwrap();
+    let named = project.join("lnk/../bp.toml").display().to_string();
+    let run = run_in(
+        dir.path(),
+        &project,
+        &[
+            "run",
+            "--blueprint",
+            &named,
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo tampered >> sub/bp.toml; exit 0",
+        ],
+        &[],
+    );
+    assert_eq!(run.code, 0, "dotdot: {}", run.stderr);
+    assert_eq!(
+        std::fs::read_to_string(project.join("sub/bp.toml")).unwrap(),
+        QUICKSTART,
+        "dotdot: the blueprint was writable"
+    );
+
+    // A `modify` grant named through a symlink resolves like the protection inside it. No
+    // `builtin:default`, whose writable temp root would split the scratch directory anyway.
+    let dir = Scratch::new("tamper-modify");
+    let project = dir.path().join("real/proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("lnk")).unwrap();
+    let body = format!(
+        "rules = [\"modify:{}/lnk/proj/**\"]\n",
+        dir.path().display()
+    );
+    std::fs::write(project.join("FORMWORK.toml"), &body).unwrap();
+    let named = dir
+        .path()
+        .join("lnk/proj/FORMWORK.toml")
+        .display()
+        .to_string();
+    let run = run_in(
+        dir.path(),
+        &project,
+        &[
+            "run",
+            "--blueprint",
+            &named,
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo tampered >> FORMWORK.toml; exit 0",
+        ],
+        &[],
+    );
+    assert_eq!(run.code, 0, "modify: {}", run.stderr);
+    assert_eq!(
+        std::fs::read_to_string(project.join("FORMWORK.toml")).unwrap(),
+        body,
+        "modify: the blueprint was writable"
+    );
 }
 
 /// FW-FID11 (channel half): `explain <channel>` and `explain <group>` print each member's verdict,

@@ -668,10 +668,18 @@ pub fn canonicalize_for_enforcement(blueprint: &Blueprint) -> Result<Blueprint> 
     let mut out = blueprint.clone();
     out.fs.reads = map(&blueprint.fs.reads)?;
     out.fs.writes = map(&blueprint.fs.writes)?;
+    out.fs.writes_no_create = map(&blueprint.fs.writes_no_create)?;
     out.fs.subtract = map(&blueprint.fs.subtract)?;
-    // A write-subtract row is a hole too: the policy inputs (FW-XR8) named through a symlink
-    // would otherwise miss the resolved path and stay writable.
-    out.fs.write_subtract = map(&blueprint.fs.write_subtract)?;
+    // A write-subtract row is a hole too, resolved like the grants it sits under. The row as
+    // written stays beside its resolution: resolving follows a symlink in the last component, and
+    // a protected symlink must keep its own hole (FW-XR8).
+    let mut write_subtract = blueprint.fs.write_subtract.clone();
+    for p in map(&blueprint.fs.write_subtract)? {
+        if !write_subtract.contains(&p) {
+            write_subtract.push(p);
+        }
+    }
+    out.fs.write_subtract = write_subtract;
     if let ExecPosture::Allowlist(paths) = &blueprint.exec {
         out.exec = ExecPosture::Allowlist(map(paths)?);
     }
@@ -759,27 +767,56 @@ fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer
     Ok(layer)
 }
 
-/// The session's own policy inputs -- the blueprint, its discovered layer, and its proposal -- as
-/// absolute paths.
+/// What a run write-protects: the blueprint, its discovered layer and its proposal, and the
+/// other discovery candidate beside the blueprint. Each is given as the kernel resolves it, both
+/// as named with its directory resolved, so a blueprint that is itself a symlink keeps a hole
+/// where discovery finds it, and through every symlink to the file it names; `lnk/..` resolves
+/// through the link, never textually.
 fn policy_inputs(blueprint_path: &Path) -> Result<Vec<PathBuf>> {
     let cwd = std::env::current_dir().context("resolving cwd to protect policy inputs")?;
-    let absolute = |p: &Path| -> PathBuf {
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            cwd.join(p)
-        }
+    let blueprint = if blueprint_path.is_absolute() {
+        blueprint_path.to_path_buf()
+    } else {
+        cwd.join(blueprint_path)
     };
-    Ok(vec![
-        absolute(blueprint_path),
-        absolute(&crate::learn::discovered_path(blueprint_path)),
-        absolute(&crate::learn::proposal_path(blueprint_path)),
-    ])
+    let mut named = vec![
+        blueprint.clone(),
+        crate::learn::discovered_path(&blueprint),
+        crate::learn::proposal_path(&blueprint),
+    ];
+    named.extend(other_discovery_candidate(&blueprint));
+    let mut out = Vec::new();
+    for path in named {
+        let as_named = match (path.parent(), path.file_name()) {
+            (Some(dir), Some(name)) => canonicalize_existing_prefix(dir).join(name),
+            _ => path.clone(),
+        };
+        for p in [as_named, canonicalize_existing_prefix(&path)] {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The discovery location beside the blueprint that it does not use. One planted there makes the
+/// next walk refuse both, or wins once the session moves the blueprint aside.
+fn other_discovery_candidate(blueprint: &Path) -> Option<PathBuf> {
+    let dir = blueprint.parent()?;
+    if blueprint.file_name()? == DEFAULT_BLUEPRINT_NAME {
+        Some(dir.join(DOTDIR_BLUEPRINT))
+    } else if blueprint.ends_with(DOTDIR_BLUEPRINT) {
+        Some(dir.parent()?.join(DEFAULT_BLUEPRINT_NAME))
+    } else {
+        None
+    }
 }
 
 /// Write-deny the session's own policy inputs inside the confined tree. A confined agent must not
-/// shape its own NEXT run by editing the files this run was built from (FW-XR8 / FW-INV8).
-/// Readable stays fine (FW-TRA7 semantics); only writes are denied.
+/// shape its own NEXT run by editing the files this run was built from, or by planting the other
+/// discovery candidate beside them (FW-XR8 / FW-INV8). Readable stays fine (FW-TRA7 semantics);
+/// only writes are denied.
 pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -> Result<()> {
     for input in policy_inputs(blueprint_path)? {
         let rendered = input.to_str().ok_or_else(|| {
@@ -799,7 +836,8 @@ pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -
 /// is granted around it (docs/linux-backend.md): every directory from the grant's root down to the
 /// input's own is left without a rule of its own, and nothing can be created, removed or renamed
 /// directly in it. Both discovery locations put the inputs under a `$CWD/**` grant; only a
-/// blueprint outside the grant keeps the root whole.
+/// blueprint outside the grant keeps the root whole. The holes are the ones
+/// [`protect_policy_inputs`] adds, from the same list, so the report and enforcement agree.
 pub fn dirs_split_by_policy_inputs(
     blueprint: &Blueprint,
     blueprint_path: &Path,
@@ -812,11 +850,9 @@ pub fn dirs_split_by_policy_inputs(
         .filter(|w| !w.is_any_depth())
         .map(|w| canonicalize_existing_prefix(w.base()))
         .collect();
-    let inputs: Vec<PathBuf> = policy_inputs(blueprint_path)?
-        .iter()
-        .map(|p| canonicalize_existing_prefix(p))
-        .collect();
-    Ok(split_dirs(&roots, &inputs))
+    let split = split_dirs(&roots, &policy_inputs(blueprint_path)?);
+    // A missing directory (an absent `.formwork/`) has nothing to split.
+    Ok(split.into_iter().filter(|d| d.is_dir()).collect())
 }
 
 /// The confiner's split rule over resolved paths: a root with a hole strictly beneath it is split,
@@ -1357,12 +1393,34 @@ mod tests {
             "FORMWORK.toml",
             "FORMWORK.toml.discovered.toml",
             "FORMWORK.toml.proposal.toml",
+            ".formwork/blueprint.toml",
         ] {
             assert!(
                 protected.contains(&real.join(name)),
                 "{name}: {protected:?}"
             );
         }
+
+        // A blueprint that is itself a symlink: the link keeps its own hole beside the file's.
+        let target = std::fs::canonicalize(dir.path()).unwrap().join("bp.toml");
+        std::fs::write(&target, "").unwrap();
+        let linked = real.join("sub");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&target, linked.join("FORMWORK.toml")).unwrap();
+        let mut blueprint = Blueprint::empty();
+        protect_policy_inputs(&mut blueprint, &linked.join("FORMWORK.toml")).unwrap();
+        let out = canonicalize_for_enforcement(&blueprint).unwrap();
+        let protected: Vec<PathBuf> = out
+            .fs
+            .write_subtract
+            .iter()
+            .map(|p| p.base().to_path_buf())
+            .collect();
+        assert!(
+            protected.contains(&linked.join("FORMWORK.toml")),
+            "{protected:?}"
+        );
+        assert!(protected.contains(&target), "{protected:?}");
     }
 
     #[test]
@@ -1478,8 +1536,9 @@ mod tests {
         assert!(format!("{err}").contains("both"), "{err}");
     }
 
-    /// FEP-5 D3: either discovery location inside a writable project splits the root, and
-    /// `.formwork/` too; a blueprint above the project splits nothing.
+    /// FEP-5 D3: either discovery location inside a writable project splits the root and an
+    /// existing `.formwork/`, since the other discovery candidate is protected too; a blueprint
+    /// above the project splits nothing.
     #[test]
     fn policy_inputs_inside_a_write_grant_split_every_directory_down_to_them() {
         let dir = Scratch::new("split");
@@ -1496,7 +1555,7 @@ mod tests {
         };
         assert_eq!(
             split(&blueprint, &project.join(DEFAULT_BLUEPRINT_NAME)),
-            vec![project.clone()]
+            vec![project.clone(), project.join(".formwork")]
         );
         assert_eq!(
             split(&blueprint, &project.join(DOTDIR_BLUEPRINT)),
