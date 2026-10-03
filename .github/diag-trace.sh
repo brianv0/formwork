@@ -10,6 +10,7 @@ cat > conn.c <<'C'
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 static int try4(int port) {
   int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -25,14 +26,17 @@ static int try6(int port) {
   inet_pton(AF_INET6, "::1", &a.sin6_addr);
   int r = connect(s, (struct sockaddr *)&a, sizeof a); int e = r ? errno : 0; close(s); return e;
 }
+static double now(void) { struct timeval t; gettimeofday(&t, 0); return t.tv_sec + t.tv_usec / 1e6; }
 int main(int argc, char **argv) {
-  int port = atoi(argv[1]), n = atoi(argv[2]);
-  int c4[128] = {0}, c6[128] = {0};
-  if (n == 1) { int e = try4(port); if (e) printf("errno %d: v4\\n", e); return 0; }
-  for (int i = 0; i < n; i++) { int e = try4(port); c4[e < 128 ? e : 127]++; }
-  for (int i = 0; i < n; i++) { int e = try6(port); c6[e < 128 ? e : 127]++; }
-  for (int e = 0; e < 128; e++) if (c4[e]) printf("sin_zero=v4 127.0.0.1 errno %d: %d/%d\n", e, c4[e], n);
-  for (int e = 0; e < 128; e++) if (c6[e]) printf("sin_zero=v6 ::1 errno %d: %d/%d\n", e, c6[e], n);
+  int port = atoi(argv[1]); double secs = atof(argv[2]);
+  double t0 = now(); int n = 0, e4 = 0, e6 = 0;
+  while (now() - t0 < secs) {
+    int a = try4(port), b = try6(port); n++;
+    if (a == EPERM) { e4++; printf("sin_zero=EPERM v4 at %.3f\n", now()); }
+    if (b == EPERM) { e6++; printf("sin_zero=EPERM v6 at %.3f\n", now()); }
+    usleep(10000);
+  }
+  printf("sin_zero=summary %d rounds, v4 EPERM %d, v6 EPERM %d\n", n, e4, e6);
   return 0;
 }
 C
@@ -44,22 +48,6 @@ T
 cat > probe.sh <<'P'
 p=${HTTP_PROXY##*:}; p=${p%/}
 echo "gateway port $p"
-fails=0
-for i in $(seq 1 ${PROCS:-3000}); do
-  out=$(./conn "$p" 1)
-  case "$out" in *"errno 1:"*) fails=$((fails+1)); echo "sin_zero=EPERM in process $i: $out";; esac
-done
-echo "sin_zero=fresh processes in one session: $fails/${PROCS:-3000} refused"
+./conn "$p" 75
 P
-"$GITHUB_WORKSPACE/target/debug/formwork" run -- /bin/sh probe.sh 2>&1 | grep -E "gateway port|sin_zero="
-cat > one.sh <<'P'
-p=${HTTP_PROXY##*:}; p=${p%/}
-./conn "$p" 1 | grep "errno 1:" && echo "sin_zero=EPERM first connect, session port $p"
-true
-P
-fails=0
-for i in $(seq 1 400); do
-  out=$("$GITHUB_WORKSPACE/target/debug/formwork" run -- /bin/sh one.sh 2>/dev/null)
-  case "$out" in *EPERM*) fails=$((fails+1)); echo "$out";; esac
-done
-echo "sin_zero=fresh sessions: $fails/400 refused"
+"$GITHUB_WORKSPACE/target/debug/formwork" run -- /bin/sh probe.sh 2>&1 | grep -E "gateway port|sin_zero=" | sed 's/sin_zero=//' | head -60
