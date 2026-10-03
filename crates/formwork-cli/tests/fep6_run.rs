@@ -112,6 +112,15 @@ fn fw_e2e_098_inspected_https_through_run() {
     assert_eq!(tunneled.stdout, "ok:/ok\n");
 }
 
+/// The port of the session Gateway's egress listener, from `formwork run`'s operator log.
+fn gateway_port(stderr: &str) -> Option<u16> {
+    let rest = stderr.split("listener=127.0.0.1:").nth(1)?;
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// Node reads the proxy variables only with `NODE_USE_ENV_PROXY`, from 22.21 on the 22 line and
 /// 24.5 on the 24 line (FEP-6 §4.11); older Node connects directly and is refused.
 fn node_uses_env_proxy() -> bool {
@@ -319,30 +328,55 @@ fn fw_e2e_094_client_matrix() {
             }
             let path = format!("/{grade}/{client}");
             let url = format!("https://{host}:{}{path}", fixture.port);
-            let row_started = std::time::Instant::now();
-            let out = formwork_env(
-                dir.path(),
-                &[
-                    "run",
-                    "--",
-                    "/bin/sh",
-                    "-c",
-                    &format!("{} 2>&1", command(&url)),
-                ],
-                // An operator's npm proxy setting, which npm prefers to `https_proxy`; the
-                // Launcher must override it too (FEP-6 §4.11).
-                &[
-                    ("SSL_CERT_FILE", &root),
-                    ("https_proxy", &proxy_url),
-                    ("npm_config_https_proxy", "http://127.0.0.1:1"),
-                    // A Rust client's error, not its backtrace.
-                    ("RUST_BACKTRACE", "0"),
-                    // A refused row shows the Gateway's side too (handshakes log at debug).
-                    ("RUST_LOG", "info,formwork_gateway=debug"),
-                ],
-                &[],
-            );
-            let reached = fixture.seen().iter().any(|s| s.path().starts_with(&path));
+            let run_row = || {
+                formwork_env(
+                    dir.path(),
+                    &[
+                        "run",
+                        "--",
+                        "/bin/sh",
+                        "-c",
+                        &format!("{} 2>&1", command(&url)),
+                    ],
+                    // An operator's npm proxy setting, which npm prefers to `https_proxy`; the
+                    // Launcher must override it too (FEP-6 §4.11).
+                    &[
+                        ("SSL_CERT_FILE", &root),
+                        ("https_proxy", &proxy_url),
+                        ("npm_config_https_proxy", "http://127.0.0.1:1"),
+                        // A Rust client's error, not its backtrace.
+                        ("RUST_BACKTRACE", "0"),
+                        // A refused row shows the Gateway's side too (handshakes log at debug).
+                        ("RUST_LOG", "info,formwork_gateway=debug"),
+                    ],
+                    &[],
+                )
+            };
+            let expected = if macos { on_macos } else { on_linux };
+            let mut row_started = std::time::Instant::now();
+            let mut out = run_row();
+            let mut reached = fixture.seen().iter().any(|s| s.path().starts_with(&path));
+            if macos && expected == Some(true) && !reached {
+                // The macOS 14 loopback window (docs/macos-characterization.md): Seatbelt refuses
+                // the session's own Gateway port for a few milliseconds every 15 s. Only a row
+                // whose own Sandbox record shows that refusal runs once more.
+                if let Some(port) = gateway_port(&out.stderr) {
+                    let own_port = format!("network-outbound remote:*:{port}");
+                    if !sandbox_records(row_started, |m| {
+                        m.contains(" deny(") && m.contains(&own_port)
+                    })
+                    .is_empty()
+                    {
+                        eprintln!(
+                            "{client} ({grade}): Seatbelt refused the session's own Gateway port \
+                             {port} (the macOS 14 loopback window); the row runs once more"
+                        );
+                        row_started = std::time::Instant::now();
+                        out = run_row();
+                        reached = fixture.seen().iter().any(|s| s.path().starts_with(&path));
+                    }
+                }
+            }
             // A refusal records the client's last error line (else its last line), so the matrix
             // says why.
             let why = if reached {
@@ -376,7 +410,6 @@ fn fw_e2e_094_client_matrix() {
             // the inspected row is refused for the session CA, the tunnel row for the fixture
             // root the keychain does not hold. Swift's URLSession also ignores the proxy
             // variables, so it never reaches the Gateway.
-            let expected = if macos { on_macos } else { on_linux };
             if let Some(expected) = expected {
                 if reached != expected {
                     // On macOS, whether Seatbelt refused the session's network: seen on macos-14,
@@ -650,6 +683,21 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// Whether the curl that printed `{label}=<status>` was refused by the Gateway's `CONNECT` answer,
+/// not by a failed connection: curl names the 403 and exits 56, or 7 from curl 8.20.0 on (curl
+/// commit a186ecf4b; Homebrew's curl, first on the Intel macOS runner's PATH, is one). The macOS
+/// system curl is older and still exits 56.
+fn curl_refused_at_connect(out: &Output, label: &str) -> bool {
+    let status = ["56", "7"]
+        .iter()
+        .any(|code| out.stdout.contains(&format!("{label}={code}\n")));
+    let named = out
+        .stderr
+        .lines()
+        .any(|l| l.starts_with("curl: (") && l.contains("403"));
+    status && named
+}
+
 /// FW-EGR17 / FW-EGR19 (both): the production resolver. An exact-name rule reaches a loopback
 /// answer of the host's own resolver; a name that does not resolve is refused as `resolution`
 /// before any upstream socket.
@@ -685,7 +733,12 @@ fn fw_egr17_the_host_resolver_decides_through_run() {
         out.stdout,
         out.stderr
     );
-    assert!(out.stdout.contains("invalid=56"), "{}", out.stdout);
+    assert!(
+        curl_refused_at_connect(&out, "invalid"),
+        "{}\n{}",
+        out.stdout,
+        out.stderr
+    );
     assert!(
         out.stderr.contains("reason=\"resolution\""),
         "{}",
@@ -733,7 +786,12 @@ fn fw_e2e_103_the_operators_upstream_proxy_through_run() {
         out.stdout,
         out.stderr
     );
-    assert!(out.stdout.contains("corp=56"), "{}", out.stdout);
+    assert!(
+        curl_refused_at_connect(&out, "corp"),
+        "{}\n{}",
+        out.stdout,
+        out.stderr
+    );
     assert_eq!(
         proxy.lines(),
         vec![format!("CONNECT model.test:{} HTTP/1.1", up.port)],

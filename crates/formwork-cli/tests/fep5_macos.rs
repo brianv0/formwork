@@ -509,7 +509,10 @@ fn http_fixture() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
 /// FW-E2E-075 (macOS): the Gateway is the session's only way out. A request through the proxy
 /// variables reaches the upstream; the same request with the proxy bypassed, a connection to the
 /// metadata address, a UDP send and a name lookup are each refused by Seatbelt with a Sandbox
-/// record; a host no rule names gets the Gateway's generic 403 and an operator line.
+/// record; a host no rule names gets the Gateway's generic 403 and an operator line. The direct
+/// connects use the system curl: Seatbelt refuses a Homebrew or locally built client's connect
+/// all the same, but on the hosted runners leaves no record of it (docs/macos-characterization.md),
+/// and Homebrew's curl is first on the Intel runner's `PATH`.
 #[test]
 fn fw_e2e_075_sole_egress_path() {
     let dir = Scratch::new("mac-075");
@@ -527,8 +530,9 @@ fn fw_e2e_075_sole_egress_path() {
     let url = format!("http://127.0.0.1:{port}/");
     let script = format!(
         r#"curl -sS -m 5 {url}
-curl -sS -m 5 --noproxy '*' {url} >/dev/null 2>&1; echo bypass=$?
-curl -sS -m 5 --noproxy '*' http://169.254.169.254/latest >/dev/null 2>&1; echo metadata=$?
+/usr/bin/curl -sS -m 5 --noproxy '*' {url} >/dev/null 2>&1; echo bypass=$?
+curl -sS -m 5 --noproxy '*' {url} >/dev/null 2>&1; echo path-bypass=$?
+/usr/bin/curl -sS -m 5 --noproxy '*' http://169.254.169.254/latest >/dev/null 2>&1; echo metadata=$?
 python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("127.0.0.1", 53))' 2>/dev/null; echo udp=$?
 python3 -c 'import socket; socket.getaddrinfo("blocked.test", 443)' 2>/dev/null; echo resolve=$?
 curl -sS -m 5 http://127.0.0.2:9/
@@ -538,7 +542,13 @@ curl -sS -m 5 http://127.0.0.2:9/
     let out = formwork(dir.path(), &["run", "--", "/bin/sh", "-c", &script], &[]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert!(out.stdout.starts_with("upstream-ok\n"), "{}", out.stdout);
-    for refused in ["bypass=7", "metadata=7", "udp=1", "resolve=1"] {
+    for refused in [
+        "bypass=7",
+        "path-bypass=7",
+        "metadata=7",
+        "udp=1",
+        "resolve=1",
+    ] {
         assert!(out.stdout.contains(refused), "{refused}:\n{}", out.stdout);
     }
     assert_eq!(
