@@ -110,13 +110,14 @@ fn basic_decoded(value: &str) -> Option<String> {
 /// that verifies in the handshake sends `unknown_ca` or a sibling alert. One that verifies after
 /// its side of the handshake (curl 8.x on OpenSSL) sends no alert: having seen the leaf, it aborts
 /// before a byte of request -- a reset, or an end without `close_notify` -- which the Gateway sees
-/// while reading the client's last flight or the first request. A client that closes with
-/// `close_notify` ended the session on purpose and is not counted.
+/// while reading the client's last flight or the first request, or as a broken pipe while it is
+/// still writing its own (macOS). A client that closes with `close_notify` ended the session on
+/// purpose and is not counted.
 fn rejected_our_ca(e: &io::Error) -> bool {
     use rustls::AlertDescription as A;
     matches!(
         e.kind(),
-        io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+        io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
     ) || matches!(
         e.get_ref()
             .and_then(|inner| inner.downcast_ref::<rustls::Error>()),

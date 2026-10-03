@@ -651,9 +651,9 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Whether the curl that printed `{label}=<status>` was refused by the Gateway's `CONNECT` answer,
-/// not by a failed connection: curl names the 403 and exits 56, or 7 from the curl 8.21 that
-/// Homebrew puts first on the Intel macOS runner's PATH (curl 8.7.1, the macOS system curl, still
-/// exits 56).
+/// not by a failed connection: curl names the 403 and exits 56, or 7 from curl 8.20.0 on (curl
+/// commit a186ecf4b; Homebrew's curl, first on the Intel macOS runner's PATH, is one). The macOS
+/// system curl is older and still exits 56.
 fn curl_refused_at_connect(out: &Output, label: &str) -> bool {
     let status = ["56", "7"]
         .iter()
