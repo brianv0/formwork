@@ -412,11 +412,21 @@ fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
         return;
     }
     let fx = Fixture::new("iso4");
-    let ls = || {
-        let mut c = Command::new("/bin/ls");
-        c.arg(fx.granted());
+    // A shell as the unlisted binary: a multi-call coreutils (uutils, busybox) makes `cat` and `ls`
+    // one inode, and Landlock binds a rule to the inode, so listing one would list both.
+    let sh = || {
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c").arg(":");
         c
     };
+    let inode = |p: &str| {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(p).unwrap().ino()
+    };
+    if inode("/bin/cat") == inode("/bin/sh") {
+        eprintln!("skipping: /bin/cat and /bin/sh are one multi-call binary on this host");
+        return;
+    }
 
     // A listed directory: its binaries run with the standard loader, and a binary outside it is
     // refused although its directory is readable.
@@ -456,7 +466,7 @@ fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
         "a listed dynamic binary must run: the confiner grants the loader it names"
     );
     assert_eq!(
-        exec_outcome(&policy, ls()),
+        exec_outcome(&policy, sh()),
         Err(libc::EACCES),
         "an unlisted binary must be refused at execve"
     );
@@ -471,11 +481,11 @@ fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
         return;
     };
     let mut via_loader = Command::new(loader);
-    via_loader.arg("/bin/ls").arg(fx.granted());
+    via_loader.arg("/bin/sh").arg("-c").arg(":");
     assert_eq!(
         exec_outcome(&policy, via_loader),
         Ok(0),
-        "the granted loader runs the unlisted /bin/ls, as the Partial verdict says"
+        "the granted loader runs the unlisted /bin/sh, as the Partial verdict says"
     );
 }
 

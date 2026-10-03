@@ -70,9 +70,10 @@ def test_exec_allowlist_starts_dynamic_binaries_on_linux(cli, tmp_path):
     demo = cli("run", "--blueprint", BLUEPRINTS / "rules-demo.toml", "--", "/bin/true", cwd=tmp_path)
     assert demo.code == 0, demo.stderr
 
-    unlisted = cli("run", "--blueprint", base, "--rule", "exec:/bin/true", "--", "/bin/ls", cwd=tmp_path)
+    # A shell, not another coreutil: a multi-call coreutils (uutils, busybox) is one inode.
+    unlisted = cli("run", "--blueprint", base, "--rule", "exec:/bin/true", "--", "/bin/sh", "-c", ":", cwd=tmp_path)
     assert unlisted.code != 0, "an unlisted program must not run"
-    assert "/bin/ls is not on the exec allow-list" in unlisted.stderr, unlisted.stderr
+    assert "/bin/sh is not on the exec allow-list" in unlisted.stderr, unlisted.stderr
 
     report = json.loads(cli("compile", "--blueprint", base, "--rule", "exec:/bin/true", "--report-only").stdout)
     assert report["per-capability"]["exec"]["status"] == "partial"

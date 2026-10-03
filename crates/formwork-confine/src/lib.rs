@@ -134,9 +134,10 @@ pub fn spawn_isolated(
 #[cfg(target_os = "linux")]
 pub use backend::isolate::stage_if_requested as isolation_stage;
 
-/// Why a confined program failed to exec, when the Linux exec allow-list is the cause (FW-ISO4).
+/// Why a confined program failed to exec, when the Linux exec allow-list is the cause (FW-ISO4),
+/// and the dynamic loaders the confiner grants beside an allow-list.
 #[cfg(target_os = "linux")]
-pub use backend::loader::exec_denial_hint;
+pub use backend::loader::{exec_denial_hint, granted_loaders};
 
 /// Irreversible; confine-self posture (FW-ISO6).
 pub fn enforce_self(policy: &CompiledPolicy) -> Result<(), ConfineError> {

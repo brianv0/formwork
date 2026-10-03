@@ -35,7 +35,8 @@ fn fail(msg: impl Into<String>) -> ConfineError {
 /// absolute floor rows under `/etc` are still holes in the expansion. Other processes'
 /// `/proc/<pid>/environ` stays closed under `/proc`: Landlock refuses ptrace-class access outside
 /// the domain, unless the process holds a capability that lifts it (`process-environment`, D9).
-const READ_ESSENTIALS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc"];
+pub(super) const READ_ESSENTIALS: &[&str] =
+    &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc"];
 const RW_DEVICES: &[&str] = &[
     "/dev/null",
     "/dev/zero",
@@ -273,8 +274,9 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
 
     if let ExecPlan::Allowlist { paths } = &policy.exec {
         // Execute only, not ReadFile: macOS `process-exec*` confers no read, so bundling it would
-        // make the same `exec:` grant readable on Linux but not macOS (FW-XR6). `readexec`/`allow`
-        // carry their own read grant; a binary the loader must re-open needs read on either backend.
+        // make the same `exec:` grant readable on Linux but not macOS (FW-XR6). Landlock's execve
+        // opens the file for read as well, so an `exec:` file runs here only where a read grant
+        // also covers it (essentials, `readexec`); the report's `exec` row says so.
         let roots: Vec<PathBuf> = paths.iter().map(root_of).collect();
         let mut exec_paths = expand_all(&roots, &[]);
         // The loader too, or no listed dynamic binary starts; the report says `Partial` (FW-INV5).

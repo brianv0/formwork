@@ -85,12 +85,15 @@ on a `--rule` flag and a file line, so a policy reads the same however you autho
 | `exec` | execute only | `exec` allow-list |
 | `deny` | nothing (terminal) | `subtract` |
 
-Any `allow`, `readexec`, or `exec` rule turns on an exec allow-list: only the listed programs run —
-the agent itself included — and a script runs only if its `#!` interpreter is listed too. On Linux
-you don't list the dynamic loader (`ld-linux-*.so`): Formwork allows the one the listed programs
-need, because no dynamically linked program starts without it, and a program that still cannot
-start fails with an error naming the rule to add. A loader can also start any program the session
-can read (`ld.so <file>`), so on Linux the report marks the allow-list `partial`.
+Any `readexec` or `exec` rule turns on an exec allow-list (`allow` does not; it grants write):
+only the listed programs run — the agent itself included — and a script runs only if its `#!`
+interpreter is listed too. On Linux you don't list the system's dynamic loader (`ld-linux-*.so`):
+Formwork allows it with the listed programs, because no dynamically linked program starts without
+it; a program built against another loader (a Nix store path, say) needs that loader listed. Linux
+also has to read a program to run it, so an `exec:` grant works only where a read grant covers the
+file; `readexec:` grants both. A program that still cannot start fails with an error naming the rule
+to add. A loader can also start any program the session can read (`ld.so <file>`), so on Linux the
+report marks the allow-list `partial`.
 
 `--mode unveil` (empty universe) or `--mode subtractive` (ambient minus the credential floor)
 is a friendlier spelling of `[fs] read-mode`. `deny` is terminal — no allow overrides it — and the

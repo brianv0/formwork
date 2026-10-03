@@ -11,17 +11,20 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use formwork_blueprint::{PathPattern, ReadMode};
 use formwork_compile::{CompiledPolicy, ConfinerPolicy, ExecPlan, LinuxPolicy};
 
-/// The loaders the psABI fixes for this architecture, glibc's and musl's. A listed directory gets
-/// these rather than the loader of every file beneath it: that walk grows with the tree
-/// (`/usr/**`), not with the allow-list.
+use super::landlock::READ_ESSENTIALS;
+
+/// The loaders the psABI fixes for this architecture, glibc's and musl's: the only loaders the
+/// confiner grants. A listed file's `PT_INTERP` picks among them and cannot add to them, because a
+/// listed binary may be one the session can rewrite, and the next session's allow-list must not
+/// follow what the agent wrote there (FW-XR8). A listed directory gets all of them rather than the
+/// loader of every file beneath it: that walk grows with the tree (`/usr/**`), not the allow-list.
 #[cfg(target_arch = "x86_64")]
 const STANDARD_LOADERS: &[&str] = &["/lib64/ld-linux-x86-64.so.2", "/lib/ld-musl-x86_64.so.1"];
 #[cfg(target_arch = "aarch64")]
 const STANDARD_LOADERS: &[&str] = &["/lib/ld-linux-aarch64.so.1", "/lib/ld-musl-aarch64.so.1"];
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const STANDARD_LOADERS: &[&str] = &[];
 
 const PT_INTERP: u64 = 3;
 /// `load_elf_phdrs` refuses a program header table larger than a page.
@@ -33,24 +36,30 @@ const BINPRM_BUF_SIZE: usize = 256;
 /// The kernel's interpreter nesting limit for scripts run by scripts.
 const MAX_SCRIPT_DEPTH: usize = 4;
 
-/// The loaders to grant execute beside the allow-list `roots`: the interpreter each listed file
-/// names, and this architecture's standard loaders for a listed directory. Only loaders that
-/// exist, so the list can be reported as granted.
+/// The loaders to grant execute beside the allow-list `roots`: the standard loader each listed
+/// file names, and every standard loader for a listed directory. Only loaders that exist, so the
+/// list can be reported as granted.
 pub(super) fn loaders_for(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let standard = || STANDARD_LOADERS.iter().map(PathBuf::from);
     let mut out = BTreeSet::new();
     for root in roots {
         if root.is_dir() {
-            out.extend(
-                STANDARD_LOADERS
-                    .iter()
-                    .map(PathBuf::from)
-                    .filter(|p| p.exists()),
-            );
+            out.extend(standard());
         } else if let Some(loader) = elf_interpreter(root) {
-            out.insert(loader);
+            out.extend(standard().filter(|s| *s == loader));
         }
     }
-    out.into_iter().collect()
+    out.into_iter().filter(|p| p.exists()).collect()
+}
+
+/// The loaders the confiner grants beside the exec allow-list `paths` on this host, for `explain`.
+pub fn granted_loaders(paths: &[PathPattern]) -> Vec<PathBuf> {
+    loaders_for(
+        &paths
+            .iter()
+            .map(|p| p.base().to_path_buf())
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// `path` opened for reading when it is a regular file; a listed FIFO never blocks the launch.
@@ -150,46 +159,82 @@ fn script_interpreter(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(&rest[..end])))
 }
 
-/// What the allow-list grants execute on, resolved as Landlock binds it: to the inode a path
-/// names, symlinks followed.
+/// What the policy grants execute and read on, resolved as Landlock binds a rule: to the inode a
+/// path names, symlinks followed. `execve` opens the file it runs, and the loader, for read as well
+/// as execute, so a file runs only where both cover it.
 struct Grants {
-    real: Vec<PathBuf>,
+    exec: Vec<PathBuf>,
+    read: Vec<PathBuf>,
+    holes: Vec<PathBuf>,
+}
+
+fn real(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect()
 }
 
 impl Grants {
+    /// `None` unless Landlock carries the allow-list here: without it no exec rule is installed.
     fn of(linux: &LinuxPolicy) -> Option<Grants> {
         let ExecPlan::Allowlist { paths } = &linux.exec else {
             return None;
         };
-        let roots: Vec<PathBuf> = paths.iter().map(|p| p.base().to_path_buf()).collect();
-        let real = roots
+        linux.landlock_abi_target.filter(|v| *v >= 1)?;
+        let base = |p: &PathPattern| p.base().to_path_buf();
+        let roots: Vec<PathBuf> = paths.iter().map(base).collect();
+        let mut read: Vec<PathBuf> = linux.reads.iter().map(base).collect();
+        if linux.read_mode == ReadMode::Closed {
+            read.extend(READ_ESSENTIALS.iter().map(PathBuf::from));
+        }
+        let holes = linux
+            .subtract
             .iter()
-            .cloned()
-            .chain(loaders_for(&roots))
-            .filter_map(|p| std::fs::canonicalize(p).ok())
-            .collect();
-        Some(Grants { real })
+            .filter(|p| !p.is_any_depth())
+            .map(base);
+        Some(Grants {
+            exec: real(roots.iter().cloned().chain(loaders_for(&roots))),
+            read: real(read),
+            holes: real(holes),
+        })
     }
 
-    fn cover(&self, path: &Path) -> bool {
-        std::fs::canonicalize(path)
-            .map(|real| self.real.iter().any(|g| real.starts_with(g)))
-            .unwrap_or(false)
+    fn covered(grants: &[PathBuf], real: &Path) -> bool {
+        grants.iter().any(|g| real.starts_with(g))
     }
 
-    /// The exec grant `file` is missing, if the allow-list is why it cannot run.
+    /// The grant `file` lacks for `execve` to open it, as the rule that adds it.
+    fn lacks(&self, file: &Path) -> Option<String> {
+        let real = std::fs::canonicalize(file).ok()?;
+        let exec = Grants::covered(&self.exec, &real);
+        let read = Grants::covered(&self.read, &real) && !Grants::covered(&self.holes, &real);
+        let shown = file.display();
+        match (exec, read) {
+            (true, true) => None,
+            (false, true) => Some(format!(
+                "is not on the exec allow-list (add `exec:{shown}`)"
+            )),
+            (false, false) => Some(format!(
+                "is neither on the exec allow-list nor readable, and execve reads the file it \
+                 runs (add `readexec:{shown}`)"
+            )),
+            (true, false) => Some(format!(
+                "is on the exec allow-list but not readable, and execve reads the file it runs \
+                 (add `readexec:{shown}`)"
+            )),
+        }
+    }
+
+    /// The grant `file` is missing, if the policy is why it cannot run.
     fn missing(&self, file: &Path, depth: usize) -> Option<String> {
-        if !self.cover(file) {
-            return Some(format!(
-                "{0} is not on the exec allow-list (add `exec:{0}`)",
-                file.display()
-            ));
+        if let Some(why) = self.lacks(file) {
+            return Some(format!("{} {why}", file.display()));
         }
         if let Some(loader) = elf_interpreter(file) {
-            return (!self.cover(&loader)).then(|| {
+            return self.lacks(&loader).map(|why| {
                 format!(
-                    "{} needs its dynamic loader {1}, which the exec allow-list does not grant \
-                     (add `exec:{1}`)",
+                    "{} needs its dynamic loader {}, which {why}",
                     file.display(),
                     loader.display()
                 )
@@ -209,29 +254,38 @@ impl Grants {
     }
 }
 
-/// `program` as `execvp` finds it: as given when it names a directory, else the first match on
-/// `PATH`.
-fn resolve(program: &Path) -> Option<PathBuf> {
+/// `program` as `execvp` finds it: as given when it contains a slash, else the first match on the
+/// child's `path`.
+fn resolve(program: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
     if program.as_os_str().as_bytes().contains(&b'/') {
         return Some(program.to_path_buf());
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    std::env::split_paths(path?)
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
 }
 
-/// Why `program` cannot be exec'd under `linux`'s allow-list, when the allow-list is the cause.
-pub(super) fn denial_hint(linux: &LinuxPolicy, program: &Path) -> Option<String> {
-    Grants::of(linux)?.missing(&resolve(program)?, 0)
+/// Why `program` cannot be exec'd under `linux`'s allow-list, when the policy is the cause; `path`
+/// is the child's `PATH`.
+pub(super) fn denial_hint(
+    linux: &LinuxPolicy,
+    program: &Path,
+    path: Option<&OsStr>,
+) -> Option<String> {
+    Grants::of(linux)?.missing(&resolve(program, path)?, 0)
 }
 
 /// Why `program` failed to exec under `policy`, when an exec allow-list is the cause: the
-/// program, the dynamic loader it names, or the interpreter of a script lacks an exec grant. A
-/// message for a spawn that already failed; it decides nothing.
-pub fn exec_denial_hint(policy: &CompiledPolicy, program: &Path) -> Option<String> {
+/// program, the dynamic loader it names, or the interpreter of a script lacks an exec or read
+/// grant. `path` is the child's `PATH`. A message for a spawn that already failed with EACCES; it
+/// decides nothing.
+pub fn exec_denial_hint(
+    policy: &CompiledPolicy,
+    program: &Path,
+    path: Option<&OsStr>,
+) -> Option<String> {
     match &policy.confiner {
-        ConfinerPolicy::Linux(linux) => denial_hint(linux, program),
+        ConfinerPolicy::Linux(linux) => denial_hint(linux, program, path),
         _ => None,
     }
 }
@@ -239,6 +293,14 @@ pub fn exec_denial_hint(policy: &CompiledPolicy, program: &Path) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn existing_standard_loaders() -> Vec<PathBuf> {
+        STANDARD_LOADERS
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .collect()
+    }
 
     #[test]
     fn reads_the_interpreter_of_a_dynamic_elf_and_none_of_a_script() {
@@ -254,14 +316,71 @@ mod tests {
         std::fs::write(&script, "#!  /bin/sh -e\necho hi\n").unwrap();
         assert_eq!(elf_interpreter(&script), None);
         assert_eq!(script_interpreter(&script), Some(PathBuf::from("/bin/sh")));
+        assert!(
+            loaders_for(&[script]).is_empty(),
+            "a script names no loader"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_listed_directory_gets_the_standard_loaders_that_exist() {
-        let loaders = loaders_for(&[PathBuf::from("/usr/bin")]);
-        assert!(loaders.iter().all(|l| STANDARD_LOADERS
-            .iter()
-            .any(|s| Path::new(s) == l && l.exists())));
+    fn a_listed_directory_gets_every_standard_loader_that_exists() {
+        assert_eq!(
+            loaders_for(&[PathBuf::from("/usr/bin")]),
+            existing_standard_loaders()
+        );
+    }
+
+    /// Without Landlock no exec rule is installed, so an EACCES is never the allow-list's.
+    #[test]
+    fn no_hint_where_landlock_carries_no_allow_list() {
+        use formwork_blueprint::{Blueprint, ExecPosture, ResolvedCatalog};
+        let blueprint = Blueprint {
+            exec: ExecPosture::Allowlist(vec![PathPattern::parse("/usr/bin/git").unwrap()]),
+            ..Blueprint::empty()
+        };
+        let policy = |abi| {
+            let mut host = formwork_detect::HostProfile::synthetic_linux(abi);
+            host.seccomp = true;
+            formwork_compile::compile(&blueprint, &host, &ResolvedCatalog::empty_no_floor())
+        };
+        let unlisted = Path::new("/bin/sh");
+        assert_eq!(exec_denial_hint(&policy(None), unlisted, None), None);
+        let hint = exec_denial_hint(&policy(Some(6)), unlisted, None).unwrap();
+        assert!(hint.contains("not on the exec allow-list"), "{hint}");
+    }
+
+    /// FW-XR8: a listed binary the session can rewrite names its interpreter, so a non-standard
+    /// `PT_INTERP` -- a directory, or any other program -- is never granted.
+    #[test]
+    fn a_listed_file_grants_only_a_standard_loader() {
+        let me = std::env::current_exe().unwrap();
+        let named = elf_interpreter(&me).unwrap();
+        let expected: Vec<PathBuf> = existing_standard_loaders()
+            .into_iter()
+            .filter(|s| *s == named)
+            .collect();
+        assert_eq!(loaders_for(std::slice::from_ref(&me)), expected);
+
+        let dir = std::env::temp_dir().join(format!("fw-loader-interp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut forged = std::fs::read(&me).unwrap();
+        let offset = forged
+            .windows(named.as_os_str().len())
+            .position(|w| w == named.as_os_str().as_bytes())
+            .unwrap();
+        // Rewrite the interpreter name in place to "/" and pad with NULs, as an agent could.
+        forged[offset] = b'/';
+        for b in &mut forged[offset + 1..offset + named.as_os_str().len()] {
+            *b = 0;
+        }
+        let path = dir.join("forged");
+        std::fs::write(&path, &forged).unwrap();
+        assert_eq!(elf_interpreter(&path), Some(PathBuf::from("/")));
+        assert!(
+            loaders_for(&[path]).is_empty(),
+            "a forged interpreter is not granted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

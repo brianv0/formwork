@@ -244,7 +244,9 @@ fn confine_and_exec(spec: StageSpec) -> Result<Infallible, StageError> {
         plan.supervise = Some(supervise::Plan::from_handoff(fd));
     }
     // Read before `apply`: the allow-list may grant execute on files Landlock then keeps unreadable.
-    let hint = super::loader::denial_hint(&spec.policy, Path::new(&spec.argv[0]));
+    // The stage carries the workload's environment, so its `PATH` is the one `exec` searches.
+    let path = std::env::var_os("PATH");
+    let hint = super::loader::denial_hint(&spec.policy, Path::new(&spec.argv[0]), path.as_deref());
     super::apply(&mut plan).map_err(setup("applying confinement"))?;
     let err = Command::new(&spec.argv[0]).args(&spec.argv[1..]).exec();
     let code = if err.kind() == io::ErrorKind::NotFound {
@@ -252,7 +254,8 @@ fn confine_and_exec(spec: StageSpec) -> Result<Infallible, StageError> {
     } else {
         126
     };
-    match hint.filter(|_| err.kind() == io::ErrorKind::PermissionDenied) {
+    // Landlock refuses an exec with EACCES; an EPERM is something else.
+    match hint.filter(|_| err.raw_os_error() == Some(libc::EACCES)) {
         Some(why) => Err((code, format!("running {}: {err}: {why}", spec.argv[0]))),
         None => Err((code, format!("running {}: {err}", spec.argv[0]))),
     }

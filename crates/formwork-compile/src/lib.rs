@@ -566,12 +566,13 @@ fn compile_linux(
                     Capability::Exec,
                     Fidelity::Partial {
                         backend: Backend::Landlock,
-                        reason: "the dynamic loader the allow-listed binaries need is granted \
-                                 execute too (the one each listed file names; this \
-                                 architecture's standard loaders for a listed directory), and a \
-                                 loader runs any ELF the session can read when invoked as \
-                                 `ld.so <file>`, so the allow-list limits which files are exec'd, \
-                                 not which readable binaries run"
+                        reason: "the standard dynamic loader the allow-listed binaries need is \
+                                 granted execute too (the one a listed file names; every one for \
+                                 a listed directory), and a loader runs any ELF the session can \
+                                 read when invoked as `ld.so <file>`, so the allow-list limits \
+                                 which files are exec'd, not which readable binaries run; execve \
+                                 also reads the file it runs, so an `exec:` grant runs a file only \
+                                 where a read grant covers it"
                             .to_string(),
                     },
                 );
