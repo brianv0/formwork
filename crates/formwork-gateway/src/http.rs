@@ -670,6 +670,62 @@ pub(crate) async fn respond<W: AsyncWrite + Unpin>(
     }
 }
 
+/// An upstream reader that also watches the client the exchange answers: when the client ends its
+/// side -- a reset, an end of stream, or a half-close, as Envoy's connection manager treats one --
+/// a read fails with [`client_gone`], so the exchange ends and its upstream connection is dropped
+/// instead of held for as long as the upstream holds it (a response has no timeout, FEP-6 §4.9).
+/// Bytes the client sends meanwhile, a pipelined request, are kept in `spill` up to **head-limit**;
+/// past that the client is no longer read until the exchange ends.
+pub(crate) struct Watched<'a, U, C> {
+    pub(crate) upstream: &'a mut U,
+    pub(crate) client: &'a mut C,
+    pub(crate) spill: &'a mut Vec<u8>,
+}
+
+impl<U: AsyncRead + Unpin, C: AsyncRead + Unpin> AsyncRead for Watched<'_, U, C> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        while this.spill.len() <= HEAD_LIMIT {
+            let mut chunk = [0u8; 4096];
+            let mut read = tokio::io::ReadBuf::new(&mut chunk);
+            match std::pin::Pin::new(&mut *this.client).poll_read(cx, &mut read) {
+                Poll::Ready(Ok(())) if read.filled().is_empty() => {
+                    return Poll::Ready(Err(client_gone()))
+                }
+                Poll::Ready(Ok(())) => this.spill.extend_from_slice(read.filled()),
+                Poll::Ready(Err(_)) => return Poll::Ready(Err(client_gone())),
+                Poll::Pending => break,
+            }
+        }
+        std::pin::Pin::new(&mut *this.upstream).poll_read(cx, buf)
+    }
+}
+
+#[derive(Debug)]
+struct ClientGone;
+
+impl std::fmt::Display for ClientGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the client ended the connection")
+    }
+}
+
+impl std::error::Error for ClientGone {}
+
+pub(crate) fn client_gone() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, ClientGone)
+}
+
+/// Whether a read failed because the client left, not the upstream.
+pub(crate) fn is_client_gone(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ClientGone>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
