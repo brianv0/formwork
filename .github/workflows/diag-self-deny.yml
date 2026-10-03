@@ -1,0 +1,33 @@
+# TEMPORARY: trace the macos-14 Seatbelt self-denial of the Gateway port (PR #41).
+name: diag-self-deny
+on:
+  push:
+    branches: ["claude/diag-seatbelt-self-deny"]
+permissions:
+  contents: read
+jobs:
+  trace:
+    name: trace (${{ matrix.os }} ${{ matrix.shard }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14]
+        shard: [a, b, c]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-prefix: test-${{ runner.arch }}
+      - name: Go and uv
+        shell: bash
+        run: |
+          go_bin=$(ls -d "$RUNNER_TOOL_CACHE"/go/*/*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -n "$go_bin" ]; then echo "$go_bin" >> "$GITHUB_PATH"; fi
+          pipx install uv
+      - name: Build
+        run: cargo build --workspace --locked && cargo test --no-run -q -p formwork-cli --test fep6_run --locked
+      - name: Trace until it reproduces
+        shell: bash
+        run: bash .github/diag-trace.sh
