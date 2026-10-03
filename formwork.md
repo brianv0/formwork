@@ -424,6 +424,8 @@ Each test names a concrete scenario with Pass/Fail conditions. Filesystem and pr
 
 <a id="fw-e2e-039"></a>**FW-E2E-039: Tamper vectors are read-through, write-denied.** Under a writable project grant, a `write-subtract` set masks execution/policy-tampering vectors (`.git/hooks/**`, `.git/config`, `.mcp.json`, `.vscode/**`, shell rc). Pass: writing `<proj>/.git/config` is denied though the surrounding tree is writable, while reading it still succeeds so git and tooling keep working. Fail: any tamper path is writable under a normal project grant ([FW-TRA7](#fw-tra7)).
 
+<a id="fw-e2e-107"></a>**FW-E2E-107: Exec allow-list under enforcement ([FW-ISO4](#fw-iso4)/[FW-ISO9](#fw-iso9)/[FW-XR6](#fw-xr6)).** An exec allow-list names one dynamically linked binary; a second names the directory that holds it. Each is enforced on Linux and on macOS. Pass: on both backends the listed binary, and a binary in the listed directory, run, and an unlisted binary the session can read is refused at `execve`; macOS reports the allow-list `Enforced`; Linux reports it `Partial`, and the gap it names holds: the loader granted with the listed binary runs an unlisted readable binary passed as its argument (`ld.so <file>`). Through `formwork run` on Linux, the unlisted program's failure names the exec rule to add. Fail: a listed binary does not start on either backend, an unlisted binary runs through `execve`, the Linux report omits the loader gap, or the loader stops running the unlisted binary while the report still says `Partial` (an under-claim).
+
 ### 7.2 Network / egress
 
 <a id="fw-e2e-006"></a>**FW-E2E-006: Direct egress denied.** With `net: Deny`, the session runs `curl https://example.com`. Pass: the connection fails closed (no route to a network the process can reach). Fail: any bytes leave the host by a path other than the gateway.
@@ -850,7 +852,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 **Linux — Landlock + seccomp (+ optional netns for the gateway side).**
 
 - Filesystem read/write scope: Landlock filesystem access rights (available since ABI v1). Clean.
-- Exec restriction: Landlock `FS_EXECUTE` on allowed paths, or seccomp on `execve`. Optional ([FW-ISO4](#fw-iso4)).
+- Exec restriction: Landlock `FS_EXECUTE` on allowed paths, or seccomp on `execve`. Optional ([FW-ISO4](#fw-iso4)). `execve` of a dynamically linked binary opens its ELF interpreter for execute, so the confiner also grants the architecture's standard loader a listed file names (every standard loader for a listed directory); a non-standard loader is listed by hand. A loader invoked as `ld.so <file>` maps any ELF the session can read without an exec check, so the allow-list is reported Partial. `execve` also opens the file for read, so an exec-only grant runs a file only where a read grant covers it.
 - Net default-deny: seccomp denies inet `socket(2)` creation by family (TCP, UDP and raw) at every Landlock ABI, because Landlock net governs TCP only; Landlock net carries the port tier alone (`docs/linux-backend.md`).
 - Net port allowlist: Landlock `ACCESS_NET_CONNECT_TCP` (ABI v4+, port-only, no host filtering). Reported Unenforceable below v4.
 - Cross-domain socket scoping: `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` and `LANDLOCK_SCOPE_SIGNAL` (ABI v6) are recent and coarse (they block abstract sockets and signals toward processes outside the domain by parent/child relationship, not per-path allowlisting). Pathname UNIX sockets are not scoped by any Landlock ABI, so a confined process can `connect()` to a socket file it can reach. `/proc/<pid>/environ` of processes outside the domain is refused, because Landlock denies ptrace-class access across the domain boundary, unless the confined process holds `CAP_SYS_ADMIN` or `CAP_PERFMON`, as in a root container (FEP-5 D9, [FW-ISO16](#fw-iso16)). Formwork uses the scopes where present for [FW-ADV-006](#fw-adv-006) and reports the gap otherwise — and does *not* rely on them for the transport ([FW-XR7](#fw-xr7)).
@@ -888,7 +890,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | private temporary directory | directory form; tmpfs under `isolate` | directory form |
 | net port allowlist (direct) | Enforced (ABI v4+) / else Reported | Enforced |
 | fs write vs create split ([FW-CAP9](#fw-cap9)) | Enforced (Landlock drops `Make*`) | Enforced (deny `file-write-create`) |
-| exec allowlist | Enforced (optional) | Enforced (optional) |
+| exec allowlist | Partial (optional; the granted loader runs any readable ELF) | Enforced (optional) |
 | MCP tool/resource/prompt shading | Enforced (gateway) | Enforced (gateway) |
 | cross-domain UNIX socket block | Partial (recent, coarse) | Enforced (path-gated) |
 | filesystem invisibility (ENOENT) | Not provided (EACCES) | Not provided (EPERM/EACCES) |
@@ -931,7 +933,7 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-XR3](#fw-xr3) Fail-closed egress | [FW-E2E-006](#fw-e2e-006), 025 | 007, 008, ADV-003 |
 | [FW-XR4](#fw-xr4) Descendant inheritance | [FW-E2E-005](#fw-e2e-005) | ADV-001, 005, INV2 |
 | [FW-XR5](#fw-xr5) Single privileged broker | [FW-E2E-019](#fw-e2e-019) | ADV-005 |
-| [FW-XR6](#fw-xr6) Behavioral parity | [FW-E2E-028](#fw-e2e-028) | 024, 071 |
+| [FW-XR6](#fw-xr6) Behavioral parity | [FW-E2E-028](#fw-e2e-028) | 024, 071, 107 |
 | [FW-XR7](#fw-xr7) Mediated transport | [FW-E2E-075](#fw-e2e-075), 076 | ADV-005, ADV-006, [FW-ADV-018](#fw-adv-018), 091 |
 | [FW-XR8](#fw-xr8) No agent-influenced escalation | [FW-ADV-001](#fw-adv-001) | [FW-E2E-005](#fw-e2e-005), INV1 |
 | [FW-XR9](#fw-xr9) Surface fail-fast | [FW-E2E-062](#fw-e2e-062) | INV5, INV6 |
@@ -949,12 +951,12 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-ISO1](#fw-iso1) Read confinement | [FW-E2E-001](#fw-e2e-001) | 003, 004 |
 | [FW-ISO2](#fw-iso2) Write confinement | [FW-E2E-002](#fw-e2e-002) | 004 |
 | [FW-ISO3](#fw-iso3) Net default-deny | [FW-E2E-006](#fw-e2e-006) | 007, 008, INV3 |
-| [FW-ISO4](#fw-iso4) Optional exec restriction | [FW-ADV-001](#fw-adv-001) | — |
+| [FW-ISO4](#fw-iso4) Optional exec restriction | [FW-E2E-107](#fw-e2e-107) | 024, 060, ADV-001 |
 | [FW-ISO5](#fw-iso5) Optional port tier | [FW-E2E-009](#fw-e2e-009) | 025 |
 | [FW-ISO6](#fw-iso6) Two postures | [FW-E2E-001](#fw-e2e-001) | — |
 | [FW-ISO7](#fw-iso7) Capability detection | [FW-E2E-025](#fw-e2e-025), 026 | INV6 |
 | [FW-ISO8](#fw-iso8) Anti-shedding baseline | [FW-ADV-001](#fw-adv-001), [FW-E2E-082](#fw-e2e-082) | 002, INV2, [FW-ADV-020](#fw-adv-020) |
-| [FW-ISO9](#fw-iso9) Exec as a verb | [FW-E2E-061](#fw-e2e-061) | [FW-XR6](#fw-xr6) |
+| [FW-ISO9](#fw-iso9) Exec as a verb | [FW-E2E-061](#fw-e2e-061) | [FW-XR6](#fw-xr6), 107 |
 | [FW-ISO10](#fw-iso10) Isolation tier | [FW-E2E-079](#fw-e2e-079), 080 | 083 |
 | [FW-ISO11](#fw-iso11) Datagram and raw closure | [FW-E2E-075](#fw-e2e-075) | 007, ADV-025 |
 | [FW-ISO12](#fw-iso12) Pathname socket mediation | [FW-E2E-076](#fw-e2e-076) | 082 |

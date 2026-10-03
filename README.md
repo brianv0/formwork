@@ -123,7 +123,7 @@ and wiring for Claude Code, codex, and opencode.
 | Host-scoped egress through the Gateway, TLS inspection, credential brokering | ✅ (clients that verify through the macOS keychain need `tunnel:`; on macOS 14 the sandbox can refuse a connection to the Gateway during a window of a few milliseconds every 15 seconds, observed on GitHub's macOS 14 runners, which the client sees as a failed connect) | ✅ (kernel 5.6+, Yama `ptrace_scope` 0 or 1) |
 | Host-service channels closed by default (`channels`) | ✅ | ✅ (sockets closed under host rules; hidden otherwise) |
 | Process isolation (`isolate = ["processes", "ipc"]`) | partial (sandbox filters) | ✅ where unprivileged user namespaces are allowed |
-| Exec allow-lists | ✅ | ✅ (list the dynamic loader too, e.g. `/lib64/ld-linux-x86-64.so.2`) |
+| Exec allow-lists | ✅ | partial (the dynamic loader the listed programs need is allowed too, and it can start any program the session can read) |
 | MCP gateway shading | ✅ | ✅ |
 | `learn` (denial observation) | ✅ unified-log feed | ✅ ptrace feed (needs `strace` and Landlock; fails fast with the reason otherwise) |
 | `compile` / `explain` dry-run | ✅ any host | ✅ any host; `compile --target` builds a Linux policy on a Mac |

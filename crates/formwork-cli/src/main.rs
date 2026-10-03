@@ -726,6 +726,27 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
                     .to_string(),
             );
         }
+        // FW-ISO4: the confiner grants an exec allow-list's dynamic loader at enforce time, which
+        // the model verdict above does not show.
+        #[cfg(target_os = "linux")]
+        if let (true, None, formwork_blueprint::ExecPosture::Allowlist(listed)) =
+            (landlock_withholds, &explanation.host_note, &blueprint.exec)
+        {
+            let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+            let target_real = real(target.base());
+            if target_real.is_some()
+                && formwork_confine::granted_loaders(listed)
+                    .iter()
+                    .any(|loader| real(loader) == target_real)
+            {
+                explanation.host_note = Some(
+                    "execute granted on this host -- the confiner grants the dynamic loader an \
+                     exec allow-list's binaries need, and a loader runs any ELF the session can \
+                     read (the report's `exec` row is partial)"
+                        .to_string(),
+                );
+            }
+        }
         rows.push((explanation, floor, shape, floor_here));
     }
     if json {
@@ -1144,13 +1165,14 @@ fn write_launcher_file(path: &std::path::Path, bytes: &[u8], mode: u32) -> Resul
     std::io::Write::write_all(&mut f, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
-/// FW-TRA9: grant a Launcher-owned directory readable (and, for the shim, executable under an
-/// exec allowlist) in every read mode, and write-protect it: it sits under the host temp root,
-/// which a profile commonly grants writable.
+/// FW-TRA9: grant a Launcher-owned directory readable in every read mode, and its `executables`
+/// executable under an exec allowlist, and write-protect it: it sits under the host temp root,
+/// which a profile commonly grants writable. The executables are listed one by one: a listed
+/// directory would grant the dynamic loader (FW-ISO4), and the shim's scripts need none.
 fn grant_launcher_dir(
     blueprint: &mut Blueprint,
     dir: &std::path::Path,
-    executable: bool,
+    executables: &[&str],
 ) -> Result<()> {
     let rendered = dir
         .to_str()
@@ -1162,10 +1184,13 @@ fn grant_launcher_dir(
         .fs
         .write_subtract
         .push(PathPattern::parse(rendered).context("write-protecting a session directory")?);
-    blueprint.fs.write_subtract.push(subtree.clone());
-    if executable {
-        if let formwork_blueprint::ExecPosture::Allowlist(allowed) = &mut blueprint.exec {
-            allowed.push(subtree);
+    blueprint.fs.write_subtract.push(subtree);
+    if let formwork_blueprint::ExecPosture::Allowlist(allowed) = &mut blueprint.exec {
+        for name in executables {
+            allowed.push(
+                PathPattern::parse(&format!("{rendered}/{name}"))
+                    .context("granting a session executable")?,
+            );
         }
     }
     Ok(())
@@ -1195,7 +1220,7 @@ fn prepare_opener(blueprint: &mut Blueprint, tmp: &mut SessionTmp) -> Result<Ope
     for name in formwork_gateway::opener::SHIM_NAMES {
         write_launcher_file(&dir.join(name), script.as_bytes(), 0o500)?;
     }
-    grant_launcher_dir(blueprint, &dir, true)?;
+    grant_launcher_dir(blueprint, &dir, formwork_gateway::opener::SHIM_NAMES)?;
     tracing::info!(shim = %dir.display(), "opener shim first in PATH and BROWSER (FW-ISO17)");
     let (host_end, session_end) =
         std::os::unix::net::UnixStream::pair().context("creating the opener socket")?;
@@ -1353,7 +1378,7 @@ fn prepare_inspection(
     let trust_dir = tmp.sibling("trust")?;
     let file = trust_dir.join("ca-bundle.pem");
     write_launcher_file(&file, ca.trust_bundle(&roots).as_bytes(), 0o400)?;
-    grant_launcher_dir(blueprint, &trust_dir, false)?;
+    grant_launcher_dir(blueprint, &trust_dir, &[])?;
     let file = file.display().to_string();
     let mut env: Vec<(String, String)> = TRUST_VARS
         .iter()
@@ -1712,6 +1737,21 @@ fn spawn_confined_child(
         Ok(c) => c,
         Err(e) => {
             session.tmp_dir.remove();
+            // Landlock refuses an exec with EACCES; under `isolate` the stage reports its own.
+            #[cfg(target_os = "linux")]
+            if e.raw_os_error() == Some(libc::EACCES) && !isolated {
+                let path = command
+                    .get_envs()
+                    .find(|(name, _)| *name == "PATH")
+                    .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+                    .unwrap_or_else(|| std::env::var_os("PATH"));
+                let program = std::path::Path::new(program);
+                if let Some(why) =
+                    formwork_confine::exec_denial_hint(&session.policy, program, path.as_deref())
+                {
+                    return Err(e).context(format!("spawning confined command: {why}"));
+                }
+            }
             return Err(e).context("spawning confined command");
         }
     };

@@ -85,6 +85,16 @@ on a `--rule` flag and a file line, so a policy reads the same however you autho
 | `exec` | execute only | `exec` allow-list |
 | `deny` | nothing (terminal) | `subtract` |
 
+Any `readexec` or `exec` rule turns on an exec allow-list (`allow` does not; it grants write):
+only the listed programs run — the agent itself included — and a script runs only if its `#!`
+interpreter is listed too. On Linux you don't list the system's dynamic loader (`ld-linux-*.so`):
+Formwork allows it with the listed programs, because no dynamically linked program starts without
+it; a program built against another loader (a Nix store path, say) needs that loader listed. Linux
+also has to read a program to run it, so an `exec:` grant works only where a read grant covers the
+file; `readexec:` grants both. A program that still cannot start fails with an error naming the rule
+to add. A loader can also start any program the session can read (`ld.so <file>`), so on Linux the
+report marks the allow-list `partial`.
+
 `--mode unveil` (empty universe) or `--mode subtractive` (ambient minus the credential floor)
 is a friendlier spelling of `[fs] read-mode`. `deny` is terminal — no allow overrides it — and the
 credential floor compiles into that same deny layer, so no rule reopens it; only
@@ -148,11 +158,11 @@ formwork run --mode unveil \
   --rule 'readonly:/usr/**' --rule 'readexec:/bin/**' --rule 'readwrite:$CWD/**' -- <agent>
 
 # Tighten an otherwise-unrestricted agent's exec down to an allowlist (last-wins over
-# `exec = "unrestricted"`, so list the agent itself too). On Linux a dynamically linked binary
-# also needs its loader, e.g. /lib64/ld-linux-x86-64.so.2 on x86_64:
+# `exec = "unrestricted"`, so list the agent itself too). On Linux the loader the listed
+# programs need is allowed with them:
 formwork run --blueprint examples/blueprints/claude-code.toml \
   --rule "exec:$(command -v claude)" --rule "exec:/usr/bin/git" --rule "exec:/usr/bin/python3" \
-  --rule "exec:/lib64/ld-linux-x86-64.so.2" -- claude
+  -- claude
 
 # Let one credential type through the floor AND grant its directory, in one invocation:
 formwork run --blueprint examples/blueprints/claude-code.toml \

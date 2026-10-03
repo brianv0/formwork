@@ -89,8 +89,25 @@ Key decisions:
   access that isn't granted, so if `AccessFs::Execute` is in `handled_fs`, only explicitly-granted
   paths are executable. For the transparent default, exclude `Execute` from `handled_fs` entirely so
   `execve` is never checked. (When the blueprint requests an exec allow-list ([FW-ISO4](../formwork.md#fw-iso4)), `Execute` is
-  governed and granted only on the allow-list -- implemented here, though not yet exercised by a
-  kernel test.)
+  governed and granted on the allow-list and its loaders, below; the paired probe on both
+  backends is [FW-E2E-107](../formwork.md#fw-e2e-107).)
+- **An exec allow-list grants the dynamic loader too.** `execve` of a dynamically linked ELF makes
+  the kernel open its interpreter (`PT_INTERP`) for execute, and Landlock checks that open, so a
+  listed binary whose loader is ungranted fails with EACCES before `main`, where macOS runs it
+  ([FW-XR6](../formwork.md#fw-xr6)). At enforce time
+  the confiner reads the `PT_INTERP` of each listed file and grants it execute when it is one of
+  this architecture's standard loaders (glibc and musl); a listed directory gets every standard
+  loader, since reading every file beneath `/usr/**` grows with the tree. A non-standard
+  `PT_INTERP` is never granted: a listed binary may be one the session can rewrite, and naming `/`
+  as its interpreter would otherwise grant execute on everything at the next launch
+  ([FW-XR8](../formwork.md#fw-xr8)); such a loader is listed by hand. The Launcher lists the opener
+  shim's scripts one by one, so a session listing only static binaries or scripts grants no loader. Landlock cannot tell the kernel's open of the interpreter
+  from an `execve` of the loader itself, and `ld.so <file>` maps any ELF the session can read with
+  no exec check -- observed on the kernel -- so the report says `Partial`. Landlock's execve also
+  checks read on the file it opens, the program and its loader both, so an `exec:`-only grant runs
+  a file only where a read grant covers it; macOS needs no read, and the report says so
+  ([FW-XR6](../formwork.md#fw-xr6)). A spawn the policy refuses with EACCES fails with an error
+  naming the program, loader, or `#!` interpreter that lacks an exec or read grant.
 - **Net default-deny via seccomp (all ABIs), *not* Landlock.** Landlock net governs only TCP, so a
   Landlock-carried deny leaves UDP/raw open. Deny denies inet `socket(2)` at the family level instead
   (TCP + UDP + raw); Landlock net (`handle_access(AccessNet::from_all(abi))` + `NetPort` allows) is
