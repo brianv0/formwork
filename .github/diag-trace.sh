@@ -45,4 +45,4 @@ p=${HTTP_PROXY##*:}; p=${p%/}
 echo "gateway port $p"
 ./conn "$p"
 P
-"$GITHUB_WORKSPACE/target/debug/formwork" run -- /bin/sh probe.sh 2>&1 | grep -v -E "INFO|WARN|refused \(|FW-EGR9"
+"$GITHUB_WORKSPACE/target/debug/formwork" run -- /bin/sh probe.sh 2>&1 | grep -E "gateway port|sin_zero="
