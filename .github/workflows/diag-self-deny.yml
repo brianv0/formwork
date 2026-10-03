@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15]
+        os: [macos-14]
         shard: [a, b, c]
     steps:
       - uses: actions/checkout@v4

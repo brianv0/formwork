@@ -28,6 +28,7 @@ static int try6(int port) {
 int main(int argc, char **argv) {
   int port = atoi(argv[1]), n = atoi(argv[2]);
   int c4[128] = {0}, c6[128] = {0};
+  if (n == 1) { int e = try4(port); if (e) printf("errno %d: v4\\n", e); return 0; }
   for (int i = 0; i < n; i++) { int e = try4(port); c4[e < 128 ? e : 127]++; }
   for (int i = 0; i < n; i++) { int e = try6(port); c6[e < 128 ? e : 127]++; }
   for (int e = 0; e < 128; e++) if (c4[e]) printf("sin_zero=v4 127.0.0.1 errno %d: %d/%d\n", e, c4[e], n);
@@ -43,6 +44,22 @@ T
 cat > probe.sh <<'P'
 p=${HTTP_PROXY##*:}; p=${p%/}
 echo "gateway port $p"
-./conn "$p" 20000
+fails=0
+for i in $(seq 1 ${PROCS:-3000}); do
+  out=$(./conn "$p" 1)
+  case "$out" in *"errno 1:"*) fails=$((fails+1)); echo "sin_zero=EPERM in process $i: $out";; esac
+done
+echo "sin_zero=fresh processes in one session: $fails/${PROCS:-3000} refused"
 P
 "$GITHUB_WORKSPACE/target/debug/formwork" run -- /bin/sh probe.sh 2>&1 | grep -E "gateway port|sin_zero="
+cat > one.sh <<'P'
+p=${HTTP_PROXY##*:}; p=${p%/}
+./conn "$p" 1 | grep "errno 1:" && echo "sin_zero=EPERM first connect, session port $p"
+true
+P
+fails=0
+for i in $(seq 1 400); do
+  out=$("$GITHUB_WORKSPACE/target/debug/formwork" run -- /bin/sh one.sh 2>/dev/null)
+  case "$out" in *EPERM*) fails=$((fails+1)); echo "$out";; esac
+done
+echo "sin_zero=fresh sessions: $fails/400 refused"
