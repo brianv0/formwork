@@ -396,8 +396,10 @@ fn fw_e2e_083_environment_disclosure_matches_the_report() {
 #[test]
 fn fw_e2e_091_loopback_callback() {
     let dir = Scratch::new("mac-091");
-    if !seatbelt_host(dir.path()) || !on_path("python3") {
-        not_exercised("Seatbelt or python3 unavailable");
+    // The system Python, whose refusals Seatbelt records (Homebrew's leave none).
+    let python = "/usr/bin/python3";
+    if !seatbelt_host(dir.path()) || !std::path::Path::new(python).exists() {
+        not_exercised("Seatbelt or the system python3 unavailable");
         return;
     }
     let listener = |bind: &str| {
@@ -434,35 +436,48 @@ fn fw_e2e_091_loopback_callback() {
         };
         write_blueprint(dir.path(), &blueprint);
         std::fs::write(dir.path().join("listen.py"), listener(bind)).unwrap();
-        let _ = std::fs::remove_file(dir.path().join("port"));
-        let nonce = format!("nonce-{}", std::process::id());
-        let root = dir.path().to_path_buf();
-        let client = {
-            let nonce = nonce.clone();
-            std::thread::spawn(move || {
-                let port_file = root.join("port");
-                let deadline = Instant::now() + std::time::Duration::from_secs(20);
-                while !port_file.exists() && Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                let port: u16 = std::fs::read_to_string(&port_file)
-                    .unwrap_or_default()
-                    .trim()
-                    .parse()
-                    .unwrap_or(0);
-                let mut s = std::net::TcpStream::connect((connect.as_str(), port)).ok()?;
-                std::io::Write::write_all(&mut s, nonce.as_bytes()).ok()
+        let attempt = || {
+            let _ = std::fs::remove_file(dir.path().join("port"));
+            let nonce = format!("nonce-{}", std::process::id());
+            let root = dir.path().to_path_buf();
+            let connect = connect.clone();
+            let client = {
+                let nonce = nonce.clone();
+                std::thread::spawn(move || {
+                    let port_file = root.join("port");
+                    let deadline = Instant::now() + std::time::Duration::from_secs(20);
+                    while !port_file.exists() && Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    let port: u16 = std::fs::read_to_string(&port_file)
+                        .unwrap_or_default()
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    let mut s = std::net::TcpStream::connect((connect.as_str(), port)).ok()?;
+                    std::io::Write::write_all(&mut s, nonce.as_bytes()).ok()
+                })
+            };
+            let started = Instant::now();
+            let out = formwork(dir.path(), &["run", "--", python, "listen.py"], &[]);
+            (client.join().unwrap(), out, nonce, started)
+        };
+        let refused_listen = |started: Instant| {
+            sandbox_records(started, |m| {
+                m.contains(" deny(")
+                    && m.contains("Python")
+                    && (m.contains("network-bind") || m.contains("network-inbound"))
             })
         };
-        let case_started = Instant::now();
-        let out = formwork(dir.path(), &["run", "--", "python3", "listen.py"], &[]);
-        let sent = client.join().unwrap();
+        let (mut sent, mut out, mut nonce, started) = attempt();
+        if sent.is_none() && !refused_listen(started).is_empty() {
+            // The macOS 14 loopback window (docs/macos-characterization.md) refuses a listen the
+            // profile admits; only a case whose own record shows it runs once more.
+            eprintln!("{posture} {bind}: the loopback window refused the listener; once more");
+            (sent, out, nonce, _) = attempt();
+        }
         if sent.is_none() {
-            // Whether Seatbelt refused the listener, and under which rule (seen once on macos-14:
-            // a bind to 127.0.0.1:0 refused under `localhost:*`).
-            let records = sandbox_records(case_started, |m| {
-                m.contains(" deny(") && m.contains("python") && m.contains("network")
-            });
+            let records = refused_listen(started);
             panic!(
                 "{posture} {bind}: the client could not connect\n{}\nSandbox records: {records:#?}",
                 out.stderr
