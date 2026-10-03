@@ -192,7 +192,11 @@ here rather than silently deviated.
   symlink keeps a hole on the link and `lnk/..` resolves through the link. `modify` grants are
   resolved too, or a hole resolved inside one named through a symlink would miss it. The other
   discovery candidate beside the blueprint is protected as well, so the session cannot plant
-  one there. `FW-ADV-026` covers each case.
+  one there. `FW-ADV-026` covers each case. On macOS its `modify` case found that a later
+  `file-write*` deny did not override an earlier `file-write-data` allow, so under a `modify`
+  grant every write deny (the credential floor, subtract rows, tamper vectors and the policy
+  inputs) left the path modifiable. Each deny now names the `modify` operations too, and
+  `macos_confine.rs` checks a write-subtract row and a subtract row under real Seatbelt.
 
 ## 4. Tests
 

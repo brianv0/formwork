@@ -305,6 +305,49 @@ fn fw_e2e_056_write_no_create_modifies_but_cannot_create() {
     );
 }
 
+/// FW-CAP8 (deny-terminal) under a `modify` grant: a write-subtract row and a subtract row inside
+/// the grant stay unmodifiable, while the grant still modifies the rest. Seatbelt let an earlier
+/// `file-write-data` allow win over a later `file-write*` deny (FW-ADV-026), so the denies name
+/// the modify operations too.
+#[test]
+fn fw_cap8_denies_hold_under_a_modify_grant() {
+    let fx = Fixture::new("cap8modify");
+    let dir = fx.root.join("proj");
+    fs::create_dir_all(&dir).unwrap();
+    let protected = dir.join("FORMWORK.toml");
+    let secret = dir.join("secret.txt");
+    let normal = dir.join("normal.txt");
+    for f in [&protected, &secret, &normal] {
+        fs::write(f, b"x\n").unwrap();
+    }
+
+    let blueprint = Blueprint {
+        fs: FsBlueprint {
+            read_mode: ReadMode::Closed,
+            reads: vec![pp(&fx.root)],
+            writes: Vec::new(),
+            writes_no_create: vec![pp(&dir)],
+            subtract: vec![PathPattern::parse(secret.to_str().unwrap()).unwrap()],
+            write_subtract: vec![PathPattern::parse(protected.to_str().unwrap()).unwrap()],
+        },
+        ..Blueprint::empty()
+    };
+    let policy = compile(&blueprint, &detect());
+
+    for denied in [&protected, &secret] {
+        assert!(
+            !sh_succeeds(&policy, &format!("echo pwned >> '{}'", denied.display())),
+            "{} must stay unmodifiable under the modify grant (FW-CAP8)",
+            denied.display()
+        );
+        assert_eq!(fs::read(denied).unwrap(), b"x\n");
+    }
+    assert!(
+        sh_succeeds(&policy, &format!("echo ok >> '{}'", normal.display())),
+        "the modify grant still modifies an ordinary file"
+    );
+}
+
 /// FW-E2E-005: a shell child, and its child, stay confined.
 #[test]
 fn fw_e2e_005_descendant_inheritance() {
