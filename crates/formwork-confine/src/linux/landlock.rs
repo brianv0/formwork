@@ -35,7 +35,8 @@ fn fail(msg: impl Into<String>) -> ConfineError {
 /// absolute floor rows under `/etc` are still holes in the expansion. Other processes'
 /// `/proc/<pid>/environ` stays closed under `/proc`: Landlock refuses ptrace-class access outside
 /// the domain, unless the process holds a capability that lifts it (`process-environment`, D9).
-const READ_ESSENTIALS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc"];
+pub(super) const READ_ESSENTIALS: &[&str] =
+    &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc"];
 const RW_DEVICES: &[&str] = &[
     "/dev/null",
     "/dev/zero",
@@ -187,7 +188,9 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     // reach. `& !IoctlDev` is a no-op below v5, where the right does not exist.
     handled_fs &= !AccessFs::IoctlDev;
     let read_access = AccessFs::from_read(abi) & !AccessFs::Execute;
-    let write_access = handled_fs; // read+write (+exec if governed); writes imply reads
+    // Writes imply reads, never execute: under an exec allow-list a writable directory would
+    // otherwise run whatever the session writes into it, where macOS refuses it (FW-XR6).
+    let write_access = handled_fs & !AccessFs::Execute;
 
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement) // no silent downgrade (FW-INV6)
@@ -273,9 +276,22 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
 
     if let ExecPlan::Allowlist { paths } = &policy.exec {
         // Execute only, not ReadFile: macOS `process-exec*` confers no read, so bundling it would
-        // make the same `exec:` grant readable on Linux but not macOS (FW-XR6). `readexec`/`allow`
-        // carry their own read grant; a binary the loader must re-open needs read on either backend.
-        let exec_paths = expand_all(&paths.iter().map(root_of).collect::<Vec<_>>(), &[]);
+        // make the same `exec:` grant readable on Linux but not macOS (FW-XR6). Landlock's execve
+        // opens the file for read as well, so an `exec:` file runs here only where a read grant
+        // also covers it (essentials, `readexec`); the report's `exec` row says so.
+        let roots: Vec<PathBuf> = paths.iter().map(root_of).collect();
+        let mut exec_paths = expand_all(&roots, &[]);
+        // The loader too, or no listed dynamic binary starts; the report says `Partial` (FW-INV5).
+        let loaders = super::loader::loaders_for(&roots);
+        if !loaders.is_empty() {
+            tracing::info!(
+                loaders = ?loaders,
+                "the exec allow-list grants execute on the dynamic loader its binaries need, and \
+                 the loader runs any ELF the session can read: the allow-list limits which \
+                 programs start, not which code runs"
+            );
+        }
+        exec_paths.extend(loaders);
         created = add_path_rules(created, &exec_paths, AccessFs::Execute.into())?;
     }
 

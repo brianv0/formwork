@@ -49,6 +49,12 @@ formwork run --blueprint examples/blueprints/agent-base.toml --net ports:443 \
   --allow-cred claude --rule "readwrite:~/.claude/**" -- claude --dangerously-skip-permissions
 ```
 
+**Exec allow-lists on Linux limit which programs start, not which code runs.** The dynamic loader
+Formwork allows with the listed programs can start any program the session can read, one the agent
+wrote into its working directory included (`/lib64/ld-linux-x86-64.so.2 ./prog`), so the report
+marks the allow-list `partial`. Closing reads (`--mode unveil`) narrows what the loader can reach,
+but whatever the session can write it can read, and so run. On macOS the allow-list holds.
+
 ## Layout
 
 ```
@@ -84,6 +90,17 @@ on a `--rule` flag and a file line, so a policy reads the same however you autho
 | `readexec` | read + execute | `reads` + `exec` allow-list |
 | `exec` | execute only | `exec` allow-list |
 | `deny` | nothing (terminal) | `subtract` |
+
+Any `readexec` or `exec` rule turns on an exec allow-list (`allow` does not; it grants write): only
+the listed programs run — the agent itself included — and a script runs only if its `#!` interpreter
+is listed too. A write grant does not make a file runnable: to run what a build produces, list its
+output (`readexec:$CWD/target/**`). On Linux you don't list the system's dynamic loader
+(`ld-linux-*.so`): Formwork allows it with the listed programs, because no dynamically linked
+program starts without it; a program built against another loader (a Nix store path, say) needs that
+loader listed. Linux also has to read a program to run it, so an `exec:` grant works only where a
+read grant covers the file; `readexec:` grants both. A program that still cannot start fails with an
+error naming the rule to add. On Linux the allow-list limits which programs start, not which code
+runs ([above](#whats-actually-enforced-be-honest-check-the-host)).
 
 `--mode unveil` (empty universe) or `--mode subtractive` (ambient minus the credential floor)
 is a friendlier spelling of `[fs] read-mode`. `deny` is terminal — no allow overrides it — and the
@@ -148,11 +165,11 @@ formwork run --mode unveil \
   --rule 'readonly:/usr/**' --rule 'readexec:/bin/**' --rule 'readwrite:$CWD/**' -- <agent>
 
 # Tighten an otherwise-unrestricted agent's exec down to an allowlist (last-wins over
-# `exec = "unrestricted"`, so list the agent itself too). On Linux a dynamically linked binary
-# also needs its loader, e.g. /lib64/ld-linux-x86-64.so.2 on x86_64:
+# `exec = "unrestricted"`, so list the agent itself too). On Linux the loader the listed
+# programs need is allowed with them:
 formwork run --blueprint examples/blueprints/claude-code.toml \
   --rule "exec:$(command -v claude)" --rule "exec:/usr/bin/git" --rule "exec:/usr/bin/python3" \
-  --rule "exec:/lib64/ld-linux-x86-64.so.2" -- claude
+  -- claude
 
 # Let one credential type through the floor AND grant its directory, in one invocation:
 formwork run --blueprint examples/blueprints/claude-code.toml \

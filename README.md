@@ -123,7 +123,7 @@ and wiring for Claude Code, codex, and opencode.
 | Host-scoped egress through the Gateway, TLS inspection, credential brokering | ✅ (clients that verify through the macOS keychain need `tunnel:`; on macOS 14 the sandbox can refuse a connection to the Gateway during a window of a few milliseconds every 15 seconds, observed on GitHub's macOS 14 runners, which the client sees as a failed connect) | ✅ (kernel 5.6+, Yama `ptrace_scope` 0 or 1) |
 | Host-service channels closed by default (`channels`) | ✅ | ✅ (sockets closed under host rules; hidden otherwise) |
 | Process isolation (`isolate = ["processes", "ipc"]`) | partial (sandbox filters) | ✅ where unprivileged user namespaces are allowed |
-| Exec allow-lists | ✅ | ✅ (list the dynamic loader too, e.g. `/lib64/ld-linux-x86-64.so.2`) |
+| Exec allow-lists | ✅ | partial: limits which programs are started, not which code runs ([below](#exec-allow-lists-on-linux)) |
 | MCP gateway shading | ✅ | ✅ |
 | `learn` (denial observation) | ✅ unified-log feed | ✅ ptrace feed (needs `strace` and Landlock; fails fast with the reason otherwise) |
 | `compile` / `explain` dry-run | ✅ any host | ✅ any host; `compile --target` builds a Linux policy on a Mac |
@@ -131,6 +131,17 @@ and wiring for Claude Code, codex, and opencode.
 On a host that can't carry a capability (an older kernel, a missing mechanism), Formwork reports
 the gap in its fidelity report and refuses to pretend — it fails closed, never silently open.
 `formwork explain` (or the `--help` epilogue) tells you where the machine you're on stands.
+
+### Exec allow-lists on Linux
+
+**On Linux an exec allow-list limits which programs are started, not which code runs.** Every
+dynamically linked program needs the system's dynamic loader, so Formwork allows the loader along
+with the programs you list. The loader can start any program the session can read, including one
+the agent has just written: `/lib64/ld-linux-x86-64.so.2 ./prog`. Landlock checks `execve` but not
+the loader's mapping of a file as code, so nothing stops this, and the fidelity report marks the
+allow-list `partial`. Treat it as a guard against starting the wrong program by accident; the
+filesystem and network walls are what hold against an agent set on running its own code. macOS
+checks every program start and has no such gap.
 
 ## Commands
 

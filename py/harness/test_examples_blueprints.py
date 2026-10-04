@@ -2,6 +2,8 @@
 `formwork` CLI. Cross-platform: compilation is pure, so no platform marker."""
 
 import json
+import shutil
+import subprocess
 
 import pytest
 
@@ -54,6 +56,39 @@ def test_rules_demo_compiles(cli):
     assert caps["fs-read"]["status"] == "enforced"
     assert caps["exec"]["status"] == "enforced"  # readexec:/bin/** governs exec
     assert caps["net-default-deny"]["status"] == "partial"  # the loopback-callback listener (FW-EGR15, C1)
+
+
+@pytest.mark.linux
+@pytest.mark.fw_e2e("FW-E2E-107")
+def test_exec_allowlist_starts_dynamic_binaries_on_linux(cli, tmp_path):
+    """An exec allow-list on Linux runs the dynamically linked binaries it lists -- the confiner
+    grants the loader they name -- for a listed file over the agent base and for rules-demo's
+    listed directory, and an unlisted program, one the session could have written included,
+    fails naming the grant it lacks."""
+    if json.loads(cli("explain", "--json").stdout)["host"].get("landlock-abi") is None:
+        pytest.skip("no Landlock on this kernel (the allow-list is not enforced)")
+    base = BLUEPRINTS / "agent-base.toml"
+    listed = cli("run", "--blueprint", base, "--rule", "exec:/bin/true", "--", "/bin/true", cwd=tmp_path)
+    assert listed.code == 0, listed.stderr
+    demo = cli("run", "--blueprint", BLUEPRINTS / "rules-demo.toml", "--", "/bin/true", cwd=tmp_path)
+    assert demo.code == 0, demo.stderr
+
+    # A shell, not another coreutil: a multi-call coreutils (uutils, busybox) is one inode.
+    unlisted = cli("run", "--blueprint", base, "--rule", "exec:/bin/true", "--", "/bin/sh", "-c", ":", cwd=tmp_path)
+    assert unlisted.code != 0, "an unlisted program must not run"
+    assert "/bin/sh is not on the exec allow-list" in unlisted.stderr, unlisted.stderr
+
+    # The base grants writes on /tmp; a write grant is not an exec grant.
+    written = tmp_path / "written"
+    shutil.copy2("/bin/sh", written)
+    assert subprocess.run([written, "-c", ":"]).returncode == 0, "sanity: the copy runs unconfined (not a noexec /tmp)"
+    wrote = cli("run", "--blueprint", base, "--rule", "exec:/bin/true", "--", written, "-c", ":", cwd=tmp_path)
+    assert wrote.code != 0, "a program written where the session may write must not run unless listed"
+    assert f"{written} is not on the exec allow-list" in wrote.stderr, wrote.stderr
+
+    report = json.loads(cli("compile", "--blueprint", base, "--rule", "exec:/bin/true", "--report-only").stdout)
+    assert report["per-capability"]["exec"]["status"] == "partial"
+    assert "loader" in report["per-capability"]["exec"]["reason"]
 
 
 @pytest.mark.macos

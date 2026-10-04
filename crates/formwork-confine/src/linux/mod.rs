@@ -13,6 +13,7 @@ use formwork_compile::{ConfinerPolicy, LinuxPolicy};
 
 pub mod isolate;
 mod landlock;
+pub mod loader;
 mod seccomp;
 pub mod supervise;
 
