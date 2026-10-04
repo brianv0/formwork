@@ -459,7 +459,8 @@ fn exec_outcome(policy: &formwork_compile::CompiledPolicy, mut cmd: Command) -> 
 
 /// FW-E2E-107 (Seatbelt; FW-ISO4/FW-INV5): the exec allow-list's paired probe, counterpart of the
 /// Linux test of the same name. A listed binary runs and an unlisted, readable one is refused at
-/// `execve`, for a listed file and for a listed directory; the report says `Enforced`.
+/// `execve`, for a listed file, for a listed directory, and for a binary the session wrote where
+/// it may write; the report says `Enforced`.
 #[test]
 fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
     use formwork_compile::{Backend, Capability, Fidelity};
@@ -496,6 +497,23 @@ fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
     assert!(
         refused(outcome),
         "an unlisted binary must be refused at execve, got {outcome:?}"
+    );
+
+    // A write grant is not an exec grant: a binary the session wrote stays unlisted.
+    let written = fx.granted().join("written");
+    fs::copy("/usr/bin/true", &written).unwrap();
+    assert!(
+        Command::new(&written).status().unwrap().success(),
+        "sanity: the written binary runs unconfined"
+    );
+    let blueprint = Blueprint {
+        exec: ExecPosture::Allowlist(vec![PathPattern::parse("/bin/cat").unwrap()]),
+        ..closed_blueprint(vec![pp(&fx.granted())], vec![pp(&fx.granted())], vec![])
+    };
+    let outcome = exec_outcome(&compile(&blueprint, &detect()), Command::new(&written));
+    assert!(
+        refused(outcome),
+        "a binary written into a writable, unlisted directory must be refused at execve, got {outcome:?}"
     );
 
     let policy = exec_policy("/bin/**");

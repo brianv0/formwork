@@ -188,7 +188,9 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     // reach. `& !IoctlDev` is a no-op below v5, where the right does not exist.
     handled_fs &= !AccessFs::IoctlDev;
     let read_access = AccessFs::from_read(abi) & !AccessFs::Execute;
-    let write_access = handled_fs; // read+write (+exec if governed); writes imply reads
+    // Writes imply reads, never execute: under an exec allow-list a writable directory would
+    // otherwise run whatever the session writes into it, where macOS refuses it (FW-XR6).
+    let write_access = handled_fs & !AccessFs::Execute;
 
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement) // no silent downgrade (FW-INV6)

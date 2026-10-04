@@ -382,10 +382,14 @@ fn baseline_is_transparent_to_fork_and_exec() {
 // --- exec allow-list (Landlock FS_EXECUTE) ---
 
 /// A Closed-mode policy whose exec posture is the allow-list `exec`; `reads` adds to essentials.
-fn exec_policy(reads: Vec<PathPattern>, exec: Vec<PathPattern>) -> CompiledPolicy {
+fn exec_policy(
+    reads: Vec<PathPattern>,
+    writes: Vec<PathPattern>,
+    exec: Vec<PathPattern>,
+) -> CompiledPolicy {
     let blueprint = Blueprint {
         exec: ExecPosture::Allowlist(exec),
-        ..closed_blueprint(reads, Vec::new(), Vec::new())
+        ..closed_blueprint(reads, writes, Vec::new())
     };
     compile(&blueprint, &detect())
 }
@@ -402,9 +406,10 @@ fn exec_outcome(policy: &CompiledPolicy, mut cmd: Command) -> Result<i32, i32> {
 
 /// FW-E2E-107 (Linux/Landlock; FW-ISO4/FW-INV5): the exec allow-list's paired probe. A listed
 /// dynamically linked binary runs -- the confiner grants the loader it names -- and an unlisted
-/// one is refused at `execve`, for a listed file and for a listed directory. The verdict is
-/// `Partial`, and the gap it names is real: the granted loader runs an unlisted binary handed to
-/// it. Should that half fail, the kernel closed the gap and the verdict can rise to `Enforced`.
+/// one is refused at `execve`, for a listed file, for a listed directory, and for a binary the
+/// session wrote where it may write. The verdict is `Partial`, and the gap it names is real: the
+/// granted loader runs an unlisted binary handed to it. Should that half fail, the kernel closed
+/// the gap and the verdict can rise to `Enforced`.
 #[test]
 fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
     if !have_landlock() {
@@ -435,6 +440,7 @@ fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
     let cat_dir = fs::canonicalize("/bin/cat").unwrap();
     let policy = exec_policy(
         vec![pp(&fx.granted()), pp(probe_dir)],
+        Vec::new(),
         vec![pp(cat_dir.parent().unwrap())],
     );
     assert_eq!(
@@ -448,7 +454,22 @@ fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
         "a readable binary outside the listed directory must be refused at execve"
     );
 
+    // A write grant is not an exec grant: the macOS profile denies `process-exec*` outside the
+    // list, so a binary the session wrote must be refused here too (FW-XR6). It is a copy of the
+    // shell, which the guard above keeps apart from a multi-call coreutils.
+    let written = fx.granted().join("written");
+    fs::copy("/bin/sh", &written).unwrap();
+    let run_written = || {
+        let mut c = Command::new(&written);
+        c.arg("-c").arg(":");
+        c
+    };
+    assert!(
+        run_written().status().unwrap().success(),
+        "sanity: the written binary runs unconfined (a noexec temp dir would make the probe vacuous)"
+    );
     let policy = exec_policy(
+        vec![pp(&fx.granted())],
         vec![pp(&fx.granted())],
         vec![PathPattern::parse("/bin/cat").unwrap()],
     );
@@ -469,6 +490,11 @@ fn fw_e2e_107_exec_allowlist_runs_listed_and_refuses_unlisted() {
         exec_outcome(&policy, sh()),
         Err(libc::EACCES),
         "an unlisted binary must be refused at execve"
+    );
+    assert_eq!(
+        exec_outcome(&policy, run_written()),
+        Err(libc::EACCES),
+        "a binary written into a writable, unlisted directory must be refused at execve"
     );
 
     // The gap the report names: `ld.so <file>` maps an unlisted, readable binary with no exec check.
