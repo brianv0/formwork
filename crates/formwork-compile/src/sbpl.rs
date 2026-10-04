@@ -448,7 +448,7 @@ fn render_writes(
     for p in writes {
         b.push_str(&format!("(allow file-write* {})\n", filter(p)));
     }
-    // Before the floor/subtract denies, so those still win by last-match (FW-CAP9).
+    // Before the floor/subtract denies, which name these operations too (below).
     if !writes_no_create.is_empty() {
         b.push_str(";; write, no create (FW-CAP9): modify existing, never create\n");
         for p in writes_no_create {
@@ -458,22 +458,44 @@ fn render_writes(
             }
         }
     }
+    // Every rule below also names the operations a `modify` grant allows: under real Seatbelt a
+    // later `file-write*` deny did not override an earlier `file-write-data` allow (FW-ADV-026 on
+    // macOS), so a bare wildcard would leave a denied path modifiable (FW-CAP8, deny-terminal).
+    let modify_ops: &[&str] = if writes_no_create.is_empty() {
+        &[]
+    } else {
+        MACOS_WRITE_NO_CREATE_OPS
+    };
+    let rule = |b: &mut String, verdict: &str, p: &PathPattern| {
+        let f = filter(p);
+        b.push_str(&format!("({verdict} file-write* {f})\n"));
+        for op in modify_ops {
+            b.push_str(&format!("({verdict} {op} {f})\n"));
+        }
+    };
     for p in floor {
-        b.push_str(&format!("(deny file-write* {})\n", filter(p)));
+        rule(b, "deny", p);
     }
-    // Writes are always closed, so the exclusion re-allow clamps to the write grants.
+    // Writes are always closed, so the exclusion re-allow clamps to the write grants: full write
+    // under `writes`, the modify operations under `writes_no_create`.
     for p in &intersect_grants(floor_exempt, writes) {
-        b.push_str(&format!("(allow file-write* {})\n", filter(p)));
+        rule(b, "allow", p);
+    }
+    for p in &intersect_grants(floor_exempt, writes_no_create) {
+        let f = filter(p);
+        for op in MACOS_WRITE_NO_CREATE_OPS {
+            b.push_str(&format!("(allow {op} {f})\n"));
+        }
     }
     for p in subtract {
-        b.push_str(&format!("(deny file-write* {})\n", filter(p)));
+        rule(b, "deny", p);
     }
-    // Tamper vectors: write-denied but NOT read-denied, so tooling still reads them (FW-TRA7). These
-    // deny file-write* only; render_reads never sees write_subtract.
+    // Tamper vectors: write-denied but NOT read-denied, so tooling still reads them (FW-TRA7);
+    // render_reads never sees write_subtract.
     if !write_subtract.is_empty() {
         b.push_str(";; write-only tamper-vector denials -- readable, not writable (FW-TRA7)\n");
         for p in write_subtract {
-            b.push_str(&format!("(deny file-write* {})\n", filter(p)));
+            rule(b, "deny", p);
         }
     }
 }
@@ -619,6 +641,36 @@ mod tests {
         assert!(!s.contains("file-write-create (subpath \"/data\")"));
         // And no blanket file-write* allow that would re-admit create.
         assert!(!s.contains("(allow file-write* (subpath \"/data\"))"));
+    }
+
+    #[test]
+    fn denies_under_a_modify_grant_name_each_modify_operation() {
+        // FW-CAP8 on Seatbelt: a `file-write*` deny alone did not override an earlier
+        // `file-write-data` allow, so each deny repeats the modify operations after the allows.
+        let mut i = input();
+        i.writes = vec![];
+        i.writes_no_create = vec![pp("/data/**")];
+        i.write_subtract = vec![pp("/data/FORMWORK.toml")];
+        i.subtract = vec![pp("/data/secret")];
+        let s = render(&i);
+        let allow = s
+            .find("(allow file-write-data (subpath \"/data\"))")
+            .unwrap();
+        for f in [
+            "(literal \"/data/FORMWORK.toml\")",
+            "(literal \"/data/secret\")",
+        ] {
+            for op in MACOS_WRITE_NO_CREATE_OPS {
+                let deny = s
+                    .find(&format!("(deny {op} {f})"))
+                    .unwrap_or_else(|| panic!("{op} {f}"));
+                assert!(deny > allow, "{op} {f}");
+            }
+        }
+        // Without a modify grant the wildcard alone is rendered, as before.
+        let mut i = input();
+        i.write_subtract = vec![pp("/data/FORMWORK.toml")];
+        assert!(!render(&i).contains("(deny file-write-data"));
     }
 
     #[test]

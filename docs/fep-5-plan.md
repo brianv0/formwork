@@ -168,6 +168,36 @@ here rather than silently deviated.
   `Enforced` without them and `Partial` with them. `FW-E2E-083` checks both directions; the whole
   suite was also run as an unprivileged user before the push.
 
+- **D3: `.formwork/` does not keep the root whole on Linux.** The discovery test checked only that
+  `.formwork/blueprint.toml` is found. A run under the quickstart could still create nothing in
+  the project root. The protected files sit inside the `$CWD/**` grant either way, so the root
+  and `.formwork/` are split, and `run` printed advice to move the blueprint into `.formwork/`
+  (or nothing, once it was there). Landlock cannot express the intended carve-out. A right on a
+  directory reaches everything beneath it, and stacked layers only intersect, so a file created in
+  the root holds exactly the rights of the protected file beside it, or of `.formwork/` below it.
+  `Make*` on the root, the §9 alternative, would let the session create the absent discovered
+  layer, and without `WriteFile` a new file is not writable anyway. The split is also
+  load-bearing: with the blueprint in a directory above the project, the root is whole, and a
+  session that wrote `FORMWORK.toml` there governed the next run from the project, widening its
+  own grant (reproduced). *Resolved:* `.formwork/` stays as the one-directory layout. `run` warns,
+  and `explain` notes, which directories lose create, delete and rename, and they name
+  `--blueprint` with a file outside every write grant as the way to a creatable root, with its
+  residual: the session can then leave a `FORMWORK.toml` that a run without the flag would use.
+  The README says to keep the blueprint in the project and launch from its root, and documents
+  the Linux cost. `FW-E2E-107` runs the quickstart in both discovery layouts and with the flag;
+  `FW-ADV-026` tries to change the inputs themselves. The same work found the policy inputs'
+  write-subtract rows unresolved at enforcement, so a blueprint named through a symlinked
+  directory stayed writable. The fix resolves each protected path as the kernel does, both as
+  named with its directory resolved and through every symlink, so a blueprint that is itself a
+  symlink keeps a hole on the link and `lnk/..` resolves through the link. `modify` grants are
+  resolved too, or a hole resolved inside one named through a symlink would miss it. The other
+  discovery candidate beside the blueprint is protected as well, so the session cannot plant
+  one there. `FW-ADV-026` covers each case. On macOS its `modify` case found that a later
+  `file-write*` deny did not override an earlier `file-write-data` allow, so under a `modify`
+  grant every write deny (the credential floor, subtract rows, tamper vectors and the policy
+  inputs) left the path modifiable. Each deny now names the `modify` operations too, and
+  `macos_confine.rs` checks a write-subtract row and a subtract row under real Seatbelt.
+
 ## 4. Tests
 
 | ID | Where | Runs on |
@@ -189,11 +219,13 @@ here rather than silently deviated.
 | `FW-E2E-089` | `fep5_run.rs` (Linux), `fep5_macos.rs` (macOS) | both |
 | `FW-E2E-090` | `fep5_run.rs` (Linux), `fep5_macos.rs` (macOS) | both |
 | `FW-E2E-091` | `fep5_macos.rs`, under `net = "deny"`, a port tier and a host rule, and from the host's network address | macOS |
+| `FW-E2E-107` | `fep5_run.rs`: the quickstart with `FORMWORK.toml`, `.formwork/blueprint.toml` and `--blueprint` from outside the project | both |
 | `FW-ADV-016` | `formwork-gateway/tests/gateway.rs` | both |
 | `FW-ADV-017` | `formwork-gateway/tests/{egress,inspect}.rs` | both |
 | `FW-ADV-018` | `formwork-confine/tests/linux_supervise.rs` | Linux |
 | `FW-ADV-019` | `fep5_macos.rs` (an unconfined process with the session's credential), `formwork-gateway/tests/egress.rs` (the gate) | macOS |
 | `FW-ADV-020` | `fep5_run.rs` (Linux, the opener route; the bus route is `FW-E2E-082`, the direct route `FW-E2E-075`), `fep5_macos.rs` (macOS: the opener, LaunchServices, an AppleEvent and the clipboard) | both |
+| `FW-ADV-026` | `fep5_run.rs`: each discovery layout, the blueprint named through a symlinked directory and through `lnk/..`, the blueprint as a symlink, and a `modify` grant named through a symlink | both |
 | C1–C8 | `formwork-confine/tests/macos_characterize.rs` (§6.3; answers in `docs/macos-characterization.md`) | macOS |
 | C9 | `fep5_macos.rs` (`c9_…`), in the macOS `agent-examples` job: Claude Code's `security` calls through a shim, reaching the keychain under `claude-code.toml` and denied without the lift | macOS |
 
@@ -202,6 +234,19 @@ instead of skipping. The README quickstart is read verbatim from `README.md` and
 
 ## 5. Still owed
 
-Nothing in FEP-5's scope. The macOS answers come from GitHub's virtual runners, which run with
-System Integrity Protection off; `docs/macos-characterization.md` asks for a repeat on a
+- **A nearer blueprint left for discovery.** The Launcher write-protects the inputs a run was
+  built from and the other discovery candidate beside the blueprint, not the candidates in other
+  directories that would shadow them. A session that can create
+  entries in a directory between a later launch directory and the blueprint can leave a
+  `FORMWORK.toml` (or `.formwork/blueprint.toml`) there, and the next run started at or below it
+  is governed by it: a blueprint above the project, a run launched from a subdirectory of the
+  project (subdirectories stay writable), or `--blueprint` followed by a run without it. Not yet
+  characterized on macOS: renaming `.formwork/` aside, which Seatbelt's path-based deny on the
+  file inside may not refuse, then writing `FORMWORK.toml`. The options are write-protecting the
+  absent candidates from the launch directory up to the blueprint (exact on Seatbelt; on Linux it
+  splits each of those directories, as D3 does), or a record of operator-accepted blueprints that
+  discovery checks. Either changes what the Launcher guarantees, so it is left for review.
+
+Otherwise nothing in FEP-5's scope. The macOS answers come from GitHub's virtual runners, which
+run with System Integrity Protection off; `docs/macos-characterization.md` asks for a repeat on a
 SIP-enabled Mac before a release that changes a verdict.
