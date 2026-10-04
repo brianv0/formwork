@@ -286,8 +286,9 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
         if !loaders.is_empty() {
             tracing::info!(
                 loaders = ?loaders,
-                "the exec allow-list grants execute on the dynamic loader its binaries need; a \
-                 loader runs any ELF the session can read"
+                "the exec allow-list grants execute on the dynamic loader its binaries need, and \
+                 the loader runs any ELF the session can read: the allow-list limits which \
+                 programs start, not which code runs"
             );
         }
         exec_paths.extend(loaders);

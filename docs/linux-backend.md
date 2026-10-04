@@ -101,13 +101,25 @@ Key decisions:
   `PT_INTERP` is never granted: a listed binary may be one the session can rewrite, and naming `/`
   as its interpreter would otherwise grant execute on everything at the next launch
   ([FW-XR8](../formwork.md#fw-xr8)); such a loader is listed by hand. The Launcher lists the opener
-  shim's scripts one by one, so a session listing only static binaries or scripts grants no loader. Landlock cannot tell the kernel's open of the interpreter
-  from an `execve` of the loader itself, and `ld.so <file>` maps any ELF the session can read with
-  no exec check -- observed on the kernel -- so the report says `Partial`. Landlock's execve also
-  checks read on the file it opens, the program and its loader both, so an `exec:`-only grant runs
-  a file only where a read grant covers it; macOS needs no read, and the report says so
-  ([FW-XR6](../formwork.md#fw-xr6)). A spawn the policy refuses with EACCES fails with an error
-  naming the program, loader, or `#!` interpreter that lacks an exec or read grant.
+  shim's scripts one by one, so a session listing only static binaries or scripts grants no loader.
+  A write grant carries no Execute (writes imply reads only), so a writable directory runs nothing
+  the list leaves out, as on macOS ([FW-XR6](../formwork.md#fw-xr6)). Landlock's execve also checks
+  read on the file it opens, the program and its loader both, so an `exec:`-only grant runs a file
+  only where a read grant covers it; macOS needs no read, and the report says so. A spawn the policy
+  refuses with EACCES fails with an error naming the program, loader, or `#!` interpreter that
+  lacks an exec or read grant.
+- **The loader is a way around the allow-list, so the report says `Partial`.** Landlock checks
+  Execute where the kernel opens a file for `execve` (the program, then its `PT_INTERP`), not where
+  a process maps a file as code. `ld.so <file>` does the second: it opens the file for read and maps
+  it `PROT_EXEC`, so the granted loader runs any ELF the session can read, one it wrote included --
+  observed on the kernel. Shared libraries are mapped the same way and need no Execute grant, so
+  none is given. The kernel closed this hole for `noexec` mounts by refusing `PROT_EXEC` maps there,
+  and SELinux (`execute`) and AppArmor (`m`) check such maps; Landlock has no hook for them. The way
+  back to `Enforced` is a loader that asks the kernel first: under `SECBIT_EXEC_RESTRICT_FILE`, an
+  `ld.so` that calls `execveat(..., AT_EXECVE_CHECK)` (Linux 6.14,
+  [check_exec](https://docs.kernel.org/userspace-api/check_exec.html)) before mapping its argument
+  gets Landlock's verdict. glibc 2.39's loader ignores the bit (observed on Linux 6.18), and setting
+  it would also change what enlightened script interpreters run, so the confiner does not set it.
 - **Net default-deny via seccomp (all ABIs), *not* Landlock.** Landlock net governs only TCP, so a
   Landlock-carried deny leaves UDP/raw open. Deny denies inet `socket(2)` at the family level instead
   (TCP + UDP + raw); Landlock net (`handle_access(AccessNet::from_all(abi))` + `NetPort` allows) is
