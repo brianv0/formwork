@@ -151,19 +151,34 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
 
    A third consequence: the policy inputs the Launcher write-protects
    ([FW-XR8](../formwork.md#fw-xr8): the blueprint, its discovered layer and its proposal, and the
-   other discovery candidate beside the blueprint) are write holes like any other. A blueprint inside a write grant, whether `FORMWORK.toml` or
-   `.formwork/blueprint.toml` under a `$CWD/**` project grant, splits every directory from the
-   grant's root down to the blueprint's own, so nothing can be created, removed or renamed directly
-   in the project root. No Landlock ruleset avoids this. A right on a directory reaches everything
-   beneath it, and stacked layers only intersect, so a file created in the root during the session
-   and the blueprint beside it (or `.formwork/` below it) always hold the same rights. `WriteFile`
-   for one is `WriteFile` for the other, and `Make*`/`Remove*` on the root would let the session
-   replace the blueprint, move `.formwork/` aside, or create the absent discovered layer. Only a
-   blueprint outside the grant keeps the root whole, and the split is load-bearing: a launch
-   directory the session can create in is one it can leave a blueprint in for the next run's
-   discovery walk. `run` and `explain` name the split directories, and name `--blueprint` with a
-   file outside the grant as the way to a whole root, with that residual (FEP-5 D3, amended in
-   `docs/fep-5-plan.md` §3; the open shape is in its §5).
+   other discovery candidate beside the blueprint) are write holes like any other. A blueprint
+   inside a write grant, whether `FORMWORK.toml` or `.formwork/blueprint.toml` under a `$CWD/**`
+   project grant, splits every directory from the grant's root down to the blueprint's own, so
+   nothing can be created, removed or renamed directly in the project root. No Landlock ruleset
+   avoids this. A right on a directory reaches everything beneath it, and stacked layers only
+   intersect, so a file created in the root during the session and the blueprint beside it (or
+   `.formwork/` below it) always hold the same rights. `WriteFile` for one is `WriteFile` for the
+   other, and `Make*`/`Remove*` on the root would let the session replace the blueprint, move
+   `.formwork/` aside, or create the absent discovered layer. Only a blueprint outside the grant
+   keeps the root whole, and the split is load-bearing: a launch directory the session can create in
+   is one it can leave a blueprint in for the next run's discovery walk. `run` and `explain` name
+   the split directories, and name `--blueprint` with a file outside the grant as the way to a whole
+   root, with that residual (FEP-5 D3, amended in `docs/fep-5-plan.md` §3; the open shape is in its
+   §5).
+
+### Any-depth rows are withheld
+
+The expansion needs a rooted hole. An any-depth row (`**/.env`, `**/credentials`, the anchored
+`<prefix>/**/<suffix>`) names a file wherever it appears, and Landlock rules attach to opened
+files and directories, so such a row has nothing to attach to. The compiler withholds these rows
+from the Linux policy: the credential floor's any-depth rows (the generic backstop is all of them)
+and any-depth `write-subtract` rows. It lists each one under `withheld` in the fidelity report and
+marks the affected credential types, the backstop and `tamper-vectors` Partial
+([FW-CRED9](../formwork.md#fw-cred9), [FW-INV5](../formwork.md#fw-inv5)). A confined process on
+Linux can therefore read a `credentials` file inside a granted directory, where Seatbelt denies it
+with a regex. `formwork explain` says so in its backstop line and names the affected types apart
+from the denied count, and `formwork explain <path>` marks such a path "withheld on this host". `formwork-confine` rejects an any-depth hole, so a row the
+compiler failed to withhold fails the run instead of going missing.
 
 ## seccomp baseline (`seccompiler`) — and its hazards
 

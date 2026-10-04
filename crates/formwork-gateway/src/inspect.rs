@@ -30,9 +30,9 @@ use crate::egress::{
     Shared,
 };
 use crate::http::{
-    connection_tokens, end_to_end, parse_head, parse_response_head, render_request,
+    connection_tokens, end_to_end, is_client_gone, parse_head, parse_response_head, render_request,
     render_response, request_framing, respond, response_framing, BodyError, BoxIo, Buffered,
-    Framing, Guard, Head, HeadError, HEAD_TIMEOUT, IDLE_TIMEOUT, READ_CHUNK,
+    Framing, Guard, Head, HeadError, Watched, HEAD_TIMEOUT, IDLE_TIMEOUT, READ_CHUNK,
 };
 
 /// The prefix of every session placeholder (FW-CRED14); the placeholder scan looks for it.
@@ -613,12 +613,15 @@ async fn exchange(
             respond(&mut client.s, "502 Bad Gateway", "", true).await?;
             return Ok(Next::Close);
         }
-        match conn
-            .raw_head(None)
+        match upstream_head(&mut conn, client)
             .await
             .and_then(|raw| parse_response_head(&raw))
         {
             Ok(response) => break (conn, response),
+            Err(HeadError::Io(e)) if is_client_gone(&e) => {
+                tracing::debug!(host = %host, "the client left before the upstream answered");
+                return Ok(Next::Close);
+            }
             Err(HeadError::Closed) if retryable => continue,
             Err(e) => {
                 tracing::info!(host = %host, error = ?e, "egress upstream response unreadable");
@@ -694,8 +697,7 @@ async fn exchange(
             let interim = render_response(&response, &end_to_end(&response.headers));
             client.s.write_all(&interim).await?;
             client.s.flush().await?;
-            response = match up
-                .raw_head(None)
+            response = match upstream_head(&mut up, client)
                 .await
                 .and_then(|raw| parse_response_head(&raw))
             {
@@ -743,11 +745,33 @@ async fn exchange(
             names.join(", ")
         );
     }
-    let bytes_down = match up
-        .copy_body(framing_down, &mut client.s, guard.as_mut())
-        .await
-    {
+    let copied = {
+        let mut spill = Vec::new();
+        let held = client.buf.len();
+        let (mut client_r, mut client_w) = tokio::io::split(&mut client.s);
+        let mut watched = Buffered::new(
+            Watched {
+                upstream: &mut up.s,
+                client: &mut client_r,
+                spill: &mut spill,
+                held,
+            },
+            std::mem::take(&mut up.buf),
+        );
+        let copied = watched
+            .copy_body(framing_down, &mut client_w, guard.as_mut())
+            .await;
+        up.buf = std::mem::take(&mut watched.buf);
+        drop(watched);
+        client.buf.extend_from_slice(&spill);
+        copied
+    };
+    let bytes_down = match copied {
         Ok(n) => n,
+        Err(BodyError::Io(e)) if is_client_gone(&e) => {
+            tracing::debug!(host = %host, "the client left mid-response; the upstream connection is dropped");
+            return Ok(Next::Close);
+        }
         Err(BodyError::Reflected) => {
             shared.refuse(at(reflection(
                 "the response body carries the brokered credential; the response is ended".into(),
@@ -781,6 +805,28 @@ async fn exchange(
         return Ok(Next::Close);
     }
     Ok(Next::KeepAlive)
+}
+
+/// A client that leaves before the head arrives ends the wait.
+async fn upstream_head(
+    up: &mut Buffered<BoxIo>,
+    client: &mut Buffered<BoxIo>,
+) -> Result<Vec<u8>, HeadError> {
+    let mut spill = Vec::new();
+    let mut watched = Buffered::new(
+        Watched {
+            upstream: &mut up.s,
+            client: &mut client.s,
+            spill: &mut spill,
+            held: client.buf.len(),
+        },
+        std::mem::take(&mut up.buf),
+    );
+    let head = watched.raw_head(None).await;
+    up.buf = std::mem::take(&mut watched.buf);
+    drop(watched);
+    client.buf.extend_from_slice(&spill);
+    head
 }
 
 #[allow(clippy::too_many_arguments)]

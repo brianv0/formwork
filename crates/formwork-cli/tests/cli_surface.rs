@@ -175,14 +175,88 @@ fn explain_with_no_path_summarizes_host_and_fidelity() {
     assert!(out.stdout.contains("host: "), "{}", out.stdout);
     assert!(out.stdout.contains("capabilities:"), "{}", out.stdout);
     assert!(out.stdout.contains("credential floor:"), "{}", out.stdout);
-    // The active backstop earns its own line in the summary, with the lift (FW-CRED6/CRED7).
-    assert!(out.stdout.contains("backstop:"), "{}", out.stdout);
-    assert!(
-        out.stdout.contains("allow-credentials = [\"backstop\"]"),
-        "{}",
-        out.stdout
-    );
     assert!(out.stdout.contains("(auto-discovered)"), "{}", out.stdout);
+
+    // The active backstop earns its own line (FW-CRED6/CRED7), worded from this host's report:
+    // denied with the lift where the backend roots any-depth rows, withheld with the reason where
+    // Landlock cannot (FW-CRED9/FW-E2E-050) -- never the denied wording over a Partial row
+    // (FW-XR1/FW-INV5).
+    let json = formwork(dir.path(), dir.path(), &["explain", "--json"]);
+    assert_eq!(json.code, 0, "{}", json.stderr);
+    let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+    let backstop = &value["report"]["credentials"]["backstop"];
+    let line = out
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("backstop: "))
+        .unwrap_or_else(|| panic!("no backstop line:\n{}", out.stdout));
+    match backstop["status"].as_str() {
+        Some("enforced") => {
+            assert!(line.contains("denied at any depth"), "{line}");
+            assert!(
+                line.contains("allow-credentials = [\"backstop\"]"),
+                "{line}"
+            );
+        }
+        Some(status) => {
+            assert!(!line.contains("denied"), "{line}");
+            assert!(line.contains(status), "{line}");
+            assert!(
+                line.contains(backstop["reason"].as_str().unwrap()),
+                "{line}"
+            );
+        }
+        None => panic!("the backstop is not lifted here: {backstop}"),
+    }
+
+    // The floor's "denied" total is the types this host enforces, not every type with a path
+    // arm: one whose any-depth rows are withheld is named apart (FW-CRED9/FW-INV5).
+    let per_type = value["report"]["credentials"]["per-type"]
+        .as_object()
+        .unwrap();
+    let statuses: Vec<(&str, &str)> = per_type
+        .iter()
+        .filter_map(|(name, t)| Some((name.as_str(), t["path"]["status"].as_str()?)))
+        .collect();
+    let enforced = statuses.iter().filter(|(_, s)| *s == "enforced").count();
+    let line = out
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("credential floor: "))
+        .unwrap();
+    assert!(
+        line.contains(&format!("-- {enforced} path types denied")),
+        "{line}"
+    );
+    for (name, _) in statuses.iter().filter(|(_, s)| *s == "partial") {
+        assert!(line.contains(name), "partial type {name} not named: {line}");
+    }
+}
+
+#[test]
+fn rule_help_names_path_and_host_targets() {
+    let dir = Scratch::new("rule-help");
+    let out = formwork(dir.path(), dir.path(), &["compile", "--help"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let help = out.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    for fs_verb in [
+        "read/readonly",
+        "readwrite",
+        "modify",
+        "readexec",
+        "deny:~/.ssh",
+    ] {
+        assert!(help.contains(fs_verb), "{fs_verb} missing:\n{help}");
+    }
+    for host_form in [
+        "host[:port][/glob]",
+        "allow:host",
+        "get,post:",
+        "tunnel:host[:port]",
+        "deny:host",
+    ] {
+        assert!(help.contains(host_form), "{host_form} missing:\n{help}");
+    }
 }
 
 /// A file named `credentials` in a granted working set is denied by the backstop (deny beats
@@ -213,6 +287,34 @@ fn explain_backstop_denial_names_shape_and_lift() {
         "{}",
         out.stdout
     );
+    // The hint agrees with the host note above it: where this host withholds the row (Landlock,
+    // FW-CRED9) it claims no denial here; elsewhere it names the any-depth surprise (FW-INV5).
+    let json = formwork(
+        dir.path(),
+        dir.path(),
+        &[
+            "explain",
+            "--blueprint",
+            "bp.toml",
+            "--json",
+            "/srv/app/credentials",
+        ],
+    );
+    assert_eq!(json.code, 0, "{}", json.stderr);
+    let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+    let hint = out
+        .stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("hint: "))
+        .unwrap_or_else(|| panic!("no hint:\n{}", out.stdout));
+    match value["explanations"][0]["host_note"].as_str() {
+        Some(note) => {
+            assert!(note.starts_with("withheld on this host"), "{note}");
+            assert!(hint.contains("no denial here to lift"), "{hint}");
+            assert!(!hint.contains("-- fires at any depth"), "{hint}");
+        }
+        None => assert!(hint.contains("-- fires at any depth"), "{hint}"),
+    }
 
     // The path a user actually types when diagnosing the failure is relative -- it must resolve
     // against cwd, not error on "must be absolute".
@@ -227,6 +329,84 @@ fn explain_backstop_denial_names_shape_and_lift() {
         "{}",
         rel.stdout
     );
+}
+
+/// The "withheld on this host" note claims the kernel lets the path through, so it appears only
+/// where that is true: not under a user's own absolute `subtract` hole, not where nothing grants
+/// the path, and not for a subtree whose floored rows the kernel roots (FW-CRED9/FW-INV5). Each
+/// of those was denied by a confined `cat` while `explain` called it withheld.
+#[test]
+fn explain_withheld_note_only_where_the_kernel_lets_the_path_through() {
+    let dir = Scratch::new("explain-withheld");
+    let root = dir.path().display().to_string();
+    let broad =
+        "net = \"deny\"\n[fs]\nread-mode = \"ambient-minus-subtract\"\nwrites = [\"/**\"]\n";
+    let blueprints = [
+        ("broad.toml", broad.to_string()),
+        (
+            "subtract.toml",
+            format!("{broad}subtract = [\"{root}/proj/.env\"]\n"),
+        ),
+        (
+            "unveil.toml",
+            format!("net = \"deny\"\nmode = \"unveil\"\nrules = [\"read:{root}/other/**\"]\n"),
+        ),
+    ];
+    for (name, body) in &blueprints {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
+    let note = |blueprint: &str, path: &str| -> (Option<String>, String) {
+        let json = formwork(
+            dir.path(),
+            dir.path(),
+            &["explain", "--blueprint", blueprint, "--json", path],
+        );
+        assert_eq!(json.code, 0, "{}", json.stderr);
+        let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+        let human = formwork(
+            dir.path(),
+            dir.path(),
+            &["explain", "--blueprint", blueprint, path],
+        );
+        assert_eq!(human.code, 0, "{}", human.stderr);
+        (
+            value["explanations"][0]["host_note"]
+                .as_str()
+                .map(str::to_string),
+            human.stdout,
+        )
+    };
+    let env_file = format!("{root}/proj/.env");
+    for (blueprint, path) in [
+        ("subtract.toml", env_file.as_str()),
+        ("unveil.toml", env_file.as_str()),
+        ("broad.toml", &format!("{root}/**")),
+    ] {
+        let (host_note, human) = note(blueprint, path);
+        assert_eq!(host_note, None, "{blueprint} {path}: {human}");
+        assert!(
+            !human.contains("no denial here to lift"),
+            "{blueprint} {path}: {human}"
+        );
+    }
+
+    // The positive control: under a broad grant with no hole of its own, a Landlock host does let
+    // the `.env` through, and says so.
+    let summary = formwork(
+        dir.path(),
+        dir.path(),
+        &["explain", "--blueprint", "broad.toml", "--json"],
+    );
+    assert_eq!(summary.code, 0, "{}", summary.stderr);
+    let report: serde_json::Value = serde_json::from_str(&summary.stdout).unwrap();
+    if report["report"]["credentials"]["backstop"]["status"] == "partial" {
+        let (host_note, human) = note("broad.toml", &env_file);
+        assert!(
+            host_note.is_some_and(|n| n.starts_with("withheld on this host")),
+            "{human}"
+        );
+        assert!(human.contains("no denial here to lift"), "{human}");
+    }
 }
 
 #[test]

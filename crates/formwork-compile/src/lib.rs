@@ -298,6 +298,21 @@ pub fn compile_for_session(
     }
 }
 
+/// The Partial reason for a row set Landlock can only partly root: its any-depth rows are withheld,
+/// and its absolute rows are named as enforced only when it has some -- the backstop and the
+/// default tamper vectors are any-depth throughout, and the clause would read as an enforcement
+/// claim for them (FW-INV5).
+fn any_depth_withheld(has_absolute: bool, cite: &str) -> String {
+    format!(
+        "any-depth (`**/`) rows cannot be rooted Landlock rules and are withheld on Linux{} ({cite})",
+        if has_absolute {
+            "; absolute rows are enforced"
+        } else {
+            ""
+        }
+    )
+}
+
 /// The FW-CRED8 section: every still-enforced type labeled with the arm that carries each of its
 /// location kinds. The path arm rides whatever mechanism carries fs reads on this host, so its
 /// fidelity is FsRead's -- including honest degradation: no Landlock -> Unenforceable, and on
@@ -322,9 +337,10 @@ fn credential_report(
         if linux_any_depth_gap && paths.iter().any(|p| p.is_any_depth()) {
             Fidelity::Partial {
                 backend: Backend::Landlock,
-                reason: "any-depth (`**/`) rows cannot be rooted Landlock rules and are withheld \
-                         on Linux; absolute rows are enforced (see docs/linux-backend.md)"
-                    .to_string(),
+                reason: any_depth_withheld(
+                    paths.iter().any(|p| !p.is_any_depth()),
+                    "formwork.md §9, FW-CRED9",
+                ),
             }
         } else {
             base_fidelity.clone()
@@ -609,9 +625,7 @@ fn compile_linux(
         } else {
             Fidelity::Partial {
                 backend: Backend::Landlock,
-                reason: "any-depth (`**/`) rows cannot be rooted Landlock rules and are withheld \
-                         on Linux (see `withheld`); absolute rows are enforced"
-                    .to_string(),
+                reason: any_depth_withheld(!write_subtract.is_empty(), "see `withheld`"),
             }
         };
         caps.insert(Capability::TamperVectors, fidelity);
@@ -1508,6 +1522,65 @@ mod tests {
                 backend: Backend::Landlock
             })
         ));
+    }
+
+    /// The Partial reason is what `explain` prints for the backstop, so it claims enforcement only
+    /// for absolute rows that exist and cites where the withholding is specified (FW-CRED9,
+    /// FW-E2E-050).
+    #[test]
+    fn any_depth_partial_reason_names_absolute_rows_only_when_present() {
+        let mut catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let linux = HostProfile::synthetic_linux(Some(6));
+        let reason = |f: &Option<Fidelity>| match f {
+            Some(Fidelity::Partial { reason, .. }) => reason.clone(),
+            other => panic!("expected Partial, got {other:?}"),
+        };
+        let creds = super::compile(&Blueprint::empty(), &linux, &catalog)
+            .report
+            .credentials;
+        let backstop = reason(&creds.backstop);
+        assert!(backstop.contains("withheld on Linux"), "{backstop}");
+        assert!(backstop.contains("FW-CRED9"), "{backstop}");
+        assert!(!backstop.contains("absolute rows"), "{backstop}");
+        assert!(!backstop.contains("linux-backend.md"), "{backstop}");
+
+        // A type mixing an absolute row with its any-depth ones keeps the absolute clause.
+        catalog
+            .types
+            .get_mut("dotenv")
+            .unwrap()
+            .paths
+            .push(pp("/home/x/.config/dotenv/**"));
+        let creds = super::compile(&Blueprint::empty(), &linux, &catalog)
+            .report
+            .credentials;
+        let mixed = reason(&creds.per_type["dotenv"].path);
+        assert!(mixed.contains("absolute rows are enforced"), "{mixed}");
+    }
+
+    /// The tamper-vector Partial reason follows the same rule as the floor's: absolute
+    /// write-subtract rows are named as enforced only when the set has some (FW-INV5).
+    #[test]
+    fn tamper_vector_reason_names_absolute_rows_only_when_present() {
+        let catalog = ResolvedCatalog::empty_no_floor();
+        let linux = HostProfile::synthetic_linux(Some(6));
+        let reason = |rows: &[&str]| {
+            let mut blueprint = Blueprint::empty();
+            blueprint.fs.write_subtract = rows.iter().map(|r| pp(r)).collect();
+            match super::compile(&blueprint, &linux, &catalog)
+                .report
+                .per_capability
+                .remove(&Capability::TamperVectors)
+            {
+                Some(Fidelity::Partial { reason, .. }) => reason,
+                other => panic!("expected Partial, got {other:?}"),
+            }
+        };
+        let any_depth = reason(&["**/.git/config"]);
+        assert!(any_depth.contains("withheld on Linux"), "{any_depth}");
+        assert!(!any_depth.contains("absolute rows"), "{any_depth}");
+        let mixed = reason(&["**/.git/config", "/work/.envrc"]);
+        assert!(mixed.contains("absolute rows are enforced"), "{mixed}");
     }
 
     #[test]

@@ -32,7 +32,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use blueprint_load::ResolvedBlueprint;
-use formwork_blueprint::{Blueprint, BlueprintLayer, NetPosture, PathPattern, ResolvedCatalog};
+use formwork_blueprint::{
+    Blueprint, BlueprintLayer, NetPosture, PathPattern, ResolvedCatalog, Verdict,
+};
 use formwork_compile::compile;
 use formwork_detect::{detect, HostProfile};
 
@@ -199,9 +201,13 @@ struct BlueprintArgs {
     /// Net posture: "deny" or "ports:443,8080".
     #[arg(long)]
     net: Option<String>,
-    /// Append a flat capability rule "<verb>:<path>" (repeatable), e.g. --rule "deny:~/.ssh". The
-    /// same vocabulary as a file `rules` line (FW-BP1). Verbs: read/readonly, readwrite, modify
-    /// (write without create), allow, readexec, exec, deny.
+    /// Append a flat capability rule "<verb>:<target>" (repeatable), the same vocabulary as a file
+    /// `rules` line (FW-BP1). A target starting with `/`, `~`, `$` or `**` is a path, and takes
+    /// read/readonly, readwrite, modify (write without create), allow, readexec, exec or deny,
+    /// e.g. --rule "deny:~/.ssh". Any other target is a host, host[:port][/glob] (FW-BP13/FW-BP16),
+    /// and puts all egress behind the session Gateway: allow:host (every method, TLS inspected),
+    /// HTTP method verbs such as get,post:github.com/acme/**, tunnel:host[:port] (TLS passed
+    /// through, not inspected; no path), or deny:host[:port][/glob].
     #[arg(long)]
     rule: Vec<String>,
     /// Reads posture: "unveil" (empty universe) or "subtractive" (ambient minus catalog);
@@ -616,9 +622,23 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
     let catalog =
         ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
     let host = detect();
-    // Channel verdicts come from the compiled report so the enforcement line is this host's.
-    let report = compile(&blueprint, &host, &catalog).report;
+    // Channel verdicts and the per-path host notes come from the compiled policy, so both say what
+    // this host's kernel is given, not what the model says (FW-INV5).
+    let policy = compile(&blueprint, &host, &catalog);
+    let report = &policy.report;
+    let fs_unconfined = matches!(
+        report
+            .per_capability
+            .get(&formwork_compile::Capability::FsRead),
+        None | Some(formwork_compile::Fidelity::Unenforceable { .. })
+    );
     let landlock_withholds = host.os == formwork_detect::Os::Linux && host.landlock_abi.is_some();
+    let landlock_holes = match &policy.confiner {
+        formwork_compile::ConfinerPolicy::Linux(linux) if landlock_withholds => {
+            Some(&linux.subtract)
+        }
+        _ => None,
+    };
     // Shape rides beside the verdict, not into the JSON: only the human door prints the lift hint,
     // the machine shape stays stable (FW-CRED7).
     let mut rows = Vec::new();
@@ -666,31 +686,50 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
                     .map(|p| p.to_string())
             });
         let mut explanation = provenance.explain(&blueprint, target.base(), floor.clone());
-        // D2: on Linux a floor or tamper row that exists only in any-depth form is withheld, so
-        // the model verdict above is not what this kernel enforces.
-        if landlock_withholds {
-            let absolute_floor_hit = catalog
-                .denied_paths(&blueprint.exposed_credentials())
-                .iter()
-                .any(|p| !p.is_any_depth() && p.matches_path(target.base()));
-            if floor.is_some() && !absolute_floor_hit {
-                explanation.host_note = Some(
-                    "withheld on this host -- Landlock cannot root the any-depth floor row, so \
-                     this path is not denied by the kernel here (see `withheld` in the report)"
-                        .to_string(),
-                );
-            } else if provenance.write_subtract_only_any_depth(target.base()) {
-                explanation.host_note = Some(
-                    "write denial withheld on this host -- Landlock cannot root the any-depth \
-                     write-subtract row, so writes here are not denied by the kernel"
-                        .to_string(),
-                );
+        // D2: the model verdict above is not always what this kernel does. With no filesystem
+        // confinement nothing is denied; on Landlock a floor row that exists only in any-depth form
+        // is withheld, unless an installed hole or the absence of any grant stops the path anyway.
+        let floor_here = if fs_unconfined {
+            render::FloorOnHost::Unconfined
+        } else {
+            match (&floor, landlock_holes) {
+                (Some(_), Some(holes)) => {
+                    let held = holes.iter().any(|hole| {
+                        hole == &target
+                            || hole.covers(&target)
+                            || target.covers(hole)
+                            || (!target.is_any_depth() && hole.matches_path(target.base()))
+                    });
+                    let reachable = matches!(
+                        provenance.explain(&blueprint, target.base(), None).read,
+                        Verdict::Granted { .. } | Verdict::Ambient
+                    );
+                    if held || !reachable {
+                        render::FloorOnHost::Denied
+                    } else {
+                        render::FloorOnHost::Withheld
+                    }
+                }
+                _ => render::FloorOnHost::Denied,
             }
+        };
+        if floor_here == render::FloorOnHost::Withheld {
+            explanation.host_note = Some(
+                "withheld on this host -- Landlock cannot root the any-depth floor row, so this \
+                 path is not denied by the kernel here (see `withheld` in the report)"
+                    .to_string(),
+            );
+        } else if landlock_withholds && provenance.write_subtract_only_any_depth(target.base()) {
+            explanation.host_note = Some(
+                "write denial withheld on this host -- Landlock cannot root the any-depth \
+                 write-subtract row, so writes here are not denied by the kernel"
+                    .to_string(),
+            );
         }
-        rows.push((explanation, floor, shape));
+        rows.push((explanation, floor, shape, floor_here));
     }
     if json {
-        let explanations: Vec<_> = rows.iter().map(|(e, _, _)| e).collect();
+        let explanations: Vec<_> = rows.iter().map(|(e, ..)| e).collect();
         let mut value = serde_json::json!({ "explanations": explanations });
         if !channel_rows.is_empty() {
             value["channels"] = serde_json::to_value(&channel_rows)?;
@@ -706,14 +745,17 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
             resolved.path.display(),
             resolved.source.as_str()
         );
-        for (explanation, floor, shape) in &rows {
+        for (explanation, floor, shape, here) in &rows {
             print!("{}", render::explanation(explanation));
             if let Some(floor_type) = floor {
-                print!("{}", render::floor_remedy(floor_type, shape.as_deref()));
+                print!(
+                    "{}",
+                    render::floor_remedy(floor_type, shape.as_deref(), *here)
+                );
             }
         }
         for channel in &channel_rows {
-            print!("{}", render::channel_explanation(channel, &report));
+            print!("{}", render::channel_explanation(channel, report));
         }
         for url in &url_rows {
             print!("{}", render::egress_explanation(url));
@@ -2104,38 +2146,43 @@ fn cloexec_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
 /// bare EACCES / the absent variable (FW-INV9).
 fn itemize_credential_floor(report: &formwork_compile::FidelityReport, catalog: &ResolvedCatalog) {
     let creds = &report.credentials;
-    let path_types: Vec<&str> = creds
-        .per_type
-        .iter()
-        .filter(|(_, f)| f.path.is_some())
-        .map(|(name, _)| name.as_str())
-        .collect();
-    let env_types: Vec<&str> = creds
-        .per_type
-        .iter()
-        .filter(|(_, f)| f.env.is_some())
-        .map(|(name, _)| name.as_str())
-        .collect();
+    // Counted by this host's verdict: a type whose any-depth rows are withheld (FW-CRED9), or
+    // that no mechanism carries here, is itemized apart and never called denied (FW-INV5).
+    let paths = render::FloorArm::paths(creds);
+    let envs = render::FloorArm::envs(creds);
     tracing::info!(
-        path_types = path_types.len(),
-        env_types = env_types.len(),
+        path_types_denied = paths.enforced.len(),
+        path_types_partial = paths.partial.len(),
+        path_types_unenforceable = paths.unenforceable.len(),
+        env_types_stripped = envs.enforced.len(),
         catalog_version = creds.catalog_version,
         allowed = ?creds.allowed,
         "credential floor active (RUST_LOG=debug itemizes per type)"
     );
     tracing::debug!(
-        denied_path_types = ?path_types,
-        stripped_env_types = ?env_types,
+        denied_path_types = ?paths.enforced,
+        partial_path_types = ?paths.partial,
+        unenforceable_path_types = ?paths.unenforceable,
+        stripped_env_types = ?envs.enforced,
         "credential catalog floor, itemized"
     );
     // The backstop is the one floor row that denies inside the operator's OWN granted set, so its
-    // bare EACCES (FW-CRED7) has no visible cause -- name it at spawn (`None` means lifted).
-    if creds.backstop.is_some() {
-        tracing::info!(
-            "credential backstop active: filename shapes (credentials, id_rsa, .netrc, …) are \
-             denied at any depth, even inside granted directories, and a confined tool hitting one \
-             sees a bare EACCES -- run `formwork explain <path>` for the shape and the lift"
-        );
+    // bare EACCES (FW-CRED7) has no visible cause -- name it at spawn (`None` means lifted). Where
+    // the host withholds it (FW-CRED9), say that instead: there is no EACCES to explain.
+    if let Some(f) = &creds.backstop {
+        if f.is_enforced() {
+            tracing::info!(
+                "credential backstop active: {}, and a confined tool hitting one sees a bare \
+                 EACCES -- run `formwork explain <path>` for the shape and the lift",
+                render::backstop(f)
+            );
+        } else {
+            tracing::info!(
+                "credential backstop not enforced on this host: {} -- `formwork explain <path>` \
+                 marks the paths it would deny",
+                render::backstop(f)
+            );
+        }
         let shapes: Vec<String> = catalog.backstop.iter().map(|p| p.to_string()).collect();
         tracing::debug!(backstop_shapes = ?shapes, "credential backstop shapes");
     }

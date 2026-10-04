@@ -670,9 +670,88 @@ pub(crate) async fn respond<W: AsyncWrite + Unpin>(
     }
 }
 
+/// An upstream reader that fails with [`client_gone`] once the client resets, ends or half-closes
+/// its side, as Envoy's connection manager does: a response has no timeout (FEP-6 §4.9), so only
+/// the client leaving frees its upstream connection. Pipelined client bytes go to `spill`, read only
+/// while `held + spill` stays within **head-limit**.
+pub(crate) struct Watched<'a, U, C> {
+    pub(crate) upstream: &'a mut U,
+    pub(crate) client: &'a mut C,
+    pub(crate) spill: &'a mut Vec<u8>,
+    pub(crate) held: usize,
+}
+
+impl<U: AsyncRead + Unpin, C: AsyncRead + Unpin> AsyncRead for Watched<'_, U, C> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        loop {
+            let room = HEAD_LIMIT.saturating_sub(this.held + this.spill.len());
+            if room == 0 {
+                break;
+            }
+            let mut chunk = [0u8; 4096];
+            let mut read = tokio::io::ReadBuf::new(&mut chunk[..room.min(4096)]);
+            match std::pin::Pin::new(&mut *this.client).poll_read(cx, &mut read) {
+                Poll::Ready(Ok(())) if read.filled().is_empty() => {
+                    return Poll::Ready(Err(client_gone()))
+                }
+                Poll::Ready(Ok(())) => this.spill.extend_from_slice(read.filled()),
+                Poll::Ready(Err(_)) => return Poll::Ready(Err(client_gone())),
+                Poll::Pending => break,
+            }
+        }
+        std::pin::Pin::new(&mut *this.upstream).poll_read(cx, buf)
+    }
+}
+
+#[derive(Debug)]
+struct ClientGone;
+
+impl std::fmt::Display for ClientGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the client ended the connection")
+    }
+}
+
+impl std::error::Error for ClientGone {}
+
+pub(crate) fn client_gone() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, ClientGone)
+}
+
+pub(crate) fn is_client_gone(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ClientGone>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bytes already held count against head-limit, so pipelining cannot grow the buffer
+    /// across exchanges.
+    #[tokio::test]
+    async fn a_watched_client_is_buffered_within_head_limit() {
+        let (mut client_far, mut client) = tokio::io::duplex(1024 * 1024);
+        client_far.write_all(&vec![b'x'; 512 * 1024]).await.unwrap();
+        let held = HEAD_LIMIT - 1000;
+        let mut upstream: &[u8] = b"upstream";
+        let mut spill = Vec::new();
+        let mut watched = Watched {
+            upstream: &mut upstream,
+            client: &mut client,
+            spill: &mut spill,
+            held,
+        };
+        let mut out = [0u8; 8];
+        watched.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"upstream");
+        assert_eq!(spill.len(), 1000, "held + spilled stays at head-limit");
+    }
 
     fn head(h: &[(&str, &str)]) -> Head {
         Head {
