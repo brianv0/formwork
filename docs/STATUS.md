@@ -89,6 +89,19 @@ Enhancement proposals and their planning docs live in this directory:
   grades, destination classes, the session CA, brokering in the engine (landed and folded; the
   design record and the scenarios' configurations stay).
 
+Proposals drafted from a comparison with nono (draft numbering, reserved blocks named in each;
+**proposed**, nothing landed):
+
+- [`fep-7.md`](fep-7.md) — blueprint trust and policy provenance: an approval gate on file-sourced
+  blueprints that widen the default, keyed by an input digest held outside every grant.
+- [`fep-8.md`](fep-8.md) — command sandboxes: per-tool grants and credentials, launched by the
+  Gateway outside the agent's session.
+- [`fep-9.md`](fep-9.md) — denial diagnostics: a session record, an end-of-run account, and
+  `explain` that matches the run; supersedes the FEP-1 violation-stream remainder on landing.
+- [`fep-10.md`](fep-10.md) — credential sources: brokered secrets from keychains, password managers
+  and files, and brokered OAuth refresh.
+- [`fep-11.md`](fep-11.md) — session rollback: snapshot the writable working set and restore it.
+
 Supporting docs: [`linux-backend.md`](linux-backend.md) (Landlock/seccomp design),
 [`macos-characterization.md`](macos-characterization.md) (what Seatbelt was observed to do, C1–C9),
 [`mcp-tool-patterns.md`](mcp-tool-patterns.md) (FW-GW9 shading), [`spikes.md`](spikes.md)
