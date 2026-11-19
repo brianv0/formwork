@@ -73,6 +73,13 @@ never silently resolved.
   byte-identically ([`FW-FID4`](../formwork.md#fw-fid4)).
 - Refusals are unchanged, so a deny-hidden name refuses exactly as a nonexistent one does — deny
   never becomes an existence oracle ([`FW-ADV-004`](../formwork.md#fw-adv-004)).
+- The listing is shaded by the shape of a backend response — any `result` that carries a
+  `tools`, `resources`, `resourceTemplates` or `prompts` array — and not by matching the response
+  to a list request ([`FW-GW15`](../formwork.md#fw-gw15)). The Gateway keeps no list state, so a
+  reused or respelled request id, a list nobody asked for, and a `list_changed` refresh are all
+  shaded by the same patterns. Request ids ([`FW-GW16`](../formwork.md#fw-gw16)) and repeated
+  keys ([`FW-GW17`](../formwork.md#fw-gw17)) are checked on the frame before a pattern is
+  consulted, and their refusals do not depend on any pattern.
 
 ## Authoring grammar
 

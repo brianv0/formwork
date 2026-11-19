@@ -17,9 +17,15 @@ struct Agent {
 
 impl Agent {
     async fn send(&mut self, message: Value) {
-        let line = message.to_string();
-        self.writer.write_all(line.as_bytes()).await.unwrap();
-        self.writer.write_all(b"\n").await.unwrap();
+        self.send_raw(&message.to_string()).await;
+    }
+
+    /// Send a frame exactly as spelled: what `json!` cannot write (a repeated key, an id of `1e0`).
+    async fn send_raw(&mut self, frame: &str) {
+        self.writer
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
         self.writer.flush().await.unwrap();
     }
 
@@ -28,18 +34,45 @@ impl Agent {
             .await;
     }
 
+    /// A request whose id is given as JSON text, for an id that is not an `i64`.
+    async fn request_raw_id(&mut self, id: &str, method: &str) {
+        self.send_raw(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{}}}}"#
+        ))
+        .await;
+    }
+
     async fn notify(&mut self, method: &str, params: Value) {
         self.send(json!({"jsonrpc": "2.0", "method": method, "params": params}))
             .await;
     }
 
     async fn recv(&mut self) -> Value {
-        let line = timeout(Duration::from_secs(5), self.reader.next_line())
+        serde_json::from_str(&self.recv_raw().await).unwrap()
+    }
+
+    async fn recv_raw(&mut self) -> String {
+        timeout(Duration::from_secs(5), self.reader.next_line())
             .await
             .expect("recv timed out")
             .expect("stream error")
-            .expect("stream closed unexpectedly");
-        serde_json::from_str(&line).unwrap()
+            .expect("stream closed unexpectedly")
+    }
+
+    /// Every frame that reaches the agent before the answer to a `ping` sent now. The fixture
+    /// answers in the order it reads, so this is all the backend and the gateway had left to say.
+    async fn drain(&mut self) -> Vec<String> {
+        self.send(json!({"jsonrpc": "2.0", "id": "drained", "method": "ping"}))
+            .await;
+        let mut frames = Vec::new();
+        loop {
+            let frame = self.recv_raw().await;
+            let parsed: Value = serde_json::from_str(&frame).unwrap();
+            if parsed["id"] == "drained" && parsed["result"].is_object() {
+                return frames;
+            }
+            frames.push(frame);
+        }
     }
 }
 
@@ -772,4 +805,400 @@ async fn fw_adv_016_gateway_frame_bypass() {
         matches!(eof, Ok(None)),
         "a non-JSON frame must close the connection, got {eof:?}"
     );
+}
+
+/// One granted item on each axis; every other item the fixture lists is hidden.
+fn one_of_each() -> McpPolicy {
+    McpPolicy {
+        tools: Visibility::allow_exact(["read_file"]),
+        resources: Visibility::allow_exact(["file:///pub", "file:///logs/{name}"]),
+        prompts: Visibility::allow_exact(["greeting"]),
+        ..Default::default()
+    }
+}
+
+/// The four list methods: the method, the array its result carries, the field that identifies an
+/// item, and the one item [`one_of_each`] grants.
+const LISTS: [(&str, &str, &str, &str); 4] = [
+    ("tools/list", "tools", "name", "read_file"),
+    ("resources/list", "resources", "uri", "file:///pub"),
+    (
+        "resources/templates/list",
+        "resourceTemplates",
+        "uriTemplate",
+        "file:///logs/{name}",
+    ),
+    ("prompts/list", "prompts", "name", "greeting"),
+];
+
+/// Every item the fixture lists and [`one_of_each`] hides carries one of these in its identifier.
+const HIDDEN: [&str; 5] = [
+    "http_fetch",
+    "write_file",
+    "delete_file",
+    "list_dir",
+    "secret",
+];
+
+fn assert_nothing_hidden(frame: &str) {
+    for name in HIDDEN {
+        assert!(
+            !frame.contains(name),
+            "the hidden name {name} reached the agent: {frame}"
+        );
+    }
+}
+
+/// `frame` is the answer to `method`, shaded to the one granted item.
+fn assert_shaded_list(frame: &str, method: &str, id: &Value) {
+    assert_nothing_hidden(frame);
+    let parsed: Value = serde_json::from_str(frame).unwrap();
+    let (_, field, id_field, granted) = LISTS.iter().find(|list| list.0 == method).unwrap();
+    assert_eq!(&parsed["id"], id, "{frame}");
+    assert_eq!(names(&parsed, field, id_field), [*granted], "{frame}");
+}
+
+/// `frame` is the gateway's refusal of a frame for its envelope, addressed to `id`.
+fn assert_invalid_request(frame: &str, id: &Value) {
+    assert_nothing_hidden(frame);
+    let parsed: Value = serde_json::from_str(frame).unwrap();
+    assert_eq!(parsed["error"]["code"], -32600, "{frame}");
+    assert_eq!(&parsed["id"], id, "{frame}");
+    assert!(parsed.get("result").is_none(), "{frame}");
+}
+
+/// FW-E2E-203 (a), (b) / FW-GW16: while a `tools/list` is unanswered, a second list request under
+/// its id -- the same kind, or another -- is refused, and the one answer that follows is shaded.
+/// The fixture holds its answers so that the first request is unanswered when the second arrives.
+#[tokio::test]
+async fn fw_gw16_e2e_203_id_of_an_unanswered_list_is_refused() {
+    for (second, ..) in LISTS {
+        let mut agent = start(one_of_each());
+        agent.notify("trigger/hold", json!({})).await;
+        agent.request(1, "tools/list", json!({})).await;
+        agent.request(1, second, json!({})).await;
+        assert_invalid_request(&agent.recv_raw().await, &json!(1));
+
+        agent.notify("trigger/release", json!({})).await;
+        let answers = agent.drain().await;
+        assert_eq!(answers.len(), 1, "the backend answered once: {answers:?}");
+        assert_shaded_list(&answers[0], "tools/list", &json!(1));
+    }
+}
+
+/// FW-E2E-203 (c) / FW-GW16: a request whose id is spelled `1.0` is refused and never reaches the
+/// backend -- which would have answered it under the id `1`.
+#[tokio::test]
+async fn fw_gw16_e2e_203_fractional_id_is_refused() {
+    let mut agent = start(one_of_each());
+    agent
+        .send_raw(r#"{"jsonrpc":"2.0","id":1.0,"method":"tools/list","params":{}}"#)
+        .await;
+    assert_invalid_request(&agent.recv_raw().await, &Value::Null);
+    assert!(
+        agent.drain().await.is_empty(),
+        "the backend received nothing to answer"
+    );
+}
+
+/// FW-E2E-203 (d) / FW-GW15: a list response nobody asked for reaches the agent shaded. It is
+/// forwarded rather than dropped: the gateway decides by what a response is and keeps no record
+/// that could tell an unrequested answer from a late one, and shading it is enough.
+#[tokio::test]
+async fn fw_gw15_e2e_203_unsolicited_list_is_shaded() {
+    let mut agent = start(one_of_each());
+    for (id, (method, field, id_field, granted)) in LISTS.into_iter().enumerate() {
+        let hidden = if id_field == "name" {
+            "http_fetch"
+        } else {
+            "file:///secret"
+        };
+        let line = json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": {field: [{id_field: hidden}, {id_field: granted}], "nextCursor": "next"}
+        });
+        agent
+            .notify("trigger/emit", json!({"line": line.to_string()}))
+            .await;
+        let frame = agent.recv_raw().await;
+        assert_shaded_list(&frame, method, &json!(id));
+        let parsed: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(parsed["result"]["nextCursor"], "next");
+    }
+
+    // With no id at all, and with every list at once.
+    let line = json!({
+        "jsonrpc": "2.0",
+        "result": {
+            "tools": [{"name": "http_fetch"}, {"name": "read_file"}],
+            "resources": [{"uri": "file:///secret"}, {"uri": "file:///pub"}],
+            "resourceTemplates": [{"uriTemplate": "file:///secret/{name}"}],
+            "prompts": [{"name": "secret_prompt"}, {"name": "greeting"}]
+        }
+    });
+    agent
+        .notify("trigger/emit", json!({"line": line.to_string()}))
+        .await;
+    let frame = agent.recv_raw().await;
+    assert_nothing_hidden(&frame);
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(
+        parsed["result"],
+        json!({
+            "tools": [{"name": "read_file"}],
+            "resources": [{"uri": "file:///pub"}],
+            "resourceTemplates": [],
+            "prompts": [{"name": "greeting"}]
+        })
+    );
+    assert!(agent.drain().await.is_empty());
+}
+
+/// FW-E2E-203 (e) / FW-GW15: the answer to a granted `tools/call` whose result carries a
+/// top-level `tools` array has that array shaded like any list. This is the fail-closed side of
+/// deciding by shape, pinned here; the rest of the result is untouched.
+#[tokio::test]
+async fn fw_gw15_e2e_203_list_shape_in_a_call_result_is_shaded() {
+    let mut agent = start(one_of_each());
+    agent
+        .request(
+            1,
+            "tools/call",
+            json!({"name": "read_file", "arguments": {"result_extra": {
+                "tools": [{"name": "read_file"}, {"name": "zzz_unlisted"}],
+                "structuredContent": {"tools": [{"name": "zzz_unlisted"}]}
+            }}}),
+        )
+        .await;
+    let answer = agent.recv().await;
+    assert_eq!(answer["id"], 1);
+    assert_eq!(answer["result"]["tools"], json!([{"name": "read_file"}]));
+    assert_eq!(answer["result"]["content"][0]["text"], "ok:read_file");
+    assert_eq!(answer["result"]["isError"], false);
+    assert_eq!(
+        answer["result"]["structuredContent"],
+        json!({"tools": [{"name": "zzz_unlisted"}]}),
+        "only a top-level list of the result is a list"
+    );
+}
+
+/// FW-E2E-204 / FW-GW17: a `tools/call` that repeats `params` -- a hidden tool first and a granted
+/// one second, or the reverse -- is refused, and the backend receives no frame. The same holds for
+/// a repeated `name` inside `params`, a repeated `method`, and a repeated `id`. The fixture answers
+/// every call it receives, and announces one without an id, so a frame that got through would be
+/// seen before the answer to the control call.
+#[tokio::test]
+async fn fw_gw17_e2e_204_repeated_keys_are_refused() {
+    let mut agent = start(tools_only(&["read_file"]));
+    let hidden = r#"{"name":"http_fetch","arguments":{}}"#;
+    let granted = r#"{"name":"read_file","arguments":{}}"#;
+    let call = |id: u32, rest: &str| {
+        format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call",{rest}}}"#)
+    };
+    let addressed = [
+        call(1, &format!(r#""params":{hidden},"params":{granted}"#)),
+        call(2, &format!(r#""params":{granted},"params":{hidden}"#)),
+        call(
+            3,
+            r#""params":{"name":"http_fetch","name":"read_file","arguments":{}}"#,
+        ),
+        call(
+            4,
+            r#""params":{"name":"read_file","name":"http_fetch","arguments":{}}"#,
+        ),
+        call(5, &format!(r#""method":"ping","params":{hidden}"#)),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"ping","method":"tools/call","params":{hidden}}}"#
+        ),
+    ];
+    for (frame, id) in addressed.iter().zip(1..) {
+        agent.send_raw(frame).await;
+        assert_invalid_request(&agent.recv_raw().await, &json!(id));
+    }
+
+    // A repeated id names no request to answer: the refusal carries a null id.
+    agent
+        .send_raw(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"id":8,"method":"tools/call","params":{granted}}}"#
+        ))
+        .await;
+    assert_invalid_request(&agent.recv_raw().await, &Value::Null);
+
+    // Without an id there is no one to answer: the frame is dropped.
+    agent
+        .send_raw(r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"http_fetch","name":"read_file"}}"#)
+        .await;
+
+    agent
+        .request(
+            9,
+            "tools/call",
+            json!({"name": "read_file", "arguments": {}}),
+        )
+        .await;
+    let control = agent.recv().await;
+    assert_eq!(control["id"], 9, "no refused frame was answered: {control}");
+    assert_eq!(control["result"]["content"][0]["text"], "ok:read_file");
+}
+
+/// When the backend answers the first of two requests that share an id, in FW-ADV-056.
+#[derive(Clone, Copy, Debug)]
+enum Answered {
+    BeforeTheSecondRequest,
+    AfterBothRequests,
+    /// The fixture writes its queued answers last-first.
+    AfterBothRequestsLastFirst,
+}
+
+/// FW-ADV-056 / FW-GW15 / FW-GW16: every pairing of two list kinds under one id, over the
+/// spellings of that id and the order of requests and answers. No hidden name reaches the agent
+/// in any combination, and the well-formed ones behave as an agent expects: an id is reusable once
+/// answered, refused while unanswered, and a usable id is echoed as spelled.
+#[tokio::test]
+async fn fw_gw15_gw16_adv_056_id_and_shape_table() {
+    // (the id as spelled, whether it is a string or an integer in the 64-bit range)
+    let spellings = [
+        ("1", true),
+        (r#""1""#, true),
+        ("12345678901234567890", true),
+        ("1.0", false),
+        ("1e0", false),
+        ("-0", false),
+        ("99999999999999999999", false),
+        ("true", false),
+    ];
+    let orders = [
+        Answered::BeforeTheSecondRequest,
+        Answered::AfterBothRequests,
+        Answered::AfterBothRequestsLastFirst,
+    ];
+    for (first, ..) in LISTS {
+        for (second, ..) in LISTS {
+            for (spelling, usable) in spellings {
+                for order in orders {
+                    let case = format!("{first} then {second}, id {spelling}, {order:?}");
+                    let ask = |method: &str| {
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":{spelling},"method":"{method}","params":{{}}}}"#
+                        )
+                    };
+                    let mut agent = start(one_of_each());
+                    let frames = match order {
+                        Answered::BeforeTheSecondRequest => {
+                            agent.send_raw(&ask(first)).await;
+                            let mut frames = agent.drain().await;
+                            agent.send_raw(&ask(second)).await;
+                            frames.extend(agent.drain().await);
+                            frames
+                        }
+                        Answered::AfterBothRequests | Answered::AfterBothRequestsLastFirst => {
+                            let reverse = matches!(order, Answered::AfterBothRequestsLastFirst);
+                            agent.notify("trigger/hold", json!({})).await;
+                            agent.send_raw(&ask(first)).await;
+                            agent.send_raw(&ask(second)).await;
+                            agent
+                                .notify("trigger/release", json!({"reverse": reverse}))
+                                .await;
+                            agent.drain().await
+                        }
+                    };
+
+                    for frame in &frames {
+                        assert_nothing_hidden(frame);
+                    }
+                    assert_eq!(frames.len(), 2, "{case}: {frames:?}");
+                    let id: Value = serde_json::from_str(spelling).unwrap();
+                    match (usable, order) {
+                        (false, _) => {
+                            assert_invalid_request(&frames[0], &Value::Null);
+                            assert_invalid_request(&frames[1], &Value::Null);
+                        }
+                        (true, Answered::BeforeTheSecondRequest) => {
+                            assert_shaded_list(&frames[0], first, &id);
+                            assert_shaded_list(&frames[1], second, &id);
+                        }
+                        (true, _) => {
+                            assert_invalid_request(&frames[0], &id);
+                            assert_shaded_list(&frames[1], first, &id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// FW-GW15 control: a paginated `tools/list` keeps its `nextCursor` on every page, also on a page
+/// the shading empties, so an agent that follows the cursor reaches the end of the listing.
+#[tokio::test]
+async fn fw_gw15_pagination_cursor_survives_shading() {
+    let mut agent = start(tools_only(&["read_file"]));
+    agent.notify("trigger/paginate", json!({})).await;
+
+    agent.request(1, "tools/list", json!({})).await;
+    let page = agent.recv().await;
+    assert_eq!(names(&page, "tools", "name"), ["read_file"]);
+    assert_eq!(page["result"]["nextCursor"], "2");
+
+    agent.request(2, "tools/list", json!({"cursor": "2"})).await;
+    let page = agent.recv().await;
+    assert!(names(&page, "tools", "name").is_empty());
+    assert_eq!(page["result"]["nextCursor"], "4");
+
+    agent.request(3, "tools/list", json!({"cursor": "4"})).await;
+    let page = agent.recv().await;
+    assert!(names(&page, "tools", "name").is_empty());
+    assert!(page["result"].get("nextCursor").is_none());
+}
+
+/// FW-GW16 control: an id is held only until its answer is forwarded. A result and an error both
+/// release it, a request the gateway refuses itself never holds it, and the server's own request
+/// ids are a separate space.
+#[tokio::test]
+async fn fw_gw16_answered_id_is_free_again() {
+    let policy = McpPolicy {
+        tools: Visibility::allow_exact(["read_file"]),
+        sampling: Gate::Allow,
+        ..Default::default()
+    };
+    let mut agent = start(policy);
+
+    for _ in 0..3 {
+        agent.request(1, "tools/list", json!({})).await;
+        assert_eq!(names(&agent.recv().await, "tools", "name"), ["read_file"]);
+    }
+
+    // The fixture never answers a method it does not know, so the id stays held...
+    agent.request(2, "fixture/unanswered", json!({})).await;
+    agent.request(2, "ping", json!({})).await;
+    assert_invalid_request(&agent.recv_raw().await, &json!(2));
+    // ...until an error under that id is forwarded.
+    let error = json!({"jsonrpc": "2.0", "id": 2, "error": {"code": -32601, "message": "Method not found"}});
+    agent
+        .notify("trigger/emit", json!({"line": error.to_string()}))
+        .await;
+    assert_eq!(agent.recv().await["error"]["code"], -32601);
+    agent.request(2, "ping", json!({})).await;
+    assert!(agent.recv().await["result"].is_object());
+
+    // A call the gateway refuses is never forwarded, so its id is not held.
+    for _ in 0..2 {
+        agent
+            .request(3, "tools/call", json!({"name": "http_fetch"}))
+            .await;
+        assert_eq!(agent.recv().await["error"]["code"], -32602);
+    }
+
+    // The fixture's sampling request is "s1"; the agent may hold the same id for its own request.
+    agent.request_raw_id(r#""s1""#, "fixture/unanswered").await;
+    agent.notify("trigger/sampling", json!({})).await;
+    let sampling = agent.recv().await;
+    assert_eq!(sampling["method"], "sampling/createMessage");
+    assert_eq!(sampling["id"], "s1");
+    agent
+        .send(json!({"jsonrpc": "2.0", "id": "s1", "result": {}}))
+        .await;
+    assert_eq!(agent.recv().await["method"], "note/sampling_ok");
+    agent.request_raw_id(r#""s1""#, "ping").await;
+    assert_invalid_request(&agent.recv_raw().await, &json!("s1"));
 }
