@@ -576,6 +576,11 @@ impl<S: AsyncRead + Unpin> Buffered<S> {
                 out.write_all(b"0\r\n").await?;
                 loop {
                     let trailer = self.line().await?;
+                    // FW-INV15: a trailer is forwarded as one line, so one that a lenient peer
+                    // would split into more is refused.
+                    if trailer.iter().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+                        return Err(BodyError::Malformed("a CR, LF or NUL inside a trailer"));
+                    }
                     if guard.as_deref().is_some_and(|g| g.scan(&trailer)) {
                         return Err(BodyError::Reflected);
                     }
@@ -965,6 +970,24 @@ mod tests {
         assert_eq!(g.push(b"x sk").unwrap(), b"x ");
         assert_eq!(g.push(b"y").unwrap(), b"sky");
         assert_eq!(g.finish(), b"");
+    }
+
+    /// FW-INV15: a trailer line carrying a bare LF would reach a lenient upstream as further
+    /// lines, a second request among them.
+    #[tokio::test]
+    async fn fw_inv15_a_trailer_with_a_bare_line_break_is_refused() {
+        for trailer in [
+            "X: y\n\nGET /second HTTP/1.1\nHost: other.test\n",
+            "X: a\rb",
+            "X: \0",
+        ] {
+            let body = format!("1\r\na\r\n0\r\n{trailer}\r\n\r\n").into_bytes();
+            let mut src = Buffered::new(&body[..], Vec::new());
+            let mut out = Vec::new();
+            let got = src.copy_body(Framing::Chunked, &mut out, None).await;
+            assert!(matches!(got, Err(BodyError::Malformed(_))), "{trailer:?}");
+            assert!(!out.windows(6).any(|w| w == b"second"), "{trailer:?}");
+        }
     }
 
     #[tokio::test]
