@@ -7,24 +7,57 @@
 //!   `note/sampling_refused` or `note/sampling_ok` (FW-E2E-017).
 //! - `trigger/probe`        -> attempt an out-of-scope read and a direct TCP connect, reporting both
 //!   in a `note/probe` (FW-E2E-019 backend confinement).
+//! - `trigger/hold`         -> queue every line instead of writing it, until `trigger/release`
+//!   writes the queue (in reverse when `params.reverse`): a test decides when, and in which order,
+//!   answers arrive (FW-E2E-203, FW-ADV-056).
+//! - `trigger/emit`         -> write `params.line` verbatim: a frame no request asked for.
+//! - `trigger/paginate`     -> answer `tools/list` two tools to a page, with a `nextCursor`.
+//!
+//! An id is echoed as a backend whose numbers are all doubles would echo it (`1.0` comes back as
+//! `1`), and a `tools/call` copies `arguments.result_extra` into the top level of its result.
 
 use std::io::{self, BufRead, Write};
 use std::net::TcpStream;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
-fn emit(value: &Value) {
+/// The lines queued since `trigger/hold`; `None` when the fixture writes as it goes.
+static HELD: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+fn write_line(line: &str) {
     let mut out = io::stdout().lock();
     // Explicit flush: stdout is block-buffered when piped, and the gateway reads line-by-line.
-    writeln!(out, "{value}").unwrap();
+    writeln!(out, "{line}").unwrap();
     out.flush().unwrap();
+}
+
+fn emit_line(line: String) {
+    let mut held = HELD.lock().unwrap();
+    match held.as_mut() {
+        Some(queue) => queue.push(line),
+        None => write_line(&line),
+    }
+}
+
+fn emit(value: &Value) {
+    emit_line(value.to_string());
+}
+
+/// The id as a backend that reads every number as a double echoes it: `1.0` and `-0` come back
+/// as `1` and `0`, the respelling FW-E2E-203 is about.
+fn echoed(id: &Value) -> Value {
+    match id.as_f64() {
+        Some(f) if id.is_f64() && f.fract() == 0.0 && f.abs() < 9e15 => json!(f as i64),
+        _ => id.clone(),
+    }
 }
 
 fn reply(id: &Option<Value>, result: Value) {
     match id {
         Some(id) if !id.is_null() => {
-            emit(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
+            emit(&json!({"jsonrpc": "2.0", "id": echoed(id), "result": result}));
         }
         // An id-less call has no reply, so announce that it arrived: a gated call the gateway
         // should have dropped then shows up at the agent (FW-ADV-016).
@@ -45,6 +78,7 @@ fn main() {
         "delete_file",
         "http_fetch",
     ];
+    let mut paginate = false;
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
@@ -78,17 +112,39 @@ fn main() {
                     .iter()
                     .map(|t| json!({"name": t, "description": format!("the {t} tool"), "inputSchema": {"type": "object"}}))
                     .collect();
-                reply(&id, json!({"tools": arr}));
+                if paginate {
+                    // The cursor is the index of the page's first tool.
+                    let start = v
+                        .pointer("/params/cursor")
+                        .and_then(Value::as_str)
+                        .and_then(|c| c.parse::<usize>().ok())
+                        .unwrap_or(0)
+                        .min(arr.len());
+                    let end = (start + 2).min(arr.len());
+                    let mut page = json!({"tools": arr[start..end]});
+                    if end < arr.len() {
+                        page["nextCursor"] = json!(end.to_string());
+                    }
+                    reply(&id, page);
+                } else {
+                    reply(&id, json!({"tools": arr}));
+                }
             }
             Some("tools/call") => {
                 let name = v
                     .pointer("/params/name")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                reply(
-                    &id,
-                    json!({"content": [{"type": "text", "text": format!("ok:{name}")}], "isError": false}),
-                );
+                let mut result = json!({"content": [{"type": "text", "text": format!("ok:{name}")}], "isError": false});
+                if let Some(extra) = v
+                    .pointer("/params/arguments/result_extra")
+                    .and_then(Value::as_object)
+                {
+                    for (key, value) in extra {
+                        result[key.as_str()] = value.clone();
+                    }
+                }
+                reply(&id, result);
             }
             Some("resources/list") => reply(
                 &id,
@@ -153,6 +209,24 @@ fn main() {
                     "params": {"messages": [], "maxTokens": 10}
                 }));
             }
+            Some("trigger/hold") => {
+                HELD.lock().unwrap().get_or_insert_with(Vec::new);
+            }
+            Some("trigger/release") => {
+                let mut queue = HELD.lock().unwrap().take().unwrap_or_default();
+                if v.pointer("/params/reverse") == Some(&json!(true)) {
+                    queue.reverse();
+                }
+                for line in queue {
+                    write_line(&line);
+                }
+            }
+            Some("trigger/emit") => {
+                if let Some(line) = v.pointer("/params/line").and_then(Value::as_str) {
+                    emit_line(line.to_owned());
+                }
+            }
+            Some("trigger/paginate") => paginate = true,
             Some("trigger/probe") => {
                 let path = v
                     .pointer("/params/path")
