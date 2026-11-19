@@ -221,10 +221,15 @@ rules.insert(libc::SYS_socket, vec![
   session process bound it, which is decided from `sock_diag` or, on kernels without
   `CONFIG_UNIX_DIAG`, `/proc/net/unix`. An abstract socket is refused. Addressed
   `sendmsg`/`sendmmsg` on an AF_UNIX datagram socket is not mediated (its destination sits in memory
-  seccomp cannot read), and the report says so. A loopback server the session itself starts is
-  refused too, because the supervisor admits inet only to the Gateway (FEP-6 §11, "In-session
-  loopback"; [FW-E2E-106](../formwork.md#fw-e2e-106) waits on it). Requires 5.6+ (`pidfd_getfd`) and
-  Yama `ptrace_scope` 0 or 1; host detection probes all three.
+  seccomp cannot read), and the report says so. A connect from inside the session to a loopback
+  server the session itself starts is refused too, because the supervisor admits inet only to the
+  Gateway (FEP-6 §11, "In-session loopback"; [FW-E2E-106](../formwork.md#fw-e2e-106) waits on it).
+  The server itself starts: the filter delivers no `bind`, `listen` or `accept`, and this plan
+  handles no Landlock net right, so a session can listen on any address and accept connections
+  from outside it. The compiler reports `net-default-deny` `Partial` under host rules and the
+  reason names inbound connections ([FW-FID33](../formwork.md#fw-fid33)); the verdict for each
+  net plan is decided in one function, `inbound_gap` in `formwork-compile/src/linux.rs`. Requires
+  5.6+ (`pidfd_getfd`) and Yama `ptrace_scope` 0 or 1; host detection probes all three.
 - **Channels.** Without host rules nothing mediates a pathname `connect()`, so the socket-shaped
   channels (`run-outside`, `open-url` through the desktop portal, `clipboard`, `screen`) are
   `Partial`: the Launcher strips their locator variables ([FW-BP11](../formwork.md#fw-bp11)), which

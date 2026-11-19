@@ -1,7 +1,7 @@
 //! Report rows that follow the host (FW-INV5), named for the requirements they discharge. Each
 //! compiles for a synthesized `HostProfile`, the one substitution the pure compiler admits.
 
-use formwork_blueprint::{Blueprint, PathPattern, ResolvedCatalog};
+use formwork_blueprint::{Blueprint, HostTable, NetPosture, PathPattern, ResolvedCatalog};
 use formwork_compile::{Backend, Capability, Fidelity, FidelityReport};
 use formwork_detect::HostProfile;
 
@@ -106,4 +106,47 @@ fn fw_fid34_truncation_joins_the_withheld_reason() {
     assert!(at.contains("withheld on Linux"), "{at}");
     assert!(at.contains("absolute rows are enforced"), "{at}");
     assert!(!at.contains("truncation"), "{at}");
+}
+
+fn host_rules() -> Blueprint {
+    let mut blueprint = Blueprint::empty();
+    blueprint.net =
+        NetPosture::AllowHosts(HostTable::new(vec!["allow:example.test".parse().unwrap()]));
+    blueprint
+}
+
+/// FW-FID33: under host rules the supervisor decides every outbound connect, and nothing decides
+/// `bind`, `listen` or `accept`, so the row is `Partial` and names inbound connections.
+/// `net = "deny"` and the port tier keep the verdict they had.
+#[test]
+fn fw_fid33_host_rules_report_unmediated_inbound_connections() {
+    let host = HostProfile::synthetic_linux(Some(7));
+    assert!(host.can_supervise_connect());
+
+    let rows = report(&host_rules(), &host).per_capability;
+    let reason = partial_reason(&rows[&Capability::NetDefaultDeny], Backend::Supervisor);
+    assert!(
+        reason.contains("inbound connections are not mediated"),
+        "{reason}"
+    );
+    assert!(reason.contains("listen"), "{reason}");
+
+    let seccomp = Fidelity::Enforced {
+        backend: Backend::Seccomp,
+    };
+    assert_eq!(Blueprint::empty().net, NetPosture::Deny);
+    let rows = report(&Blueprint::empty(), &host).per_capability;
+    assert_eq!(rows[&Capability::NetDefaultDeny], seccomp, "net = deny");
+
+    // Landlock refuses `bind()` under the port tier; the row is pinned as it stands.
+    let mut ports = Blueprint::empty();
+    ports.net = NetPosture::Ports(vec![443]);
+    let rows = report(&ports, &host).per_capability;
+    assert_eq!(rows[&Capability::NetDefaultDeny], seccomp, "port tier");
+
+    // Host rules on a host that cannot supervise fall back to the full inet deny.
+    let mut unsupervised = host.clone();
+    unsupervised.connect_supervision = false;
+    let rows = report(&host_rules(), &unsupervised).per_capability;
+    assert_eq!(rows[&Capability::NetDefaultDeny], seccomp, "no supervisor");
 }

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use formwork_blueprint::{
     Blueprint, HostRule, HostTable, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
 };
-use formwork_compile::{Capability, CompiledPolicy, Fidelity};
+use formwork_compile::{Backend, Capability, CompiledPolicy, Fidelity};
 use formwork_confine::SupervisorConfig;
 use formwork_detect::detect;
 
@@ -149,9 +149,11 @@ fn fw_e2e_075_gateway_is_the_sole_egress_path() {
     let other = Counting::start();
     let registry = Arc::new(Mutex::new(HashSet::new()));
     let pol = policy(&work.0, &[]);
+    // FW-FID33: the supervisor carries the outbound half this test probes; the row is `Partial`
+    // because nothing mediates inbound connections.
     assert!(matches!(
-        pol.report.per_capability[&Capability::NetDefaultDeny],
-        Fidelity::Enforced { .. }
+        &pol.report.per_capability[&Capability::NetDefaultDeny],
+        Fidelity::Partial { backend: Backend::Supervisor, reason } if reason.contains("inbound")
     ));
 
     let to_gateway = run(

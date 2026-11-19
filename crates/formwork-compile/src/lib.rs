@@ -523,9 +523,10 @@ fn compile_linux(
     }
 
     let (net_plan, inet_deny, tier) = linux::net_plan(host, &input.net);
-    // Net default-deny is seccomp-carried on every Linux path: an outright deny blocks the inet
-    // family, and the port tier needs seccomp for the inet DGRAM/RAW deny (Landlock net governs TCP
-    // only). Without a working seccomp filter it is not claimed (FW-ISO11, FW-INV5).
+    // Net default-deny is seccomp-carried on every Linux path the supervisor does not carry: an
+    // outright deny blocks the inet family, and the port tier needs seccomp for the inet DGRAM/RAW
+    // deny (Landlock net governs TCP only). Without a working seccomp filter it is not claimed
+    // (FW-ISO11, FW-INV5).
     let seccomp_or = |what: &str| -> Fidelity {
         if host.seccomp {
             Fidelity::Enforced {
@@ -537,9 +538,27 @@ fn compile_linux(
             }
         }
     };
+    let supervise = matches!(net_plan, LinuxNetPlan::SupervisedConnect);
+    let outbound = if supervise {
+        Fidelity::Enforced {
+            backend: Backend::Supervisor,
+        }
+    } else {
+        seccomp_or("direct egress denial")
+    };
+    // FW-FID33: an outbound deny beside unmediated inbound connections is not a default deny.
     caps.insert(
         Capability::NetDefaultDeny,
-        seccomp_or("direct egress denial"),
+        match (outbound, linux::inbound_gap(&net_plan)) {
+            (Fidelity::Enforced { backend }, Some(gap)) => Fidelity::Partial {
+                backend,
+                reason: format!(
+                    "outbound connections are denied apart from the granted endpoints; inbound \
+                     connections are not mediated: {gap}"
+                ),
+            },
+            (outbound, _) => outbound,
+        },
     );
     caps.insert(Capability::NetUdp, seccomp_or("UDP/raw closure"));
     // D8/FW-EGR12: UDP resolution is closed with the inet deny, but the pathname resolver sockets
@@ -682,7 +701,6 @@ fn compile_linux(
         return (confiner, Vec::new());
     }
 
-    let supervise = matches!(net_plan, LinuxNetPlan::SupervisedConnect);
     let seccomp = linux::seccomp_plan(inet_deny, supervise);
     debug_assert!(
         !matches!(inet_deny, InetSeccompDeny::DgramRawOnly) || seccomp.deny_inet_dgram_raw
@@ -1059,7 +1077,6 @@ fn egress_rows(
             let supervisor = || Fidelity::Enforced {
                 backend: Backend::Supervisor,
             };
-            caps.insert(Capability::NetDefaultDeny, supervisor());
             caps.insert(Capability::NetResolver, supervisor());
             let sendmsg_gap = "addressed sendmsg()/sendmmsg() on an AF_UNIX datagram socket is not mediated (its destination sits in memory seccomp cannot read); connect() and addressed sendto() are";
             caps.insert(

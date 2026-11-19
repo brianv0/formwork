@@ -16,6 +16,24 @@ pub const LANDLOCK_NET_ABI: u32 = 4;
 /// Landlock ABI at which the truncate right (`ACCESS_FS_TRUNCATE`) becomes available (Linux 6.2).
 pub const LANDLOCK_TRUNCATE_ABI: u32 = 3;
 
+/// What a net plan leaves unmediated on the inbound side; `None` when it leaves nothing
+/// (FW-FID33). A plan's inbound verdict is decided here and nowhere else.
+pub fn inbound_gap(plan: &LinuxNetPlan) -> Option<&'static str> {
+    match plan {
+        // No inet socket exists to listen on.
+        LinuxNetPlan::SeccompDenyInet => None,
+        // Landlock handles `BIND_TCP` and the plan carries no bind rule, so `bind()` is refused.
+        // `listen()` on an unbound socket binds itself without that check and is not
+        // characterized; this arm follows that answer.
+        LinuxNetPlan::LandlockTcpSeccompDgramRawDeny { .. } => None,
+        // The notify filter delivers `connect` and addressed `sendto` only.
+        LinuxNetPlan::SupervisedConnect => Some(
+            "nothing governs bind(), listen() or accept(), so the session can listen on any \
+             address and accept connections from outside it",
+        ),
+    }
+}
+
 /// Escalation and confinement-shedding syscalls denied outright (EPERM). Sorted for byte-identical
 /// output (FW-FID4); none is touched by an ordinary build/test/vcs toolchain.
 const BASELINE_DENY: &[&str] = &[
