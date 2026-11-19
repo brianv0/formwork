@@ -362,11 +362,13 @@ Host-scoped egress: the confiner stays default-deny, and a confined process reac
 | <a id="fw-egr19"></a>**FW-EGR19** Local and private admission | The Gateway shall admit a loopback, private, shared, link-local or host-interface address other than a metadata address only for a host matched by an exact-name or IP-literal rule. |
 | <a id="fw-egr20"></a>**FW-EGR20** Inspected ALPN | For an inspected host, the Gateway shall offer only `http/1.1` in ALPN and shall refuse a ClientHello whose ALPN list is present and excludes `http/1.1`. |
 | <a id="fw-egr21"></a>**FW-EGR21** Streamed bodies | The Gateway shall forward request and response bodies as they arrive, holding at most **body-buffer** bytes of a body per direction in memory. |
-| <a id="fw-egr22"></a>**FW-EGR22** Authorized forwarding | For an inspected request, the Gateway shall send upstream a request line built from the method and canonical path that matched, with hop-by-hop headers and `Proxy-Authorization` removed. |
+| <a id="fw-egr22"></a>**FW-EGR22** Authorized forwarding | For an inspected request, the Gateway shall send upstream a request line built from the method and canonical path that matched, with hop-by-hop headers and `Proxy-Authorization` removed, except that a `Connection` header removes neither `Host` nor the framing ([FW-EGR38](#fw-egr38)). |
 | <a id="fw-egr23"></a>**FW-EGR23** Reflective methods | On an inspected host, the Gateway shall refuse TRACE and CONNECT requests under every rule. |
 | <a id="fw-egr24"></a>**FW-EGR24** Upstream verification | The Gateway shall verify every upstream TLS certificate for the requested host name against the host trust store it loaded at session start, and shall never trust the session CA or a file a confined process can write for upstream verification. |
 | <a id="fw-egr25"></a>**FW-EGR25** Constrained session CA | The session CA certificate shall carry name constraints whose permitted subtrees are exactly the session's inspected exact names, wildcard suffixes and IP literals. |
 | <a id="fw-egr26"></a>**FW-EGR26** Upstream proxy | When `formwork run`'s environment names an upstream proxy, the Gateway shall send admitted egress through it, except to hosts that environment's `NO_PROXY` exempts, and shall report destination classification `Partial` with the reason for each proxied host. |
+| <a id="fw-egr36"></a>**FW-EGR36** Singleton fields | The Gateway shall refuse a request that carries more than one `Host`, `Content-Length` or `Transfer-Encoding` field, or more than one field bearing a header name brokered for the request's host. |
+| <a id="fw-egr38"></a>**FW-EGR38** Decided framing | For every request and response it forwards, the Gateway shall write the message framing (`Content-Length` or `Transfer-Encoding`) from the framing it decided, and shall forward no framing field received from the peer, except on a response that has no body by its status or its request's method. |
 
 ## 6. Invariants
 
@@ -465,6 +467,8 @@ The egress tests drive the real gateway against loopback fixture upstreams and a
 <a id="fw-e2e-096"></a>**FW-E2E-096: Latency budget (both).** Medians over 1,000 requests against a loopback fixture, compared with the same client connecting directly: each sample pairs the request direct and through the Gateway, in alternating order, and the statistic is the median of the pairs' differences with a distribution-free 95% interval. The budget is the §8 target times the node's speed relative to a reference node -- a calibration workload of TLS handshakes and records on the Gateway's provider, timed between batches -- clamped to [1, 3]. Pass: the interval lies under the budget. Fail: it lies over, or still straddles it after 4,000 pairs. (Amended: a fixed bound on a shared runner is a flaky test, constitution *Testing*.)
 
 <a id="fw-e2e-097"></a>**FW-E2E-097: Session CA shape (both).** Pass: the bundle's session certificate is a CA with path length 0 and the name constraints [FW-EGR25](#fw-egr25) lists; no file under the session scratch, `$HOME` or the temporary directories contains the CA private key after the session starts; the leaf for an inspected host verifies with `openssl verify` against the bundle. Fail: any of these does not hold.
+
+<a id="fw-e2e-212"></a>**FW-E2E-212: Singleton fields and decided framing (both).** Against a fixture that records every request it receives, over an inspected connection, with the repeated `Host` and the framing cases also over plain HTTP. A request with two `Host` fields, and one with two of each other singleton field ([FW-EGR36](#fw-egr36)), is sent, and a CONNECT with two `Host`, `Content-Length` and `Transfer-Encoding` fields in turn; a `POST` whose `Connection` header names `content-length`, and one naming `transfer-encoding`, carries a second request head as its body, under a rule that admits only the `POST`; the fixture answers a `GET` with a response whose `Connection` header names its own framing field. Pass: each repeated-field request is refused with a `malformed` violation record and the fixture receives nothing; each `POST` reaches the fixture as exactly one request with its framing field and its whole body, and leaves one grant record; the client receives each response with its framing field, and the connection serves a further request ([FW-EGR38](#fw-egr38)). Fail: a refused request reaches the fixture, the fixture receives a request the Gateway did not decide, or a message arrives without its framing.
 
 ### 7.3 Transport / fd seam (retired)
 
@@ -640,7 +644,7 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 
 <a id="fw-adv-023"></a>**FW-ADV-023: Address classes.** Under `allow:*.test`, the resolver fixture answers `127.0.0.1`, `10.0.0.1`, `100.100.100.200`, `168.63.129.16`, `::ffff:169.254.169.254`, `64:ff9b::a9fe:a9fe`, `2002:a9fe:a9fe::1`, `fe80::1`, a public address mixed with `10.0.0.1`, an address of the runner's own interfaces, and the Gateway's own listener address. Then, under the exact rule `allow:allowed.test`, it answers `127.0.0.1` and then `169.254.169.254`. Pass: every wildcard case and the exact-name metadata case are refused with `address-class`, and the exact-name loopback case is admitted. Fail: any other outcome.
 
-<a id="fw-adv-024"></a>**FW-ADV-024: Parser battery ([FW-INV15](#fw-inv15)).** Heads carrying both `Content-Length` and `Transfer-Encoding`, two differing `Content-Length` values, obsolete line folding, a bare LF, a NUL in a header value, an invalid method token, a head over **head-limit**, CONNECT authorities with userinfo, a path, a zone identifier, a percent-encoded dot, or a numeric spelling (`2130706433`, `0x7f.1`, `127.1`), and a truncated ClientHello. Pass: the fixture upstream receives no byte from any of them. Fail: any byte arrives.
+<a id="fw-adv-024"></a>**FW-ADV-024: Parser battery ([FW-INV15](#fw-inv15)).** Heads carrying both `Content-Length` and `Transfer-Encoding`, two differing `Content-Length` values, a repeated `Host`, `Content-Length` or `Transfer-Encoding` field with equal values ([FW-EGR36](#fw-egr36)), obsolete line folding, a bare LF, a NUL in a header value, an invalid method token, a head over **head-limit**, CONNECT authorities with userinfo, a path, a zone identifier, a percent-encoded dot, or a numeric spelling (`2130706433`, `0x7f.1`, `127.1`), and a truncated ClientHello. Pass: the fixture upstream receives no byte from any of them. Fail: any byte arrives.
 
 ### 7.11 Host-service channels & isolation
 
@@ -1065,6 +1069,8 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-EGR24](#fw-egr24) Upstream verification | [FW-E2E-098](#fw-e2e-098) | 103 |
 | [FW-EGR25](#fw-egr25) Constrained session CA | [FW-E2E-097](#fw-e2e-097) | 094 |
 | [FW-EGR26](#fw-egr26) Upstream proxy | [FW-E2E-103](#fw-e2e-103) | — |
+| [FW-EGR36](#fw-egr36) Singleton fields | [FW-E2E-212](#fw-e2e-212) | ADV-024 |
+| [FW-EGR38](#fw-egr38) Decided framing | [FW-E2E-212](#fw-e2e-212) | 092 |
 | Launcher arm (§2) | [FW-E2E-046](#fw-e2e-046), 050 | 047, INV7, ADV-014 |
 
 ## 11. Open questions
