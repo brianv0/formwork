@@ -288,9 +288,9 @@ enum Frame {
     Batch,
     /// A frame that repeats a key the gateway reads (FW-GW17). It is never forwarded.
     Ambiguous { id: Id },
-    /// Not JSON at all. From the agent it closes the connection (D6); from a backend it forwards,
-    /// since backend output is not a door into anything.
-    NotJson(Vec<u8>),
+    /// Not JSON at all. From the agent it closes the connection (D6); from a backend it is
+    /// dropped, since a frame the gateway cannot read is one it cannot shade (FW-GW15).
+    NotJson,
     /// JSON that is neither an object nor an array.
     Passthrough(Vec<u8>),
 }
@@ -380,7 +380,7 @@ impl Frame {
         // serde_json does not check the encoding of a value it skips, and a peer that repairs bad
         // UTF-8 could read a different structure out of the same bytes.
         let Ok(text) = std::str::from_utf8(&raw) else {
-            return Frame::NotJson(raw);
+            return Frame::NotJson;
         };
         match serde_json::from_str::<Shape<Envelope>>(text) {
             Ok(Shape::Object(envelope)) => {
@@ -402,9 +402,9 @@ impl Frame {
             // separates that from a frame that is also malformed further on.
             Err(e) if e.is_data() => match serde_json::from_str::<IdProbe>(text) {
                 Ok(IdProbe(id)) => Frame::Ambiguous { id },
-                Err(_) => Frame::NotJson(raw),
+                Err(_) => Frame::NotJson,
             },
-            Err(_) => Frame::NotJson(raw),
+            Err(_) => Frame::NotJson,
         }
     }
 }
@@ -568,7 +568,7 @@ where
             Frame::Ambiguous { id } => {
                 invalid_request(&agent_w, id.valid(), "the frame repeats a key").await?;
             }
-            Frame::NotJson(_) => {
+            Frame::NotJson => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "agent sent a frame that is not JSON; closing the connection (fail-closed)",
@@ -594,15 +594,31 @@ where
     let mut reader = BufReader::new(reader);
     while let Some(raw) = read_frame(&mut reader, MAX_FRAME_BYTES).await? {
         match Frame::parse(raw) {
+            // FW-GW3: the gate applies with or without an `id`; without one there is no one to
+            // answer, so the frame is dropped.
             Frame::Message {
-                id: id @ (Id::Valid(_) | Id::Invalid),
+                id: Id::Absent,
+                method: Some(Method::Sampling),
+                ..
+            } if policy.sampling != Gate::Allow => {
+                tracing::warn!("gateway dropped an id-less sampling/createMessage");
+            }
+            Frame::Message {
+                id: Id::Absent,
+                method: Some(Method::Elicitation),
+                ..
+            } if policy.elicitation != Gate::Allow => {
+                tracing::warn!("gateway dropped an id-less elicitation/create");
+            }
+            Frame::Message {
+                id,
                 method: Some(Method::Sampling),
                 ..
             } if policy.sampling != Gate::Allow => {
                 police(&backend_w, id.valid(), "sampling/createMessage").await?;
             }
             Frame::Message {
-                id: id @ (Id::Valid(_) | Id::Invalid),
+                id,
                 method: Some(Method::Elicitation),
                 ..
             } if policy.elicitation != Gate::Allow => {
@@ -639,7 +655,10 @@ where
             Frame::Ambiguous { .. } => {
                 tracing::warn!("gateway dropped a backend frame that repeats a key");
             }
-            Frame::NotJson(raw) | Frame::Passthrough(raw) => write_frame(&agent_w, &raw).await?,
+            Frame::NotJson => {
+                tracing::warn!("gateway dropped a backend frame that is not JSON");
+            }
+            Frame::Passthrough(raw) => write_frame(&agent_w, &raw).await?,
         }
     }
     Ok(())
@@ -1223,7 +1242,7 @@ mod tests {
         // A repeated key ahead of a syntax error is still not JSON (D6).
         assert!(matches!(
             parse(r#"{"id":1,"id":2,"method":"ping""#),
-            Frame::NotJson(_)
+            Frame::NotJson
         ));
     }
 
@@ -1316,6 +1335,46 @@ mod tests {
             [r#"{"jsonrpc":"2.0","method":"notifications/x"}"#]
         );
         assert!(to_backend.is_empty());
+    }
+
+    /// FW-GW15: a backend line the gateway cannot parse is not forwarded. A client with a lenient
+    /// parser would read a list out of it that was never shaded.
+    #[tokio::test]
+    async fn fw_gw15_unparseable_backend_frames_are_dropped() {
+        let backend = [
+            r#"{"id":1,"result":{"tools":[{"name":"hidden","x":NaN}]}}"#,
+            r#"{"id":2,"result":{"tools":[{"name":"hidden"}]},"\ud800":1}"#,
+            "{\"id\":3,\"result\":{\"tools\":[{\"name\":\"hidden\"}]}",
+            r#"{"jsonrpc":"2.0","method":"notifications/x"}"#,
+        ]
+        .join("\n");
+        let (to_agent, to_backend) = from_backend(allow(&["keep"]), backend.as_bytes()).await;
+        assert_eq!(
+            to_agent,
+            [r#"{"jsonrpc":"2.0","method":"notifications/x"}"#]
+        );
+        assert!(to_backend.is_empty());
+    }
+
+    /// FW-GW3: a gated server->client request with no `id` is dropped, not forwarded.
+    #[tokio::test]
+    async fn fw_gw3_id_less_server_requests_are_gated() {
+        let backend = [
+            r#"{"jsonrpc":"2.0","method":"sampling/createMessage","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":null,"method":"elicitation/create","params":{}}"#,
+        ]
+        .join("\n");
+        let deny = McpPolicy::default();
+        let (to_agent, to_backend) = from_backend(deny, backend.as_bytes()).await;
+        assert!(to_agent.is_empty(), "{to_agent:?}");
+        assert!(to_backend.is_empty());
+        let allow = McpPolicy {
+            sampling: Gate::Allow,
+            elicitation: Gate::Allow,
+            ..Default::default()
+        };
+        let (to_agent, _) = from_backend(allow, backend.as_bytes()).await;
+        assert_eq!(to_agent.len(), 2);
     }
 
     /// FW-GW8: a frame the gateway admits is forwarded as the bytes received -- spacing, key
@@ -1435,11 +1494,11 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(parse("not json"), Frame::NotJson(_)));
-        assert!(matches!(parse(""), Frame::NotJson(_)));
+        assert!(matches!(parse("not json"), Frame::NotJson));
+        assert!(matches!(parse(""), Frame::NotJson));
         assert!(matches!(
             Frame::parse(b"{\"id\":1,\"method\":\"ping\",\"x\":\"\xff\"}".to_vec()),
-            Frame::NotJson(_)
+            Frame::NotJson
         ));
         assert!(matches!(parse("17"), Frame::Passthrough(_)));
         assert!(matches!(
