@@ -138,7 +138,8 @@ fn fw_fid33_host_rules_report_unmediated_inbound_connections() {
     let rows = report(&Blueprint::empty(), &host).per_capability;
     assert_eq!(rows[&Capability::NetDefaultDeny], seccomp, "net = deny");
 
-    // Landlock refuses `bind()` under the port tier; the row is pinned as it stands.
+    // Pinned as it stands: Landlock refuses `bind()` under the port tier, and `listen()` on an
+    // unbound socket is not characterized.
     let mut ports = Blueprint::empty();
     ports.net = NetPosture::Ports(vec![443]);
     let rows = report(&ports, &host).per_capability;
@@ -149,4 +150,54 @@ fn fw_fid33_host_rules_report_unmediated_inbound_connections() {
     unsupervised.connect_supervision = false;
     let rows = report(&host_rules(), &unsupervised).per_capability;
     assert_eq!(rows[&Capability::NetDefaultDeny], seccomp, "no supervisor");
+}
+
+fn unenforceable_reason(fidelity: &Fidelity) -> &str {
+    match fidelity {
+        Fidelity::Unenforceable { reason } => reason,
+        other => panic!("expected Unenforceable, got {other:?}"),
+    }
+}
+
+/// FW-INV5 (issue #60 a): seccomp closes UDP resolution, so without it `net-resolver` is
+/// `Unenforceable` for the reason `net-udp` is, and names no backend the host lacks.
+#[test]
+fn fw_inv5_resolver_row_needs_seccomp() {
+    let mut host = HostProfile::synthetic_linux(Some(6));
+    let rows = report(&Blueprint::empty(), &host).per_capability;
+    let reason = partial_reason(&rows[&Capability::NetResolver], Backend::Seccomp);
+    assert!(reason.contains("UDP resolution is closed"), "{reason}");
+
+    host.seccomp = false;
+    let rows = report(&Blueprint::empty(), &host).per_capability;
+    for cap in [Capability::NetUdp, Capability::NetResolver] {
+        let reason = unenforceable_reason(&rows[&cap]);
+        assert!(
+            reason.starts_with("seccomp unavailable on this host"),
+            "{cap}: {reason}"
+        );
+    }
+}
+
+/// FW-INV5 (issue #60 b): a profile that spells no Landlock as ABI 0 gets the report of one that
+/// spells it as absent, so no row names Landlock beside `fs-read: unenforceable`.
+#[test]
+fn fw_inv5_landlock_abi_zero_is_no_landlock() {
+    let mut privileged = HostProfile::synthetic_linux(Some(0));
+    privileged.facilities.ptrace_privileged = true;
+    for zero in [HostProfile::synthetic_linux(Some(0)), privileged] {
+        let mut absent = zero.clone();
+        absent.landlock_abi = None;
+        for blueprint in [write_subtract(), host_rules()] {
+            let at_zero = report(&blueprint, &zero);
+            let rows = &at_zero.per_capability;
+            for cap in [Capability::FsRead, Capability::ProcessEnvironment] {
+                let reason = unenforceable_reason(&rows[&cap]);
+                assert!(reason.contains("Landlock unavailable"), "{cap}: {reason}");
+            }
+            let at_absent = report(&blueprint, &absent);
+            assert_eq!(rows, &at_absent.per_capability);
+            assert_eq!(at_zero.credentials, at_absent.credentials);
+        }
+    }
 }

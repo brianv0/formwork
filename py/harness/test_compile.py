@@ -21,12 +21,43 @@ def test_dry_run_cross_platform_compile(cli, tmp_path):
 
 
 @pytest.mark.fw_e2e("FW-E2E-026")
+@pytest.mark.fw_e2e("FW-E2E-214")
 def test_degraded_host_reports_unenforceable(cli, tmp_path):
-    blueprint = write_blueprint(tmp_path / "blueprint.toml", reads=["/work/project/**"])
-    result = cli("compile", "--blueprint", blueprint, "--target", "linux-v1", "--report-only")
-    report = json.loads(result.stdout)
-    net = report["per-capability"]["net-default-deny"]
-    assert net["status"] in ("enforced", "partial"), "net must never be silently open"
+    """A Landlock ABI 1 host (Linux 5.13) asked for a port tier and a write-protected file: each
+    row the kernel cannot carry says so, and egress fails closed (FW-INV5, FW-INV6)."""
+    blueprint = write_blueprint(
+        tmp_path / "blueprint.toml",
+        reads=["/work/project/**"],
+        writes=["/work/project/**"],
+        write_subtract=["/work/project/.envrc"],
+    )
+
+    def compile_for(target):
+        result = cli(
+            "compile", "--blueprint", blueprint, "--net", "ports:8080", "--target", target, "--report-only"
+        )
+        assert result.code == 0, result.stderr
+        return json.loads(result.stdout)["per-capability"]
+
+    caps = compile_for("linux-v1")
+    # TCP port rules arrive at ABI 4 and scoping at ABI 6: neither is claimed.
+    assert caps["net-port-tier"]["status"] == "unenforceable", caps["net-port-tier"]
+    assert "ABI v4" in caps["net-port-tier"]["reason"]
+    assert caps["cross-domain-socket"]["status"] == "unenforceable", caps["cross-domain-socket"]
+    assert "ABI v6" in caps["cross-domain-socket"]["reason"]
+    # The port tier falls back to the full inet deny, which seccomp carries at every ABI.
+    assert caps["net-default-deny"] == {"status": "enforced", "backend": "seccomp"}
+    assert caps["net-udp"] == {"status": "enforced", "backend": "seccomp"}
+    assert caps["fs-read"] == {"status": "enforced", "backend": "landlock"}
+    # FW-FID34: the truncate right arrives at ABI 3, so the write rows are partial below it.
+    for key in ("fs-write", "tamper-vectors"):
+        assert caps[key]["status"] == "partial", caps[key]
+        assert caps[key]["backend"] == "landlock", caps[key]
+        assert "truncation" in caps[key]["reason"], caps[key]
+
+    modern = compile_for("linux-v6")
+    for key in ("fs-write", "tamper-vectors", "net-port-tier"):
+        assert modern[key] == {"status": "enforced", "backend": "landlock"}, modern[key]
 
 
 @pytest.mark.fw_e2e("FW-E2E-027")

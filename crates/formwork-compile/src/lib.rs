@@ -487,8 +487,8 @@ fn compile_linux(
     caps: &mut BTreeMap<Capability, Fidelity>,
     withheld: &mut Vec<String>,
 ) -> (ConfinerPolicy, Vec<u16>) {
-    let abi = host.landlock_abi.unwrap_or(0);
-    let has_landlock = abi >= 1;
+    let abi = linux::landlock_abi(host);
+    let has_landlock = linux::has_landlock(host);
     let landlock = || Fidelity::Enforced {
         backend: Backend::Landlock,
     };
@@ -562,15 +562,19 @@ fn compile_linux(
     );
     caps.insert(Capability::NetUdp, seccomp_or("UDP/raw closure"));
     // D8/FW-EGR12: UDP resolution is closed with the inet deny, but the pathname resolver sockets
-    // stay connect()-reachable without the supervisor, so resolution is not closed.
+    // stay connect()-reachable without the supervisor, so resolution is not closed. Without
+    // seccomp the UDP half is not closed either, and the row names no backend (FW-INV5).
     caps.insert(
         Capability::NetResolver,
-        Fidelity::Partial {
-            backend: Backend::Seccomp,
-            reason: "UDP resolution is closed, but pathname resolver sockets (nscd, \
-                     systemd-resolved) are connect()-reachable; host rules route resolution \
-                     through the Gateway and close them"
-                .to_string(),
+        match seccomp_or("resolver closure") {
+            Fidelity::Enforced { backend } => Fidelity::Partial {
+                backend,
+                reason: "UDP resolution is closed, but pathname resolver sockets (nscd, \
+                         systemd-resolved) are connect()-reachable; host rules route resolution \
+                         through the Gateway and close them"
+                    .to_string(),
+            },
+            unenforceable => unenforceable,
         },
     );
 
@@ -842,12 +846,12 @@ fn baseline_rows(
         }
         // Landlock refuses a confined process ptrace-class access to any process outside its
         // domain, which is the check `/proc/<pid>/environ` goes through (FW-ISO16).
-        Os::Linux if host.landlock_abi.is_some() && !facilities.ptrace_privileged => {
+        Os::Linux if linux::has_landlock(host) && !facilities.ptrace_privileged => {
             Fidelity::Enforced {
                 backend: Backend::Landlock,
             }
         }
-        Os::Linux if host.landlock_abi.is_some() => Fidelity::Partial {
+        Os::Linux if linux::has_landlock(host) => Fidelity::Partial {
             backend: Backend::Landlock,
             reason: format!(
                 "Landlock refuses ptrace-class access, /proc/<pid>/environ included, to processes \
@@ -973,7 +977,7 @@ fn linux_channel_fidelity(
         Channel::RunOutside => unmediated("the session bus and the systemd --user socket"),
         Channel::OpenUrl => unmediated("the session bus (the desktop portal)"),
         Channel::Clipboard | Channel::Screen => {
-            if host.landlock_abi.unwrap_or(0) >= 6 {
+            if linux::landlock_abi(host) >= 6 {
                 unmediated("the X11/Wayland pathname socket")
             } else {
                 unmediated("the X11/Wayland socket, abstract X11 included (Landlock ABI < 6)")
@@ -1090,7 +1094,7 @@ fn egress_rows(
                 Capability::CrossDomainSocket,
                 Fidelity::Partial {
                     backend: Backend::Supervisor,
-                    reason: if host.landlock_abi.unwrap_or(0) >= 6 {
+                    reason: if linux::landlock_abi(host) >= 6 {
                         format!("pathname and abstract connect() are supervised; {sendmsg_gap}")
                     } else {
                         format!(

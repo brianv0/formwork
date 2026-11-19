@@ -16,6 +16,16 @@ pub const LANDLOCK_NET_ABI: u32 = 4;
 /// Landlock ABI at which the truncate right (`ACCESS_FS_TRUNCATE`) becomes available (Linux 6.2).
 pub const LANDLOCK_TRUNCATE_ABI: u32 = 3;
 
+/// The host's Landlock ABI, 0 when it has none. A profile spells absence as `None` or as ABI 0, so
+/// every row reads the ABI here and none names Landlock on a host without it (FW-INV5).
+pub fn landlock_abi(host: &HostProfile) -> u32 {
+    host.landlock_abi.unwrap_or(0)
+}
+
+pub fn has_landlock(host: &HostProfile) -> bool {
+    landlock_abi(host) >= 1
+}
+
 /// What a net plan leaves unmediated on the inbound side; `None` when it leaves nothing
 /// (FW-FID33). A plan's inbound verdict is decided here and nowhere else.
 pub fn inbound_gap(plan: &LinuxNetPlan) -> Option<&'static str> {
@@ -116,7 +126,7 @@ pub fn seccomp_plan(inet_deny: InetSeccompDeny, supervise_connect: bool) -> Secc
 
 /// Returns `(plan, inet_deny, port_tier)`.
 pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, InetSeccompDeny, PortTier) {
-    let abi = host.landlock_abi.unwrap_or(0);
+    let abi = landlock_abi(host);
     match net {
         // Deny ALL inet egress via seccomp (TCP, UDP and raw at the socket-family level), matching
         // macOS `(deny network*)`. AF_UNIX (local IPC) stays allowed.
