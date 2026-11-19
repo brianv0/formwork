@@ -593,6 +593,59 @@ async fn fw_e2e_078_brokered_header_is_presented_where_bound() {
     );
 }
 
+/// FW-E2E-217 / FW-CRED37: a placeholder behind percent-escapes in the request target -- in a
+/// query, or in a path, where canonicalization would forward it decoded -- is refused with
+/// `placeholder` toward its bound host and toward another, and nothing reaches the upstream. A
+/// target whose escapes decode to something else passes, forwarded as sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn fw_e2e_217_a_percent_encoded_placeholder_is_refused() {
+    let s = inspected(
+        &["allow:api.test:{port}", "allow:other.test:{port}"],
+        anthropic_broker(),
+    )
+    .await;
+    let first = PLACEHOLDER.replacen('f', "%66", 1);
+    let hyphen = PLACEHOLDER.replacen('-', "%2d", 1);
+    let every: String = PLACEHOLDER.bytes().map(|b| format!("%{b:02X}")).collect();
+    let targets = [
+        format!("/v1?k={first}"),
+        format!("/v1?k={hyphen}"),
+        format!("/v1?k={every}"),
+        format!("/v1/{first}"),
+    ];
+    for host in ["api.test", "other.test"] {
+        let mut tls = s.tunnel(host).await;
+        for target in &targets {
+            let out = request(
+                &mut tls,
+                &format!("GET {target} HTTP/1.1\r\n{}\r\n", s.host_header(host)),
+            )
+            .await;
+            assert!(out.starts_with("HTTP/1.1 403"), "{host}{target}: {out}");
+        }
+    }
+    assert!(s.up.seen().is_empty(), "{:?}", s.up.seen());
+    assert_eq!(
+        reasons(&s.proxy),
+        vec![RefusalReason::Placeholder; 2 * targets.len()]
+    );
+
+    let mut tls = s.tunnel("api.test").await;
+    let other = "/v1?k=%66wcre%64&pct=100%25";
+    let out = request(
+        &mut tls,
+        &format!("GET {other} HTTP/1.1\r\n{}\r\n", s.host_header("api.test")),
+    )
+    .await;
+    assert!(out.ends_with("ok:/v1"), "{out}");
+    let seen = s.up.seen();
+    assert!(
+        seen[0].head.starts_with(&format!("GET {other} ")),
+        "{}",
+        seen[0].head
+    );
+}
+
 /// FW-ADV-021 / FW-CRED17: an upstream that echoes the presented credential -- in the body, split
 /// across two writes 50 ms apart, in a response header, or compressed -- has its response ended;
 /// no 8-byte run of the credential reaches the client, and TRACE is refused outright.

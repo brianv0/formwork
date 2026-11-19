@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use formwork_blueprint::RefusalReason;
-use formwork_gateway::UpstreamProxy;
+use formwork_gateway::{ListenerRefusal, ListenerRefusalReason, UpstreamProxy};
 use rustls::pki_types::ServerName;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -365,6 +365,58 @@ async fn fw_adv_009_no_unauthenticated_door() {
     assert_eq!(asked[1].1, checked.addr());
 }
 
+/// FW-E2E-216 / FW-FID35: attempts the listener turns away before admitting a request are counted
+/// by reason -- one record per reason however many attempts -- and none enters the bounded queue
+/// of violation records. An admitted request is not counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn fw_e2e_216_listener_refusals_are_counted_per_reason() {
+    use ListenerRefusalReason::{Unauthenticated, UnregisteredPeer};
+    let up = upstream(None).await;
+    let rules = [format!("allow:allowed.test:{}", up.port)];
+    let request_line = format!(
+        "GET http://allowed.test:{0}/door HTTP/1.1\r\nHost: allowed.test:{0}\r\n\r\n",
+        up.port
+    );
+    let session = || Session::new(&rules, resolver(&[("allowed.test", "127.0.0.1")]));
+    let counted = |reason, count| vec![ListenerRefusal { reason, count }];
+
+    let (open, _) = session().start();
+    assert!(open.listener_refusals().is_empty());
+    let wrong = request_line.replacen(
+        "\r\n",
+        "\r\nProxy-Authorization: Basic Znc6bm90LXRoZS1jcmVkZW50aWFs\r\n",
+        1,
+    );
+    for head in [&request_line, &request_line, &wrong] {
+        let out = raw(&open, head.as_bytes()).await;
+        assert!(out.starts_with("HTTP/1.1 407"), "{out}");
+    }
+    assert_eq!(open.listener_refusals(), counted(Unauthenticated, 3));
+    assert!(open.violations().is_empty(), "{:?}", open.violations());
+    assert!(up.seen().is_empty(), "{:?}", up.seen());
+    let admitted = raw(&open, with_auth(&request_line).as_bytes()).await;
+    assert!(admitted.ends_with("ok:/door"), "{admitted}");
+    assert_eq!(open.listener_refusals(), counted(Unauthenticated, 3));
+
+    let mut gated = session();
+    gated.registry = Some(Arc::new(Mutex::new(HashSet::new())));
+    let (gated, _) = gated.start();
+    for _ in 0..2 {
+        let out = raw(&gated, with_auth(&request_line).as_bytes()).await;
+        assert!(out.is_empty(), "{out:?}");
+    }
+    assert_eq!(gated.listener_refusals(), counted(UnregisteredPeer, 2));
+
+    let mut checked = session();
+    checked.peer_check = Some(formwork_gateway::PeerCheck(Arc::new(|_, _| false)));
+    let (checked, _) = checked.start();
+    let out = raw(&checked, with_auth(&request_line).as_bytes()).await;
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(checked.listener_refusals(), counted(UnregisteredPeer, 1));
+    assert!(gated.violations().is_empty() && checked.violations().is_empty());
+    assert_eq!(up.seen().len(), 1, "only the admitted request crossed");
+}
+
 /// Plain HTTP runs the inspected request pipeline without TLS (FEP-6 §4.8): decided by method and
 /// canonical path, forwarded from what matched (FW-EGR22), with traversal, smuggling and a
 /// tunnel-grade host refused.
@@ -694,6 +746,99 @@ async fn fw_egr26_egress_leaves_through_the_upstream_proxy() {
         !lines.iter().any(|l| l.contains("corp.test")),
         "NO_PROXY exempts the intranet: {lines:?}"
     );
+}
+
+/// FW-E2E-215 / FW-CRED36: a plain request leaves through the operator's proxy carrying the
+/// operator's proxy credential, which the confined client never holds. The fixture proxy forwards
+/// that field to the origin, as a non-conforming proxy does, and the origin echoes it -- in the
+/// body, split across two writes inside the value, in a response header, in the reason phrase, or
+/// in a body marked compressed. Each response is ended with a `reflection` record and no 8-byte
+/// run of the credential reaches the client; a response that echoes nothing passes, requested in
+/// identity coding. Through a proxy that takes no credential there is nothing to guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn fw_e2e_215_a_reflected_proxy_credential_ends_the_response() {
+    use base64::Engine as _;
+    let plain = upstream(None).await;
+    let mut ports = BTreeMap::new();
+    ports.insert("plain.test".to_string(), plain.port);
+    let corporate = corporate_proxy(ports).await;
+    let through = |userinfo: &str| {
+        let url = format!("http://{userinfo}127.0.0.1:{}", corporate.port);
+        let mut session = Session::new(
+            &[format!("allow:plain.test:{}", plain.port)],
+            // plain.test has no answer: only the proxy can reach it.
+            resolver(&[]),
+        );
+        session.upstream_proxy = UpstreamProxy::from_values(None, Some(&url), None).unwrap();
+        session.start().0
+    };
+    let get = |proxy: &formwork_gateway::EgressProxy, path: &str| {
+        let head = format!(
+            "GET http://plain.test:{0}{path} HTTP/1.1\r\nHost: plain.test:{0}\r\nProxy-Authorization: {1}\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+            plain.port,
+            proxy_auth()
+        );
+        let addr = proxy.addr();
+        async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            request(&mut s, &head).await
+        }
+    };
+    let credentials =
+        base64::engine::general_purpose::STANDARD.encode("operator:s3cret-proxy-password");
+    let leaks = |out: &str| {
+        credentials
+            .as_bytes()
+            .windows(8)
+            .any(|w| out.as_bytes().windows(8).any(|o| o == w))
+    };
+
+    let proxy = through("operator:s3cret-proxy-password@");
+    let ok = get(&proxy, "/p").await;
+    assert!(ok.contains("ok:/p"), "{ok}");
+    let seen = plain.seen();
+    assert_eq!(
+        seen[0].header("proxy-authorization"),
+        Some(format!("Basic {credentials}")),
+        "the fixture proxy forwards the credential, or the echoes below prove nothing"
+    );
+    assert_eq!(
+        seen[0].header("accept-encoding").as_deref(),
+        Some("identity")
+    );
+    assert!(proxy.violations().is_empty(), "{:?}", proxy.violations());
+
+    let echoes = [
+        "",
+        "?split=1&of=proxy",
+        "?in=header&of=proxy",
+        "?in=reason&of=proxy",
+        "?gzip=1",
+    ];
+    for query in echoes {
+        let out = get(&proxy, &format!("/reflect{query}")).await;
+        assert!(
+            !leaks(&out),
+            "{query}: the credential reached the client: {out}"
+        );
+    }
+    assert_eq!(plain.seen().len(), 1 + echoes.len());
+    let v = proxy.violations();
+    assert_eq!(
+        reasons(&proxy),
+        vec![RefusalReason::Reflection; echoes.len()]
+    );
+    assert!(
+        v.iter().all(|v| v.host.as_deref() == Some("plain.test")) && !leaks(&format!("{v:?}")),
+        "{v:?}"
+    );
+
+    let open = through("");
+    let echo = get(&open, "/reflect").await;
+    assert!(echo.contains("echo:"), "{echo}");
+    let last = plain.seen().pop().unwrap();
+    assert_eq!(last.header("accept-encoding").as_deref(), Some("gzip"));
+    assert!(open.violations().is_empty(), "{:?}", open.violations());
 }
 
 /// FW-EGR22 at the tunnel boundary: the confined client's proxy credential never crosses a tunnel,

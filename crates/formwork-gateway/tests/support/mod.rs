@@ -158,8 +158,10 @@ impl Seen {
 /// An HTTP/1.1 upstream on loopback, over TLS or plain, that records every handshake and request
 /// and answers by path:
 ///
-/// - `/reflect`: echoes the request head in the body (`?in=header` also in a response header,
-///   `?gzip=1` marks the body gzip-coded, `?split=1` writes it in two halves 50 ms apart);
+/// - `/reflect`: echoes the request head in the body (`?in=header` also echoes the request's
+///   `x-api-key` in a response header and `?in=reason` in the reason phrase, `?of=proxy` making
+///   that its `Proxy-Authorization`; `?gzip=1` marks the body gzip-coded; `?split=1` writes it in
+///   two halves 50 ms apart, cut inside the echoed value);
 /// - `/sse`: a server-sent-event stream of two events, the second sent only once the test calls
 ///   [`Upstream::ack`] (or after five seconds, which [`Upstream::acked`] then reports);
 /// - `/ws`: `101 Switching Protocols` to an upgrade, then echoes every byte;
@@ -311,7 +313,13 @@ async fn serve_fixture<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, fixture: Ups
             body: body.clone(),
         });
         let target = head.split(' ').nth(1).unwrap_or("/").to_string();
-        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        // An origin accepts the absolute form too (RFC 9112 §3.2.2), which is how the proxy
+        // fixture passes on every request after the first on a connection.
+        let origin_form = target
+            .strip_prefix("http://")
+            .and_then(|rest| rest.find('/').map(|i| &rest[i..]))
+            .unwrap_or(&target);
+        let (path, query) = origin_form.split_once('?').unwrap_or((origin_form, ""));
         let respond = |extra: &str, body: &str| {
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{extra}\r\n{body}",
@@ -321,19 +329,29 @@ async fn serve_fixture<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, fixture: Ups
         let ok = match path {
             "/reflect" => {
                 let echoed = format!("echo:\n{head}\n");
+                // The field whose value is echoed, and how far past its name the value's middle is.
+                let (field, lead) = if query.contains("of=proxy") {
+                    ("proxy-authorization", ": Basic ".len() + 6)
+                } else {
+                    ("x-api-key", 5)
+                };
+                let key = header(field).unwrap_or_default();
                 let mut extra = String::new();
                 if query.contains("in=header") {
-                    let key = header("x-api-key").unwrap_or_default();
                     extra.push_str(&format!("X-Echo: {key}\r\n"));
                 }
                 if query.contains("gzip=1") {
                     extra.push_str("Content-Encoding: gzip\r\n");
                 }
+                let mut whole = respond(&extra, &echoed);
+                if query.contains("in=reason") {
+                    whole = whole.replacen("200 OK", &format!("200 {key}"), 1);
+                }
                 if query.contains("split=1") {
-                    let whole = respond(&extra, &echoed);
                     let mid = whole
-                        .find("x-api-key")
-                        .map(|i| i + 14)
+                        .to_ascii_lowercase()
+                        .find(field)
+                        .map(|i| i + field.len() + lead)
                         .unwrap_or(whole.len() / 2);
                     let (a, b) = whole.split_at(mid);
                     let first = s.write_all(a.as_bytes()).await.is_ok();
@@ -341,9 +359,7 @@ async fn serve_fixture<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, fixture: Ups
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     first && s.write_all(b.as_bytes()).await.is_ok()
                 } else {
-                    s.write_all(respond(&extra, &echoed).as_bytes())
-                        .await
-                        .is_ok()
+                    s.write_all(whole.as_bytes()).await.is_ok()
                 }
             }
             "/sse" => {

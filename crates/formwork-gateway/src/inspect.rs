@@ -3,7 +3,8 @@
 //! HTTP/1.1 (FW-EGR20), then decides every request by `Host`, method and canonical path before
 //! writing it upstream from what matched (FW-EGR22). Plain HTTP to an inspected rule runs the same
 //! request pipeline without TLS. Brokered credentials are presented here, over TLS only
-//! (FW-CRED11, FW-CRED18, FW-CRED19), and a response that would echo one is ended (FW-CRED17).
+//! (FW-CRED11, FW-CRED18, FW-CRED19), and a response that would echo one, or the operator's proxy
+//! credential, is ended (FW-CRED17, FW-CRED36).
 //! Upstream connections come from a per-session keep-alive pool, each reused only for the host it
 //! was opened for.
 
@@ -31,8 +32,9 @@ use crate::egress::{
 };
 use crate::http::{
     connection_tokens, end_to_end, framed, is_client_gone, parse_head, parse_response_head,
-    render_request, render_response, request_framing, respond, response_framing, BodyError, BoxIo,
-    Buffered, Framing, Guard, Head, HeadError, Watched, HEAD_TIMEOUT, IDLE_TIMEOUT, READ_CHUNK,
+    percent_decoded, render_request, render_response, request_framing, respond, response_framing,
+    BodyError, BoxIo, Buffered, Framing, Guard, Head, HeadError, Watched, HEAD_TIMEOUT,
+    IDLE_TIMEOUT, READ_CHUNK,
 };
 
 /// The prefix of every session placeholder (FW-CRED14); the placeholder scan looks for it.
@@ -520,7 +522,7 @@ async fn exchange(
         .iter()
         .filter(|b| b.bindings.iter().any(|(h, _)| h == &host))
         .collect();
-    let encodings = if plain || brokered.is_empty() {
+    let mut encodings = if plain || brokered.is_empty() {
         Vec::new()
     } else if head.method == "OPTIONS" {
         // FW-CRED18: no credential on OPTIONS; its placeholder goes nowhere either.
@@ -529,9 +531,22 @@ async fn exchange(
     } else {
         present(&mut headers, &host, &brokered)
     };
+    let presented = !encodings.is_empty();
+    // Only a plain request crosses the operator's proxy as a request: TLS crosses it inside a
+    // tunnel the Gateway opened, and the credential stays on that tunnel's own `CONNECT`.
+    let via = dest.proxy().filter(|_| plain);
+    let proxy_credential = via.and_then(|proxy| proxy.authorization.as_deref());
+    if let Some(authorization) = proxy_credential {
+        encodings.extend(proxy_credential_encodings(authorization));
+    }
+    let guarded = if presented {
+        "the brokered credential"
+    } else {
+        "the operator's proxy credential (FW-CRED36)"
+    };
     if !encodings.is_empty() {
-        // FW-CRED17: identity coding keeps a reflected credential scannable; a compressed
-        // WebSocket would hide it the same way.
+        // FW-CRED17, FW-CRED36: identity coding keeps a reflected credential scannable; a
+        // compressed WebSocket would hide it the same way.
         headers.retain(|(n, _)| {
             !n.eq_ignore_ascii_case("accept-encoding")
                 && !n.eq_ignore_ascii_case("sec-websocket-extensions")
@@ -548,13 +563,13 @@ async fn exchange(
         Some(q) => format!("{path}?{q}"),
         None => path.to_string(),
     };
-    if let (true, Some(proxy)) = (plain, dest.proxy()) {
+    if via.is_some() {
         line_target = format!(
             "http://{}{line_target}",
             authority(&host, port, default_port)
         );
-        if let Some(auth) = &proxy.authorization {
-            headers.push(("Proxy-Authorization".into(), auth.clone()));
+        if let Some(authorization) = proxy_credential {
+            headers.push(("Proxy-Authorization".into(), authorization.to_string()));
         }
     }
     let request_bytes = render_request(&head.method, &line_target, &headers);
@@ -646,19 +661,20 @@ async fn exchange(
             if let Some(coding) = coding {
                 // FW-CRED17: a compressed echo cannot be scanned without decompressing it.
                 shared.refuse(at(reflection(format!(
-                    "the response to a brokered request came with content coding {coding:?}; \
-                     the reflection guard admits identity-coded responses only"
+                    "the response to a request that carried {guarded} came with content coding \
+                     {coding:?}; the reflection guard admits identity-coded responses only"
                 ))));
                 return Ok(Next::Close);
             }
-            if response
-                .headers
-                .iter()
-                .any(|(n, v)| g.scan(n.as_bytes()) || g.scan(v.as_bytes()))
+            if g.scan(response.reason.as_bytes())
+                || response
+                    .headers
+                    .iter()
+                    .any(|(n, v)| g.scan(n.as_bytes()) || g.scan(v.as_bytes()))
             {
-                shared.refuse(at(reflection(
-                    "a response header carries the brokered credential".into(),
-                )));
+                shared.refuse(at(reflection(format!(
+                    "the response head carries {guarded}"
+                ))));
                 return Ok(Next::Close);
             }
         }
@@ -680,9 +696,9 @@ async fn exchange(
             client.s.flush().await?;
             let spliced = splice(client, &mut up, guard.as_mut()).await;
             if spliced.reflected {
-                shared.refuse(at(reflection(
-                    "the upgraded stream carried the brokered credential".into(),
-                )));
+                shared.refuse(at(reflection(format!(
+                    "the upgraded stream carried {guarded}"
+                ))));
             }
             shared.grant(grant(
                 &host,
@@ -740,7 +756,7 @@ async fn exchange(
         .s
         .write_all(&render_response(&response, &out))
         .await?;
-    if guard.is_some() && matches!(response.status, 401 | 403) {
+    if presented && matches!(response.status, 401 | 403) {
         let names: Vec<&str> = brokered.iter().map(|b| b.name.as_str()).collect();
         tracing::warn!(
             host = %host,
@@ -779,9 +795,9 @@ async fn exchange(
             return Ok(Next::Close);
         }
         Err(BodyError::Reflected) => {
-            shared.refuse(at(reflection(
-                "the response body carries the brokered credential; the response is ended".into(),
-            )));
+            shared.refuse(at(reflection(format!(
+                "the response body carries {guarded}; the response is ended"
+            ))));
             return Ok(Next::Close);
         }
         Err(BodyError::Malformed(why)) => {
@@ -1084,8 +1100,9 @@ fn carries_any(value: &str, brokers: &[&Broker]) -> bool {
 }
 
 /// The placeholder scan (FEP-6 §4.7): every occurrence of the placeholder prefix in the request
-/// target or a header value (a `Basic` value decoded) must be a known placeholder, bound to this
-/// host, in its scheme's header, on a request forwarded over TLS.
+/// target (as received and percent-decoded, FW-CRED37) or a header value (a `Basic` value decoded)
+/// must be a known placeholder, bound to this host, in its scheme's header, on a request forwarded
+/// over TLS.
 fn scan_placeholders(
     head: &Head,
     target: &str,
@@ -1094,6 +1111,12 @@ fn scan_placeholders(
     plain: bool,
 ) -> Result<(), String> {
     let mut sites: Vec<(Option<&str>, bool, String)> = vec![(None, false, target.to_string())];
+    // FW-CRED37: an origin decodes the target once before it reads it. A second layer of escapes
+    // is an encoding of the caller's own, like any other the scan does not undo.
+    let decoded = percent_decoded(target);
+    if decoded != target {
+        sites.push((None, false, decoded));
+    }
     for (name, value) in &head.headers {
         sites.push((Some(name.as_str()), false, value.clone()));
         if name.eq_ignore_ascii_case("authorization") {
@@ -1142,6 +1165,18 @@ fn scan_placeholders(
         }
     }
     Ok(())
+}
+
+/// The wire encodings of the operator's proxy credential (FW-CRED36): the `Proxy-Authorization`
+/// value, and its credentials alone, since an echo may drop or respell the scheme.
+fn proxy_credential_encodings(authorization: &str) -> Vec<Vec<u8>> {
+    let credentials = authorization
+        .rsplit_once(' ')
+        .map_or(authorization, |(_, c)| c);
+    vec![
+        authorization.as_bytes().to_vec(),
+        credentials.as_bytes().to_vec(),
+    ]
 }
 
 /// Present each brokered credential bound to this host (FW-CRED11): substitute its placeholder in
@@ -1279,6 +1314,18 @@ mod tests {
         let in_query = head(&[]);
         assert!(
             scan_placeholders(&in_query, "/?k=fwcred-github-abc", &gh, &brokers, false).is_err()
+        );
+        // FW-CRED37: the same placeholder, and an unknown one, behind percent-escapes.
+        for target in [
+            "/?k=%66wcred-github-abc",
+            "/?k=fwcred%2Dgithub-abc",
+            "/%66%77%63%72%65%64%2d",
+        ] {
+            let got = scan_placeholders(&in_query, target, &gh, &brokers, false);
+            assert!(got.is_err(), "{target}");
+        }
+        assert!(
+            scan_placeholders(&in_query, "/?k=%66wcre-d&pct=100%", &gh, &brokers, false).is_ok()
         );
         let elsewhere = head(&[("X-Debug", "fwcred-github-abc")]);
         assert!(scan_placeholders(&elsewhere, "/", &gh, &brokers, false).is_err());
