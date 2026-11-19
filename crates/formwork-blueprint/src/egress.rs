@@ -920,7 +920,8 @@ fn parse_port(p: &str, hostport: &str) -> Result<u16, String> {
 
 /// The one-grade-per-host-and-port rule (FW-BP14): a tunnel rule and an inspected rule that could
 /// match one host on one port (directly or through a wildcard) are a compile error naming both, as
-/// is a path-scoped deny on a host no inspected rule covers. Returns every conflict.
+/// is a path-scoped deny that could match a host and port a tunnel rule carries, or that no
+/// inspected rule covers. Returns every conflict.
 pub fn validate_host_rules(rules: &[HostRule]) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     for (i, a) in rules.iter().enumerate() {
@@ -940,10 +941,29 @@ pub fn validate_host_rules(rules: &[HostRule]) -> Result<(), Vec<String>> {
             }
         }
         if let HostAccess::Deny { path: Some(_) } = &a.access {
+            let reached = |r: &&HostRule| r.host.overlaps(&a.host) && r.same_port(a);
+            // An inspected rule for one host the deny names says nothing about another: a
+            // wildcard or port-less deny also names every host and port a tunnel carries.
+            let tunnels: Vec<&HostRule> = rules
+                .iter()
+                .filter(|r| matches!(r.access, HostAccess::Tunnel))
+                .filter(reached)
+                .collect();
+            for tunnel in &tunnels {
+                let inspecting = tunnel.to_string().replacen("tunnel:", "allow:", 1);
+                errors.push(format!(
+                    "`{a}` denies a path on a host and port that `{tunnel}` tunnels, and a \
+                     tunnelled host is not inspected, so the Gateway cannot see the path there \
+                     and the deny would never apply; inspect that host (`{inspecting}` in place \
+                     of the tunnel), deny it whole, or name in the deny only the host and port \
+                     that are inspected"
+                ));
+            }
             let covered = rules
                 .iter()
-                .any(|r| r.is_inspected() && r.host.overlaps(&a.host) && r.same_port(a));
-            if !covered {
+                .filter(|r| r.is_inspected())
+                .any(|r| reached(&r));
+            if tunnels.is_empty() && !covered {
                 errors.push(format!(
                     "`{a}` denies a path on a host that is not inspected, so the Gateway cannot see \
                      the path; add an inspected rule for the host (e.g. `allow:{}`) or deny the \
@@ -1285,6 +1305,57 @@ mod tests {
             rule("allow:internal.corp.example")
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn fw_bp14_a_path_deny_is_refused_wherever_a_tunnel_carries_the_host() {
+        // A wildcard deny names the tunnelled host as well as the inspected one.
+        let err = validate_host_rules(&[
+            rule("deny:*.corp.example/admin/**"),
+            rule("allow:wiki.corp.example"),
+            rule("tunnel:git.corp.example"),
+        ])
+        .unwrap_err();
+        assert_eq!(err.len(), 1, "{err:?}");
+        assert!(
+            err[0].contains("`deny:*.corp.example/admin/**`")
+                && err[0].contains("`tunnel:git.corp.example`")
+                && err[0].contains("`allow:git.corp.example`"),
+            "{err:?}"
+        );
+        // A port-less deny names every port, the tunnelled one included.
+        let err = validate_host_rules(&[
+            rule("deny:internal.corp.example/admin/**"),
+            rule("allow:internal.corp.example"),
+            rule("tunnel:internal.corp.example:8443"),
+        ])
+        .unwrap_err();
+        assert!(
+            err[0].contains("`tunnel:internal.corp.example:8443`")
+                && err[0].contains("`allow:internal.corp.example:8443`"),
+            "{err:?}"
+        );
+        // Scoped to the inspected host and port, each deny is one the Gateway can apply.
+        assert_eq!(
+            validate_host_rules(&[
+                rule("deny:wiki.corp.example/admin/**"),
+                rule("deny:internal.corp.example:443/admin/**"),
+                rule("allow:wiki.corp.example"),
+                rule("allow:internal.corp.example"),
+                rule("tunnel:git.corp.example"),
+                rule("tunnel:internal.corp.example:8443"),
+            ]),
+            Ok(())
+        );
+        // The decision the refusal prevents: the request is tunnelled past the deny.
+        let table = HostTable::new(vec![
+            rule("deny:*.corp.example/admin/**"),
+            rule("allow:wiki.corp.example"),
+            rule("tunnel:git.corp.example"),
+        ]);
+        assert!(table
+            .decide(&host("git.corp.example"), 443, None, &path("/admin/x"))
+            .is_ok());
     }
 
     #[test]

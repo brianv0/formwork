@@ -267,7 +267,7 @@ Applied by the launcher at spawn (§2) — not the confiner — and reported in 
 | Req | Requirement |
 |---|---|
 | <a id="fw-env1"></a>**FW-ENV1** Environment axis | The blueprint carries an `env` posture — passthrough, allowlist (only named vars survive), or scrub (secret-shaped vars removed) — and the child's environment is built at spawn from the filtered set, not inherited wholesale. A capability axis parallel to fs/net/exec/mcp. |
-| <a id="fw-env2"></a>**FW-ENV2** Default secret-shaped scrub | The default profile scrubs env vars whose *name* matches a secret shape (`TOKEN\|SECRET\|PASSWORD\|KEY\|AUTH\|CREDENTIAL\|CERT`) or whose *value* matches a high-confidence secret shape (PEM blocks, `ghp_…`, `AKIA…`, `AIza…`, JWT); git's environment-supplied configuration (`GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`) is judged per entry by its config key and value -- an `http.<url>.extraheader` or a URL carrying a password is secret -- and the surviving entries keep a matching count; minus a blueprint-named allowlist for vars the agent legitimately needs (its model API key). Transparency ([FW-TRA2](#fw-tra2)) is preserved by the allowlist; the scrub is heuristic, so it is reported Partial, never a silent over-claim. |
+| <a id="fw-env2"></a>**FW-ENV2** Default secret-shaped scrub | The default profile scrubs env vars whose *name* matches a secret shape (`TOKEN\|SECRET\|PASSWORD\|KEY\|AUTH\|CREDENTIAL\|CERT`) or whose *value* matches a high-confidence secret shape (PEM blocks, `ghp_…`, `AKIA…`, `AIza…`, JWT); git's environment-supplied configuration (`GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`) is judged per entry by its config key and value -- an `http.<url>.extraheader` or a URL carrying a password is secret -- and the surviving entries keep a matching count; minus a blueprint-named allowlist for vars the agent legitimately needs (its model API key). A blueprint-named deny list drops a variable whatever its shape, and a name on both lists is dropped. Transparency ([FW-TRA2](#fw-tra2)) is preserved by the allowlist; the scrub is heuristic, so it is reported Partial, never a silent over-claim. |
 
 ### 5.8 Blueprint model & format (FW-BP)
 
@@ -276,7 +276,7 @@ The Blueprint is one typed model with multiple surfaces (§4); these requirement
 | Req | Requirement |
 |---|---|
 | <a id="fw-bp1"></a>**FW-BP1** One model, many surfaces | The Blueprint is a typed, versioned schema. The file format and the CLI flags are two surfaces onto the same model, not two models: any grant/deny/exclusion expressible in one is expressible in the other. |
-| <a id="fw-bp2"></a>**FW-BP2** Override precedence | Layers merge in a fixed, documented order, lowest to highest: built-in baseline (the fail-closed empty Blueprint plus the credential-catalog floor) → `extends` chain (depth-first, bases before deriveds) → Blueprint file → `--set` fragments → the discovered layer (`<blueprint>.discovered.toml`, [FW-DISC6](#fw-disc6)) → CLI sugar flags. Postures (read-mode/net/exec/env) are last-set-wins; path sets merge additively; the result is deterministic. Overrides are an additive last layer, never a separate mechanism. |
+| <a id="fw-bp2"></a>**FW-BP2** Override precedence | Layers merge in a fixed, documented order, lowest to highest: built-in baseline (the fail-closed empty Blueprint plus the credential-catalog floor) → `extends` chain (depth-first, bases before deriveds) → Blueprint file → `--set` fragments → the discovered layer (`<blueprint>.discovered.toml`, [FW-DISC6](#fw-disc6)) → CLI sugar flags. Postures (read-mode/net/exec/env) are last-set-wins; path sets merge additively; the result is deterministic. Host rules are how a layer sets the host-allowlist posture ([FW-BP13](#fw-bp13)): a `net = "deny"` in a later layer removes the host rules of the layers below it, and host rules in layers above that deny union among themselves. Overrides are an additive last layer, never a separate mechanism. |
 | <a id="fw-bp3"></a>**FW-BP3** Composition via `extends` | A Blueprint may extend one or more base Blueprints (presets/profiles). Resolution is deterministic and cycles are detected and errored. |
 | <a id="fw-bp4"></a>**FW-BP4** allow / deny / subtract vocabulary | First-class allow (reads/writes), deny/subtract (read+write), and write-subtract semantics over path patterns in the [FW-CAP6](#fw-cap6) grammar. At any layer and at equal precedence, deny/subtract wins over allow (safety bias); no allow at any layer shadows a deny at any layer — the only un-deny is the typed credential exclude ([FW-CRED5](#fw-cred5)). No general glob exists. |
 | <a id="fw-bp5"></a>**FW-BP5** Path sigils | Blueprint path patterns admit a closed set of authoring sigils, expanded at the CLI edge *before* compilation: `~` → `$HOME` and `$CWD` → the launch directory, so a grant can be written relative to the project it runs in. Fixed tokens only — never general `$VAR` interpolation, since the process environment is exactly what the launcher strips ([FW-CRED2](#fw-cred2)), and letting an arbitrary variable name a path would reopen that surface. An expanded sigil is an absolute path that canonicalizes like any grant ([FW-CAP6](#fw-cap6)/[FW-FID4](#fw-fid4)); an unresolvable sigil (e.g. no readable working directory) fails loud, never silently widening ([FW-INV6](#fw-inv6)). |
@@ -287,8 +287,8 @@ The Blueprint is one typed model with multiple surfaces (§4); these requirement
 | <a id="fw-bp10"></a>**FW-BP10** Channel layering | Across layers, channel `allow` scopes shall union, `deny` entries shall be terminal, and the `"deny"` keyword shall mean an empty `allow` scope. |
 | <a id="fw-bp11"></a>**FW-BP11** Locator variables | The Launcher shall re-admit the environment variables by which a lifted channel's platform clients locate it. |
 | <a id="fw-bp12"></a>**FW-BP12** Credential entry forms | `allow-credentials` shall accept a bare Catalog type, `broker:<type>`, or an inline binding `{ name, env, hosts, scheme }`; a type present in both bare and `broker:` forms shall resolve to `broker`. |
-| <a id="fw-bp13"></a>**FW-BP13** Host-rule grammar | `rules` shall accept host rules of the form `<atoms>:host[:port][/glob]` with the §4 grammar, where the atoms are HTTP methods, `allow`, `tunnel` or `deny`; any host rule shall set the net posture to host-allowlist, and a host rule together with a port tier shall be a compile error. |
-| <a id="fw-bp14"></a>**FW-BP14** One host, one grade | The compiler shall reject a blueprint in which a tunnel rule and an inspected rule both match one host and port, or in which a path-scoped `deny` names a host that has no inspected rule, naming the conflicting lines. |
+| <a id="fw-bp13"></a>**FW-BP13** Host-rule grammar | `rules` shall accept host rules of the form `<atoms>:host[:port][/glob]` with the §4 grammar, where the atoms are HTTP methods, `allow`, `tunnel` or `deny`; any host rule shall set the net posture to host-allowlist, and a host rule together with a port tier, or together with `net = "deny"` in the same layer, shall be a compile error. |
+| <a id="fw-bp14"></a>**FW-BP14** One host, one grade | The compiler shall reject a blueprint in which a tunnel rule and an inspected rule both match one host and port, or in which a path-scoped `deny` could match a host and port that a tunnel rule matches or that no inspected rule matches, naming the conflicting lines. |
 | <a id="fw-bp15"></a>**FW-BP15** Verb atoms | The verb position of a rule shall be a comma-separated list of atoms; for the fs axis the atoms shall be `read`, `write`, `modify` and `exec`, with the landed compound verbs accepted as aliases of the same meaning. |
 | <a id="fw-bp16"></a>**FW-BP16** Host target shape | The Blueprint parser shall read a rule target as a path pattern when it begins with `/`, `~`, `$` or `**`, and otherwise as a host target, which it shall accept only if the host contains a dot, is `localhost`, or is an IP literal. |
 
@@ -300,7 +300,7 @@ A versioned, typed catalog of credential **locations only** — dotfiles, well-k
 |---|---|
 | <a id="fw-cred1"></a>**FW-CRED1** Typed location catalog | A versioned catalog of credential *locations* keyed by type. Each type contributes path patterns and/or env-var names. |
 | <a id="fw-cred2"></a>**FW-CRED2** Two kinds, two arms | **path** entries → confiner deny (EACCES); **env** entries → launcher strips the variable before spawn (variable absent). Enforced and reported distinctly. |
-| <a id="fw-cred3"></a>**FW-CRED3** Env-points-to-file types | A type may carry both an env var and the file it references (e.g. `GOOGLE_APPLICATION_CREDENTIALS`). Excluding the type strips the variable and denies the referenced file. |
+| <a id="fw-cred3"></a>**FW-CRED3** Env-points-to-file types | A type may carry both an env var and the file it references (e.g. `GOOGLE_APPLICATION_CREDENTIALS`). Excluding the type strips the variable and denies the referenced file; for a variable the Catalog marks as a list, every file it names ([FW-CRED33](#fw-cred33)). |
 | <a id="fw-cred4"></a>**FW-CRED4** Deny-superset by default | The whole known catalog is blocked/stripped by default (fail-closed); exclusion is opt-in per type ([FW-CRED5](#fw-cred5)). Coverage of uncatalogued secrets is [FW-CRED6](#fw-cred6)'s job. |
 | <a id="fw-cred5"></a>**FW-CRED5** Exclude-by-type is un-blocking | `allow-credentials: [aws]` (CLI `--allow-cred aws`) deliberately and visibly lets one type through; nothing adjacent is affected. This is the knob for when the agent genuinely needs a credential. |
 | <a id="fw-cred6"></a>**FW-CRED6** Generic backstop | Beyond curated types, a generic rule denies known-sensitive *shapes* — files literally named like credentials or SSH private keys — at any depth, anywhere. A catch-all is location-independent by nature: it must reach the containers, CI runners, and project trees where uncatalogued secrets live, not just `$HOME`, and it stays denied even under a broad grant. Liftable only as the whole named pseudo-type `backstop`. |
@@ -317,6 +317,10 @@ A versioned, typed catalog of credential **locations only** — dotfiles, well-k
 | <a id="fw-cred17"></a>**FW-CRED17** Reflection guard | For a response to a request on which it presented a brokered credential, the Gateway shall request identity content coding, refuse a response with another content coding, and end the response without releasing any byte that begins an occurrence of a wire encoding of the presented credential. |
 | <a id="fw-cred18"></a>**FW-CRED18** No credential on OPTIONS | The Gateway shall not present a brokered credential on an OPTIONS request. |
 | <a id="fw-cred19"></a>**FW-CRED19** No credential in cleartext | The Gateway shall present a brokered credential only on a request it forwards to the upstream over TLS. |
+| <a id="fw-cred33"></a>**FW-CRED33** List-valued references | For an `env-file-refs` variable the Catalog marks as a list, the Launcher shall deny the file named by each non-empty `:`-separated element of its value. |
+| <a id="fw-cred34"></a>**FW-CRED34** Unrenderable references | The Launcher shall refuse to start, naming the variable, when the value of a set `env-file-refs` variable, or an element of a list-valued one, cannot be rendered into a path pattern that names one file. |
+
+Numbers absent from this table's sequence are reserved by FEP drafts that have not landed.
 
 ### 5.10 Discovery (FW-DISC)
 
@@ -538,7 +542,7 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 
 <a id="fw-e2e-041"></a>**FW-E2E-041: Rename regression.** *(Retired with the `--spec` compat alias. This was a transitional regression guard for the spec → Blueprint rename — never tied to a numbered requirement — and its number stays retired now that the alias is gone. Byte-deterministic compile is covered by [FW-E2E-026](#fw-e2e-026)/027.)*
 
-<a id="fw-e2e-042"></a>**FW-E2E-042: Override precedence.** A path allowed in the file is denied by a CLI `--subtract` layered over it; a deny and an allow at equal precedence resolve to deny. Pass: merge follows baseline → extends → file → CLI ([FW-BP2](#fw-bp2)), postures last-set-wins, path sets additive, with deny-beats-allow at ties. Fail: any ordering or tie deviation.
+<a id="fw-e2e-042"></a>**FW-E2E-042: Override precedence.** A path allowed in the file is denied by a CLI `--subtract` layered over it; a deny and an allow at equal precedence resolve to deny. Pass: merge follows baseline → extends → file → CLI ([FW-BP2](#fw-bp2)), postures last-set-wins, path sets additive, with deny-beats-allow at ties; a `net = "deny"` from the `--net` flag, a `--set` fragment or a leaf file replaces the host rules of the layers below it, the operator channel names the rules dropped, and beside a host rule in one layer it is refused ([FW-BP13](#fw-bp13)). Fail: any ordering or tie deviation, or a host rule that outlives a later `net = "deny"`.
 
 <a id="fw-e2e-043"></a>**FW-E2E-043: CLI/file parity.** The same grant authored in the file and expressed via CLI flag produce identical compiled policy. Pass: byte-identical policy from both surfaces. Fail: divergence.
 
@@ -573,6 +577,10 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 <a id="fw-e2e-049"></a>**FW-E2E-049: Generic backstop.** An uncatalogued but sensitive-shaped location (a novel `~/.someprovider/credentials`, an unusual `.env` variant). Pass: denied by the backstop despite no curated entry. Fail: the uncatalogued secret is accessible.
 
 <a id="fw-e2e-050"></a>**FW-E2E-050: Report mechanism labeling.** Pass: FidelityReport marks env-kind types `enforced-via-launcher` and path-kind types `enforced-via-OS-sandbox`, carries the launcher-contingency note for env, and marks any-depth floor rows Partial where the host cannot root them ([FW-CRED9](#fw-cred9)). Fail: mislabeled or missing mechanism.
+
+<a id="fw-e2e-198"></a>**FW-E2E-198: List-valued file reference (both; [FW-CRED33](#fw-cred33)).** `KUBECONFIG` names one, two and three files, then a list with empty elements and a relative element, then an element that leaves a symlinked directory through `..`, each beside files the list does not name. Pass: under enforcement every file the list names is denied and every other is readable, and the variable is absent from the session; with the variable unset, or with `--allow-cred kube`, every file is readable. Fail: a file the list names is readable, or one it does not name is denied.
+
+<a id="fw-e2e-201"></a>**FW-E2E-201: Unrenderable file reference ([FW-CRED34](#fw-cred34)).** A single-file reference whose value holds a non-UTF-8 byte, a `KUBECONFIG` with a non-UTF-8 element, and a `KUBECONFIG` with an element the pattern grammar reads as a wildcard (`/srv/kube/**`, `/srv/**/config`). Pass: `run` exits non-zero before the workload starts, and the refusal names the variable. Fail: the workload starts.
 
 ### 7.9 Discovery
 
@@ -795,6 +803,7 @@ any refusal row reaches a fixture, or a key byte sequence reaches the session.
 | 3 | `rules = ["get:status.corp.internal:80/**"]` and an inline binding bound to `status.corp.internal` | refused; the message names the port-80 rule | [FW-CRED19](#fw-cred19), FEP-6 §9 (i) |
 | 4 | `net = { ports = [443] }` and `rules = ["allow:api.anthropic.com"]` | refused | [FW-BP13](#fw-bp13) |
 | 5 | `rules = ["tunnel:api.github.com", "deny:api.github.com/repos/acme/secret/**"]` | refused; a path `deny` needs an inspected host | [FW-BP14](#fw-bp14) |
+| 5a | `rules = ["deny:*.corp.example/admin/**", "allow:wiki.corp.example", "tunnel:git.corp.example"]` | refused; the message names the `deny` and the tunnel it could not apply through | [FW-BP14](#fw-bp14) |
 | 6 | `rules = ["allow:*"]` | refused at parse; the message states the host grammar | FEP-5 §4 |
 | 7 | `rules = ["tunnel:api.anthropic.com/v1/**"]` | refused at parse; a tunnel has no path (`allow:api.anthropic.com/v1/**` inspects) | FEP-6 §9 j |
 | 7a | `rules = ["allow:build/**"]` | refused at parse; a host target needs a dot (a relative path typed by mistake) | [FW-BP16](#fw-bp16) |
@@ -938,13 +947,13 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-XR10](#fw-xr10) Wrapper transparency | [FW-E2E-086](#fw-e2e-086) | — |
 | [FW-XR11](#fw-xr11) Failure attribution | [FW-E2E-086](#fw-e2e-086) (first half; the second is not reachable black-box) | — |
 | [FW-CAP1](#fw-cap1) Enumerable vocabulary | [FW-E2E-013](#fw-e2e-013), 001 | — |
-| [FW-CAP2](#fw-cap2) Monotonic narrowing | [FW-E2E-005](#fw-e2e-005) | INV1 |
+| [FW-CAP2](#fw-cap2) Monotonic narrowing | [FW-E2E-005](#fw-e2e-005) | INV1; tests named for it (`narrow.rs`) |
 | [FW-CAP3](#fw-cap3) Subtractive default profile | [FW-E2E-003](#fw-e2e-003), 020 | 021, 022 |
 | [FW-CAP4](#fw-cap4) Invisibility/denial split | [FW-E2E-013](#fw-e2e-013), 014 | 001, 023 |
 | [FW-CAP5](#fw-cap5) Inspectable interpreter | [FW-E2E-026](#fw-e2e-026), 027 | 024 |
 | [FW-CAP6](#fw-cap6) Anchored & basename patterns | [FW-E2E-038](#fw-e2e-038) | [FW-FID4](#fw-fid4) |
 | [FW-CAP7](#fw-cap7) Metadata denial (sensitive set) | [FW-E2E-037](#fw-e2e-037) | INV5 |
-| [FW-CAP8](#fw-cap8) Three-layer evaluation, deny-terminal | [FW-E2E-058](#fw-e2e-058) | INV11, [FW-BP4](#fw-bp4) |
+| [FW-CAP8](#fw-cap8) Three-layer evaluation, deny-terminal | [FW-E2E-058](#fw-e2e-058) | INV11, [FW-BP4](#fw-bp4); on the socket axis, tests named for it (`formwork-compile`, `linux_supervise.rs`) |
 | [FW-CAP9](#fw-cap9) Verb grammar & create/write split | [FW-E2E-056](#fw-e2e-056) | 061 |
 | [FW-ISO1](#fw-iso1) Read confinement | [FW-E2E-001](#fw-e2e-001) | 003, 004 |
 | [FW-ISO2](#fw-iso2) Write confinement | [FW-E2E-002](#fw-e2e-002) | 004 |
@@ -995,9 +1004,9 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-FID12](#fw-fid12) Egress refusal reasons | [FW-ADV-022](#fw-adv-022) | ADV-023, 098 |
 | [FW-FID13](#fw-fid13) Egress grant records | tests named for it (`formwork-gateway/tests`) | — |
 | [FW-ENV1](#fw-env1) Environment axis | [FW-E2E-036](#fw-e2e-036) | [FW-FID1](#fw-fid1) |
-| [FW-ENV2](#fw-env2) Default secret-shaped scrub | [FW-E2E-036](#fw-e2e-036) | [FW-TRA2](#fw-tra2) |
+| [FW-ENV2](#fw-env2) Default secret-shaped scrub | [FW-E2E-036](#fw-e2e-036) | [FW-TRA2](#fw-tra2); tests named for it (`formwork-blueprint`) |
 | [FW-BP1](#fw-bp1) One model, many surfaces | [FW-E2E-043](#fw-e2e-043), 060 | 042 |
-| [FW-BP2](#fw-bp2) Override precedence | [FW-E2E-042](#fw-e2e-042), 060 | 043 |
+| [FW-BP2](#fw-bp2) Override precedence | [FW-E2E-042](#fw-e2e-042), 060 | 043; tests named for it (`layer.rs`, `blueprint_load.rs`) |
 | [FW-BP3](#fw-bp3) `extends` composition | [FW-E2E-044](#fw-e2e-044) | — |
 | [FW-BP4](#fw-bp4) allow/deny/subtract | [FW-E2E-042](#fw-e2e-042) | 045, 049 |
 | [FW-BP5](#fw-bp5) Path sigils | [FW-E2E-055](#fw-e2e-055) | — |
@@ -1008,13 +1017,13 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-BP10](#fw-bp10) Channel layering | [FW-E2E-088](#fw-e2e-088) | — |
 | [FW-BP11](#fw-bp11) Locator variables | [FW-E2E-088](#fw-e2e-088) | 087 |
 | [FW-BP12](#fw-bp12) Credential entry forms | [FW-E2E-078](#fw-e2e-078), 099 | — |
-| [FW-BP13](#fw-bp13) Host-rule grammar | [FW-E2E-104](#fw-e2e-104) | 077 |
-| [FW-BP14](#fw-bp14) One host, one grade | [FW-E2E-104](#fw-e2e-104) | — |
+| [FW-BP13](#fw-bp13) Host-rule grammar | [FW-E2E-104](#fw-e2e-104) | 077, 042 |
+| [FW-BP14](#fw-bp14) One host, one grade | [FW-E2E-104](#fw-e2e-104) | tests named for it (`egress.rs`) |
 | [FW-BP15](#fw-bp15) Verb atoms | unit tests (`blueprint_load.rs`) | — |
 | [FW-BP16](#fw-bp16) Host target shape | [FW-E2E-104](#fw-e2e-104) | — |
 | [FW-CRED1](#fw-cred1) Typed catalog | [FW-E2E-045](#fw-e2e-045), 046 | 049 |
 | [FW-CRED2](#fw-cred2) Two kinds, two arms | [FW-E2E-045](#fw-e2e-045), 046 | 050 |
-| [FW-CRED3](#fw-cred3) Env-points-to-file | [FW-E2E-047](#fw-e2e-047) | — |
+| [FW-CRED3](#fw-cred3) Env-points-to-file | [FW-E2E-047](#fw-e2e-047) | 198 |
 | [FW-CRED4](#fw-cred4) Deny-superset default | [FW-E2E-045](#fw-e2e-045), 046, 049 | — |
 | [FW-CRED5](#fw-cred5) Exclude-by-type | [FW-E2E-048](#fw-e2e-048) | ADV-013 |
 | [FW-CRED6](#fw-cred6) Generic backstop | [FW-E2E-049](#fw-e2e-049) | ADV-015 |
@@ -1031,6 +1040,8 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-CRED17](#fw-cred17) Reflection guard | [FW-ADV-021](#fw-adv-021) | ADV-025 |
 | [FW-CRED18](#fw-cred18) No credential on OPTIONS | [FW-E2E-099](#fw-e2e-099) | — |
 | [FW-CRED19](#fw-cred19) No credential in cleartext | [FW-E2E-104](#fw-e2e-104) | — |
+| [FW-CRED33](#fw-cred33) List-valued references | [FW-E2E-198](#fw-e2e-198) | — |
+| [FW-CRED34](#fw-cred34) Unrenderable references | [FW-E2E-201](#fw-e2e-201) | — |
 | [FW-DISC1](#fw-disc1) Learning mode | [FW-E2E-051](#fw-e2e-051) | 054, 062, 064, 071 |
 | [FW-DISC2](#fw-disc2) Reverse compile | [FW-E2E-051](#fw-e2e-051) | 052, 053, 064, 071 |
 | [FW-DISC3](#fw-disc3) Catalog floor | [FW-ADV-013](#fw-adv-013), 015 | 051, INV8 |

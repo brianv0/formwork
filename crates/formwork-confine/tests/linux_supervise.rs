@@ -26,6 +26,15 @@ fn supervision_available() -> bool {
     host.connect_supervision && host.seccomp && host.landlock_abi.is_some()
 }
 
+/// The supervisor takes every descendant of this process as the session (FW-ISO12), and a child
+/// between fork and exec still holds this process's descriptors, a fixture listener among them. A
+/// test forking while another's connect is being decided would make that fixture look bound
+/// in-session, so the tests hold one session at a time.
+fn one_session() -> std::sync::MutexGuard<'static, ()> {
+    static SESSION: Mutex<()> = Mutex::new(());
+    SESSION.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A listener that counts the connections it accepts.
 struct Counting {
     addr: SocketAddr,
@@ -84,6 +93,15 @@ fn probe(name: &str) -> PathBuf {
 /// A host-rule blueprint: closed reads of the probes, writes to `work` (subtree), plus any literal
 /// socket grants.
 fn policy(work: &Path, literal_grants: &[&Path]) -> CompiledPolicy {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    formwork_compile::compile(
+        &blueprint(work, literal_grants),
+        &detect(),
+        &ResolvedCatalog::builtin_for_home(&home).unwrap(),
+    )
+}
+
+fn blueprint(work: &Path, literal_grants: &[&Path]) -> Blueprint {
     let mut bp = Blueprint::empty();
     bp.fs.read_mode = ReadMode::Closed;
     bp.fs.reads = vec![subtree(probe("connect").parent().unwrap())];
@@ -95,12 +113,7 @@ fn policy(work: &Path, literal_grants: &[&Path]) -> CompiledPolicy {
     }
     let rule: HostRule = serde_json::from_str("\"tunnel:allowed.test\"").unwrap();
     bp.net = NetPosture::AllowHosts(HostTable::new(vec![rule]));
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    formwork_compile::compile(
-        &bp,
-        &detect(),
-        &ResolvedCatalog::builtin_for_home(&home).unwrap(),
-    )
+    bp
 }
 
 fn run(
@@ -144,6 +157,7 @@ fn fw_e2e_075_gateway_is_the_sole_egress_path() {
         eprintln!("skipping: connect supervision unavailable on this host");
         return;
     }
+    let _session = one_session();
     let work = Scratch::new("075");
     let gateway = Counting::start();
     let other = Counting::start();
@@ -204,6 +218,7 @@ fn fw_e2e_076_pathname_sockets_are_mediated() {
         eprintln!("skipping: connect supervision unavailable on this host");
         return;
     }
+    let _session = one_session();
     let work = Scratch::new("076");
     let gateway = Counting::start();
     let registry = Arc::new(Mutex::new(HashSet::new()));
@@ -283,6 +298,70 @@ fn fw_e2e_076_pathname_sockets_are_mediated() {
     );
 }
 
+/// The socket axis of the deny-terminal model (FW-CAP8, FW-CRED5): three live sockets, each named
+/// by a literal write grant. The one an operator deny covers and the one under the credential
+/// floor are refused; the third connects, and so does the floored one once its type is excluded.
+#[test]
+fn fw_cap8_a_denied_or_floored_socket_grant_is_refused() {
+    if !supervision_available() {
+        eprintln!("skipping: connect supervision unavailable on this host");
+        return;
+    }
+    let _session = one_session();
+    let work = Scratch::new("cap8");
+    let gateway = Counting::start();
+    let registry = Arc::new(Mutex::new(HashSet::new()));
+
+    let home = work.0.join("home");
+    let docker = home.join(".docker/run/docker.sock");
+    fs::create_dir_all(docker.parent().unwrap()).unwrap();
+    let denied = work.0.join("denied.sock");
+    let granted = work.0.join("granted.sock");
+    let _listeners: Vec<UnixListener> = [&docker, &denied, &granted]
+        .iter()
+        .map(|p| UnixListener::bind(p).unwrap())
+        .collect();
+    for socket in [&docker, &denied, &granted] {
+        assert!(
+            std::os::unix::net::UnixStream::connect(socket).is_ok(),
+            "control: {} is live for an unconfined client",
+            socket.display()
+        );
+    }
+
+    let catalog = ResolvedCatalog::builtin_for_home(home.to_str().unwrap()).unwrap();
+    let compile = |allow_credentials: &[&str]| {
+        let mut bp = blueprint(&work.0, &[&docker, &denied, &granted]);
+        bp.fs
+            .subtract
+            .push(PathPattern::parse(denied.to_str().unwrap()).unwrap());
+        bp.allow_credentials = allow_credentials.iter().map(|t| (*t).into()).collect();
+        formwork_compile::compile(&bp, &detect(), &catalog)
+    };
+    let unix = probe("unix");
+    let connect = |pol: &CompiledPolicy, socket: &Path| {
+        run(
+            pol,
+            gateway.addr,
+            registry.clone(),
+            cmd(&unix, &["connect", socket.to_str().unwrap()]),
+        )
+    };
+
+    let floored = compile(&[]);
+    assert_eq!(connect(&floored, &granted), 0, "an undenied grant connects");
+    assert_eq!(
+        connect(&floored, &denied),
+        7,
+        "an operator deny is terminal"
+    );
+    assert_eq!(connect(&floored, &docker), 7, "a path rule lifts no floor");
+
+    let lifted = compile(&["docker"]);
+    assert_eq!(connect(&lifted, &docker), 0, "the typed exclude lifts it");
+    assert_eq!(connect(&lifted, &denied), 7);
+}
+
 /// FW-ADV-018: rewriting the `sockaddr` from another thread while `connect()` is pending cannot
 /// redirect the connection -- the supervisor connects to its own copy of the checked address.
 #[test]
@@ -291,6 +370,7 @@ fn fw_adv_018_supervisor_race_cannot_redirect() {
         eprintln!("skipping: connect supervision unavailable on this host");
         return;
     }
+    let _session = one_session();
     let work = Scratch::new("018");
     let gateway = Counting::start();
     let denied = Counting::start();

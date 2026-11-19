@@ -68,6 +68,9 @@ pub fn merge_with_provenance(layers: &[(RuleSource, BlueprintLayer)]) -> (Bluepr
             Some(ExecPosture::Unrestricted) => p.exec.clear(),
             None => {}
         }
+        if crate::layer::clears_host_rules(layer) {
+            p.hosts.clear();
+        }
         p.hosts
             .extend(layer.hosts.iter().map(|h| (h.clone(), src.clone())));
         if let Some(channels) = &layer.channels {
@@ -306,6 +309,33 @@ mod tests {
             prov.explain(&bp, Path::new("/etc/hosts"), None).read,
             Verdict::Hidden
         );
+    }
+
+    #[test]
+    fn fw_bp2_a_host_rule_is_attributed_to_the_layer_above_a_net_deny() {
+        let rule: crate::HostRule = "allow:example.com".parse().unwrap();
+        let hosts = || BlueprintLayer {
+            hosts: vec![rule.clone()],
+            ..Default::default()
+        };
+        let deny = BlueprintLayer {
+            net: Some(crate::NetPosture::Deny),
+            ..Default::default()
+        };
+        let (bp, prov) = merge_with_provenance(&[
+            (RuleSource::Profile("base.toml".into()), hosts()),
+            (RuleSource::File("leaf.toml".into()), deny.clone()),
+        ]);
+        assert_eq!(bp.net, crate::NetPosture::Deny);
+        assert_eq!(prov.host_rule_source(&rule), None);
+
+        let (bp, prov) = merge_with_provenance(&[
+            (RuleSource::Profile("base.toml".into()), hosts()),
+            (RuleSource::File("leaf.toml".into()), deny),
+            (RuleSource::Cli, hosts()),
+        ]);
+        assert_eq!(bp.net.host_table().unwrap().rules, vec![rule.clone()]);
+        assert_eq!(prov.host_rule_source(&rule), Some(&RuleSource::Cli));
     }
 
     #[test]

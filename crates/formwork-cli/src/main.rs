@@ -198,7 +198,7 @@ struct BlueprintArgs {
     /// The only mechanism that lifts a catalog entry; path grants never do.
     #[arg(long = "allow-cred")]
     allow_cred: Vec<String>,
-    /// Net posture: "deny" or "ports:443,8080".
+    /// Net posture: "deny", which also drops the blueprint's host rules, or "ports:443,8080".
     #[arg(long)]
     net: Option<String>,
     /// Append a flat capability rule "<verb>:<target>" (repeatable), the same vocabulary as a file

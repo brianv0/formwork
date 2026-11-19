@@ -235,6 +235,7 @@ pub fn load_stack_with_provenance(
     let layers = load_layers(path, sets, sugar, sigils)?;
     let (blueprint, provenance) = merge_with_provenance(&layers);
     refuse_universe_row(&layers, &blueprint)?;
+    note_host_rules_dropped_by_deny(&layers);
     validate_net(&layers, &blueprint)?;
     Ok((validate(blueprint, sigils.home)?, provenance))
 }
@@ -507,6 +508,18 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
     if !exec_paths.is_empty() {
         layer.exec = Some(ExecPosture::Allowlist(exec_paths));
     }
+    // FW-BP13: within one layer neither reading is safe to pick -- the host rule winning drops an
+    // explicit deny, and the deny winning drops a rule the same author wrote beside it.
+    if let (Some(rule), Some(formwork_blueprint::NetPosture::Deny)) =
+        (layer.hosts.first(), &layer.net)
+    {
+        bail!(
+            "the host rule `{rule}` and `net = \"deny\"` are set together (in one file, one \
+             `--set` fragment, or the command-line flags) and contradict: a host rule sends \
+             egress through the Gateway to the hosts listed, and `net = \"deny\"` allows none. \
+             Remove one; a `net = \"deny\"` in a later layer drops the host rules below it"
+        );
+    }
     Ok(())
 }
 
@@ -579,6 +592,24 @@ fn validate_net(layers: &[(RuleSource, BlueprintLayer)], merged: &Blueprint) -> 
         bail!("host rules conflict:\n  {}", errors.join("\n  "));
     }
     Ok(())
+}
+
+/// FW-BP2: a later layer's `net = "deny"` replaces the host-allowlist posture the layers below it
+/// set, so their host rules stop applying. The operator asked for the deny; the rules it removes
+/// are named here so that neither side of the override is silent.
+fn note_host_rules_dropped_by_deny(layers: &[(RuleSource, BlueprintLayer)]) {
+    let mut below: Vec<String> = Vec::new();
+    for (source, layer) in layers {
+        if matches!(layer.net, Some(formwork_blueprint::NetPosture::Deny)) && !below.is_empty() {
+            tracing::info!(
+                dropped = ?below,
+                "net = \"deny\" from {} drops the host rules of the layers below it (FW-BP2)",
+                describe_source(source)
+            );
+            below.clear();
+        }
+        below.extend(layer.hosts.iter().map(|rule| rule.to_string()));
+    }
 }
 
 fn describe_source(source: &RuleSource) -> String {
@@ -796,10 +827,21 @@ pub fn env_file_ref_denies(
     allow: &[String],
 ) -> Result<Vec<PathPattern>> {
     let cwd = std::env::current_dir().context("resolving cwd for env-file-ref denies")?;
+    env_file_ref_patterns(catalog, allow, &cwd, |var| std::env::var_os(var))
+}
+
+/// [`env_file_ref_denies`] with the launching environment and directory passed in.
+fn env_file_ref_patterns(
+    catalog: &formwork_blueprint::ResolvedCatalog,
+    allow: &[String],
+    cwd: &Path,
+    value_of: impl Fn(&str) -> Option<OsString>,
+) -> Result<Vec<PathPattern>> {
     let mut out = Vec::new();
     for (type_name, entry) in catalog.enforced_types(allow) {
-        for var in &entry.env_file_refs {
-            let Some(raw) = std::env::var_os(var) else {
+        for reference in &entry.env_file_refs {
+            let var = &reference.var;
+            let Some(raw) = value_of(var) else {
                 continue;
             };
             let value = raw.to_str().ok_or_else(|| {
@@ -808,21 +850,64 @@ pub fn env_file_ref_denies(
                      enforce a deny that might silently not match (FW-INV6)"
                 )
             })?;
-            if value.is_empty() {
-                continue;
-            }
-            let absolute = if Path::new(value).is_absolute() {
-                PathBuf::from(value)
+            // FW-CRED33: read whole, a list names one file that does not exist.
+            let files: Vec<&str> = if reference.list {
+                value.split(':').collect()
             } else {
-                cwd.join(value)
+                vec![value]
             };
-            let pattern = absolute
-                .to_str()
-                .ok_or_else(|| anyhow!("{var} resolves to a non-UTF-8 path; refusing (FW-INV6)"))?;
-            out.push(PathPattern::parse(pattern).with_context(|| {
-                format!("{var} (credential type {type_name}) does not name a deniable path")
-            })?);
+            for file in files.into_iter().filter(|f| !f.is_empty()) {
+                let absolute = if Path::new(file).is_absolute() {
+                    PathBuf::from(file)
+                } else {
+                    cwd.join(file)
+                };
+                let absolute = fold_parent_components(&absolute).with_context(|| {
+                    format!(
+                        "{var} (credential type {type_name}) names a path whose `..` cannot be \
+                         resolved; refusing to start with that file undenied (FW-INV6)"
+                    )
+                })?;
+                let rendered = absolute.to_str().ok_or_else(|| {
+                    anyhow!("{var} resolves to a non-UTF-8 path; refusing (FW-INV6)")
+                })?;
+                let pattern = PathPattern::parse(rendered).with_context(|| {
+                    format!("{var} (credential type {type_name}) does not name a deniable path")
+                })?;
+                // FW-CRED34: the pattern grammar reads a `**` component as a wildcard, so the
+                // deny would not be the file named -- and an any-depth row is one Landlock
+                // withholds.
+                if pattern.is_subtree() || pattern.is_any_depth() {
+                    bail!(
+                        "{var} (credential type {type_name}) names a path with a `**` \
+                         component, which a path pattern cannot name as one file; refusing to \
+                         start with that file undenied (FW-INV6)"
+                    );
+                }
+                out.push(pattern);
+            }
         }
+    }
+    Ok(out)
+}
+
+/// Fold each `..` the way the kernel will when the workload opens the path: against the directory
+/// the path has reached by then, symlinks resolved. Folded lexically, as [`PathPattern::parse`]
+/// does, `a/link/../f` would deny `a/f` while the file opened is the one beside the link's target.
+fn fold_parent_components(path: &Path) -> std::io::Result<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        if component != std::path::Component::ParentDir {
+            out.push(component);
+            continue;
+        }
+        match std::fs::canonicalize(&out) {
+            Ok(real) => out = real,
+            // Nothing is there to be a symlink, so the lexical parent is the parent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        out.pop();
     }
     Ok(out)
 }
@@ -1263,6 +1348,159 @@ mod tests {
             bp.fs.subtract,
             vec![PathPattern::parse("/work/secret.txt").unwrap()]
         );
+    }
+
+    /// FW-BP2 on the net axis: host rules are how a layer sets the host-allowlist posture, so a
+    /// `net = "deny"` in any later layer -- a leaf file, a `--set` fragment, the `--net` flag --
+    /// replaces them, and host rules in a layer later still apply alone.
+    #[test]
+    fn fw_bp2_a_later_net_deny_drops_the_host_rules_below_it() {
+        let dir = Scratch::new("net-deny");
+        let base = dir.path().join("base.toml");
+        std::fs::write(
+            &base,
+            "extends = [\"builtin:default\"]\n\
+             rules = [\"readwrite:/work/**\", \"allow:example.com\"]\n",
+        )
+        .unwrap();
+        let leaf = dir.path().join("leaf.toml");
+        std::fs::write(&leaf, "extends = [\"base.toml\"]\nnet = \"deny\"\n").unwrap();
+        let sigils = Sigils::new("/home/x", "/work");
+        let deny_flag = || BlueprintLayer {
+            net: Some(formwork_blueprint::NetPosture::Deny),
+            ..Default::default()
+        };
+        let set = ["net = \"deny\"".to_string()];
+        let stack = |file: &Path, sets: &[String], sugar: BlueprintLayer| {
+            load_stack(file, sets, sugar, &sigils).unwrap().net
+        };
+
+        let control = stack(&base, &[], BlueprintLayer::default());
+        assert_eq!(control.host_table().unwrap().rules.len(), 1);
+        for denied in [
+            stack(&leaf, &[], BlueprintLayer::default()),
+            stack(&base, &set, BlueprintLayer::default()),
+            stack(&base, &[], deny_flag()),
+        ] {
+            assert_eq!(denied, formwork_blueprint::NetPosture::Deny);
+        }
+
+        let later_rule = BlueprintLayer {
+            rules: vec!["allow:other.example".into()],
+            ..Default::default()
+        };
+        let rules: Vec<String> = stack(&base, &set, later_rule)
+            .host_table()
+            .unwrap()
+            .rules
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        assert_eq!(rules, ["allow:other.example"]);
+    }
+
+    /// FW-BP13: a host rule and `net = "deny"` in one layer is refused, not resolved either way.
+    #[test]
+    fn fw_bp13_a_host_rule_beside_net_deny_in_one_layer_is_refused() {
+        let dir = Scratch::new("net-deny-same-layer");
+        let file = dir.path().join("bp.toml");
+        std::fs::write(&file, "net = \"deny\"\nrules = [\"allow:example.com\"]\n").unwrap();
+        let msg = format!("{:#}", load(&file, "/home/x").unwrap_err());
+        assert!(
+            msg.contains("allow:example.com") && msg.contains("net = \"deny\""),
+            "{msg}"
+        );
+
+        std::fs::write(&file, "rules = [\"readwrite:/work/**\"]\n").unwrap();
+        let flags = BlueprintLayer {
+            net: Some(formwork_blueprint::NetPosture::Deny),
+            rules: vec!["allow:example.com".into()],
+            ..Default::default()
+        };
+        assert!(load_stack(&file, &[], flags, &Sigils::new("/home/x", "/work")).is_err());
+    }
+
+    /// The env-file-ref denies for one set variable, launched from `/work`.
+    fn file_ref_denies(var: &str, value: &[u8], allow: &[String]) -> Result<Vec<String>> {
+        use std::os::unix::ffi::OsStringExt;
+        let catalog = formwork_blueprint::ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let value = OsString::from_vec(value.to_vec());
+        env_file_ref_patterns(&catalog, allow, Path::new("/work"), |name| {
+            (name == var).then(|| value.clone())
+        })
+        .map(|patterns| patterns.iter().map(PathPattern::canonical).collect())
+    }
+
+    #[test]
+    fn fw_cred33_each_file_of_a_list_valued_reference_is_denied() {
+        let kube = |value: &str| file_ref_denies("KUBECONFIG", value.as_bytes(), &[]).unwrap();
+        assert_eq!(kube("/k/a.yaml"), ["/k/a.yaml"]);
+        assert_eq!(kube("/k/a.yaml:/k/b.yaml"), ["/k/a.yaml", "/k/b.yaml"]);
+        // Empty elements name nothing; a relative one resolves against the launch directory.
+        assert_eq!(
+            kube(":/k/a.yaml::rel/c.yaml:/k/b.yaml:"),
+            ["/k/a.yaml", "/work/rel/c.yaml", "/k/b.yaml"]
+        );
+        assert!(kube("").is_empty() && kube(":").is_empty());
+        // A reference the Catalog does not mark as a list keeps its colon: it is one path.
+        assert_eq!(
+            file_ref_denies("GOOGLE_APPLICATION_CREDENTIALS", b"/k/a:b.json", &[]).unwrap(),
+            ["/k/a:b.json"]
+        );
+        // An excluded type's reference is the session's to read (FW-CRED5).
+        assert!(
+            file_ref_denies("KUBECONFIG", b"/k/a.yaml:/k/b.yaml", &["kube".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The deny names the file the kernel will open: a `..` is folded against the directory the
+    /// path has reached, so one that follows a symlink leaves through the link's target.
+    #[test]
+    fn fw_cred3_a_parent_component_is_folded_as_the_kernel_resolves_it() {
+        let dir = Scratch::new("ref-dotdot");
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere/sub")).unwrap();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere/sub"), root.join("keys/link")).unwrap();
+        let shown = |p: &str| format!("{}/{p}", root.display());
+        let denies = |value: String| {
+            file_ref_denies("GOOGLE_APPLICATION_CREDENTIALS", value.as_bytes(), &[]).unwrap()
+        };
+        assert_eq!(
+            denies(shown("keys/link/../sa.json")),
+            [shown("elsewhere/sa.json")]
+        );
+        // Without a symlink, and where nothing exists yet, the lexical parent is the parent;
+        // above the root there is only the root.
+        assert_eq!(denies(shown("keys/../sa.json")), [shown("sa.json")]);
+        assert_eq!(
+            denies(shown("absent/dir/../sa.json")),
+            [shown("absent/sa.json")]
+        );
+        assert_eq!(denies("/../../sa.json".to_string()), ["/sa.json"]);
+    }
+
+    #[test]
+    fn fw_cred34_an_unrenderable_reference_is_refused_naming_the_variable() {
+        let cases: &[(&str, &[u8])] = &[
+            ("GOOGLE_APPLICATION_CREDENTIALS", b"/k/\xff/sa.json"),
+            ("KUBECONFIG", b"/k/a.yaml:/k/\xff.yaml"),
+            // A `**` component is a wildcard to the pattern grammar, not a file name.
+            ("KUBECONFIG", b"/k/a.yaml:/k/**"),
+            ("KUBECONFIG", b"/k/**/b.yaml"),
+            ("GOOGLE_APPLICATION_CREDENTIALS", b"/**"),
+        ];
+        for (var, value) in cases {
+            let refusal = file_ref_denies(var, value, &[]).unwrap_err();
+            let msg = format!("{refusal:#}");
+            assert!(
+                msg.contains(var),
+                "{var}={:?}: {msg}",
+                String::from_utf8_lossy(value)
+            );
+        }
     }
 
     #[test]
