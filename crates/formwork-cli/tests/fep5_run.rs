@@ -416,6 +416,39 @@ fn fw_e2e_075_run_routes_egress_through_the_gateway() {
     );
 }
 
+/// FW-ISO34 through `run`: under host rules a workload's `listen()` on a loopback inet socket is
+/// refused with `EACCES` and the operator channel names the refusal with its reproduction
+/// (FW-FID9); a UNIX-socket listener in the same session listens.
+#[cfg(target_os = "linux")]
+#[test]
+fn fw_iso34_run_refuses_an_inet_listener_and_names_the_refusal() {
+    let dir = Scratch::new("listen");
+    if !supervision_host(dir.path()) || !on_path("python3") {
+        not_exercised("connect supervision or python3 unavailable");
+        return;
+    }
+    std::fs::write(
+        dir.path().join("FORMWORK.toml"),
+        "extends = [\"builtin:default\"]\nrules = [\"readwrite:$CWD/**\", \"allow:example.test\"]\n",
+    )
+    .unwrap();
+    let script = "import errno, os, socket\n\
+                  s = socket.socket(); s.bind(('127.0.0.1', 0))\n\
+                  try:\n    s.listen(1); print('listening')\n\
+                  except OSError as e:\n    print('refused' if e.errno == errno.EACCES else e)\n\
+                  u = socket.socket(socket.AF_UNIX)\n\
+                  u.bind(os.path.join(os.environ['TMPDIR'], 'l.sock')); u.listen(1)\n\
+                  print('unix listening')\n";
+    let out = formwork(dir.path(), &["run", "--", "python3", "-c", script], &[]);
+    assert_eq!(out.stdout, "refused\nunix listening\n", "{}", out.stderr);
+    assert!(
+        out.stderr.contains("refused listen on an inet socket")
+            && out.stderr.contains("formwork explain --hosts"),
+        "the operator channel names the refusal and its reproduction: {}",
+        out.stderr
+    );
+}
+
 /// FW-E2E-086 (first half, FW-XR10): `run` exits with the workload's status and writes nothing of
 /// its own to stdout.
 #[test]

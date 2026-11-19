@@ -211,9 +211,12 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 | <a id="fw-iso29"></a>**FW-ISO29** No connection by send (Linux) | On Linux, for every posture that admits stream sockets (the port tier and host rules), the Confiner shall refuse, with `EOPNOTSUPP`, a `sendto`, `sendmsg` or `sendmmsg` call carrying `MSG_FASTOPEN` in its flags argument. |
 | <a id="fw-iso31"></a>**FW-ISO31** No exec by descriptor (Linux) | On Linux, under an exec allow-list, the Confiner shall refuse, with `EACCES`, `execveat` with `AT_EMPTY_PATH` set in its flags argument. |
 | <a id="fw-iso33"></a>**FW-ISO33** Syscall-number bound (Linux) | On x86_64, in every posture, the Confiner shall refuse, with `EPERM`, every system call whose number has bit 30 set (the x32 range). |
+| <a id="fw-iso34"></a>**FW-ISO34** No inet listening (Linux) | Under supervised connect, the Confiner shall deliver every `listen()` to the supervisor, which shall answer `EACCES` to a call on a socket whose domain is `AF_INET` or `AF_INET6`, whatever address the socket is bound to, so that no `listen()` in the session puts an inet socket into the listening state. |
 | <a id="fw-iso35"></a>**FW-ISO35** Stream protocols (Linux) | For every net posture other than `allow`, the Confiner shall refuse creation of an inet stream socket whose protocol is neither `0` nor `IPPROTO_TCP`. |
 
-`FW-ISO15` was drafted and retired before FEP-5 landed; the number stays retired. [FW-ISO28](#fw-iso28), [FW-ISO29](#fw-iso29) and [FW-ISO31](#fw-iso31) are the seccomp phase of draft FEP-14, and [FW-ISO33](#fw-iso33) and [FW-ISO35](#fw-iso35) come from draft FEP-17; they landed as fixes ahead of those drafts. `FW-ISO19`..`FW-ISO27`, `FW-ISO30`, `FW-ISO32` and `FW-ISO34` are reserved by open drafts. The blueprint has no `allow` net posture today, so the socket rules hold under every posture.
+`FW-ISO15` was drafted and retired before FEP-5 landed; the number stays retired. [FW-ISO28](#fw-iso28), [FW-ISO29](#fw-iso29) and [FW-ISO31](#fw-iso31) are the seccomp phase of draft FEP-14, and [FW-ISO33](#fw-iso33), [FW-ISO34](#fw-iso34) and [FW-ISO35](#fw-iso35) come from draft FEP-17; they landed as fixes ahead of those drafts. `FW-ISO19`..`FW-ISO27`, `FW-ISO30` and `FW-ISO32` are reserved by open drafts. The blueprint has no `allow` net posture today, so the socket rules hold under every posture.
+
+Under [FW-ISO34](#fw-iso34) a session under host rules has no inet listener, loopback included (maintainer decision of 2026-11-17, over admitting loopback listeners): [FW-E2E-106](#fw-e2e-106) stays unbuilt, and a login flow that waits for a browser redirect to `localhost` does not complete on Linux under host rules. `bind` and `accept` need no rule, because a TCP socket takes no connection until it listens, and an unbound one binds itself to the wildcard address when it does. For a socket of another domain the supervisor makes the `listen()` call itself, on the descriptor whose domain it read: after a `CONTINUE` the kernel would look the descriptor number up again, and a second thread can have put an inet socket under it by then. A UNIX-socket listener therefore carries the supervisor's process, not the session process that asked, in its peer credentials (`SO_PEERCRED`).
 
 ### 5.4 Gateway / MCP (FW-GW)
 
@@ -372,6 +375,9 @@ Host-scoped egress: the confiner stays default-deny, and a confined process reac
 | <a id="fw-egr24"></a>**FW-EGR24** Upstream verification | The Gateway shall verify every upstream TLS certificate for the requested host name against the host trust store it loaded at session start, and shall never trust the session CA or a file a confined process can write for upstream verification. |
 | <a id="fw-egr25"></a>**FW-EGR25** Constrained session CA | The session CA certificate shall carry name constraints whose permitted subtrees are exactly the session's inspected exact names, wildcard suffixes and IP literals. |
 | <a id="fw-egr26"></a>**FW-EGR26** Upstream proxy | When `formwork run`'s environment names an upstream proxy, the Gateway shall send admitted egress through it, except to hosts that environment's `NO_PROXY` exempts, and shall report destination classification `Partial` with the reason for each proxied host. |
+| <a id="fw-egr37"></a>**FW-EGR37** Registry lifetime (Linux) | The supervisor shall remove from the admission registry a source port it registered for a `connect()` that made no connection: at once when the call fails, and, when the call returns with its handshake in progress, when the handshake fails or is still in progress **handshake-wait** (2 s) after the return. |
+
+[FW-EGR37](#fw-egr37) comes from draft FEP-17 and landed as a fix ahead of it; `FW-EGR27`..`FW-EGR36` and `FW-EGR38` are reserved by open drafts. A registration is used once: the Gateway listener removes a port when it accepts a connection from it ([FW-EGR9](#fw-egr9)). With [FW-EGR37](#fw-egr37) the registry therefore holds a port only between a `connect()` and the listener's accept of the connection that call made. The supervisor registers the port before it connects, not after the connect succeeds, because the listener can accept the connection before `connect()` returns to the supervisor. A registration the call found already present belongs to an earlier `connect()` the listener has yet to accept, and a failing repeat call leaves it. A connection that was made and that the listener never accepts keeps its port registered: the supervisor does not hold the session's socket and cannot observe its close.
 
 ## 6. Invariants
 
@@ -474,6 +480,10 @@ The egress tests drive the real gateway against loopback fixture upstreams and a
 <a id="fw-e2e-185"></a>**FW-E2E-185: No connection by send (Linux).** Under the port tier with one granted loopback port, a listener on that port and a listener on a second port. A control runs unconfined first: a `sendto` carrying `MSG_FASTOPEN` to the second port opens a connection, and where it does not (Fast Open client-disabled) the test reports not exercised. The session then connects and sends without the flag to the granted port, attempts a plain `connect()` to the second port, and attempts `sendto`, `sendmsg` and `sendmmsg` carrying `MSG_FASTOPEN` to the second port. Pass: the granted connection and its sends succeed; the `connect()` is refused; each flagged send returns `EOPNOTSUPP`; the second listener receives nothing from the session ([FW-ISO29](#fw-iso29)). Fail: a flagged send opens a connection or returns another errno, or an unflagged send is refused.
 
 <a id="fw-e2e-187"></a>**FW-E2E-187: Socket-family allow-list (Linux).** A control runs the same calls unconfined, and where every refusal below already holds there the test reports not exercised. Under `net = "deny"` the session calls `socket()` for `AF_UNIX`, `AF_NETLINK` with `NETLINK_ROUTE`, `AF_VSOCK`, `AF_ALG`, `AF_PACKET`, `AF_SMC`, the first family number above the highest Linux 6.18 assigns, `AF_NETLINK` with `NETLINK_SOCK_DIAG`, `AF_INET` and `AF_INET6`. Under the port tier and under host rules it calls `socket()` for `AF_UNIX`, for an inet stream with protocol `0`, `IPPROTO_TCP`, `IPPROTO_MPTCP` and `IPPROTO_SCTP`, for inet datagram and raw sockets, and for `AF_SMC` and `AF_VSOCK`. Under each posture it calls `socketpair()` for `AF_UNIX` and `AF_VSOCK`. Pass: the `AF_UNIX` sockets and pair, route netlink under `net = "deny"`, and the protocol-`0` and TCP streams where streams are admitted, are created; every other call returns `EPERM` ([FW-ISO28](#fw-iso28), [FW-ISO35](#fw-iso35)). Fail: a socket outside the admitted set is created or is refused with another errno, or an admitted one is refused.
+
+<a id="fw-e2e-206"></a>**FW-E2E-206: No inet listening (Linux).** Under host rules. A control runs unconfined first: a probe calls `listen` on an inet stream socket bound to the wildcard address, one bound to loopback and one unbound, for `AF_INET` and for `AF_INET6`, and holds them open while the test connects to each from outside; a socket that does not listen or is not reached there (a host without IPv6) is reported not exercised. The session makes the same six calls and holds the sockets open while the test tries to connect to the port each ended on; it calls `io_uring_setup`; it binds and listens on a pathname UNIX socket, calls `listen` on that socket again, on a pipe, on a closed descriptor and on an unbound UNIX socket, and accepts a connection the test makes from outside; and it connects to the Gateway listener. Pass: each inet `listen` returns `EACCES` and no connection from outside is made, the unbound sockets included; `io_uring_setup` returns `EPERM`; the UNIX socket listens, the four further calls return what the kernel answers (success, `ENOTSOCK`, `EBADF`, `EINVAL`), and the listener reads the byte the test sends, its peer credentials naming the supervisor's process; the Gateway connect succeeds ([FW-ISO34](#fw-iso34)). Fail: an inet socket listens or is reached from outside, the UNIX listener is refused, or the Gateway is not reached.
+
+<a id="fw-e2e-213"></a>**FW-E2E-213: Registry lifetime (Linux).** Under host rules, with a loopback address standing in for the Gateway listener. With nothing listening on it, the session makes a blocking `connect()`, which is refused, and a non-blocking one, whose handshake fails after the call returned; where that call is refused before it returns the test reports not exercised. With a listener that removes the peer's port from the registry when it accepts, as the Gateway listener does, the session connects, waits for a byte from the listener, calls `connect()` again on the connected socket, which returns `EISCONN`, and exits. It does the same against a listener that leaves the registry alone. Pass: the registry is empty after each of the first three, and holds the one port after the last ([FW-EGR37](#fw-egr37)). Fail: a port stays registered after a `connect()` that made no connection, or the second `connect()` removes a registration the listener has yet to take.
 
 ### 7.3 Transport / fd seam (retired)
 
@@ -838,7 +848,10 @@ listens on `127.0.0.1:<port>`.
 | 2 | `curl -sS http://127.0.0.1:<fixture port>/` | refused; refusal record; the fixture logs nothing |
 
 Pass: row 1 succeeds and row 2 is refused. Fail: row 1 is refused, or row 2 reaches the fixture. The
-macOS form waits for a Seatbelt design that can tell a session-bound port from a host service.
+macOS form waits for a Seatbelt design that can tell a session-bound port from a host service. On
+Linux the supervisor refuses row 1's `listen` as well as its `connect()` ([FW-ISO34](#fw-iso34)), so
+the Linux form waits for a design that admits a listener inside the session without admitting a
+peer outside it.
 
 ## 8. Performance target
 
@@ -870,7 +883,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 - Anti-shedding: `NO_NEW_PRIVS` + seccomp baseline ([FW-ISO8](#fw-iso8)).
 - Datagram and raw closure: seccomp denies AF_INET/AF_INET6 `SOCK_DGRAM` and `SOCK_RAW` under every net posture ([FW-ISO11](#fw-iso11)), so under the port tier nothing resolves names.
 - Second entry points: a second seccomp filter refuses the routes around a mediated call that a scalar argument identifies: a send carrying `MSG_FASTOPEN`, which opens a TCP connection without `connect()` ([FW-ISO29](#fw-iso29)); under an exec allow-list, `execveat` with `AT_EMPTY_PATH`, which runs a descriptor that has no path ([FW-ISO31](#fw-iso31)); and on x86_64 every syscall number in the x32 range, under which a kernel built with that ABI offers each syscall again ([FW-ISO33](#fw-iso33)).
-- Connect supervisor (FEP-5): under host rules, seccomp user notification routes every `connect()` and addressed `sendto()` to the `formwork` process, which copies the address once, takes the target's socket with `pidfd_getfd`, and performs the operation itself: to the Gateway egress listener, or to a pathname socket that is granted or bound in the session ([FW-EGR7](#fw-egr7), [FW-ISO12](#fw-iso12)). Needs Linux 5.6+ and Yama `ptrace_scope` 0 or 1; `run` refuses host rules without it.
+- Connect supervisor (FEP-5): under host rules, seccomp user notification routes every `connect()` and addressed `sendto()` to the `formwork` process, which copies the address once, takes the target's socket with `pidfd_getfd`, and performs the operation itself: to the Gateway egress listener, or to a pathname socket that is granted or bound in the session ([FW-EGR7](#fw-egr7), [FW-ISO12](#fw-iso12)). Every `listen()` is routed the same way: the supervisor refuses it on an inet socket, loopback included, and makes the call itself on any other socket ([FW-ISO34](#fw-iso34)). Needs Linux 5.6+ and Yama `ptrace_scope` 0 or 1; `run` refuses host rules without it.
 - Isolation tier (FEP-5): `isolate = ["processes"]` adds user, PID, mount and UTS namespaces with a fresh `/proc` and a tmpfs over the session temp directory; `ipc` adds an IPC namespace ([FW-ISO10](#fw-iso10)). Refused before spawn where unprivileged user namespaces are unavailable (Ubuntu 24.04's AppArmor default).
 
 **macOS — Seatbelt (SBPL via `sandbox_init`).**
@@ -919,7 +932,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 |---|---|---|---|
 | Violation latency | synchronous per `connect()` | post-hoc (unified log) | Seatbelt has no notification channel |
 | Egress endpoint authentication | by construction | credential + peer check (sandbox marker) | SBPL cannot scope `localhost` to a session |
-| Loopback listen ([FW-EGR15](#fw-egr15)) | not granted | also listens on the host's other addresses (`net-default-deny` `Partial`) | `localhost` in an SBPL local filter matches every local address (C1) |
+| Loopback listen ([FW-EGR15](#fw-egr15)) | not granted; refused under host rules ([FW-ISO34](#fw-iso34)) | also listens on the host's other addresses (`net-default-deny` `Partial`) | `localhost` in an SBPL local filter matches every local address (C1) |
 | TLS inspection clients | all env-trust clients | excludes Security.framework clients | no per-process trust on macOS |
 | Keychain lift granularity | per bus name (Secret Service as a whole) | whole keychain channel | Seatbelt gates `securityd` as one service |
 | `os-keyring` lift | `Partial` (shares the session bus with `run-outside`) | `Enforced` (own mach service) | D-Bus routes by bus name inside the socket |
@@ -981,6 +994,7 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-ISO29](#fw-iso29) No connection by send | [FW-E2E-185](#fw-e2e-185) | under host rules by a test named for it (`linux_supervise.rs`) |
 | [FW-ISO31](#fw-iso31) No exec by descriptor | [FW-E2E-188](#fw-e2e-188) | filter-level test named for it (`seccomp.rs`) |
 | [FW-ISO33](#fw-iso33) Syscall-number bound | [FW-E2E-205](#fw-e2e-205) | — |
+| [FW-ISO34](#fw-iso34) No inet listening | [FW-E2E-206](#fw-e2e-206) | tests named for it: the descriptor swap (`linux_supervise.rs`) and the refusal through `run` with its operator line (`fep5_run.rs`) |
 | [FW-ISO35](#fw-iso35) Stream protocols | [FW-E2E-187](#fw-e2e-187) | filter-level test named for it (`seccomp.rs`) |
 | [FW-GW1](#fw-gw1) Transport-agnostic backends | [FW-E2E-013](#fw-e2e-013) (stdio only; http/SSE backends not built) | 019 |
 | [FW-GW2](#fw-gw2) Tool shading | [FW-E2E-013](#fw-e2e-013), 014 | ADV-004, 016 |
@@ -1084,6 +1098,7 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-EGR24](#fw-egr24) Upstream verification | [FW-E2E-098](#fw-e2e-098) | 103 |
 | [FW-EGR25](#fw-egr25) Constrained session CA | [FW-E2E-097](#fw-e2e-097) | 094 |
 | [FW-EGR26](#fw-egr26) Upstream proxy | [FW-E2E-103](#fw-e2e-103) | — |
+| [FW-EGR37](#fw-egr37) Registry lifetime | [FW-E2E-213](#fw-e2e-213) | ADV-009 (the listener's single use of a registration) |
 | Launcher arm (§2) | [FW-E2E-046](#fw-e2e-046), 050 | 047, INV7, ADV-014 |
 
 ## 11. Open questions

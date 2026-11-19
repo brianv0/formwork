@@ -64,6 +64,15 @@ under test.
   by the native number. The second filter returns `EPERM` for any number with that bit
   ([FW-ISO33](../formwork.md#fw-iso33)), on every kernel: seccomp runs before dispatch, so where
   the ABI is absent the errno changes from `ENOSYS` to `EPERM` and nothing else does.
+- **No inet socket listens under host rules.** The connect supervisor governed the outbound
+  direction only. Under host rules a session called `listen` on an inet socket bound to the
+  wildcard address, on one bound to loopback, and on one never bound, which `listen` binds to the
+  wildcard address itself, and a process outside the session connected to all three (verified on
+  6.18). seccomp cannot refuse `listen` alone: it sees a descriptor number, and a UNIX-socket
+  listener makes the same call. `listen` now goes to the supervisor, which reads the socket's
+  domain and answers `EACCES` for `AF_INET` and `AF_INET6`, loopback included
+  ([FW-ISO34](../formwork.md#fw-iso34)). `bind` and `accept` need no rule, because a TCP socket
+  takes no connection until it listens.
 - **Abstract-UNIX-socket + signal scoping is enforced at ABI v6+** via the `Scope` handle — closing a
   pathless escape the fs rules cannot reach — matching the compiler's CrossDomainSocket = Partial.
 - **Device ioctls are *not* governed** (`IOCTL_DEV` excluded from `handled_fs`). Governing it denies
@@ -257,24 +266,52 @@ reaches what the bound guards.
 ### Connect supervision and the isolation tier (FEP-5)
 
 - **Supervised connect ([FW-EGR7](../formwork.md#fw-egr7), [FW-ISO12](../formwork.md#fw-iso12)).**
-  Under host rules a second seccomp filter returns `SECCOMP_RET_USER_NOTIF` for `connect` and for
-  `sendto` with a non-null destination (x32 numbers are refused outright). The listener is handed to
-  the `formwork` process over a socketpair; the supervisor copies the `sockaddr` once, re-checks the
+  Under host rules a second seccomp filter returns `SECCOMP_RET_USER_NOTIF` for `connect`, for
+  `sendto` with a non-null destination, and for `listen` (x32 numbers are refused outright). The
+  listener is handed to the `formwork` process over a socketpair. For `connect` and `sendto` the
+  supervisor copies the `sockaddr` once, re-checks the
   notification id, takes the socket with `pidfd_getfd` and performs the call itself, so a thread
   rewriting the address after the check changes nothing ([FW-ADV-018](../formwork.md#fw-adv-018)).
   Inet goes to the Gateway only, from a source port the supervisor registers first, so the Gateway
   listener admits exactly the connections the supervisor made ([FW-EGR9](../formwork.md#fw-egr9));
-  this is the Linux counterpart of the macOS peer check. A pathname socket is admitted when a
-  literal write grant names it, when a lifted channel's facility owns it (the session bus and user
+  this is the Linux counterpart of the macOS peer check. The port is registered before the
+  connect, because the listener can accept before `connect` returns to the supervisor, and the
+  listener removes it at that accept. A connect that makes no connection would leave it behind
+  for another process to connect from, so the supervisor takes it back: at once when the call
+  fails, and for a non-blocking socket, whose call returns `EINPROGRESS`, after a `poll` of up to
+  2 s shows the handshake failed or unfinished ([FW-EGR37](../formwork.md#fw-egr37)). `poll`
+  leaves the pending error for the session to read. A repeat `connect` on a socket whose first
+  registration the listener has not taken yet leaves that registration alone. A pathname socket
+  is admitted when a literal write grant names it, when a lifted channel's facility owns it (the session bus and user
   manager for `run-outside`, the display socket for `clipboard` and `screen`, the audio socket for
   `microphone`; the keyring sockets and the session bus when `os-keyring` is lifted), or when a
   session process bound it, which is decided from `sock_diag` or, on kernels without
   `CONFIG_UNIX_DIAG`, `/proc/net/unix`. An abstract socket is refused. Addressed
   `sendmsg`/`sendmmsg` on an AF_UNIX datagram socket is not mediated (its destination sits in memory
   seccomp cannot read), and the report says so. A loopback server the session itself starts is
-  refused too, because the supervisor admits inet only to the Gateway (FEP-6 §11, "In-session
-  loopback"; [FW-E2E-106](../formwork.md#fw-e2e-106) waits on it). Requires 5.6+ (`pidfd_getfd`) and
+  refused too: its `listen` is refused, and a `connect` to it would be, because the supervisor
+  admits inet only to the Gateway (FEP-6 §11, "In-session loopback";
+  [FW-E2E-106](../formwork.md#fw-e2e-106) waits on it). Requires 5.6+ (`pidfd_getfd`) and
   Yama `ptrace_scope` 0 or 1; host detection probes all three.
+- **Supervised listen ([FW-ISO34](../formwork.md#fw-iso34)).** The supervisor takes the caller's
+  socket with `pidfd_getfd` after re-checking the notification id, as for `connect`, and reads
+  `SO_DOMAIN` from its own copy. `AF_INET` and `AF_INET6` get `EACCES` and an operator line; a
+  descriptor that is no socket gets the kernel's errno for it. For any other socket the supervisor
+  calls `listen` itself, with the caller's backlog, on that copy, and returns the result. It does
+  not answer `CONTINUE`: the kernel would then look the descriptor number up a second time, in the
+  calling thread's table, and the socket there need not be the one that was checked. Two cases
+  make them differ, and a probe runs both
+  (`fw_iso34_listen_acts_on_the_socket_it_checked`): a second thread replaces the descriptor
+  between the check and the call, which made an inet socket listen in each of five 300 ms runs
+  against a build that answered `CONTINUE` (6.18); and a thread that has called
+  `unshare(CLONE_FILES)` has a table of its own, while `pidfd_getfd` reads the thread group
+  leader's. One effect is visible to a client: the kernel stamps a UNIX listener with the
+  credentials of the process that called `listen`, so `SO_PEERCRED` on a connection to a
+  session's UNIX listener names the `formwork` process
+  ([FW-E2E-206](../formwork.md#fw-e2e-206) records it). A listening inet socket the session did
+  not make listen is outside this rule: one already listening when `formwork run` inherited it,
+  or one passed to the session over a granted UNIX socket. `io_uring`, whose `IORING_OP_LISTEN`
+  would not reach the filter, is refused by the baseline.
 - **Channels.** Without host rules nothing mediates a pathname `connect()`, so the socket-shaped
   channels (`run-outside`, `open-url` through the desktop portal, `clipboard`, `screen`) are
   `Partial`: the Launcher strips their locator variables ([FW-BP11](../formwork.md#fw-bp11)), which
