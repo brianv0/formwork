@@ -299,17 +299,28 @@ pub fn compile_for_session(
 }
 
 /// The Partial reason for a row set Landlock can only partly root: its any-depth rows are withheld,
-/// and its absolute rows are named as enforced only when it has some -- the backstop and the
-/// default tamper vectors are any-depth throughout, and the clause would read as an enforcement
-/// claim for them (FW-INV5).
-fn any_depth_withheld(has_absolute: bool, cite: &str) -> String {
+/// and its absolute rows are named as enforced only when it has some the host enforces whole --
+/// the backstop and the default tamper vectors are any-depth throughout, and the clause would read
+/// as an enforcement claim for them (FW-INV5).
+fn any_depth_withheld(absolute_enforced: bool, cite: &str) -> String {
     format!(
         "any-depth (`**/`) rows cannot be rooted Landlock rules and are withheld on Linux{} ({cite})",
-        if has_absolute {
+        if absolute_enforced {
             "; absolute rows are enforced"
         } else {
             ""
         }
+    )
+}
+
+/// The Partial reason for a write row below Landlock's truncate ABI (FW-FID34). `files` names what
+/// the row protects.
+fn truncation_ungoverned(abi: u32, files: &str) -> String {
+    format!(
+        "Landlock ABI v{abi} cannot govern truncation (the truncate right needs ABI v{}): \
+         truncate(2), and open(2) with O_TRUNC on a read-only open, can empty {files} where the \
+         file's own permissions allow writing",
+        linux::LANDLOCK_TRUNCATE_ABI
     )
 }
 
@@ -476,16 +487,29 @@ fn compile_linux(
     caps: &mut BTreeMap<Capability, Fidelity>,
     withheld: &mut Vec<String>,
 ) -> (ConfinerPolicy, Vec<u16>) {
-    let abi = host.landlock_abi.unwrap_or(0);
-    let has_landlock = abi >= 1;
+    let abi = linux::landlock_abi(host);
+    let has_landlock = linux::has_landlock(host);
     let landlock = || Fidelity::Enforced {
         backend: Backend::Landlock,
     };
 
+    // FW-FID34: a write deny does not stop truncation below the truncate ABI.
+    let truncation_gap = has_landlock && abi < linux::LANDLOCK_TRUNCATE_ABI;
+
     // Filesystem read/write require Landlock. Report honestly if it is absent.
     if has_landlock {
         caps.insert(Capability::FsRead, landlock());
-        caps.insert(Capability::FsWrite, landlock());
+        caps.insert(
+            Capability::FsWrite,
+            if truncation_gap {
+                Fidelity::Partial {
+                    backend: Backend::Landlock,
+                    reason: truncation_ungoverned(abi, "a file outside the write grants"),
+                }
+            } else {
+                landlock()
+            },
+        );
     } else {
         let reason =
             "Landlock unavailable on this host; filesystem scope cannot be enforced".to_string();
@@ -499,9 +523,10 @@ fn compile_linux(
     }
 
     let (net_plan, inet_deny, tier) = linux::net_plan(host, &input.net);
-    // Net default-deny is seccomp-carried on every Linux path: an outright deny blocks the inet
-    // family, and the port tier needs seccomp for the inet DGRAM/RAW deny (Landlock net governs TCP
-    // only). Without a working seccomp filter it is not claimed (FW-ISO11, FW-INV5).
+    // Net default-deny is seccomp-carried on every Linux path the supervisor does not carry: an
+    // outright deny blocks the inet family, and the port tier needs seccomp for the inet DGRAM/RAW
+    // deny (Landlock net governs TCP only). Without a working seccomp filter it is not claimed
+    // (FW-ISO11, FW-INV5).
     let seccomp_or = |what: &str| -> Fidelity {
         if host.seccomp {
             Fidelity::Enforced {
@@ -513,21 +538,43 @@ fn compile_linux(
             }
         }
     };
+    let supervise = matches!(net_plan, LinuxNetPlan::SupervisedConnect);
+    let outbound = if supervise {
+        Fidelity::Enforced {
+            backend: Backend::Supervisor,
+        }
+    } else {
+        seccomp_or("direct egress denial")
+    };
+    // FW-FID33: an outbound deny beside unmediated inbound connections is not a default deny.
     caps.insert(
         Capability::NetDefaultDeny,
-        seccomp_or("direct egress denial"),
+        match (outbound, linux::inbound_gap(&net_plan)) {
+            (Fidelity::Enforced { backend }, Some(gap)) => Fidelity::Partial {
+                backend,
+                reason: format!(
+                    "outbound connections are denied apart from the granted endpoints; inbound \
+                     connections are not mediated: {gap}"
+                ),
+            },
+            (outbound, _) => outbound,
+        },
     );
     caps.insert(Capability::NetUdp, seccomp_or("UDP/raw closure"));
     // D8/FW-EGR12: UDP resolution is closed with the inet deny, but the pathname resolver sockets
-    // stay connect()-reachable without the supervisor, so resolution is not closed.
+    // stay connect()-reachable without the supervisor, so resolution is not closed. Without
+    // seccomp the UDP half is not closed either, and the row names no backend (FW-INV5).
     caps.insert(
         Capability::NetResolver,
-        Fidelity::Partial {
-            backend: Backend::Seccomp,
-            reason: "UDP resolution is closed, but pathname resolver sockets (nscd, \
-                     systemd-resolved) are connect()-reachable; host rules route resolution \
-                     through the Gateway and close them"
-                .to_string(),
+        match seccomp_or("resolver closure") {
+            Fidelity::Enforced { backend } => Fidelity::Partial {
+                backend,
+                reason: "UDP resolution is closed, but pathname resolver sockets (nscd, \
+                         systemd-resolved) are connect()-reachable; host rules route resolution \
+                         through the Gateway and close them"
+                    .to_string(),
+            },
+            unenforceable => unenforceable,
         },
     );
 
@@ -616,16 +663,25 @@ fn compile_linux(
         .cloned()
         .partition(|p| !p.is_any_depth());
     if !input.write_subtract.is_empty() {
+        let withheld_rows = (!any_depth_ws.is_empty()).then(|| {
+            any_depth_withheld(
+                !write_subtract.is_empty() && !truncation_gap,
+                "see `withheld`",
+            )
+        });
+        let truncation =
+            truncation_gap.then(|| truncation_ungoverned(abi, "a write-protected file"));
+        let gaps: Vec<String> = withheld_rows.into_iter().chain(truncation).collect();
         let fidelity = if !has_landlock {
             Fidelity::Unenforceable {
                 reason: "Landlock unavailable on this host".to_string(),
             }
-        } else if any_depth_ws.is_empty() {
+        } else if gaps.is_empty() {
             landlock()
         } else {
             Fidelity::Partial {
                 backend: Backend::Landlock,
-                reason: any_depth_withheld(!write_subtract.is_empty(), "see `withheld`"),
+                reason: gaps.join("; "),
             }
         };
         caps.insert(Capability::TamperVectors, fidelity);
@@ -649,7 +705,6 @@ fn compile_linux(
         return (confiner, Vec::new());
     }
 
-    let supervise = matches!(net_plan, LinuxNetPlan::SupervisedConnect);
     let seccomp = linux::seccomp_plan(inet_deny, supervise);
     debug_assert!(
         !matches!(inet_deny, InetSeccompDeny::DgramRawOnly) || seccomp.deny_inet_dgram_raw
@@ -791,12 +846,12 @@ fn baseline_rows(
         }
         // Landlock refuses a confined process ptrace-class access to any process outside its
         // domain, which is the check `/proc/<pid>/environ` goes through (FW-ISO16).
-        Os::Linux if host.landlock_abi.is_some() && !facilities.ptrace_privileged => {
+        Os::Linux if linux::has_landlock(host) && !facilities.ptrace_privileged => {
             Fidelity::Enforced {
                 backend: Backend::Landlock,
             }
         }
-        Os::Linux if host.landlock_abi.is_some() => Fidelity::Partial {
+        Os::Linux if linux::has_landlock(host) => Fidelity::Partial {
             backend: Backend::Landlock,
             reason: format!(
                 "Landlock refuses ptrace-class access, /proc/<pid>/environ included, to processes \
@@ -922,7 +977,7 @@ fn linux_channel_fidelity(
         Channel::RunOutside => unmediated("the session bus and the systemd --user socket"),
         Channel::OpenUrl => unmediated("the session bus (the desktop portal)"),
         Channel::Clipboard | Channel::Screen => {
-            if host.landlock_abi.unwrap_or(0) >= 6 {
+            if linux::landlock_abi(host) >= 6 {
                 unmediated("the X11/Wayland pathname socket")
             } else {
                 unmediated("the X11/Wayland socket, abstract X11 included (Landlock ABI < 6)")
@@ -1026,7 +1081,6 @@ fn egress_rows(
             let supervisor = || Fidelity::Enforced {
                 backend: Backend::Supervisor,
             };
-            caps.insert(Capability::NetDefaultDeny, supervisor());
             caps.insert(Capability::NetResolver, supervisor());
             let sendmsg_gap = "addressed sendmsg()/sendmmsg() on an AF_UNIX datagram socket is not mediated (its destination sits in memory seccomp cannot read); connect() and addressed sendto() are";
             caps.insert(
@@ -1040,7 +1094,7 @@ fn egress_rows(
                 Capability::CrossDomainSocket,
                 Fidelity::Partial {
                     backend: Backend::Supervisor,
-                    reason: if host.landlock_abi.unwrap_or(0) >= 6 {
+                    reason: if linux::landlock_abi(host) >= 6 {
                         format!("pathname and abstract connect() are supervised; {sendmsg_gap}")
                     } else {
                         format!(
@@ -1345,19 +1399,20 @@ mod tests {
     /// Landlock, which would leave UDP open). And it degrades honestly to Unenforceable if the host
     /// carries no seccomp to install that deny.
     #[test]
-    fn linux_port_tier_net_default_deny_is_honestly_enforced() {
+    fn linux_port_tier_net_default_deny_follows_the_host() {
         let blueprint = Blueprint {
             net: NetPosture::Ports(vec![443]),
             ..Blueprint::empty()
         };
-        // ABI 6 host with seccomp: UDP/raw are actually denied, so Enforced (via seccomp) is honest.
+        // ABI 6 host with seccomp: UDP/raw are denied and TCP connects are port-scoped, but an
+        // unbound socket can still listen (FW-FID33), so the row is Partial, carried by seccomp.
         let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(6)));
-        assert_eq!(
-            policy.report.per_capability[&Capability::NetDefaultDeny],
-            Fidelity::Enforced {
-                backend: Backend::Seccomp
-            },
-            "net-deny under the port tier is carried by seccomp (UDP/raw) + Landlock (TCP)"
+        assert!(
+            matches!(
+                &policy.report.per_capability[&Capability::NetDefaultDeny],
+                Fidelity::Partial { backend: Backend::Seccomp, reason } if reason.contains("listen()")
+            ),
+            "net-deny under the port tier names the unbound listen"
         );
         assert!(policy.report.per_capability[&Capability::NetPortTier].is_enforced());
         assert!(policy.report.net_is_fail_closed());

@@ -85,6 +85,7 @@ def write_blueprint(
     reads=(),
     writes=(),
     subtract=(),
+    write_subtract=(),
 ) -> Path:
     """Write a Formwork blueprint TOML."""
     body = "\n".join(
@@ -95,6 +96,7 @@ def write_blueprint(
             f"reads = {_toml_array(reads)}",
             f"writes = {_toml_array(writes)}",
             f"subtract = {_toml_array(subtract)}",
+            f"write-subtract = {_toml_array(write_subtract)}",
             "",
         ]
     )

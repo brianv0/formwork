@@ -2,9 +2,12 @@
 //! exercise the compiler as a black box the way the CLI and Python harness do.
 
 use formwork_blueprint::{
-    Blueprint, FsBlueprint, NetPosture, PathPattern, ReadMode, ResolvedCatalog,
+    Blueprint, FsBlueprint, HostTable, IsolateMember, NetPosture, PathPattern, ReadMode,
+    ResolvedCatalog,
 };
-use formwork_compile::{to_canonical_json, Capability, CompiledPolicy, ConfinerPolicy, Fidelity};
+use formwork_compile::{
+    to_canonical_json, Backend, Capability, CompiledPolicy, ConfinerPolicy, Fidelity,
+};
 use formwork_detect::{HostProfile, Os};
 
 /// Dry-run compiles carry the credential floor like the product does; a fixed home keeps them
@@ -96,14 +99,17 @@ fn fw_e2e_028_cross_platform_equivalence_dry_run() {
          a missing key)"
     );
 
-    // (b) Both backends carry net-default-deny: Linux enforces it; macOS denies every outbound
-    // connection but reports Partial, because the loopback-callback listener FW-EGR15 grants also
-    // accepts on the host's other addresses (characterization C1) -- the difference is in the
-    // report, with its reason, as (c) requires. Every capability enforced on both denies the same
-    // way (semantics match), so observable behavior matches across platforms for the intersection.
+    // (b) Both backends carry net-default-deny and both report it Partial, each naming its
+    // inbound residual as (c) requires: under the port tier Linux leaves `listen()` on an unbound
+    // socket (FW-FID33); macOS grants the FW-EGR15 loopback-callback listener, which also accepts
+    // on the host's other addresses (characterization C1).
     assert!(
-        linux.report.per_capability[&Capability::NetDefaultDeny].is_enforced(),
-        "net-default-deny must be enforced on Linux"
+        matches!(
+            &linux.report.per_capability[&Capability::NetDefaultDeny],
+            Fidelity::Partial { reason, .. } if reason.contains("listen()")
+        ),
+        "Linux net-default-deny names its unbound-listen residual: {:?}",
+        linux.report.per_capability[&Capability::NetDefaultDeny]
     );
     assert!(
         matches!(
@@ -159,20 +165,104 @@ fn fw_e2e_027_deterministic_compile() {
     );
 }
 
-/// FW-INV5 (report soundness, compile half): every `Enforced` capability names a real backend.
+/// Whether the host profile carries the mechanism a report row names.
+fn host_has(host: &HostProfile, backend: Backend) -> bool {
+    let linux = host.os == Os::Linux;
+    match backend {
+        Backend::Landlock => linux && host.landlock_abi.unwrap_or(0) >= 1,
+        Backend::Seccomp => linux && host.seccomp,
+        Backend::Supervisor => host.can_supervise_connect(),
+        Backend::Namespaces => linux && host.user_namespaces,
+        Backend::Seatbelt => host.os == Os::MacOs && host.seatbelt,
+        // The Gateway and the Launcher are the `formwork` process itself.
+        Backend::Gateway | Backend::Launcher => true,
+        Backend::None => false,
+    }
+}
+
+/// One blueprint per net posture, between them asking for every row the Linux report can carry.
+fn blueprints_for_every_row() -> Vec<Blueprint> {
+    let mut deny = Blueprint::empty();
+    deny.fs.writes = vec![pp("/work/project/**")];
+    deny.fs.write_subtract = vec![pp("/work/project/.envrc")];
+    deny.exec = formwork_blueprint::ExecPosture::Allowlist(vec![pp("/usr/bin/git")]);
+    deny.isolate = vec![IsolateMember::Processes, IsolateMember::Ipc];
+
+    let mut host_rules = Blueprint::empty();
+    host_rules.net = NetPosture::AllowHosts(HostTable::new(vec![
+        "allow:example.test".parse().unwrap(),
+        "tunnel:tunnel.test".parse().unwrap(),
+    ]));
+
+    vec![rich_blueprint(), deny, host_rules]
+}
+
+/// FW-INV5 (report soundness, compile half): no row, `Enforced` or `Partial`, names a backend the
+/// host profile lacks. The hosts are the degraded Linux profiles a row can get wrong, and the two
+/// full ones.
 #[test]
 fn fw_inv5_every_enforced_capability_names_a_backend() {
-    for host in [
-        HostProfile::synthetic_macos(),
-        HostProfile::synthetic_linux(Some(6)),
-    ] {
-        let policy = compile(&rich_blueprint(), &host);
-        for (cap, fidelity) in &policy.report.per_capability {
-            if let Fidelity::Enforced { backend } = fidelity {
+    let linux = HostProfile::synthetic_linux;
+    let with = |abi: Option<u32>, change: fn(&mut HostProfile)| {
+        let mut host = linux(abi);
+        change(&mut host);
+        host
+    };
+    let hosts = [
+        ("no seccomp", with(Some(6), |h| h.seccomp = false)),
+        ("no Landlock", linux(None)),
+        ("Landlock ABI 0 with seccomp", linux(Some(0))),
+        (
+            "Landlock ABI 0, privileged",
+            with(Some(0), |h| h.facilities.ptrace_privileged = true),
+        ),
+        ("Landlock ABI 1", linux(Some(1))),
+        ("Landlock ABI 3", linux(Some(3))),
+        ("Landlock ABI 6", linux(Some(6))),
+        (
+            "no connect supervision",
+            with(Some(7), |h| h.connect_supervision = false),
+        ),
+        (
+            "no user namespaces",
+            with(Some(7), |h| h.user_namespaces = false),
+        ),
+        (
+            "no confiner at all",
+            with(None, |h| {
+                h.seccomp = false;
+                h.user_namespaces = false;
+                h.connect_supervision = false;
+            }),
+        ),
+        ("everything", linux(Some(7))),
+        ("macOS", HostProfile::synthetic_macos()),
+    ];
+    for blueprint in blueprints_for_every_row() {
+        for (label, host) in &hosts {
+            let report = compile(&blueprint, host).report;
+            let capabilities = report
+                .per_capability
+                .iter()
+                .map(|(cap, fidelity)| (cap.as_key(), fidelity));
+            let credentials = &report.credentials;
+            let arms = credentials.per_type.iter().flat_map(|(name, arms)| {
+                [("path", &arms.path), ("env", &arms.env)]
+                    .into_iter()
+                    .filter_map(move |(arm, f)| Some((format!("{name} {arm}"), f.as_ref()?)))
+            });
+            let backstop = credentials
+                .backstop
+                .iter()
+                .map(|fidelity| ("backstop".to_string(), fidelity));
+            for (row, fidelity) in capabilities.chain(arms).chain(backstop) {
+                let backend = match fidelity {
+                    Fidelity::Enforced { backend } | Fidelity::Partial { backend, .. } => *backend,
+                    Fidelity::Unenforceable { .. } => continue,
+                };
                 assert!(
-                    !matches!(backend, formwork_compile::Backend::None),
-                    "{cap:?} claims Enforced but names no backend on {:?}",
-                    host.os
+                    host_has(host, backend),
+                    "{label}: {row} names {backend:?}, which the host profile lacks: {fidelity:?}"
                 );
             }
         }

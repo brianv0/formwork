@@ -13,6 +13,40 @@ use crate::policy::{LinuxNetPlan, SeccompPlan, SocketFamily};
 /// Landlock ABI at which TCP network rules (`ACCESS_NET_CONNECT_TCP`) become available.
 pub const LANDLOCK_NET_ABI: u32 = 4;
 
+/// Landlock ABI at which the truncate right (`ACCESS_FS_TRUNCATE`) becomes available (Linux 6.2).
+pub const LANDLOCK_TRUNCATE_ABI: u32 = 3;
+
+/// The host's Landlock ABI, 0 when it has none. A profile spells absence as `None` or as ABI 0, so
+/// every row reads the ABI here and none names Landlock on a host without it (FW-INV5).
+pub fn landlock_abi(host: &HostProfile) -> u32 {
+    host.landlock_abi.unwrap_or(0)
+}
+
+pub fn has_landlock(host: &HostProfile) -> bool {
+    landlock_abi(host) >= 1
+}
+
+/// What a net plan leaves unmediated on the inbound side; `None` when it leaves nothing
+/// (FW-FID33). A plan's inbound verdict is decided here and nowhere else.
+pub fn inbound_gap(plan: &LinuxNetPlan) -> Option<&'static str> {
+    match plan {
+        // No inet socket exists to listen on.
+        LinuxNetPlan::SeccompDenyInet => None,
+        // Landlock handles `BIND_TCP` and the plan carries no bind rule, so `bind()` is refused.
+        // `listen()` on an unbound socket binds itself to the wildcard address without passing
+        // that check (observed on 6.18, ABI 7).
+        LinuxNetPlan::LandlockTcpSeccompDgramRawDeny { .. } => Some(
+            "bind() is refused, but listen() on an unbound socket binds itself to the wildcard \
+             address, so the session can accept connections from outside it",
+        ),
+        // The notify filter delivers `connect` and addressed `sendto` only.
+        LinuxNetPlan::SupervisedConnect => Some(
+            "nothing governs bind(), listen() or accept(), so the session can listen on any \
+             address and accept connections from outside it",
+        ),
+    }
+}
+
 /// Escalation and confinement-shedding syscalls denied outright (EPERM). Sorted for byte-identical
 /// output (FW-FID4); none is touched by an ordinary build/test/vcs toolchain.
 const BASELINE_DENY: &[&str] = &[
@@ -95,7 +129,7 @@ pub fn seccomp_plan(inet_deny: InetSeccompDeny, supervise_connect: bool) -> Secc
 
 /// Returns `(plan, inet_deny, port_tier)`.
 pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, InetSeccompDeny, PortTier) {
-    let abi = host.landlock_abi.unwrap_or(0);
+    let abi = landlock_abi(host);
     match net {
         // Deny ALL inet egress via seccomp (TCP, UDP and raw at the socket-family level), matching
         // macOS `(deny network*)`. AF_UNIX (local IPC) stays allowed.

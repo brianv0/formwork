@@ -98,9 +98,22 @@ Key decisions:
   seccomp-denies inet **DGRAM/RAW** `socket(2)` (type masked to `SOCK_TYPE_MASK` so
   `SOCK_NONBLOCK`/`SOCK_CLOEXEC` cannot evade it) while allowing STREAM, so UDP/raw egress fails
   closed and only the granted TCP ports connect ([FW-ISO3](../formwork.md#fw-iso3)/[FW-INV3](../formwork.md#fw-inv3)).
+  Inbound is not closed: the handled `BIND_TCP` right with no bind rule refuses `bind()`, but
+  `listen()` on an unbound socket binds itself to the wildcard address without passing that check
+  (observed on 6.18, ABI 7), so `net-default-deny` is `Partial` under the port tier
+  ([FW-FID33](../formwork.md#fw-fid33)).
 - **UNIX-socket / signal scoping (ABI ≥ v6):** the `Scope` handle (`.scope(Scope::from_all(abi))`)
   blocks abstract-UNIX-socket and signal reach-out of the domain ([FW-ADV-006](../formwork.md#fw-adv-006)). Coarse (domain-
   relative, not per-path); reported Partial at v6+, Unenforceable below — matches the compiler.
+- **Truncation (ABI ≥ v3):** `AccessFs::from_all(abi)` carries `Truncate` from ABI v3 (Linux 6.2).
+  Below it the ruleset cannot handle the right, so `truncate(2)` on any path, and `open(2)` with
+  `O_TRUNC` on a read-only open, are not governed: a confined process can empty a file whose own
+  permissions allow writing, whether or not a write grant covers it or a `write-subtract` row names
+  it. That is every kernel from 5.13 through 6.1, the 5.15 and 6.1 long-term series among them. The
+  compiler reports `fs-write` and `tamper-vectors` `Partial` there and the reason names truncation
+  ([FW-FID34](../formwork.md#fw-fid34)). An open for writing still needs the write right at every
+  ABI. `Refer` arrives at ABI v2; at ABI v1 Landlock refuses every rename or link across
+  directories (`EXDEV`), which denies more than the blueprint asks and weakens no report row.
 - **ABI negotiation vs honesty:** the compiler already accounted fidelity from `host.landlock_abi`.
   Enforce at exactly `landlock_abi_target`. Prefer `CompatLevel::HardRequirement` so a missing
   access right is an error (fail-closed), *not* `BestEffort` (which would silently drop enforcement
@@ -212,10 +225,15 @@ rules.insert(libc::SYS_socket, vec![
   session process bound it, which is decided from `sock_diag` or, on kernels without
   `CONFIG_UNIX_DIAG`, `/proc/net/unix`. An abstract socket is refused. Addressed
   `sendmsg`/`sendmmsg` on an AF_UNIX datagram socket is not mediated (its destination sits in memory
-  seccomp cannot read), and the report says so. A loopback server the session itself starts is
-  refused too, because the supervisor admits inet only to the Gateway (FEP-6 §11, "In-session
-  loopback"; [FW-E2E-106](../formwork.md#fw-e2e-106) waits on it). Requires 5.6+ (`pidfd_getfd`) and
-  Yama `ptrace_scope` 0 or 1; host detection probes all three.
+  seccomp cannot read), and the report says so. A connect from inside the session to a loopback
+  server the session itself starts is refused too, because the supervisor admits inet only to the
+  Gateway (FEP-6 §11, "In-session loopback"; [FW-E2E-106](../formwork.md#fw-e2e-106) waits on it).
+  The server itself starts: the filter delivers no `bind`, `listen` or `accept`, and this plan
+  handles no Landlock net right, so a session can listen on any address and accept connections
+  from outside it. The compiler reports `net-default-deny` `Partial` under host rules and the
+  reason names inbound connections ([FW-FID33](../formwork.md#fw-fid33)); the verdict for each
+  net plan is decided in one function, `inbound_gap` in `formwork-compile/src/linux.rs`. Requires
+  5.6+ (`pidfd_getfd`) and Yama `ptrace_scope` 0 or 1; host detection probes all three.
 - **Channels.** Without host rules nothing mediates a pathname `connect()`, so the socket-shaped
   channels (`run-outside`, `open-url` through the desktop portal, `clipboard`, `screen`) are
   `Partial`: the Launcher strips their locator variables ([FW-BP11](../formwork.md#fw-bp11)), which

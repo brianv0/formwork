@@ -28,7 +28,8 @@ pub enum Capability {
     /// applied by the Gateway -- reported here so the honesty ledger is complete.
     EnvScrub,
     /// The write-denied-but-readable tamper-vector set (FW-TRA7): `Partial` where a backend
-    /// withholds rows it cannot install (Landlock cannot root `**/` rows, D1).
+    /// withholds rows it cannot install (Landlock cannot root `**/` rows, D1) or cannot stop
+    /// truncation (Landlock below ABI 3, FW-FID34).
     TamperVectors,
     /// Host-scoped egress through the Gateway (FW-EGR1).
     NetHostScope,
