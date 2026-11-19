@@ -33,9 +33,12 @@ pub fn inbound_gap(plan: &LinuxNetPlan) -> Option<&'static str> {
         // No inet socket exists to listen on.
         LinuxNetPlan::SeccompDenyInet => None,
         // Landlock handles `BIND_TCP` and the plan carries no bind rule, so `bind()` is refused.
-        // `listen()` on an unbound socket binds itself without that check and is not
-        // characterized; this arm follows that answer.
-        LinuxNetPlan::LandlockTcpSeccompDgramRawDeny { .. } => None,
+        // `listen()` on an unbound socket binds itself to the wildcard address without passing
+        // that check (observed on 6.18, ABI 7).
+        LinuxNetPlan::LandlockTcpSeccompDgramRawDeny { .. } => Some(
+            "bind() is refused, but listen() on an unbound socket binds itself to the wildcard \
+             address, so the session can accept connections from outside it",
+        ),
         // The notify filter delivers `connect` and addressed `sendto` only.
         LinuxNetPlan::SupervisedConnect => Some(
             "nothing governs bind(), listen() or accept(), so the session can listen on any \

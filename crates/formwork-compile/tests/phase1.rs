@@ -99,14 +99,17 @@ fn fw_e2e_028_cross_platform_equivalence_dry_run() {
          a missing key)"
     );
 
-    // (b) Both backends carry net-default-deny: Linux enforces it; macOS denies every outbound
-    // connection but reports Partial, because the loopback-callback listener FW-EGR15 grants also
-    // accepts on the host's other addresses (characterization C1) -- the difference is in the
-    // report, with its reason, as (c) requires. Every capability enforced on both denies the same
-    // way (semantics match), so observable behavior matches across platforms for the intersection.
+    // (b) Both backends carry net-default-deny and both report it Partial, each naming its
+    // inbound residual as (c) requires: under the port tier Linux leaves `listen()` on an unbound
+    // socket (FW-FID33); macOS grants the FW-EGR15 loopback-callback listener, which also accepts
+    // on the host's other addresses (characterization C1).
     assert!(
-        linux.report.per_capability[&Capability::NetDefaultDeny].is_enforced(),
-        "net-default-deny must be enforced on Linux"
+        matches!(
+            &linux.report.per_capability[&Capability::NetDefaultDeny],
+            Fidelity::Partial { reason, .. } if reason.contains("listen()")
+        ),
+        "Linux net-default-deny names its unbound-listen residual: {:?}",
+        linux.report.per_capability[&Capability::NetDefaultDeny]
     );
     assert!(
         matches!(

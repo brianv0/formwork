@@ -98,6 +98,10 @@ Key decisions:
   seccomp-denies inet **DGRAM/RAW** `socket(2)` (type masked to `SOCK_TYPE_MASK` so
   `SOCK_NONBLOCK`/`SOCK_CLOEXEC` cannot evade it) while allowing STREAM, so UDP/raw egress fails
   closed and only the granted TCP ports connect ([FW-ISO3](../formwork.md#fw-iso3)/[FW-INV3](../formwork.md#fw-inv3)).
+  Inbound is not closed: the handled `BIND_TCP` right with no bind rule refuses `bind()`, but
+  `listen()` on an unbound socket binds itself to the wildcard address without passing that check
+  (observed on 6.18, ABI 7), so `net-default-deny` is `Partial` under the port tier
+  ([FW-FID33](../formwork.md#fw-fid33)).
 - **UNIX-socket / signal scoping (ABI ≥ v6):** the `Scope` handle (`.scope(Scope::from_all(abi))`)
   blocks abstract-UNIX-socket and signal reach-out of the domain ([FW-ADV-006](../formwork.md#fw-adv-006)). Coarse (domain-
   relative, not per-path); reported Partial at v6+, Unenforceable below — matches the compiler.

@@ -117,7 +117,8 @@ fn host_rules() -> Blueprint {
 
 /// FW-FID33: under host rules the supervisor decides every outbound connect, and nothing decides
 /// `bind`, `listen` or `accept`, so the row is `Partial` and names inbound connections.
-/// `net = "deny"` and the port tier keep the verdict they had.
+/// The port tier refuses `bind()` and leaves `listen()` on an unbound socket, so it is `Partial`
+/// too. `net = "deny"` has no inet socket and keeps its verdict.
 #[test]
 fn fw_fid33_host_rules_report_unmediated_inbound_connections() {
     let host = HostProfile::synthetic_linux(Some(7));
@@ -138,12 +139,11 @@ fn fw_fid33_host_rules_report_unmediated_inbound_connections() {
     let rows = report(&Blueprint::empty(), &host).per_capability;
     assert_eq!(rows[&Capability::NetDefaultDeny], seccomp, "net = deny");
 
-    // Pinned as it stands: Landlock refuses `bind()` under the port tier, and `listen()` on an
-    // unbound socket is not characterized.
     let mut ports = Blueprint::empty();
     ports.net = NetPosture::Ports(vec![443]);
     let rows = report(&ports, &host).per_capability;
-    assert_eq!(rows[&Capability::NetDefaultDeny], seccomp, "port tier");
+    let reason = partial_reason(&rows[&Capability::NetDefaultDeny], Backend::Seccomp);
+    assert!(reason.contains("listen() on an unbound socket"), "{reason}");
 
     // Host rules on a host that cannot supervise fall back to the full inet deny.
     let mut unsupervised = host.clone();

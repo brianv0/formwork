@@ -1399,19 +1399,20 @@ mod tests {
     /// Landlock, which would leave UDP open). And it degrades honestly to Unenforceable if the host
     /// carries no seccomp to install that deny.
     #[test]
-    fn linux_port_tier_net_default_deny_is_honestly_enforced() {
+    fn linux_port_tier_net_default_deny_follows_the_host() {
         let blueprint = Blueprint {
             net: NetPosture::Ports(vec![443]),
             ..Blueprint::empty()
         };
-        // ABI 6 host with seccomp: UDP/raw are actually denied, so Enforced (via seccomp) is honest.
+        // ABI 6 host with seccomp: UDP/raw are denied and TCP connects are port-scoped, but an
+        // unbound socket can still listen (FW-FID33), so the row is Partial, carried by seccomp.
         let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(6)));
-        assert_eq!(
-            policy.report.per_capability[&Capability::NetDefaultDeny],
-            Fidelity::Enforced {
-                backend: Backend::Seccomp
-            },
-            "net-deny under the port tier is carried by seccomp (UDP/raw) + Landlock (TCP)"
+        assert!(
+            matches!(
+                &policy.report.per_capability[&Capability::NetDefaultDeny],
+                Fidelity::Partial { backend: Backend::Seccomp, reason } if reason.contains("listen()")
+            ),
+            "net-deny under the port tier names the unbound listen"
         );
         assert!(policy.report.per_capability[&Capability::NetPortTier].is_enforced());
         assert!(policy.report.net_is_fail_closed());

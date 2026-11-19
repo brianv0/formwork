@@ -881,7 +881,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 | fs read scope | Enforced | Enforced |
 | fs write scope | Enforced (ABI v3+); Partial below (truncation not governed, [FW-FID34](#fw-fid34)) | Enforced |
 | tamper vectors (write-subtract, [FW-TRA7](#fw-tra7)) | absolute rows Enforced (ABI v3+), Partial below (truncation, [FW-FID34](#fw-fid34)); Partial where any-depth rows are withheld | Enforced |
-| net default-deny | Enforced under `deny`; Partial under host rules (inbound connections are not mediated, [FW-FID33](#fw-fid33)); reported Enforced under the port tier, where Landlock refuses `bind()` and `listen()` on an unbound socket is not characterized | Partial (the loopback-callback listener also accepts on the host's other addresses, C1) |
+| net default-deny | Enforced under `deny`; Partial under host rules (inbound connections are not mediated, [FW-FID33](#fw-fid33)); Partial under the port tier (Landlock refuses `bind()`, but `listen()` on an unbound socket binds itself to the wildcard address, [FW-FID33](#fw-fid33)) | Partial (the loopback-callback listener also accepts on the host's other addresses, C1) |
 | net host allowlist (host rules) | Enforced (connect supervisor + gateway); Partial with a `tunnel:` host | Enforced (gateway listener, credential + peer check, C2); Partial with a `tunnel:` host |
 | TLS inspection (`allow:` and method rules) | Enforced (gateway) | Enforced (gateway); Security.framework clients fail closed |
 | credential brokering | Partial (the reflection guard recognizes only the credential's wire encodings) | Partial (same) |
