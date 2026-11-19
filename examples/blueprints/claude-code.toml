@@ -6,8 +6,10 @@
 #   formwork explain --blueprint examples/blueprints/claude-code.toml --hosts
 #
 # Login: `claude` opens a browser for the OAuth flow. `desktop` lifts `open-url` (the URL is handed
-# to your browser outside the session, http(s) only) and the clipboard. The callback listener on
-# localhost is allowed under every posture.
+# to your browser outside the session, http(s) only) and the clipboard. On macOS the callback
+# listener on localhost is allowed under every posture. On Linux, host rules refuse every inet
+# listener, loopback included, so a login that waits for the browser's redirect to localhost does
+# not complete inside the session: log in once outside it, or use the API-key blueprint.
 #
 # With an API key instead of the login, use `claude-code-api-key.toml`: the key is brokered, so the
 # agent never holds it.

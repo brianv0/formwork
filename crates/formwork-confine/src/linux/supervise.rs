@@ -1,9 +1,9 @@
 //! The `connect()` supervisor (FW-EGR7, FW-ISO12): the Linux transport of host-scoped egress.
 //!
 //! A second seccomp filter, installed after the baseline, returns `SECCOMP_RET_USER_NOTIF` for
-//! `connect()` and for `sendto()` with a destination address. The listener descriptor goes to the
-//! spawning `formwork` process over a socketpair; that process -- outside the sandbox -- services
-//! each notification:
+//! `connect()`, for `sendto()` with a destination address, and for `listen()`. The listener
+//! descriptor goes to the spawning `formwork` process over a socketpair; that process -- outside
+//! the sandbox -- services each notification. For `connect()` and `sendto()`:
 //!
 //! 1. copy the `sockaddr` out of the target once and validate the notification id;
 //! 2. decide on that copy;
@@ -16,6 +16,11 @@
 //! port is registered with the Gateway before connecting, FW-EGR9) and pathname sockets that are
 //! granted or were bound by a process in the session. Netlink sockets continue in the kernel: their
 //! family is fixed at creation, so a rewritten address still names a netlink peer.
+//!
+//! `listen()` is supervised because egress is not the only direction (FW-ISO34): a listening inet
+//! socket takes connections from peers outside the session, and seccomp sees a descriptor number,
+//! not the family behind it. The supervisor takes the socket the same way, refuses an inet one,
+//! and puts any other into the listening state itself.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -25,7 +30,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use formwork_blueprint::PathPattern;
 
@@ -52,13 +57,18 @@ pub(super) const AUDIT_ARCH: u32 = 0xc000_00b7;
 const MAX_RECORDED_REFUSALS: usize = 1024;
 /// Largest datagram the supervisor sends on a target's behalf.
 const MAX_DATAGRAM: usize = 256 * 1024;
+/// **handshake-wait** (FW-EGR37): how long a registration outlives a `connect()` to the Gateway
+/// that returned with its handshake still in progress.
+const HANDSHAKE_WAIT: Duration = Duration::from_secs(2);
 
 /// What the parent needs to service a session's notifications.
 #[derive(Clone)]
 pub struct SupervisorConfig {
     /// The Gateway egress listener: the one inet destination (FW-EGR8/EGR9).
     pub gateway: SocketAddr,
-    /// Source ports registered for connections the supervisor makes to the Gateway (FW-EGR9).
+    /// Source ports registered for connections the supervisor makes to the Gateway (FW-EGR9). The
+    /// Gateway listener removes a port when it accepts from it; the supervisor removes one whose
+    /// `connect()` made no connection (FW-EGR37).
     pub registry: Arc<Mutex<HashSet<u16>>>,
     /// Pathname sockets admitted besides in-session ones (FW-ISO12).
     pub unix_grants: Vec<PathPattern>,
@@ -111,9 +121,9 @@ pub fn prepare() -> Result<(Plan, Pending), ConfineError> {
     ))
 }
 
-/// A classic-BPF program: notify on `connect`, and on `sendto` whose destination pointer is set;
-/// allow everything else (the baseline filter, stacked before this one, already decided it). On
-/// x86_64, x32 syscalls are refused: this filter matches only the native numbers.
+/// A classic-BPF program: notify on `connect`, on `listen`, and on `sendto` whose destination
+/// pointer is set; allow everything else (the baseline filter, stacked before this one, already
+/// decided it). On x86_64, x32 syscalls are refused: this filter matches only the native numbers.
 fn notify_filter() -> Vec<libc::sock_filter> {
     use libc::{BPF_ABS, BPF_JEQ, BPF_JGE, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W};
     let ld = |off: u32| libc::sock_filter {
@@ -141,21 +151,22 @@ fn notify_filter() -> Vec<libc::sock_filter> {
         k,
     };
     // seccomp_data: nr @0, arch @4, args[i] @16 + 8*i (little-endian low word first).
-    // Offsets below are relative jumps to: NOTIFY (index 10), ALLOW (11), ERRNO (12).
+    // Offsets below are relative jumps to: NOTIFY (index 11), ALLOW (12), ERRNO (13).
     vec![
         ld(4),                                             // 0
-        jeq(AUDIT_ARCH, 0, 9),                             // 1: foreign arch -> ALLOW
+        jeq(AUDIT_ARCH, 0, 10),                            // 1: foreign arch -> ALLOW
         ld(0),                                             // 2
-        jge(0x4000_0000, 8, 0),                            // 3: x32 -> ERRNO
-        jeq(libc::SYS_connect as u32, 5, 0),               // 4: connect -> NOTIFY
-        jeq(libc::SYS_sendto as u32, 0, 5),                // 5: not sendto -> ALLOW
-        ld(16 + 8 * 4),                                    // 6: sendto dest_addr, low word
-        jeq(0, 0, 2),                                      // 7: nonzero -> NOTIFY
-        ld(16 + 8 * 4 + 4),                                // 8: high word
-        jeq(0, 1, 0),                                      // 9: zero -> ALLOW, else NOTIFY
-        ret(libc::SECCOMP_RET_USER_NOTIF),                 // 10: NOTIFY
-        ret(libc::SECCOMP_RET_ALLOW),                      // 11: ALLOW
-        ret(libc::SECCOMP_RET_ERRNO | libc::EPERM as u32), // 12: ERRNO
+        jge(0x4000_0000, 9, 0),                            // 3: x32 -> ERRNO
+        jeq(libc::SYS_connect as u32, 6, 0),               // 4: connect -> NOTIFY
+        jeq(libc::SYS_listen as u32, 5, 0),                // 5: listen -> NOTIFY
+        jeq(libc::SYS_sendto as u32, 0, 5),                // 6: not sendto -> ALLOW
+        ld(16 + 8 * 4),                                    // 7: sendto dest_addr, low word
+        jeq(0, 0, 2),                                      // 8: nonzero -> NOTIFY
+        ld(16 + 8 * 4 + 4),                                // 9: high word
+        jeq(0, 1, 0),                                      // 10: zero -> ALLOW, else NOTIFY
+        ret(libc::SECCOMP_RET_USER_NOTIF),                 // 11: NOTIFY
+        ret(libc::SECCOMP_RET_ALLOW),                      // 12: ALLOW
+        ret(libc::SECCOMP_RET_ERRNO | libc::EPERM as u32), // 13: ERRNO
     ]
 }
 
@@ -405,7 +416,8 @@ fn take_socket(listener: RawFd, id: u64, tid: u32, fd: i32) -> Result<OwnedFd, i
     Ok(unsafe { OwnedFd::from_raw_fd(dup as RawFd) })
 }
 
-fn sockopt_int(fd: RawFd, opt: libc::c_int) -> Option<libc::c_int> {
+/// One `SOL_SOCKET` integer option, or the errno (`ENOTSOCK` for a descriptor that is no socket).
+fn sockopt_int(fd: RawFd, opt: libc::c_int) -> Result<libc::c_int, i32> {
     let mut v: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: getsockopt writes one int.
@@ -418,7 +430,7 @@ fn sockopt_int(fd: RawFd, opt: libc::c_int) -> Option<libc::c_int> {
             &mut len,
         )
     };
-    (rc == 0).then_some(v)
+    check(rc).map(|()| v)
 }
 
 fn last_errno() -> i32 {
@@ -497,6 +509,9 @@ fn parse_sockaddr(raw: &[u8]) -> Dest {
 fn handle(listener: RawFd, notif: &libc::seccomp_notif, config: &SupervisorConfig) -> Reply {
     let nr = notif.data.nr as i64;
     let args = notif.data.args;
+    if nr == libc::SYS_listen {
+        return listen_for(listener, notif);
+    }
     let (addr_ptr, addr_len) = if nr == libc::SYS_connect {
         (args[1], args[2] as usize)
     } else {
@@ -543,6 +558,38 @@ fn refuse(pid: libc::pid_t, what: &str, reproduce: &str) {
         reproduce,
         "formwork: refused connect to {what} (supervised connect, FW-EGR7)"
     );
+}
+
+/// A `listen()` (FW-ISO34). An inet socket is refused, loopback included: once it listens, a peer
+/// outside the session can connect to it, and under host rules nothing else stands in the way.
+/// Any other socket is put into the listening state here, on the descriptor whose domain was
+/// read. Answering CONTINUE instead would have the kernel look the descriptor number up again,
+/// and by then a second thread can have put an inet socket under it, or the caller can be a
+/// thread whose descriptor table is not the one `pidfd_getfd` read.
+fn listen_for(listener: RawFd, notif: &libc::seccomp_notif) -> Reply {
+    let args = notif.data.args;
+    let sock = match take_socket(listener, notif.id, notif.pid, args[0] as i32) {
+        Ok(s) => s,
+        Err(e) => return Reply::Errno(e),
+    };
+    match sockopt_int(sock.as_raw_fd(), SO_DOMAIN) {
+        Ok(libc::AF_INET | libc::AF_INET6) => {
+            // FW-FID9, as `refuse` does for a connect.
+            tracing::warn!(
+                pid = notif.pid,
+                reproduce = "formwork explain --hosts",
+                "formwork: refused listen on an inet socket: host rules admit no inbound \
+                 connection (supervised connect, FW-ISO34)"
+            );
+            Reply::Errno(libc::EACCES)
+        }
+        // SAFETY: listen takes a descriptor we own and a scalar backlog.
+        Ok(_) => match check(unsafe { libc::listen(sock.as_raw_fd(), args[1] as libc::c_int) }) {
+            Ok(()) => Reply::Value(0),
+            Err(e) => Reply::Errno(e),
+        },
+        Err(e) => Reply::Errno(e),
+    }
 }
 
 fn connect_for(
@@ -599,7 +646,9 @@ fn connect_for(
 }
 
 /// Connect the target's socket to the Gateway from a source port registered first, so the Gateway
-/// admits exactly this connection (FW-EGR9).
+/// admits exactly this connection (FW-EGR9). The port is registered before the connect, not after
+/// it succeeds: the Gateway listener can accept the connection before `connect()` returns here.
+/// A registration this call added is taken back when the call made no connection (FW-EGR37).
 fn connect_gateway(
     sock: OwnedFd,
     gateway: SocketAddr,
@@ -629,9 +678,13 @@ fn connect_gateway(
         }
         Some(p) => p,
     };
-    if let Ok(mut r) = config.registry.lock() {
-        r.insert(port);
-    }
+    // False when the port is already registered: an earlier connect from it that the Gateway has
+    // yet to accept, whose registration a failing repeat call must leave alone.
+    let registered = config
+        .registry
+        .lock()
+        .map(|mut r| r.insert(port))
+        .unwrap_or(false);
     let target = if domain == libc::AF_INET6 {
         match gateway.ip() {
             IpAddr::V4(v4) => {
@@ -642,9 +695,43 @@ fn connect_gateway(
     } else {
         gateway
     };
-    match connect_inet(fd, target) {
+    let result = connect_inet(fd, target);
+    let made = match result {
+        Ok(()) => true,
+        // A non-blocking socket, or a signal here: the handshake goes on after the call returned.
+        Err(libc::EINPROGRESS | libc::EINTR) => established(fd),
+        Err(_) => false,
+    };
+    if registered && !made {
+        if let Ok(mut r) = config.registry.lock() {
+            r.remove(&port);
+        }
+    }
+    match result {
         Ok(()) => Reply::Value(0),
         Err(e) => Reply::Errno(e),
+    }
+}
+
+/// Wait up to **handshake-wait** for a TCP handshake in progress on `fd`; true once it is
+/// established. `poll` leaves the pending error on the socket for the target to read.
+fn established(fd: RawFd) -> bool {
+    let deadline = Instant::now() + HANDSHAKE_WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        let rc = unsafe { libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) };
+        if rc < 0 && last_errno() == libc::EINTR && !left.is_zero() {
+            continue;
+        }
+        return rc == 1
+            && pfd.revents & libc::POLLOUT != 0
+            && pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0;
     }
 }
 
@@ -1051,11 +1138,11 @@ mod tests {
 
     #[test]
     fn filter_jumps_land_on_the_named_returns() {
-        const NOTIFY: usize = 10;
-        const ALLOW: usize = 11;
-        const ERRNO: usize = 12;
+        const NOTIFY: usize = 11;
+        const ALLOW: usize = 12;
+        const ERRNO: usize = 13;
         let f = notify_filter();
-        assert_eq!(f.len(), 13);
+        assert_eq!(f.len(), 14);
         let target =
             |i: usize, taken: bool| i + 1 + usize::from(if taken { f[i].jt } else { f[i].jf });
         assert_eq!(
@@ -1065,10 +1152,12 @@ mod tests {
         );
         assert_eq!(target(3, true), ERRNO, "x32 syscalls are refused");
         assert_eq!(target(4, true), NOTIFY, "connect is supervised");
-        assert_eq!(target(5, false), ALLOW, "other syscalls pass");
-        assert_eq!(target(7, false), NOTIFY, "sendto with a low-word address");
-        assert_eq!(target(9, true), ALLOW, "sendto with no address");
-        assert_eq!(target(9, false), NOTIFY, "sendto with a high-word address");
+        assert_eq!(f[5].k, libc::SYS_listen as u32);
+        assert_eq!(target(5, true), NOTIFY, "listen is supervised (FW-ISO34)");
+        assert_eq!(target(6, false), ALLOW, "other syscalls pass");
+        assert_eq!(target(8, false), NOTIFY, "sendto with a low-word address");
+        assert_eq!(target(10, true), ALLOW, "sendto with no address");
+        assert_eq!(target(10, false), NOTIFY, "sendto with a high-word address");
         assert_eq!(f[NOTIFY].k, libc::SECCOMP_RET_USER_NOTIF);
         assert_eq!(f[ALLOW].k, libc::SECCOMP_RET_ALLOW);
         assert_eq!(f[ERRNO].k, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32);

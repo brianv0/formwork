@@ -79,7 +79,8 @@ pub enum LinuxNetPlan {
     /// The host-allowlist posture (FW-EGR7): inet STREAM sockets may be created, but every
     /// `connect()` (and every addressed `sendto`) is delivered to the supervisor in the spawning
     /// process, which performs the allowed ones itself -- only the session's Gateway listener and
-    /// admitted pathname sockets. UDP and raw stay seccomp-denied (FW-ISO11).
+    /// admitted pathname sockets. UDP and raw stay seccomp-denied (FW-ISO11). Every `listen()`
+    /// goes to the supervisor too, which refuses it on an inet socket (FW-ISO34).
     SupervisedConnect,
 }
 
@@ -118,8 +119,9 @@ pub struct SeccompPlan {
     /// Refuse `execveat` with `AT_EMPTY_PATH` (FW-ISO31): a descriptor has no path for the exec
     /// allow-list to judge. Set only under an exec allow-list.
     pub deny_exec_by_descriptor: bool,
-    /// Deliver `connect()` and addressed `sendto()` to the supervisor via seccomp user
-    /// notification (FW-EGR7). The confiner refuses to spawn without a supervisor when set.
+    /// Deliver `connect()`, addressed `sendto()` (FW-EGR7) and `listen()` (FW-ISO34) to the
+    /// supervisor via seccomp user notification. The confiner refuses to spawn without a
+    /// supervisor when set.
     #[serde(default)]
     pub supervise_connect: bool,
     /// Deny new user namespaces (`CLONE_NEWUSER`, `setns`), which would hand back capabilities the
