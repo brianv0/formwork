@@ -31,6 +31,49 @@ fn have_landlock() -> bool {
     detect().landlock_abi.is_some()
 }
 
+/// A test that cannot exercise its mechanism on this host says so; on a CI runner, where
+/// `FW_REQUIRE_EXERCISED=1`, that is a failure rather than a skip.
+fn not_exercised(reason: &str) {
+    if std::env::var("FW_REQUIRE_EXERCISED").as_deref() == Ok("1") {
+        panic!("not exercised on a CI runner: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
+/// A Closed-mode blueprint that reads `reads`; the caller sets the posture under test.
+fn closed_blueprint(reads: Vec<PathPattern>) -> Blueprint {
+    let mut blueprint = Blueprint::empty();
+    blueprint.fs.read_mode = ReadMode::Closed;
+    blueprint.fs.reads = reads;
+    blueprint
+}
+
+/// The port tier with `port` granted, or `None` where Landlock cannot carry it and the posture
+/// fell back to the full inet deny.
+fn port_tier_policy(reads: Vec<PathPattern>, port: u16) -> Option<CompiledPolicy> {
+    use formwork_compile::{Capability, Fidelity};
+    let mut blueprint = closed_blueprint(reads);
+    blueprint.net = NetPosture::Ports(vec![port]);
+    let policy = compile(&blueprint, &detect());
+    matches!(
+        policy.report.per_capability.get(&Capability::NetPortTier),
+        Some(Fidelity::Enforced { .. })
+    )
+    .then_some(policy)
+}
+
+/// The exit code of `cmd` run with no confinement: the control that shows a probe can fail.
+fn unconfined(mut cmd: Command) -> i32 {
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.status().expect("control runs").code().unwrap_or(-1)
+}
+
+fn probe_with(probe: &Path, args: &[&str]) -> Command {
+    let mut c = Command::new(probe);
+    c.args(args);
+    c
+}
+
 /// A `{path}/**` subtree pattern.
 fn pp(path: &Path) -> PathPattern {
     PathPattern::parse(&format!("{}/**", path.display())).unwrap()
@@ -620,6 +663,210 @@ fn fw_e2e_045_credential_floor_denies_catalog_path_linux() {
         "a catalog credential path must be denied (EACCES) despite the broad read grant"
     );
     let _ = fs::remove_dir_all(&home);
+}
+
+// --- entry points beside the mediated one (FW-ISO28, FW-ISO29, FW-ISO31, FW-ISO33, FW-ISO35) ---
+
+/// FW-E2E-187 (Linux): socket creation is an allow-list (FW-ISO28). Under `net = "deny"` a socket
+/// of a family outside the admitted set -- vsock, the crypto API, packet, SMC, and a number no
+/// kernel assigns yet -- is refused with EPERM while AF_UNIX and route netlink work; under the
+/// port tier an inet stream socket is created with protocol 0 or TCP and refused with MPTCP or
+/// SCTP (FW-ISO35). The probe run with no confinement must fail, or the refusals prove nothing.
+#[test]
+fn fw_e2e_187_sockets_outside_the_admitted_set_are_refused() {
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-family-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    if unconfined(Command::new(&probe)) == 0 || unconfined(probe_with(&probe, &["stream"])) == 0 {
+        not_exercised("something outside Formwork already refuses these socket families");
+        return;
+    }
+
+    let deny = closed_policy(vec![pp(probe_dir)], vec![], vec![]);
+    let code = run(&deny, Command::new(&probe));
+    assert_eq!(
+        code, 0,
+        "net = \"deny\" admits AF_UNIX and route netlink only (10+n = check n of the probe's \
+         table answered wrongly; 40/41 = socketpair); got {code}"
+    );
+
+    let Some(tier) = port_tier_policy(vec![pp(probe_dir)], 443) else {
+        not_exercised("no Landlock net port tier on this host; no posture admits a stream socket");
+        return;
+    };
+    let code = run(&tier, probe_with(&probe, &["stream"]));
+    assert_eq!(
+        code, 0,
+        "the port tier admits an inet socket only as a TCP stream (10+n = check n of the \
+         probe's table answered wrongly); got {code}"
+    );
+}
+
+/// FW-E2E-185 (Linux): no connection by send (FW-ISO29). Under the port tier with one granted
+/// port, a plain `connect()` to another loopback port is refused, and so is each of `sendto`,
+/// `sendmsg` and `sendmmsg` carrying `MSG_FASTOPEN` to that port -- the kernel's connect hook,
+/// where Landlock sits, does not run for a connection a send opens. The control runs the same
+/// sends unconfined and requires that one opens a connection, so a host with Fast Open disabled
+/// cannot pass this by accident.
+#[test]
+fn fw_e2e_185_a_send_cannot_open_a_connection_the_port_tier_refuses() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let tfo = PathBuf::from(env!("CARGO_BIN_EXE_fw-tfo-probe"));
+    let connect = PathBuf::from(env!("CARGO_BIN_EXE_fw-connect-probe"));
+    let granted = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let other = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let granted_addr = granted.local_addr().unwrap().to_string();
+    let other_addr = other.local_addr().unwrap().to_string();
+    // The first byte of the next connection `other` accepts.
+    let next_byte = || {
+        let mut byte = [0u8; 1];
+        other.accept().unwrap().0.read_exact(&mut byte).unwrap();
+        byte[0]
+    };
+
+    let control = unconfined(probe_with(&tfo, &[&other_addr]));
+    if control != 40 {
+        not_exercised(&format!(
+            "an unconfined MSG_FASTOPEN sendto did not open a connection (probe exit {control}); \
+             is net.ipv4.tcp_fastopen client-enabled?"
+        ));
+        return;
+    }
+    assert_eq!(next_byte(), b'x', "control: the send delivered its byte");
+
+    let reads = vec![pp(tfo.parent().unwrap()), pp(connect.parent().unwrap())];
+    let port = granted.local_addr().unwrap().port();
+    let Some(policy) = port_tier_policy(reads, port) else {
+        not_exercised("no Landlock net port tier on this host; no posture admits a stream socket");
+        return;
+    };
+
+    assert_eq!(
+        run(&policy, probe_with(&connect, &[&granted_addr])),
+        0,
+        "the granted port connects"
+    );
+    assert_eq!(
+        run(&policy, probe_with(&tfo, &[&granted_addr, "plain"])),
+        0,
+        "sends without the flag deliver (80+n = send n failed)"
+    );
+    assert_eq!(
+        run(&policy, probe_with(&connect, &[&other_addr])),
+        7,
+        "control: a plain connect() to a non-granted port is refused"
+    );
+    let code = run(&policy, probe_with(&tfo, &[&other_addr]));
+    assert_eq!(
+        code, 0,
+        "each MSG_FASTOPEN send to the non-granted port must be refused with EOPNOTSUPP \
+         (40+n = send n opened a connection; 80+n = another errno); got {code}"
+    );
+    // The accept queue is in arrival order: a connection from the session would come out first.
+    TcpStream::connect(other.local_addr().unwrap())
+        .unwrap()
+        .write_all(b"S")
+        .unwrap();
+    assert_eq!(
+        next_byte(),
+        b'S',
+        "nothing from the session reached the non-granted listener"
+    );
+}
+
+/// The ELF interpreter this test binary was started through, which the probes share. Landlock
+/// checks the execute right on it as on the program, so an exec allow-list for a dynamically
+/// linked probe has to carry it. `None` for a static build.
+fn dynamic_loader() -> Option<PathBuf> {
+    let maps = fs::read_to_string("/proc/self/maps").ok()?;
+    maps.lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .find(|path| {
+            path.rsplit('/')
+                .next()
+                .is_some_and(|f| f.starts_with("ld-"))
+        })
+        .map(PathBuf::from)
+}
+
+/// FW-E2E-188 (Linux): no exec by descriptor (FW-ISO31). Under an exec allow-list of one program
+/// (and its ELF interpreter), that program runs, `execve` of an unlisted copy by path is refused
+/// by Landlock, and `execveat(fd, "", AT_EMPTY_PATH)` of the same bytes in a memfd -- which has no
+/// path for Landlock to judge -- is refused too. With exec unrestricted the memfd exec runs, so the
+/// refusal belongs to the allow-list; the unconfined control shows the route exists on this host.
+#[test]
+fn fw_e2e_188_exec_by_descriptor_is_refused_under_an_exec_allowlist() {
+    use formwork_blueprint::ExecPosture;
+    if !have_landlock() {
+        not_exercised("no Landlock on this host; the exec allow-list is unenforceable");
+        return;
+    }
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-memfd-exec-probe"));
+    let fx = Fixture::new("exec188");
+    let unlisted = fx.granted().join("unlisted");
+    fs::copy(&probe, &unlisted).unwrap();
+    let unlisted = unlisted.to_str().unwrap();
+    let reads = vec![pp(probe.parent().unwrap()), pp(&fx.granted())];
+
+    let control = unconfined(probe_with(&probe, &["memfd", unlisted]));
+    if control != 42 {
+        not_exercised(&format!(
+            "exec of a memfd does not run on this host even unconfined (probe exit {control}); \
+             is vm.memfd_noexec set?"
+        ));
+        return;
+    }
+    let unrestricted = compile(&closed_blueprint(reads.clone()), &detect());
+    assert_eq!(
+        run(&unrestricted, probe_with(&probe, &["memfd", unlisted])),
+        42,
+        "with exec unrestricted, exec of a memfd runs (fexecve keeps working)"
+    );
+
+    let mut listed = vec![PathPattern::parse(probe.to_str().unwrap()).unwrap()];
+    listed.extend(dynamic_loader().map(|l| PathPattern::parse(l.to_str().unwrap()).unwrap()));
+    let mut blueprint = closed_blueprint(reads);
+    blueprint.exec = ExecPosture::Allowlist(listed);
+    let allowlist = compile(&blueprint, &detect());
+    assert_eq!(
+        run(&allowlist, probe_with(&probe, &["ran"])),
+        42,
+        "the listed program runs"
+    );
+    assert_eq!(
+        run(&allowlist, probe_with(&probe, &["path", unlisted])),
+        7,
+        "control: execve of the unlisted copy by path is refused with EACCES"
+    );
+    let code = run(&allowlist, probe_with(&probe, &["memfd", unlisted]));
+    assert_eq!(
+        code, 7,
+        "execveat(AT_EMPTY_PATH) of the unlisted bytes must be refused with EACCES \
+         (42 = the unlisted program ran; 8 = another errno); got {code}"
+    );
+}
+
+/// FW-E2E-205 (Linux x86_64), kernel half: a syscall number in the x32 range is refused with
+/// EPERM (FW-ISO33). The filter answers before the kernel dispatches, so this holds whether or
+/// not the kernel has the x32 ABI; without the filter the probe sees ENOSYS, or the call runs.
+/// The filter half (`seccomp::tests`) checks the numbers a kernel without the ABI cannot reach.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn fw_e2e_205_an_x32_syscall_number_is_refused() {
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-x32-probe"));
+    let probe_dir = probe.parent().expect("probe has a parent directory");
+    if unconfined(Command::new(&probe)) == 0 {
+        not_exercised("something outside Formwork already refuses x32 syscall numbers");
+        return;
+    }
+    let policy = closed_policy(vec![pp(probe_dir)], vec![], vec![]);
+    let code = run(&policy, Command::new(&probe));
+    assert_eq!(
+        code, 0,
+        "getpid under its x32 number must be refused with EPERM (4 = it ran; 8 = another \
+         errno, so no filter answered); got {code}"
+    );
 }
 
 /// Sanity: the confiner really is the Linux one and targets the host's ABI, so the tests above are

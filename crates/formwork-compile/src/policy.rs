@@ -101,21 +101,23 @@ pub enum ExecPlan {
     Allowlist { paths: Vec<PathPattern> },
 }
 
-/// The seccomp baseline plan (FW-ISO8): deny-list shaped for transparency -- it blocks
-/// confinement-shedding and escalation surfaces while letting normal toolchains through (FW-TRA2).
+/// The seccomp plan (FW-ISO8): the syscall refusals are deny-list shaped for transparency -- they
+/// block confinement-shedding and escalation surfaces while letting normal toolchains through
+/// (FW-TRA2) -- and socket creation is allow-list shaped (FW-ISO28).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SeccompPlan {
     /// Sorted, for deterministic output.
     pub deny_syscalls: Vec<String>,
-    /// Socket domains (arg0 of `socket(2)`) denied outright: the full inet deny lists
-    /// Inet/Inet6/Packet/non-route Netlink; the port tier lists only Packet + non-route Netlink and
-    /// carries the inet deny in `deny_inet_dgram_raw`.
-    pub deny_socket_families: Vec<SocketFamily>,
-    /// Deny inet/inet6 DGRAM and RAW `socket(2)` (type masked to `SOCK_TYPE_MASK`, so
-    /// `SOCK_NONBLOCK`/`SOCK_CLOEXEC` cannot evade it) while allowing STREAM (FW-ISO11).
-    #[serde(default)]
-    pub deny_inet_dgram_raw: bool,
+    /// The only sockets `socket(2)` and `socketpair(2)` create (FW-ISO28). An allow-list, so a
+    /// family a later kernel adds is refused with no change here.
+    pub allow_socket_families: Vec<SocketFamily>,
+    /// Refuse `sendto`/`sendmsg`/`sendmmsg` carrying `MSG_FASTOPEN` (FW-ISO29): that flag opens a
+    /// TCP connection without `connect()`, the one call the port tier and the supervisor mediate.
+    pub deny_send_fastopen: bool,
+    /// Refuse `execveat` with `AT_EMPTY_PATH` (FW-ISO31): a descriptor has no path for the exec
+    /// allow-list to judge. Set only under an exec allow-list.
+    pub deny_exec_by_descriptor: bool,
     /// Deliver `connect()` and addressed `sendto()` to the supervisor via seccomp user
     /// notification (FW-EGR7). The confiner refuses to spawn without a supervisor when set.
     #[serde(default)]
@@ -127,14 +129,18 @@ pub struct SeccompPlan {
     pub set_no_new_privs: bool,
 }
 
+/// One admitted kind of socket; the confiner encodes the exact predicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SocketFamily {
-    Inet,
-    Inet6,
-    Packet,
-    /// Netlink except the route family toolchains need; the confiner encodes the exact predicate.
-    NetlinkNonRoute,
+    /// `AF_UNIX`, any type: local IPC is not egress (FW-XR7).
+    Unix,
+    /// `AF_NETLINK` with protocol `NETLINK_ROUTE`, which resolvers and `getifaddrs` read (FW-TRA2).
+    NetlinkRoute,
+    /// `AF_INET`, `SOCK_STREAM`, protocol `0` or `IPPROTO_TCP` (FW-ISO11, FW-ISO35).
+    InetTcpStream,
+    /// `AF_INET6`, `SOCK_STREAM`, protocol `0` or `IPPROTO_TCP` (FW-ISO11, FW-ISO35).
+    Inet6TcpStream,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 //! Linux Landlock + seccomp backend. Allocation-heavy work (rule expansion, opening `PathFd`s,
 //! compiling the BPF program) happens in the *parent*; the forked child's `pre_exec` closure only
-//! issues syscalls (`NO_NEW_PRIVS` -> Landlock `restrict_self` -> seccomp filter), which is the order
+//! issues syscalls (`NO_NEW_PRIVS` -> Landlock `restrict_self` -> seccomp filters), which is the order
 //! the kernel requires and the only async-signal-safe shape. Confinement is inherited across `execve`
 //! and by descendants (FW-XR4). Fail closed (FW-INV6): a promised mechanism that cannot install
 //! aborts the spawn -- there is no unconfined-child path.
@@ -30,7 +30,7 @@ fn linux_policy(policy: &CompiledPolicy) -> Result<&LinuxPolicy, ConfineError> {
 /// `landlock` is `None` when the host carries no ABI (the seccomp half then does what it can).
 struct Plan {
     landlock: Option<landlock::Built>,
-    seccomp: seccompiler::BpfProgram,
+    seccomp: seccomp::Built,
     no_new_privs: bool,
     /// The supervised-connect filter and listener handoff (FW-EGR7), when the policy needs it.
     supervise: Option<supervise::Plan>,
@@ -47,7 +47,7 @@ fn build(policy: &LinuxPolicy) -> Result<Plan, ConfineError> {
 
 /// Runs in the child (or in place for confine-self). Syscalls only, allocation-free on the success
 /// path (the allocator may be poisoned post-`fork`), so it returns raw OS errors. Order is
-/// kernel-required: `NO_NEW_PRIVS` first, then Landlock `restrict_self`, then the seccomp filter.
+/// kernel-required: `NO_NEW_PRIVS` first, then Landlock `restrict_self`, then the seccomp filters.
 fn apply(plan: &mut Plan) -> io::Result<()> {
     if plan.no_new_privs {
         // SAFETY: PR_SET_NO_NEW_PRIVS takes fixed scalar args and only sets a per-thread flag.

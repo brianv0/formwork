@@ -45,9 +45,9 @@ const UDIAG_SHOW_VFS: u32 = 0x2;
 const UNIX_DIAG_VFS: u16 = 1;
 // <linux/audit.h>
 #[cfg(target_arch = "x86_64")]
-const AUDIT_ARCH: u32 = 0xc000_003e;
+pub(super) const AUDIT_ARCH: u32 = 0xc000_003e;
 #[cfg(target_arch = "aarch64")]
-const AUDIT_ARCH: u32 = 0xc000_00b7;
+pub(super) const AUDIT_ARCH: u32 = 0xc000_00b7;
 /// Distinct refused socket paths kept for `learn` (FW-DISC12).
 const MAX_RECORDED_REFUSALS: usize = 1024;
 /// Largest datagram the supervisor sends on a target's behalf.

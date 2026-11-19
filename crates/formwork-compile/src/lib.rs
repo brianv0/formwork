@@ -27,7 +27,7 @@ use formwork_blueprint::{
 };
 use formwork_detect::{HostProfile, Os};
 
-use linux::{InetSeccompDeny, PortTier};
+use linux::PortTier;
 
 /// The normalized intermediate both backends consume: canonicalized, with write grants folded into
 /// the read surface (writes imply reads). Operator denies (`subtract`) and the credential floor
@@ -650,9 +650,10 @@ fn compile_linux(
     }
 
     let supervise = matches!(net_plan, LinuxNetPlan::SupervisedConnect);
-    let seccomp = linux::seccomp_plan(inet_deny, supervise);
-    debug_assert!(
-        !matches!(inet_deny, InetSeccompDeny::DgramRawOnly) || seccomp.deny_inet_dgram_raw
+    let seccomp = linux::seccomp_plan(
+        inet_deny,
+        supervise,
+        matches!(exec_plan, ExecPlan::Allowlist { .. }),
     );
     // The floor's absolute rows ride the subtract holes. Any-depth (`**/`) floor rows cannot be
     // rooted Landlock rules (formwork-confine rejects them loud); they are withheld above and the
@@ -1321,19 +1322,17 @@ mod tests {
                     matches!(&l.net, LinuxNetPlan::LandlockTcpSeccompDgramRawDeny { ports } if ports == &vec![443]),
                     "the TCP port tier is carried by Landlock net"
                 );
-                // ...and the inet DGRAM/RAW deny is carried by seccomp, so direct UDP/raw egress
+                // ...and seccomp admits no inet socket but a TCP stream, so direct UDP/raw egress
                 // (DNS tunneling) is closed while STREAM survives for Landlock to govern (FW-INV3).
-                assert!(
-                    l.seccomp.deny_inet_dgram_raw,
-                    "the port tier must seccomp-deny inet UDP/raw, not leave them open"
-                );
-                assert!(
-                    !l.seccomp.deny_socket_families.contains(&SocketFamily::Inet)
-                        && !l
-                            .seccomp
-                            .deny_socket_families
-                            .contains(&SocketFamily::Inet6),
-                    "the inet families must not be denied wholesale, or TCP dies too"
+                assert_eq!(
+                    l.seccomp.allow_socket_families,
+                    [
+                        SocketFamily::Unix,
+                        SocketFamily::NetlinkRoute,
+                        SocketFamily::InetTcpStream,
+                        SocketFamily::Inet6TcpStream,
+                    ],
+                    "the port tier admits inet TCP streams and no other inet socket"
                 );
             }
             other => panic!("expected Linux confiner, got {other:?}"),
@@ -1374,6 +1373,75 @@ mod tests {
             ),
             "without seccomp the UDP/raw deny cannot hold; net-deny must not over-claim Enforced"
         );
+    }
+
+    fn linux_seccomp(blueprint: &Blueprint, host: &HostProfile) -> SeccompPlan {
+        match compile(blueprint, host).confiner {
+            ConfinerPolicy::Linux(l) => l.seccomp,
+            other => panic!("expected Linux confiner, got {other:?}"),
+        }
+    }
+
+    /// FW-ISO28 / FW-ISO35 / FW-ISO29: each net posture compiles to its admitted set, and a
+    /// posture that falls back to the full deny admits no inet socket (FW-INV6).
+    #[test]
+    fn fw_iso28_each_net_posture_compiles_to_its_socket_allow_list() {
+        let local = vec![SocketFamily::Unix, SocketFamily::NetlinkRoute];
+        let mut with_streams = local.clone();
+        with_streams.extend([SocketFamily::InetTcpStream, SocketFamily::Inet6TcpStream]);
+        let modern = HostProfile::synthetic_linux(Some(6));
+        let old = HostProfile::synthetic_linux(Some(1));
+        let mut unsupervised = HostProfile::synthetic_linux(Some(6));
+        unsupervised.connect_supervision = false;
+        let hosts = NetPosture::AllowHosts(Default::default());
+        for (net, host, expected) in [
+            (NetPosture::Deny, &modern, &local),
+            (NetPosture::Ports(vec![443]), &modern, &with_streams),
+            (NetPosture::Ports(vec![443]), &old, &local),
+            (hosts.clone(), &modern, &with_streams),
+            (hosts, &unsupervised, &local),
+        ] {
+            let blueprint = Blueprint {
+                net: net.clone(),
+                ..Blueprint::empty()
+            };
+            let plan = linux_seccomp(&blueprint, host);
+            assert_eq!(&plan.allow_socket_families, expected, "{net:?}");
+            assert!(plan.deny_send_fastopen, "{net:?}");
+        }
+    }
+
+    /// FW-ISO31: the `execveat` refusal follows the exec posture.
+    #[test]
+    fn fw_iso31_exec_allowlist_compiles_the_exec_by_descriptor_refusal() {
+        let host = HostProfile::synthetic_linux(Some(6));
+        let listed = Blueprint {
+            exec: ExecPosture::Allowlist(vec![pp("/usr/bin/git")]),
+            ..Blueprint::empty()
+        };
+        assert!(linux_seccomp(&listed, &host).deny_exec_by_descriptor);
+        assert!(!linux_seccomp(&Blueprint::empty(), &host).deny_exec_by_descriptor);
+    }
+
+    /// FW-INV6: a serialized plan missing one of these fields -- the shape before FW-ISO28 lacks
+    /// all three -- must not load as a plan with that rule absent.
+    #[test]
+    fn seccomp_plan_missing_a_refusal_field_does_not_deserialize() {
+        let plan = linux_seccomp(&Blueprint::empty(), &HostProfile::synthetic_linux(Some(6)));
+        let json = serde_json::to_value(&plan).unwrap();
+        assert!(serde_json::from_value::<SeccompPlan>(json.clone()).is_ok());
+        for field in [
+            "allow-socket-families",
+            "deny-send-fastopen",
+            "deny-exec-by-descriptor",
+        ] {
+            let mut without = json.clone();
+            assert!(without.as_object_mut().unwrap().remove(field).is_some());
+            assert!(
+                serde_json::from_value::<SeccompPlan>(without).is_err(),
+                "{field}"
+            );
+        }
     }
 
     #[test]
