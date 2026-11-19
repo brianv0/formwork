@@ -6,7 +6,8 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{PathError, PathPattern};
 
@@ -41,7 +42,7 @@ pub struct CatalogEntry {
     /// Env vars whose *value* names a file: excluding the type strips the var and denies the
     /// referenced file (FW-CRED3). Must be a subset of `envs`.
     #[serde(default)]
-    pub env_file_refs: Vec<String>,
+    pub env_file_refs: Vec<EnvFileRef>,
     /// Service locations (FW-CRED13): `mach:<name>` on macOS, `bus:<name>` or
     /// `runtime:<socket under $XDG_RUNTIME_DIR>` on Linux. Denied like paths, by the channel
     /// mechanism of each backend.
@@ -51,6 +52,53 @@ pub struct CatalogEntry {
     /// hosts, since one credential can need different schemes on different hosts.
     #[serde(default)]
     pub broker: Vec<BrokerBlock>,
+}
+
+/// One `env-file-refs` entry: the bare variable name for a variable whose value is one file
+/// (FW-CRED3), or `{ var = "<name>", list = true }` for one whose value is a `:`-separated list of
+/// files (FW-CRED33). The list form is opt-in per variable because `:` is an ordinary byte in a
+/// single path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvFileRef {
+    pub var: String,
+    pub list: bool,
+}
+
+impl<'de> Deserialize<'de> for EnvFileRef {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            var: String,
+            #[serde(default)]
+            list: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Name(String),
+            Table(Table),
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Name(var) => EnvFileRef { var, list: false },
+            Repr::Table(t) => EnvFileRef {
+                var: t.var,
+                list: t.list,
+            },
+        })
+    }
+}
+
+impl Serialize for EnvFileRef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !self.list {
+            return serializer.serialize_str(&self.var);
+        }
+        let mut table = serializer.serialize_struct("EnvFileRef", 2)?;
+        table.serialize_field("var", &self.var)?;
+        table.serialize_field("list", &self.list)?;
+        table.end()
+    }
 }
 
 /// One `{ hosts, scheme }` pair of a Catalog `broker` block (FEP-5 §3.2).
@@ -144,7 +192,7 @@ pub struct ResolvedCatalog {
 pub struct ResolvedEntry {
     pub paths: Vec<PathPattern>,
     pub envs: Vec<String>,
-    pub env_file_refs: Vec<String>,
+    pub env_file_refs: Vec<EnvFileRef>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -241,7 +289,7 @@ mod tests {
     #[test]
     fn builtin_catalog_parses_and_resolves() {
         let catalog = Catalog::builtin();
-        assert_eq!(catalog.version, 2);
+        assert_eq!(catalog.version, 3);
         // The FEP-named curated types are present.
         for t in [
             "aws",
@@ -276,13 +324,50 @@ mod tests {
     #[test]
     fn env_file_refs_are_a_subset_of_envs() {
         for (name, entry) in &Catalog::builtin().types {
-            for var in &entry.env_file_refs {
+            for reference in &entry.env_file_refs {
+                let var = &reference.var;
                 assert!(
                     entry.envs.contains(var),
                     "{name}: env-file-ref {var} must also be listed in envs"
                 );
             }
         }
+    }
+
+    #[test]
+    fn fw_cred33_env_file_refs_take_a_name_or_a_list_marked_table() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct Refs {
+            env_file_refs: Vec<EnvFileRef>,
+        }
+        let parse = |src: &str| toml::from_str::<Refs>(src).map(|r| r.env_file_refs);
+        let refs = parse(
+            r#"env-file-refs = ["ONE_FILE", { var = "FILE_LIST", list = true }, { var = "PLAIN" }]"#,
+        )
+        .unwrap();
+        let shape: Vec<(&str, bool)> = refs.iter().map(|r| (r.var.as_str(), r.list)).collect();
+        assert_eq!(
+            shape,
+            [("ONE_FILE", false), ("FILE_LIST", true), ("PLAIN", false)]
+        );
+        assert!(parse(r#"env-file-refs = [{ var = "X", lst = true }]"#).is_err());
+        assert!(parse(r#"env-file-refs = [{ list = true }]"#).is_err());
+        // The written form round-trips: a plain reference stays the bare name.
+        assert_eq!(
+            serde_json::to_string(&refs).unwrap(),
+            r#"["ONE_FILE",{"var":"FILE_LIST","list":true},"PLAIN"]"#
+        );
+
+        // The shipped catalog marks the one list-valued reference it carries.
+        let lists: Vec<&str> = Catalog::builtin()
+            .types
+            .values()
+            .flat_map(|entry| entry.env_file_refs.iter())
+            .filter(|r| r.list)
+            .map(|r| r.var.as_str())
+            .collect();
+        assert_eq!(lists, ["KUBECONFIG"]);
     }
 
     #[test]

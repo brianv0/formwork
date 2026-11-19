@@ -210,6 +210,32 @@ mod tests {
     }
 
     #[test]
+    fn fw_env2_an_explicit_deny_holds_against_a_lifted_type_and_channel() {
+        // The lifted type's variables and the lifted channel's locators join the scrub's allow
+        // list; the operator's deny names two of them.
+        let scrub = EnvPosture::Scrub(EnvScrub {
+            allow: vec![],
+            deny: vec!["AWS_SESSION_TOKEN".into(), "DISPLAY".into()],
+        });
+        let out = super::construct_env(
+            &scrub,
+            &catalog(),
+            &["aws".to_string()],
+            &ChannelPolicy::allow([crate::Channel::Clipboard]),
+            vars(&[
+                ("AWS_SESSION_TOKEN", "t"),
+                ("AWS_SECRET_ACCESS_KEY", "k"),
+                ("DISPLAY", ":0"),
+                ("WAYLAND_DISPLAY", "wayland-0"),
+                ("PATH", "/usr/bin"),
+            ]),
+        );
+        let kept: Vec<&str> = out.kept.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kept, ["AWS_SECRET_ACCESS_KEY", "WAYLAND_DISPLAY", "PATH"]);
+        assert_eq!(out.posture_dropped, ["AWS_SESSION_TOKEN", "DISPLAY"]);
+    }
+
+    #[test]
     fn explicit_allowlist_posture_is_not_widened() {
         let out = construct_env(
             &EnvPosture::Allowlist(vec!["PATH".to_string()]),

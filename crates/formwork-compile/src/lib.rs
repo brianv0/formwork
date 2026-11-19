@@ -96,6 +96,17 @@ impl CompileInput {
             .filter(|(name, _)| exposed.iter().any(|a| a == name.as_str()))
             .flat_map(|(_, entry)| entry.paths.iter().cloned())
             .collect();
+        let floor = catalog.denied_paths(&exposed);
+        // A socket grant is a write grant, so every deny that voids the write voids the socket:
+        // an operator deny is terminal (FW-CAP8) and only the typed exclude lifts the floor
+        // (FW-CRED5). The backends match denies per file operation, which a connect() is not, so
+        // the deny is applied here, once, for both.
+        let write_denied = |p: &PathPattern| {
+            let hit = |rows: &[PathPattern]| rows.iter().any(|row| row.matches_path(p.base()));
+            hit(&blueprint.fs.subtract)
+                || hit(&blueprint.fs.write_subtract)
+                || (hit(&floor) && !floor_exempt.iter().any(|lifted| lifted.covers(p)))
+        };
         CompileInput {
             read_mode: blueprint.fs.read_mode,
             effective_reads: canonicalize_set(&reads),
@@ -103,7 +114,7 @@ impl CompileInput {
             writes_no_create: canonicalize_set(&blueprint.fs.writes_no_create),
             subtract: canonicalize_set(&blueprint.fs.subtract),
             write_subtract: canonicalize_set(&blueprint.fs.write_subtract),
-            floor: canonicalize_set(&catalog.denied_paths(&exposed)),
+            floor: canonicalize_set(&floor),
             floor_exempt: canonicalize_set(&floor_exempt),
             net: blueprint.net.clone(),
             exec: blueprint.exec.clone(),
@@ -131,6 +142,7 @@ impl CompileInput {
                     .writes
                     .iter()
                     .filter(|p| !p.is_subtree() && !p.is_any_depth())
+                    .filter(|p| !write_denied(p))
                     .cloned()
                     .collect::<Vec<_>>(),
             ),
@@ -1602,6 +1614,70 @@ mod tests {
             "adjacent types stay enforced"
         );
         assert!(creds.launcher_contingency.contains("launching process"));
+    }
+
+    /// The socket axis of the deny-terminal model: a literal write grant admits its pathname
+    /// socket (FW-ISO12) only where the write itself survives the operator's denies (FW-CAP8) and
+    /// the credential floor, which the typed exclude alone lifts (FW-CRED5).
+    #[test]
+    fn fw_cap8_a_deny_or_the_floor_voids_a_literal_socket_grant() {
+        let catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let blueprint = |allow: &[&str]| Blueprint {
+            fs: FsBlueprint {
+                read_mode: ReadMode::Closed,
+                writes: vec![
+                    pp("/home/x/.docker/run/docker.sock"),
+                    pp("/srv/app/control.sock"),
+                    pp("/srv/app/tamper.sock"),
+                    pp("/srv/app/credentials"),
+                    pp("/srv/app/ok.sock"),
+                ],
+                subtract: vec![pp("/srv/app/control.sock")],
+                write_subtract: vec![pp("**/tamper.sock")],
+                ..FsBlueprint::default()
+            },
+            allow_credentials: allow.iter().map(|t| (*t).into()).collect(),
+            ..Blueprint::empty()
+        };
+        let sockets = |allow: &[&str]| -> (Vec<PathPattern>, Vec<String>) {
+            let linux = super::compile(
+                &blueprint(allow),
+                &HostProfile::synthetic_linux(Some(6)),
+                &catalog,
+            );
+            let macos =
+                super::compile(&blueprint(allow), &HostProfile::synthetic_macos(), &catalog);
+            let (ConfinerPolicy::Linux(linux), ConfinerPolicy::Macos(macos)) =
+                (linux.confiner, macos.confiner)
+            else {
+                panic!("expected one policy per backend");
+            };
+            let literals = macos
+                .sbpl
+                .lines()
+                .filter_map(|l| l.strip_prefix("(allow network-outbound (literal \""))
+                .filter_map(|l| l.strip_suffix("\"))"))
+                .map(str::to_string)
+                .collect();
+            (linux.unix_socket_grants, literals)
+        };
+
+        let (linux, macos) = sockets(&[]);
+        assert_eq!(linux, vec![pp("/srv/app/ok.sock")]);
+        assert_eq!(macos, ["/srv/app/ok.sock"]);
+
+        let (linux, macos) = sockets(&["docker"]);
+        assert_eq!(
+            linux,
+            vec![
+                pp("/home/x/.docker/run/docker.sock"),
+                pp("/srv/app/ok.sock")
+            ]
+        );
+        assert_eq!(
+            macos,
+            ["/home/x/.docker/run/docker.sock", "/srv/app/ok.sock"]
+        );
     }
 
     #[test]

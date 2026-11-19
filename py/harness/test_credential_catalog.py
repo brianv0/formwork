@@ -140,6 +140,88 @@ def test_env_points_to_file_dual_arm(cli, fake_home, tmp_path):
     assert "FAKE" not in denied.stdout
 
 
+def _needs_a_confiner(cli):
+    host = json.loads(cli("explain", "--json").stdout)["host"]
+    if host.get("landlock-abi") is None and not host.get("seatbelt"):
+        pytest.skip("no confiner on this host: nothing enforces a file deny")
+
+
+@pytest.mark.fw_e2e("FW-E2E-198")
+def test_every_file_of_a_kubeconfig_list_is_denied(cli, fake_home, tmp_path):
+    """`KUBECONFIG` is a `:`-separated list (FW-CRED33): with one, two and three elements, an
+    empty element, a relative one and one that leaves a symlinked directory through `..`, the
+    kernel denies each file the list names and no other. Read whole, a list names one file that
+    does not exist, and every config stays readable."""
+    _needs_a_confiner(cli)
+    bp = _blueprint_for(fake_home, tmp_path)
+    project = fake_home / "project"
+    # `link/..` is `elsewhere`, where the link points, not `project`, where it sits.
+    (fake_home / "elsewhere" / "sub").mkdir(parents=True)
+    (project / "link").symlink_to(fake_home / "elsewhere" / "sub")
+    beside_the_target = "../elsewhere/cluster-d.yaml"
+    names = ["cluster-a.yaml", "cluster-b.yaml", "cluster-c.yaml", "relative.yaml",
+             beside_the_target]
+    for name in names:
+        (project / name).write_text(f"token-for-{name}\n")
+    a, b, c = (str(project / name) for name in names[:3])
+    probe = (
+        'echo "kubeconfig=${KUBECONFIG-UNSET}";'
+        ' for f in "$@"; do'
+        ' if /bin/cat "$f" >/dev/null 2>&1; then echo "read:$f"; else echo "denied:$f"; fi;'
+        " done"
+    )
+
+    def denied(kubeconfig, *flags):
+        env = {"HOME": str(fake_home)}
+        if kubeconfig is not None:
+            env["KUBECONFIG"] = kubeconfig
+        res = cli("run", "--blueprint", bp, *flags, "--", "/bin/sh", "-c", probe, "probe", *names,
+                  cwd=project, env=env)
+        assert res.code == 0, res.stderr
+        lines = res.stdout.splitlines()
+        verdicts = dict(line.split(":", 1)[::-1] for line in lines[1:])
+        assert set(verdicts) == set(names), res.stdout
+        return lines[0], {name for name, verdict in verdicts.items() if verdict == "denied"}
+
+    # Control: with the variable unset these are ordinary in-grant files.
+    assert denied(None) == ("kubeconfig=UNSET", set())
+    for kubeconfig, expected in [
+        (a, {"cluster-a.yaml"}),
+        (f"{a}:{b}", {"cluster-a.yaml", "cluster-b.yaml"}),
+        (f"{a}:{b}:{c}", {"cluster-a.yaml", "cluster-b.yaml", "cluster-c.yaml"}),
+        (f":{a}::relative.yaml:", {"cluster-a.yaml", "relative.yaml"}),
+        (f"{a}:link/../cluster-d.yaml", {"cluster-a.yaml", beside_the_target}),
+    ]:
+        # The variable is stripped either way (FW-CRED3): the list is denied, not handed over.
+        assert denied(kubeconfig) == ("kubeconfig=UNSET", expected), kubeconfig
+
+    # The typed exclude lifts the whole reference with its type (FW-CRED5).
+    assert denied(f"{a}:{b}", "--allow-cred", "kube") == (f"kubeconfig={a}:{b}", set())
+
+
+@pytest.mark.fw_e2e("FW-E2E-201")
+def test_an_unrenderable_file_reference_refuses_to_start(cli, fake_home, tmp_path):
+    """A set env-file reference that cannot be rendered into the path of one file -- a non-UTF-8
+    value, a non-UTF-8 list element, an element the pattern grammar reads as a wildcard -- stops
+    `run` before the workload starts, and the refusal names the variable (FW-CRED34)."""
+    bp = _blueprint_for(fake_home, tmp_path)
+    project = fake_home / "project"
+    config = project / "cluster-a.yaml"
+    config.write_text("token-a\n")
+    for var, value in [
+        ("GOOGLE_APPLICATION_CREDENTIALS", os.fsdecode(b"/srv/\xff/sa.json")),
+        ("KUBECONFIG", f"{config}:" + os.fsdecode(b"/srv/\xff.yaml")),
+        ("KUBECONFIG", f"{config}:/srv/kube/**"),
+        ("KUBECONFIG", f"{config}:/srv/**/config"),
+    ]:
+        res = cli("run", "--blueprint", bp, "--", "/bin/echo", "workload-started",
+                  cwd=project, env={"HOME": str(fake_home), var: value})
+        assert res.code != 0, f"{var} must refuse the launch"
+        assert "workload-started" not in res.stdout, f"started despite an unrenderable {var}"
+        refusal = [line for line in res.stderr.splitlines() if "refusing" in line]
+        assert refusal and var in refusal[0], res.stderr
+
+
 @pytest.mark.fw_e2e("FW-E2E-048")
 @pytest.mark.macos
 def test_exclude_by_type_unblocks_exactly_one(cli, fake_home, tmp_path):

@@ -51,6 +51,39 @@ def test_override_precedence_cli_subtract_beats_file_allow(cli, workspace, tmp_p
     assert tied_run.code != 0, "deny must beat allow at equal precedence"
 
 
+@pytest.mark.fw_e2e("FW-E2E-042")
+def test_override_precedence_net_deny_replaces_lower_host_rules(cli, tmp_path):
+    """Host rules are how a layer sets the host-allowlist posture, and postures are last-set-wins
+    (FW-BP2): `net = "deny"` from the `--net` flag, a `--set` fragment or a leaf file replaces the
+    host rules of the layers below it, and the operator channel names the rules it dropped. Beside
+    a host rule in one layer it is refused (FW-BP13)."""
+    base = tmp_path / "base.toml"
+    base.write_text('rules = ["readwrite:/work/**", "allow:example.com"]\n')
+    leaf = tmp_path / "leaf.toml"
+    leaf.write_text('extends = ["base.toml"]\nnet = "deny"\n')
+
+    control = cli("compile", "--blueprint", base, "--target", "linux-v6")
+    assert control.code == 0, control.stderr
+    assert json.loads(control.stdout)["gateway"]["egress"] == ["allow:example.com"]
+
+    for override in (
+        ["--blueprint", base, "--net", "deny"],
+        ["--blueprint", base, "--set", 'net = "deny"'],
+        ["--blueprint", leaf],
+    ):
+        denied = cli("compile", *override, "--target", "linux-v6")
+        assert denied.code == 0, denied.stderr
+        policy = json.loads(denied.stdout)
+        assert "egress" not in policy["gateway"], override
+        assert policy["confiner"]["net"]["kind"] == "seccomp-deny-inet", override
+        assert "allow:example.com" in denied.stderr and "FW-BP2" in denied.stderr, denied.stderr
+
+    both = cli("compile", "--blueprint", base, "--net", "deny", "--rule", "allow:other.example",
+               "--target", "linux-v6")
+    assert both.code != 0, "a host rule beside net=deny in one layer must be refused"
+    assert "allow:other.example" in both.stderr
+
+
 @pytest.mark.fw_e2e("FW-E2E-043")
 def test_cli_file_parity_byte_identical_policy(cli, tmp_path):
     """The same grants authored in the file, via --set fragments, and via sugar flags compile to

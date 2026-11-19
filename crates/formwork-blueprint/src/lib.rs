@@ -13,7 +13,8 @@ mod path;
 mod provenance;
 
 pub use catalog::{
-    BrokerBlock, Catalog, CatalogEntry, ResolvedCatalog, ResolvedEntry, BACKSTOP, OS_KEYRING,
+    BrokerBlock, Catalog, CatalogEntry, EnvFileRef, ResolvedCatalog, ResolvedEntry, BACKSTOP,
+    OS_KEYRING,
 };
 pub use channel::{
     valid_channel_names, Channel, ChannelError, ChannelGroup, ChannelPolicy, IsolateMember,
@@ -217,9 +218,11 @@ pub enum EnvPosture {
     Scrub(EnvScrub),
 }
 
-/// Overrides for [`EnvPosture::Scrub`]: `allow` names are always kept (e.g. the model API key the
-/// agent legitimately needs), `deny` names are always dropped, and anything else is dropped only if
-/// it looks like a secret by name or value shape.
+/// Overrides for [`EnvPosture::Scrub`]: `deny` names are always dropped, `allow` names not also
+/// denied are kept (e.g. the model API key the agent legitimately needs), and anything else is
+/// dropped only if it looks like a secret by name or value shape. Deny wins because the Launcher
+/// extends `allow` with the variables of lifted credential types and channels, and an operator's
+/// explicit deny must hold against those too (FW-ENV2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct EnvScrub {
@@ -350,23 +353,24 @@ impl EnvScrub {
         }
     }
 
-    /// One git config entry: the operator's `allow`/`deny` names first, then the entry's own shape.
+    /// One git config entry: the operator's `deny` names first, then `allow`, then the entry's own
+    /// shape.
     fn keeps_git_entry(&self, key_name: &str, value_name: &str, key: &str, value: &str) -> bool {
         let named = |list: &[String]| list.iter().any(|n| n == key_name || n == value_name);
-        if named(&self.allow) {
-            true
-        } else if named(&self.deny) {
+        if named(&self.deny) {
             false
+        } else if named(&self.allow) {
+            true
         } else {
             !git_config_is_secret(key, value)
         }
     }
 
     fn keeps(&self, name: &str, value: &str) -> bool {
-        if self.allow.iter().any(|n| n == name) {
-            true
-        } else if self.deny.iter().any(|n| n == name) {
+        if self.deny.iter().any(|n| n == name) {
             false
+        } else if self.allow.iter().any(|n| n == name) {
+            true
         } else {
             !env_is_secret_shaped(name, value)
         }
@@ -1135,6 +1139,58 @@ mod tests {
             );
         }
         assert!(!dropped.contains(&"ANTHROPIC_API_KEY".to_string()));
+    }
+
+    #[test]
+    fn fw_env2_an_explicit_deny_beats_the_scrub_allowlist() {
+        let scrub = EnvPosture::Scrub(EnvScrub {
+            allow: vec![
+                "AWS_SESSION_TOKEN".into(),
+                "DISPLAY".into(),
+                "GIT_CONFIG_KEY_0".into(),
+            ],
+            deny: vec![
+                "AWS_SESSION_TOKEN".into(),
+                "DISPLAY".into(),
+                "GIT_CONFIG_KEY_0".into(),
+            ],
+        });
+        let vars: Vec<(String, String)> = [
+            ("AWS_SESSION_TOKEN", "t"),
+            ("DISPLAY", ":0"),
+            ("PATH", "/usr/bin"),
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "user.name"),
+            ("GIT_CONFIG_VALUE_0", "Formwork Test"),
+            ("GIT_CONFIG_KEY_1", "safe.directory"),
+            ("GIT_CONFIG_VALUE_1", "*"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut kept = scrub.apply(vars.clone());
+        kept.sort();
+        let kept: Vec<(&str, &str)> = kept.iter().map(|(k, v)| (&**k, &**v)).collect();
+        assert_eq!(
+            kept,
+            [
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "safe.directory"),
+                ("GIT_CONFIG_VALUE_0", "*"),
+                ("PATH", "/usr/bin"),
+            ]
+        );
+        let mut dropped = scrub.dropped_names(&vars);
+        dropped.sort();
+        assert_eq!(
+            dropped,
+            [
+                "AWS_SESSION_TOKEN",
+                "DISPLAY",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0"
+            ]
+        );
     }
 
     #[test]

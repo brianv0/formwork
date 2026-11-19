@@ -1017,6 +1017,11 @@ fn fw_e2e_104_blueprints_the_compiler_refuses() {
             false,
             &["not inspected"],
         ),
+        (
+            "rules = [\"deny:*.corp.example/admin/**\", \"allow:wiki.corp.example\", \"tunnel:git.corp.example\"]",
+            false,
+            &["deny:*.corp.example/admin/**", "tunnel:git.corp.example"],
+        ),
         ("rules = [\"allow:*\"]", false, &["a host target is"]),
         (
             "rules = [\"tunnel:api.anthropic.com/v1/**\"]",

@@ -54,8 +54,9 @@ pub struct BlueprintLayer {
     /// Isolation-tier members (FW-ISO10); unions across layers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub isolate: Vec<IsolateMember>,
-    /// Host rules desugared from `rules` by the loader (FW-BP13); never authored as a field. They
-    /// union across layers, and any host rule sets the net posture to `AllowHosts`.
+    /// Host rules desugared from `rules` by the loader (FW-BP13); never authored as a field. Any
+    /// host rule sets the net posture to `AllowHosts`; they union across layers, up to a later
+    /// layer's `net = "deny"`, which replaces them (FW-BP2).
     #[serde(skip)]
     pub hosts: Vec<crate::HostRule>,
 }
@@ -125,6 +126,9 @@ pub fn merge(layers: &[BlueprintLayer]) -> Blueprint {
     let mut out = Blueprint::empty();
     let mut hosts: Vec<crate::HostRule> = Vec::new();
     for layer in layers {
+        if clears_host_rules(layer) {
+            hosts.clear();
+        }
         hosts.extend(layer.hosts.iter().cloned());
         if let Some(mode) = layer.fs.read_mode {
             out.fs.read_mode = mode;
@@ -166,6 +170,14 @@ pub fn merge(layers: &[BlueprintLayer]) -> Blueprint {
         out.net = NetPosture::AllowHosts(crate::HostTable::new(hosts));
     }
     out.canonicalize()
+}
+
+/// Whether this layer's `net = "deny"` drops the host rules of the layers below it. Host rules are
+/// how a layer sets the host-allowlist posture (FW-BP13), and postures are last-set-wins (FW-BP2),
+/// so a later deny replaces them; were they kept, the operator's narrowing would be lost without
+/// a word, since any surviving host rule turns the posture back to host-allowlist.
+pub(crate) fn clears_host_rules(layer: &BlueprintLayer) -> bool {
+    matches!(layer.net, Some(NetPosture::Deny))
 }
 
 #[cfg(test)]
@@ -259,6 +271,47 @@ mod tests {
             NetPosture::Ports(vec![443])
         );
         assert_eq!(merge(&[a, b, c]).net, NetPosture::Deny);
+    }
+
+    #[test]
+    fn fw_bp2_net_deny_replaces_the_host_rules_of_lower_layers() {
+        let hosts = |rules: &[&str]| BlueprintLayer {
+            hosts: rules.iter().map(|r| r.parse().unwrap()).collect(),
+            ..Default::default()
+        };
+        let table = |rules: &[&str]| {
+            NetPosture::AllowHosts(crate::HostTable::new(
+                rules.iter().map(|r| r.parse().unwrap()).collect(),
+            ))
+        };
+        let deny = layer_toml(r#"net = "deny""#);
+        let unset = layer_toml(r#"[fs]"#);
+        let base = hosts(&["allow:example.com", "tunnel:git.example.com"]);
+
+        assert_eq!(
+            merge(&[base.clone(), unset.clone()]).net,
+            table(&["allow:example.com", "tunnel:git.example.com"])
+        );
+        assert_eq!(
+            merge(&[base.clone(), deny.clone(), unset]).net,
+            NetPosture::Deny
+        );
+        // Host rules union among the layers above the deny, and only those.
+        assert_eq!(
+            merge(&[
+                base.clone(),
+                deny.clone(),
+                hosts(&["allow:other.example"]),
+                hosts(&["deny:other.example/admin/**"]),
+            ])
+            .net,
+            table(&["allow:other.example", "deny:other.example/admin/**"])
+        );
+        // A deny below the host rules is the posture they replace.
+        assert_eq!(
+            merge(&[deny, base]).net,
+            table(&["allow:example.com", "tunnel:git.example.com"])
+        );
     }
 
     #[test]
