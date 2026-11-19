@@ -442,6 +442,114 @@ async fn plain_http_is_the_inspected_pipeline_without_tls() {
     );
 }
 
+/// FW-E2E-212 / FW-EGR38, FW-EGR36 over plain HTTP, the same pipeline without TLS: a request or a
+/// response whose `Connection` header names its own framing field is forwarded in the framing the
+/// Gateway read, and a second `Host` field is refused although the forwarded `Host` is rebuilt.
+#[tokio::test(flavor = "multi_thread")]
+async fn fw_egr38_plain_http_forwards_the_decided_framing() {
+    let up = upstream(None).await;
+    let p = up.port;
+    let (proxy, _) = Session::new(
+        &[
+            format!("post:api.test:{p}/allowed"),
+            format!("get:api.test:{p}/hop"),
+        ],
+        resolver(&[("api.test", "127.0.0.1")]),
+    )
+    .start();
+    let smuggled = "GET /smuggled HTTP/1.1\r\nHost: other.test\r\n\r\n";
+    let send = |method: &str, path: &str, fields: &str, body: &str| {
+        let proxy = &proxy;
+        let raw_request = format!(
+            "{method} http://api.test:{p}{path} HTTP/1.1\r\nHost: api.test:{p}\r\n\
+             Proxy-Authorization: {}\r\n{fields}\r\n{body}",
+            proxy_auth()
+        );
+        async move { raw(proxy, raw_request.as_bytes()).await }
+    };
+    let sized = send(
+        "POST",
+        "/allowed",
+        &format!(
+            "Connection: content-length\r\nContent-Length: {}\r\n",
+            smuggled.len()
+        ),
+        smuggled,
+    )
+    .await;
+    assert!(sized.ends_with("ok:/allowed"), "{sized}");
+    let chunked = send(
+        "POST",
+        "/allowed",
+        "Connection: transfer-encoding\r\nTransfer-Encoding: chunked\r\n",
+        &format!("{:x}\r\n{smuggled}\r\n0\r\n\r\n", smuggled.len()),
+    )
+    .await;
+    assert!(chunked.ends_with("ok:/allowed"), "{chunked}");
+    let seen = up.seen();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(
+        seen.iter()
+            .all(|r| r.head.starts_with("POST /allowed ") && r.body == smuggled.as_bytes()),
+        "{seen:?}"
+    );
+    assert_eq!(
+        seen[0].header("content-length"),
+        Some(smuggled.len().to_string())
+    );
+    assert_eq!(
+        seen[1].header("transfer-encoding").as_deref(),
+        Some("chunked")
+    );
+
+    let hop = send("GET", "/hop", "", "").await;
+    assert_eq!(hop, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nhop");
+    let hop = send("GET", "/hop?chunked=1", "", "").await;
+    assert_eq!(
+        hop,
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhop\r\n0\r\n\r\n"
+    );
+    assert!(proxy.violations().is_empty(), "{:?}", proxy.violations());
+
+    let twice = send("GET", "/hop", &format!("Host: api.test:{p}\r\n"), "").await;
+    assert!(twice.starts_with("HTTP/1.1 400"), "{twice}");
+    assert_eq!(up.seen().len(), 4, "the refused request did not cross");
+    assert_eq!(reasons(&proxy), vec![RefusalReason::Malformed]);
+}
+
+/// FW-E2E-212 / FW-EGR36 at the front door: a CONNECT head that repeats a singleton field is
+/// refused as `malformed` before any upstream socket; the same CONNECT with each field once
+/// passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn fw_egr36_a_connect_head_with_a_repeated_field_is_refused() {
+    let up = upstream(Some(fixture_tls(&["allowed.test"]))).await;
+    let target = format!("allowed.test:{}", up.port);
+    let (proxy, _) = Session::new(
+        &[format!("tunnel:{target}")],
+        resolver(&[("allowed.test", "127.0.0.1")]),
+    )
+    .start();
+    let repeated = [
+        format!("Host: {target}\r\n"),
+        "Content-Length: 0\r\nContent-Length: 0\r\n".to_string(),
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n".to_string(),
+    ];
+    for fields in &repeated {
+        let head = format!(
+            "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: {}\r\n{fields}\r\n",
+            proxy_auth()
+        );
+        let out = raw(&proxy, head.as_bytes()).await;
+        assert!(out.starts_with("HTTP/1.1 400"), "{fields:?}: {out}");
+    }
+    assert_eq!(
+        reasons(&proxy),
+        vec![RefusalReason::Malformed; repeated.len()]
+    );
+    assert!(connect(&proxy, &target).await.is_ok());
+    assert_eq!(up.handshakes.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 /// FW-ADV-024 (`FW-INV15`): heads, authorities and ClientHellos the engine cannot parse are
 /// refused, and the fixture upstream receives no byte from any of them.
 #[tokio::test(flavor = "multi_thread")]
@@ -467,6 +575,9 @@ async fn fw_adv_024_parser_battery() {
     let heads = [
         get("Content-Length: 1\r\nTransfer-Encoding: chunked\r\n"),
         get("Content-Length: 1\r\nContent-Length: 2\r\n"),
+        get("Content-Length: 1\r\nContent-Length: 1\r\n"),
+        get("Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n"),
+        get(&format!("Host: api.test:{p}\r\n")),
         get("X-Folded: a\r\n b\r\n"),
         format!("GET http://api.test:{p}/ HTTP/1.1\nHost: api.test\r\nProxy-Authorization: {auth}\r\n\r\n"),
         get("X-Nul: a\0b\r\n"),

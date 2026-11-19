@@ -33,8 +33,8 @@ use formwork_blueprint::{
 };
 use formwork_compile::Capability;
 
-use crate::http::{parse_head, parse_response_head, respond, BoxIo, Buffered, HeadError};
-use crate::inspect::{basic_value, Broker, Inspection, Pool};
+use crate::http::{parse_head, parse_response_head, respond, BoxIo, Buffered, Head, HeadError};
+use crate::inspect::{basic_value, singleton_fields, Broker, Inspection, Pool};
 use crate::upstream::{ProxyEndpoint, UpstreamProxy};
 use crate::GatewayError;
 
@@ -581,7 +581,7 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
         .await;
     }
     if head.method == "CONNECT" {
-        serve_connect(client, head.target, shared).await
+        serve_connect(client, head, shared).await
     } else {
         crate::inspect::serve_plain(client, head, shared).await
     }
@@ -590,10 +590,11 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
 /// Stages 2-6 for `CONNECT host:port`.
 async fn serve_connect(
     mut client: Buffered<TcpStream>,
-    target: String,
+    head: Head,
     shared: Arc<Shared>,
 ) -> io::Result<()> {
-    let authority = split_host_port(&target)
+    let target = &head.target;
+    let authority = split_host_port(target)
         .map_err(|e| e.to_string())
         .and_then(|(h, p)| {
             let port = p.ok_or("a CONNECT authority without a port")?;
@@ -610,6 +611,11 @@ async fn serve_connect(
             return respond(&mut client.s, "400 Bad Request", "", true).await;
         }
     };
+    // FW-EGR36 holds for a CONNECT head too, though none of it is forwarded.
+    if let Err(why) = singleton_fields(&head.headers, &host, &shared.config.brokers) {
+        shared.refuse(Refusal::new(RefusalReason::Malformed, why).at(&host, port));
+        return respond(&mut client.s, "400 Bad Request", "", true).await;
+    }
     let inspect = match shared.config.table.decide_connect(&host, port) {
         ConnectDecision::Tunnel(_) => false,
         ConnectDecision::Inspect => true,

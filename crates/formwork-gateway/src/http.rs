@@ -87,17 +87,46 @@ pub(crate) const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
+/// The fields that frame a message body (RFC 9112 §6).
+const FRAMING: &[&str] = &["content-length", "transfer-encoding"];
+
+/// Is `name` hop-by-hop, or named by `Connection`? `Host` is neither: `Connection` cannot remove
+/// the field the Gateway checked (FW-EGR10).
+fn one_hop(name: &str, named: &[String]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    HOP_BY_HOP.contains(&lower.as_str()) || (lower != "host" && named.contains(&lower))
+}
+
 /// `headers` without hop-by-hop fields, including every field the `Connection` header names.
 pub(crate) fn end_to_end(headers: &[(String, String)]) -> Vec<(String, String)> {
     let named = connection_tokens(headers);
     headers
         .iter()
-        .filter(|(n, _)| {
-            let lower = n.to_ascii_lowercase();
-            !HOP_BY_HOP.contains(&lower.as_str()) && !named.contains(&lower)
-        })
+        .filter(|(n, _)| !one_hop(n, &named))
         .cloned()
         .collect()
+}
+
+/// [`end_to_end`] with the framing the Gateway decided (FW-EGR38), written where the peer's first
+/// framing field stood. No framing field of the peer's is kept: a `Connection` header that names
+/// one would otherwise leave the next hop a body it reads as a second message.
+pub(crate) fn framed(headers: &[(String, String)], framing: Framing) -> Vec<(String, String)> {
+    let named = connection_tokens(headers);
+    let mut decided = match framing {
+        Framing::Length(n) => Some(("Content-Length".to_string(), n.to_string())),
+        Framing::Chunked => Some(("Transfer-Encoding".to_string(), "chunked".to_string())),
+        Framing::None | Framing::UntilClose => None,
+    };
+    let mut out = Vec::with_capacity(headers.len() + 1);
+    for (name, value) in headers {
+        if FRAMING.iter().any(|f| name.eq_ignore_ascii_case(f)) {
+            out.extend(decided.take());
+        } else if !one_hop(name, &named) {
+            out.push((name.clone(), value.clone()));
+        }
+    }
+    out.extend(decided);
+    out
 }
 
 /// RFC 9110 `tchar`, the bytes of a method or header name.
@@ -246,6 +275,16 @@ pub(crate) enum Framing {
     UntilClose,
 }
 
+/// `chunked`, in one field, is the one transfer coding the Gateway reads and writes (FW-EGR38): a
+/// message in another is refused, since its framing could not be forwarded as decided.
+fn chunked(te: &[&str]) -> Result<Framing, &'static str> {
+    match te {
+        [one] if one.eq_ignore_ascii_case("chunked") => Ok(Framing::Chunked),
+        [_] => Err("a Transfer-Encoding other than chunked"),
+        _ => Err("more than one Transfer-Encoding"),
+    }
+}
+
 pub(crate) fn request_framing(head: &Head) -> Result<Framing, &'static str> {
     let te: Vec<&str> = head
         .headers
@@ -263,11 +302,7 @@ pub(crate) fn request_framing(head: &Head) -> Result<Framing, &'static str> {
         return Err("both Content-Length and Transfer-Encoding");
     }
     if !te.is_empty() {
-        return if te.len() == 1 && te[0].eq_ignore_ascii_case("chunked") {
-            Ok(Framing::Chunked)
-        } else {
-            Err("a Transfer-Encoding other than chunked")
-        };
+        return chunked(&te);
     }
     match cl.as_slice() {
         [] => Ok(Framing::None),
@@ -296,15 +331,7 @@ pub(crate) fn response_framing(
         .map(|(_, v)| v.as_str())
         .collect();
     if !te.is_empty() {
-        let last = te
-            .last()
-            .and_then(|v| v.split(',').next_back())
-            .map(|v| v.trim());
-        return if last.is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
-            Ok(Framing::Chunked)
-        } else {
-            Ok(Framing::UntilClose)
-        };
+        return chunked(&te);
     }
     let cl: Vec<&str> = head
         .headers
@@ -806,6 +833,113 @@ mod tests {
         assert_eq!(
             request_framing(&head(&[("Content-Length", "3")])),
             Ok(Framing::Length(3))
+        );
+        assert!(
+            request_framing(&head(&[("Content-Length", "3"), ("content-length", "3")])).is_err()
+        );
+        assert!(request_framing(&head(&[
+            ("Transfer-Encoding", "chunked"),
+            ("transfer-encoding", "chunked")
+        ]))
+        .is_err());
+        assert!(request_framing(&head(&[("Transfer-Encoding", "chunked, chunked")])).is_err());
+        assert_eq!(
+            request_framing(&head(&[("transfer-encoding", "Chunked")])),
+            Ok(Framing::Chunked)
+        );
+    }
+
+    fn response(h: &[(&str, &str)]) -> ResponseHead {
+        ResponseHead {
+            version: "HTTP/1.1".into(),
+            status: 200,
+            reason: "OK".into(),
+            headers: head(h).headers,
+        }
+    }
+
+    /// FW-EGR38: a response is read in a framing the Gateway can write back, or refused.
+    #[test]
+    fn fw_egr38_response_framing_is_one_the_gateway_writes() {
+        let framing = |h: &[(&str, &str)], method: &str| response_framing(&response(h), method);
+        assert_eq!(
+            framing(&[("Content-Length", "3")], "GET"),
+            Ok(Framing::Length(3))
+        );
+        assert_eq!(
+            framing(
+                &[("Content-Length", "3"), ("Transfer-Encoding", "chunked")],
+                "GET"
+            ),
+            Ok(Framing::Chunked)
+        );
+        assert_eq!(framing(&[], "GET"), Ok(Framing::UntilClose));
+        assert_eq!(
+            framing(&[("Content-Length", "3")], "HEAD"),
+            Ok(Framing::None)
+        );
+        for coding in ["gzip", "gzip, chunked", "chunked, chunked", "identity"] {
+            assert!(
+                framing(&[("Transfer-Encoding", coding)], "GET").is_err(),
+                "{coding}"
+            );
+        }
+        assert!(framing(
+            &[
+                ("Transfer-Encoding", "chunked"),
+                ("Transfer-Encoding", "chunked")
+            ],
+            "GET"
+        )
+        .is_err());
+    }
+
+    /// FW-EGR38: the forwarded framing is the decided one, whatever `Connection` names and
+    /// whatever framing fields the peer sent; FW-EGR10's `Host` is not `Connection`'s to remove.
+    #[test]
+    fn fw_egr38_forwarded_framing_is_the_decided_framing() {
+        let pairs = |h: &[(&str, &str)]| head(h).headers;
+        assert_eq!(
+            framed(
+                &pairs(&[
+                    ("Host", "a.test"),
+                    ("Connection", "content-length, host, x-hop"),
+                    ("content-length", "005"),
+                    ("X-Hop", "1"),
+                    ("Accept", "*/*"),
+                ]),
+                Framing::Length(5)
+            ),
+            pairs(&[
+                ("Host", "a.test"),
+                ("Content-Length", "5"),
+                ("Accept", "*/*")
+            ])
+        );
+        assert_eq!(
+            framed(
+                &pairs(&[
+                    ("Connection", "Transfer-Encoding"),
+                    ("Content-Length", "9"),
+                    ("Transfer-Encoding", "chunked"),
+                ]),
+                Framing::Chunked
+            ),
+            pairs(&[("Transfer-Encoding", "chunked")])
+        );
+        assert_eq!(
+            framed(&pairs(&[("Accept", "*/*")]), Framing::Length(0)),
+            pairs(&[("Accept", "*/*"), ("Content-Length", "0")])
+        );
+        for none in [Framing::None, Framing::UntilClose] {
+            assert_eq!(
+                framed(&pairs(&[("Content-Length", "9"), ("Accept", "*/*")]), none),
+                pairs(&[("Accept", "*/*")])
+            );
+        }
+        assert_eq!(
+            end_to_end(&pairs(&[("Connection", "host"), ("Host", "a.test")])),
+            pairs(&[("Host", "a.test")])
         );
     }
 

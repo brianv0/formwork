@@ -30,9 +30,9 @@ use crate::egress::{
     Shared,
 };
 use crate::http::{
-    connection_tokens, end_to_end, is_client_gone, parse_head, parse_response_head, render_request,
-    render_response, request_framing, respond, response_framing, BodyError, BoxIo, Buffered,
-    Framing, Guard, Head, HeadError, Watched, HEAD_TIMEOUT, IDLE_TIMEOUT, READ_CHUNK,
+    connection_tokens, end_to_end, framed, is_client_gone, parse_head, parse_response_head,
+    render_request, render_response, request_framing, respond, response_framing, BodyError, BoxIo,
+    Buffered, Framing, Guard, Head, HeadError, Watched, HEAD_TIMEOUT, IDLE_TIMEOUT, READ_CHUNK,
 };
 
 /// The prefix of every session placeholder (FW-CRED14); the placeholder scan looks for it.
@@ -422,6 +422,9 @@ async fn exchange(
             .request(&head.method, path.as_str())
             .plain(plain)
     };
+    if let Err(why) = singleton_fields(&head.headers, &host, &shared.config.brokers) {
+        return refused(client, shared, at(malformed(&why)), None).await;
+    }
     let framing = match request_framing(&head) {
         Ok(f) => f,
         Err(why) => {
@@ -496,14 +499,14 @@ async fn exchange(
         },
     };
 
-    // FW-EGR22: what goes upstream is built from what matched.
+    // FW-EGR22, FW-EGR38: what goes upstream is built from what matched and framed as decided.
     let upgrade = connection_tokens(&head.headers).contains(&"upgrade".to_string())
         && head.header("upgrade").is_some();
     let expect_continue = head
         .header("expect")
         .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
         && framing != Framing::None;
-    let mut headers: Vec<(String, String)> = end_to_end(&head.headers)
+    let mut headers: Vec<(String, String)> = framed(&head.headers, framing)
         .into_iter()
         .filter(|(n, _)| !(expect_continue && n.eq_ignore_ascii_case("expect")))
         .collect();
@@ -722,11 +725,14 @@ async fn exchange(
             && !connection_tokens(&response.headers).contains(&"keep-alive".to_string()));
     let client_close = connection_tokens(&head.headers).contains(&"close".to_string());
     let close_after = client_close || framing_down == Framing::UntilClose;
-    let mut out = end_to_end(&response.headers);
-    if framing_down == Framing::Chunked {
-        // A response framed by both is read as chunked here; the client must read it the same way.
-        out.retain(|(n, _)| !n.eq_ignore_ascii_case("content-length"));
-    }
+    let mut out = if framing_down == Framing::None {
+        // No body follows by status or request method, so these fields frame nothing: in a
+        // response to HEAD or a 304 they describe the representation (RFC 9110 §8.6).
+        end_to_end(&response.headers)
+    } else {
+        // FW-EGR38: the client reads the body in the framing the Gateway read it in.
+        framed(&response.headers, framing_down)
+    };
     if close_after {
         out.push(("Connection".into(), "close".into()));
     }
@@ -1037,6 +1043,35 @@ async fn connect_upstream(
             Err(None)
         }
         Err(_) => Err(None),
+    }
+}
+
+/// Singleton fields (FW-EGR36): a request to `host` carries each field the Gateway decides on
+/// once -- `Host`, the framing fields, and the header of each credential brokered for the host --
+/// or the upstream may read the copy that was not decided on.
+pub(crate) fn singleton_fields(
+    headers: &[(String, String)],
+    host: &CanonicalHost,
+    brokers: &[Broker],
+) -> Result<(), String> {
+    let brokered = brokers
+        .iter()
+        .flat_map(|b| &b.bindings)
+        .filter(|(h, _)| h == host)
+        .map(|(_, scheme)| match scheme {
+            BrokerScheme::Bearer | BrokerScheme::Basic { .. } => "Authorization",
+            BrokerScheme::Header(name) => name.as_str(),
+        });
+    let repeated = ["Host", "Content-Length", "Transfer-Encoding"]
+        .into_iter()
+        .chain(brokered)
+        .find(|name| {
+            let bears = |(n, _): &&(String, String)| n.eq_ignore_ascii_case(name);
+            headers.iter().filter(bears).count() > 1
+        });
+    match repeated {
+        Some(name) => Err(format!("more than one {name} field (FW-EGR36)")),
+        None => Ok(()),
     }
 }
 

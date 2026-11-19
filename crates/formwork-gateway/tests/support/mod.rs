@@ -167,7 +167,10 @@ impl Seen {
 /// - `/bye`: answers as keep-alive, then closes the connection;
 /// - `/events?n=N&gap_ms=G`: a server-sent-event stream of `N` events `G` ms apart, each written
 ///   as its own chunk and its write time recorded in [`Upstream::events`];
-/// - anything else: `ok:<path>`.
+/// - `/hop`: answers `hop` with a `Connection` header that names the response's own framing
+///   field, `Content-Length` or (`?chunked=1`) `Transfer-Encoding`;
+/// - `/none`: `204 No Content`;
+/// - anything else: `ok:<path>`, the head alone to a `HEAD`.
 #[derive(Clone)]
 pub struct Upstream {
     pub port: u16,
@@ -432,10 +435,28 @@ async fn serve_fixture<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, fixture: Ups
                 let _ = s.flush().await;
                 return;
             }
-            _ => s
-                .write_all(respond("", &format!("ok:{path}")).as_bytes())
+            "/hop" => {
+                let whole = if query.contains("chunked=1") {
+                    "HTTP/1.1 200 OK\r\nConnection: transfer-encoding\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n3\r\nhop\r\n0\r\n\r\n"
+                        .to_string()
+                } else {
+                    respond("Connection: content-length\r\n", "hop")
+                };
+                s.write_all(whole.as_bytes()).await.is_ok()
+            }
+            "/none" => s
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
                 .await
                 .is_ok(),
+            _ => {
+                let body = format!("ok:{path}");
+                let mut whole = respond("", &body);
+                if head.starts_with("HEAD ") {
+                    whole.truncate(whole.len() - body.len());
+                }
+                s.write_all(whole.as_bytes()).await.is_ok()
+            }
         };
         let _ = s.flush().await;
         if !ok {
