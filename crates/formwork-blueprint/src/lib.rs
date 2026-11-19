@@ -23,9 +23,9 @@ pub use credential::{
     InlineBinding,
 };
 pub use discovery::{
-    propose_channels, propose_host_rules, reverse_compile, synthesize_blueprint, AccessRecord,
-    Candidate, CandidateTag, DenialAccess, DenialRecord, EgressObservation, EgressProposal,
-    ProposalOutcome, WithheldEntry,
+    proposable_host_rule, propose_channels, propose_host_rules, reverse_compile,
+    synthesize_blueprint, AccessRecord, Candidate, CandidateTag, DenialAccess, DenialRecord,
+    EgressObservation, EgressProposal, LauncherDeny, ProposalOutcome, WithheldEntry,
 };
 pub use egress::{
     admit_addresses, canonical_ip, canonicalize_host, classify, is_restricted_ip, split_host_port,
