@@ -464,7 +464,7 @@ fn main() -> Result<()> {
     unsafe {
         formwork_confine::conceal_environment();
     }
-    take_learning_report_fd();
+    take_learning_fds();
     init_telemetry();
     let cli = parse_cli();
     let cmd = match &cli.command {
@@ -536,11 +536,11 @@ fn main() -> Result<()> {
                          not to review mode -- review reads a proposal and needs no denial feed"
                     );
                 }
-                let proposal = match proposal {
-                    Some(p) => p,
-                    None => learn::proposal_path(&blueprint.resolve()?.path),
-                };
-                learn::accept(&proposal, &accept, accept_all, &home())?;
+                // FW-DISC19: the blueprint is resolved whatever names the proposal, because its
+                // discovered layer is the only place an accept writes.
+                let resolved = blueprint.resolve()?.path;
+                let proposal = proposal.unwrap_or_else(|| learn::proposal_path(&resolved));
+                learn::accept(&proposal, &resolved, &accept, accept_all, &home())?;
             } else if argv.is_empty() {
                 bail!(
                     "nothing to do: give a command to observe (`formwork learn -- cmd …`) or \
@@ -1025,6 +1025,9 @@ fn log_exit(what: &'static str, status: &std::process::ExitStatus) {
 struct Session {
     blueprint: Blueprint,
     catalog: ResolvedCatalog,
+    /// The denies the Launcher added for credential types (FW-CRED3); `learn` withholds a denial
+    /// that matches one (FW-DISC15).
+    launcher_denies: Vec<formwork_blueprint::LauncherDeny>,
     policy: formwork_compile::CompiledPolicy,
     /// The resolved blueprint file this session was built from (flag or discovered FORMWORK.toml);
     /// `learn` derives the proposal/discovered-layer paths from it.
@@ -1217,13 +1220,12 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
         ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
     // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
     // blueprint's enforcement-time canonicalization resolves everything together.
+    let launcher_denies =
+        blueprint_load::env_file_ref_denies(&catalog, &blueprint.exposed_credentials())?;
     blueprint
         .fs
         .subtract
-        .extend(blueprint_load::env_file_ref_denies(
-            &catalog,
-            &blueprint.exposed_credentials(),
-        )?);
+        .extend(launcher_denies.iter().map(|deny| deny.pattern.clone()));
     // The policy inputs are write-denied inside the session: a confined agent must not be able
     // to edit the blueprint, forge the discovered layer, or doctor the proposal that shapes its
     // own NEXT run (FW-XR8 / FW-INV8). Keys off the RESOLVED path, so a discovered FORMWORK.toml
@@ -1277,6 +1279,7 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
         deny_tag: spec.deny_tag,
         blueprint,
         catalog,
+        launcher_denies,
         policy,
         blueprint_path: resolved.path,
         tmp_dir,
@@ -1759,16 +1762,23 @@ fn spawn_confined_child(
 /// from the environment before anything else reads it, so no workload inherits it.
 static LEARNING_REPORT_FD: std::sync::OnceLock<std::os::fd::RawFd> = std::sync::OnceLock::new();
 
-fn take_learning_report_fd() {
-    let Some(raw) = std::env::var_os(learn::REPORT_FD_ENV) else {
-        return;
-    };
+fn take_learning_fds() {
     // Single-threaded here: telemetry and every runtime start after this.
-    std::env::remove_var(learn::REPORT_FD_ENV);
-    let Some(fd) = raw
-        .to_str()
-        .and_then(|s| s.parse::<std::os::fd::RawFd>().ok())
-    else {
+    let take = |name: &str| -> Option<std::os::fd::RawFd> {
+        let raw = std::env::var_os(name)?;
+        std::env::remove_var(name);
+        // Never a standard stream, whatever the variable says.
+        raw.to_str()?.parse().ok().filter(|fd| *fd > 2)
+    };
+    // FW-DISC17: strace keeps the feed's write end open across its fork, so this process was
+    // born holding it. Closed before anything else runs, no workload inherits a descriptor it
+    // could write trace lines to.
+    if let Some(fd) = take(learn::FEED_FD_ENV) {
+        // SAFETY: closes a descriptor the learning parent opened for strace alone; nothing in
+        // this process has used it.
+        unsafe { libc::close(fd) };
+    }
+    let Some(fd) = take(learn::REPORT_FD_ENV) else {
         return;
     };
     // SAFETY: F_SETFD on a descriptor the learning parent handed us; the workload must not
@@ -1974,11 +1984,15 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
             learn::service_observations(&messages, &session.catalog, &mut observations);
             let records = learn::fs_denials(&messages);
             learn::conclude_learning_run(
-                &session.blueprint,
-                &session.blueprint_path,
-                &session.catalog,
+                &learn::LearnedSession {
+                    blueprint: &session.blueprint,
+                    blueprint_path: &session.blueprint_path,
+                    catalog: &session.catalog,
+                    launcher_denies: &session.launcher_denies,
+                },
                 &run_id,
                 records,
+                0,
                 &observations,
                 &status,
             )?;
@@ -1994,8 +2008,10 @@ fn learn_run(blueprint: BlueprintArgs, argv: Vec<String>, observe_anyway: bool) 
 /// no grant, no ptrace hole in the policy, and no Yama exception (it is the tracee's ancestor).
 /// Session preparation, env construction, and the operator itemization all happen once, in the
 /// shim -- this side only resolves what `conclude_learning_run` needs. Unlike the macOS window
-/// there is no persistence latency: the trace file is complete when strace exits, and only this
-/// run's process tree is in it.
+/// there is no persistence latency: the trace is complete when strace exits, and only this run's
+/// process tree is in it. strace writes the trace to a pipe this process created and holds the
+/// read end of (FW-DISC17): the workload has this user's uid, so a trace file's mode bits would
+/// not keep it from writing lines of its own, and a pipe has no path for it to open.
 fn learn_run_linux(
     strace: PathBuf,
     args: &BlueprintArgs,
@@ -2011,21 +2027,27 @@ fn learn_run_linux(
         .context("canonicalizing grant paths")?;
     let catalog =
         ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
+    // FW-DISC15: the denies the shim's Launcher will add, computed from the same environment.
+    let launcher_denies =
+        blueprint_load::env_file_ref_denies(&catalog, &loaded.exposed_credentials())?;
     let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
         .context("canonicalizing credential catalog paths")?;
 
     tracing::info!(
         "LEARNING MODE (observe-then-widen): the policy below is enforced unchanged; denials are recorded and proposed, never granted live (FW-DISC1/FW-INV10)"
     );
-    let trace_path = std::env::temp_dir().join(format!("formwork-{run_id}.strace"));
+    let (feed_read, feed_write) = cloexec_pipe().context("creating the denial feed pipe")?;
+    let feed_fd = {
+        use std::os::fd::AsRawFd;
+        feed_write.as_raw_fd()
+    };
     let current_exe = std::env::current_exe()
         .context("locating the formwork binary for the confine-self shim")?;
     let mut command = Command::new(&strace);
     command
-        // -s 4096: strace abbreviates strings at 32 bytes by default, which would truncate real
-        // paths and silently lose their denials (the FW-INV6 shape).
-        .args(["-f", "-qq", "-s", "4096", "-e", "trace=%file", "-o"])
-        .arg(&trace_path)
+        .args(learn::STRACE_OPTIONS)
+        .arg("-o")
+        .arg(format!("/dev/fd/{feed_fd}"))
         .arg("--")
         .arg(&current_exe)
         // Host rules need the spawn posture's Gateway and supervisor outside the sandbox, and the
@@ -2050,17 +2072,24 @@ fn learn_run_linux(
         report_write.as_raw_fd()
     };
     command.env(learn::REPORT_FD_ENV, report_fd.to_string());
-    // `report_write` stays open until the spawn returns.
+    command.env(learn::FEED_FD_ENV, feed_fd.to_string());
+    // `report_write` and `feed_write` stay open until the spawn returns.
     formwork_confine::inherit_fd(&mut command, report_fd);
-    let reader = std::thread::spawn(move || {
-        let mut body = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut &report_read, &mut body);
-        body
-    });
+    formwork_confine::inherit_fd(&mut command, feed_fd);
+    let drain = |pipe: std::fs::File| {
+        std::thread::spawn(move || {
+            let mut body = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut &pipe, &mut body);
+            body
+        })
+    };
+    let reader = drain(report_read);
+    let feed = drain(feed_read);
     tracing::info!(tracer = %strace.display(), "spawning the workload under the ptrace denial feed");
     let status = command.status();
     drop(command);
     drop(report_write);
+    drop(feed_write);
     let status = status.context("spawning strace")?;
     log_exit("traced workload exited", &status);
     let observations: learn::SessionObservations = reader
@@ -2070,17 +2099,30 @@ fn learn_run_linux(
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
 
-    let trace = std::fs::read_to_string(&trace_path)
-        .with_context(|| format!("reading the strace log {}", trace_path.display()))?;
-    let _ = std::fs::remove_file(&trace_path);
+    let trace = feed
+        .join()
+        .map_err(|_| anyhow!("the denial feed reader panicked"))?;
+    // A run strace traced begins with the shim's own exec, so an empty feed means strace never
+    // traced anything (FW-INV5): no proposal is written from it.
+    if trace.is_empty() {
+        bail!(
+            "the denial feed is empty: strace wrote no trace ({status}), so the workload was \
+             not observed and no proposal is written. strace's own message is above."
+        );
+    }
     let cwd = cwd()?;
-    let records = learn::parse_strace_denials(&trace, std::path::Path::new(&cwd));
+    let denials =
+        learn::parse_strace_denials(&String::from_utf8_lossy(&trace), std::path::Path::new(&cwd));
     learn::conclude_learning_run(
-        &blueprint,
-        &resolved.path,
-        &catalog,
+        &learn::LearnedSession {
+            blueprint: &blueprint,
+            blueprint_path: &resolved.path,
+            catalog: &catalog,
+            launcher_denies: &launcher_denies,
+        },
         run_id,
-        records,
+        denials.records,
+        denials.unattributed,
         &observations,
         &status,
     )?;

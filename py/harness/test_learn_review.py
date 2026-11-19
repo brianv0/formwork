@@ -85,6 +85,175 @@ def test_accept_by_number_and_pattern_moves_exactly_the_selection(review):
     assert "/srv/app/credentials" in remaining
 
 
+@pytest.mark.fw_e2e("FW-E2E-211")
+def test_list_and_accept_name_the_layer_and_each_entry(review):
+    # The listing says where an accept will write before anything is accepted...
+    listed = review("--list")
+    assert listed.code == 0, listed.stderr
+    assert str(review.discovered) in listed.stdout.splitlines()[0], listed.stdout
+
+    # ...and the accept prints each entry it wrote, not a count alone (FW-DISC19).
+    accepted = review("--accept", "2", "--accept", "/opt/toolchain/**")
+    assert accepted.code == 0, accepted.stderr
+    lines = accepted.stdout.splitlines()
+    assert any(l.startswith("accepted /opt/toolchain/** (read") for l in lines), accepted.stdout
+    assert any(l.startswith("accepted /srv/data/out.log (write") for l in lines), accepted.stdout
+    assert not any("/srv/app/credentials" in l for l in lines), accepted.stdout
+    assert str(review.discovered) in lines[-1], accepted.stdout
+
+
+@pytest.mark.fw_e2e("FW-E2E-211")
+def test_a_selector_that_matches_nothing_refuses_the_whole_accept(review):
+    """Public issue #54: beside a valid selector, one that names no entry used to be dropped
+    and the accept exited 0 -- `--accept 2 --accept 12` read as two grants accepted."""
+    before = review.proposal.read_text()
+    for stray in ("99", "0", "/opt/toolchain", "allow:nowhere.test"):
+        refused = review("--accept", "1", "--accept", stray)
+        assert refused.code != 0, f"{stray}: {refused.stdout}"
+        assert stray in refused.stderr, refused.stderr
+        assert "accepted" not in refused.stdout, refused.stdout
+        assert not review.discovered.exists(), "a refused accept must write nothing"
+        assert review.proposal.read_text() == before, "a refused accept consumes nothing"
+    # --accept-all does not excuse a selector either.
+    assert review("--accept-all", "--accept", "99").code != 0
+    assert not review.discovered.exists()
+
+
+@pytest.mark.fw_e2e("FW-E2E-211")
+def test_a_selector_naming_an_auto_accepted_entry_is_refused(review):
+    """An auto-accepted entry is listed for audit and already in the discovered layer; naming
+    it accepts nothing, so the selector is refused rather than passed over."""
+    review.proposal.write_text(
+        review.proposal.read_text().replace(
+            'access = "write"\ntag = "needs-review"', 'access = "write"\ntag = "auto-accepted"'
+        )
+    )
+    refused = review("--accept", "1", "--accept", "2")
+    assert refused.code != 0, refused.stdout
+    assert "2" in refused.stderr and "needs-review" in refused.stderr, refused.stderr
+    assert not review.discovered.exists()
+
+
+@pytest.mark.fw_e2e("FW-E2E-211")
+def test_accept_refuses_a_proposal_learned_against_another_blueprint(tmp_path, cli):
+    """Public issue #54: the destination used to be the path string inside the proposal. A
+    proposal that names another project's blueprint -- a copied or moved project, or a file
+    reviewed with --proposal -- wrote grants into a layer the invocation never resolved."""
+    env = {"HOME": str(tmp_path)}
+    projects = {}
+    for name in ("here", "elsewhere"):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "bp.toml").write_text(BLUEPRINT)
+        projects[name] = root
+    here, elsewhere = projects["here"], projects["elsewhere"]
+    stale = PROPOSAL.format(blueprint=elsewhere / "bp.toml")
+
+    # A proposal beside this blueprint that names the other one (the copied-project shape).
+    (here / "bp.toml.proposal.toml").write_text(stale)
+    # The other project's own proposal, reviewed from here with --proposal.
+    (elsewhere / "bp.toml.proposal.toml").write_text(stale)
+    for extra in ([], ["--proposal", elsewhere / "bp.toml.proposal.toml"]):
+        for review_flags in (["--list"], ["--accept", "1"], ["--accept-all"]):
+            refused = cli(
+                "learn", "--blueprint", "bp.toml", *extra, *review_flags, cwd=here, env=env
+            )
+            assert refused.code != 0, refused.stdout
+            assert str(elsewhere / "bp.toml") in refused.stderr, refused.stderr
+            assert str(here / "bp.toml") in refused.stderr, refused.stderr
+    for root in (here, elsewhere):
+        assert not (root / "bp.toml.discovered.toml").exists(), f"{root} was written to"
+    assert (here / "bp.toml.proposal.toml").read_text() == stale
+
+
+@pytest.mark.fw_e2e("FW-E2E-211")
+def test_accept_writes_to_the_resolved_blueprint_when_the_proposal_sits_elsewhere(tmp_path, cli):
+    """--proposal names where the proposal file is; the layer written is still the resolved
+    blueprint's own."""
+    blueprint = tmp_path / "bp.toml"
+    blueprint.write_text(BLUEPRINT)
+    moved = tmp_path / "review" / "pending.toml"
+    moved.parent.mkdir()
+    moved.write_text(PROPOSAL.format(blueprint=blueprint))
+    accepted = cli(
+        "learn", "--blueprint", "bp.toml", "--proposal", moved, "--accept", "1",
+        cwd=tmp_path, env={"HOME": str(tmp_path)},
+    )
+    assert accepted.code == 0, accepted.stderr
+    assert "/opt/toolchain/**" in (tmp_path / "bp.toml.discovered.toml").read_text()
+    assert not (moved.parent / "bp.toml.discovered.toml").exists()
+
+
+FORGED_KINDS = """\
+blueprint = "{blueprint}"
+
+[[candidates]]
+pattern = "/srv/**/config"
+access = "write"
+tag = "needs-review"
+run-id = "learn-1"
+
+[[candidates]]
+pattern = "**/notes.txt"
+access = "read"
+tag = "needs-review"
+run-id = "learn-1"
+
+[[hosts]]
+rule = "tunnel:git.corp.example"
+run-id = "learn-1"
+
+[[hosts]]
+rule = "deny:wiki.corp.example"
+run-id = "learn-1"
+
+[[hosts]]
+rule = "allow:*.corp.example"
+run-id = "learn-1"
+
+[[hosts]]
+rule = "allow:169.254.169.254"
+run-id = "learn-1"
+
+[[hosts]]
+rule = "get:api.corp.example/v1/**"
+run-id = "learn-1"
+
+[[hosts]]
+rule = "allow:blocked.test"
+run-id = "learn-1"
+"""
+
+
+@pytest.mark.fw_e2e("FW-E2E-211")
+def test_accept_refuses_entry_kinds_discovery_never_proposes(review):
+    """The proposal is untrusted input (FW-DISC3). A learning run proposes a denied path or its
+    directory's subtree, `allow:` on an exact public host, or one method on one literal path
+    (FW-DISC12) -- never a tunnel grade, a deny, a wildcard, a restricted destination or a
+    pattern. A proposal carrying one of those does not pass it through accept."""
+    review.proposal.write_text(FORGED_KINDS.format(blueprint=review.blueprint))
+    for number, why in (
+        (1, "any-depth"),
+        (2, "any-depth"),
+        (3, "tunnel"),
+        (4, "deny"),
+        (5, "wildcard"),
+        (6, "FW-EGR19"),
+        (7, "glob"),
+    ):
+        refused = review("--accept", str(number))
+        assert refused.code != 0, f"{number}: {refused.stdout}"
+        assert "refusing to accept" in refused.stderr and why in refused.stderr, refused.stderr
+        assert not review.discovered.exists(), "a refused accept must write nothing"
+    assert review("--accept-all").code != 0
+    assert not review.discovered.exists()
+
+    # The one entry of a proposable kind still goes through.
+    accepted = review("--accept", "8")
+    assert accepted.code == 0, accepted.stderr
+    assert "allow:blocked.test" in review.discovered.read_text()
+
+
 @pytest.mark.fw_e2e("FW-E2E-063")
 def test_accept_refuses_a_credential_floor_match(review):
     # The backstop shape (`**/credentials`) floors the entry wherever it sits -- a forged

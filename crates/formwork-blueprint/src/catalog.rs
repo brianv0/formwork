@@ -205,12 +205,7 @@ impl ResolvedCatalog {
     /// (FW-INV8) must classify by shape everywhere. Enforcement denies the same shapes everywhere
     /// too (`denied_paths`), keeping the two floors symmetric (FW-CRED6).
     pub fn floor_type_of(&self, allow: &[String], candidate: &PathPattern) -> Option<String> {
-        fn hit(floor: &PathPattern, candidate: &PathPattern) -> bool {
-            floor == candidate
-                || floor.covers(candidate)
-                || candidate.covers(floor)
-                || (!candidate.is_any_depth() && floor.matches_path(candidate.base()))
-        }
+        let hit = floor_hit;
         for (name, entry) in self.enforced_types(allow) {
             if entry.paths.iter().any(|p| hit(p, candidate)) {
                 return Some(name.to_string());
@@ -232,6 +227,15 @@ impl ResolvedCatalog {
         }
         None
     }
+}
+
+/// Does a floor row reach a candidate grant? Shared by the Catalog rows and the denies the
+/// Launcher adds to one session (FW-DISC15), so both floors hold the same relation.
+pub(crate) fn floor_hit(floor: &PathPattern, candidate: &PathPattern) -> bool {
+    floor == candidate
+        || floor.covers(candidate)
+        || candidate.covers(floor)
+        || (!candidate.is_any_depth() && floor.matches_path(candidate.base()))
 }
 
 #[cfg(test)]

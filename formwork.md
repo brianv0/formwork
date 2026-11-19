@@ -332,6 +332,10 @@ Discovery observes what a confined workload tries to touch and turns denials int
 | <a id="fw-disc6"></a>**FW-DISC6** Provenance | An accepted discovered grant is recorded with provenance (added-via-discovery, run id), so audit distinguishes authored from learned grants. |
 | <a id="fw-disc11"></a>**FW-DISC11** Loop drivability | The discovery loop — observe, list, accept, next run — is drivable end-to-end from the `learn` surface without the user naming its artifact files: `<blueprint>.proposal.toml` and `<blueprint>.discovered.toml` are implementation conventions that surface in *output* as provenance, never as required *input* knowledge. Derived-path flags (`--proposal`) are fallbacks, not the default path, and a flag a mode would ignore is refused, never silently dropped ([FW-INV6](#fw-inv6) at the CLI surface). *(`FW-DISC7`–`FW-DISC10` are reserved by the in-flight FEP-4 draft and are not landed numbers.)* |
 | <a id="fw-disc12"></a>**FW-DISC12** Host and channel discovery | `learn` shall reverse-compile Gateway egress violations and channel denials into proposal entries (host rules, `channels`) on both backends, at the grade an existing rule for the host already has, and shall withhold and itemize metadata and private-IP destinations and credential-typed channels ([FW-DISC3](#fw-disc3)). |
+| <a id="fw-disc15"></a>**FW-DISC15** Launcher denies are floored | Discovery shall withhold, and never propose, a denial that matches a deny the Launcher added for a credential type in the observed session ([FW-CRED3](#fw-cred3)). |
+| <a id="fw-disc17"></a>**FW-DISC17** Feed integrity | `learn` shall read the denial feed only from a descriptor it created, with no filesystem path a confined process can open for writing. |
+| <a id="fw-disc18"></a>**FW-DISC18** Discovered-layer keys | The CLI shall refuse a discovered layer containing any key other than `fs.reads`, `fs.writes`, host `rules`, channel lifts and `discovery.provenance`, naming each such key. |
+| <a id="fw-disc19"></a>**FW-DISC19** Accept names its effect | `accept` shall write only to the discovered layer of the blueprint the invocation resolved, and shall print each entry it accepts. *(`FW-DISC13`, `FW-DISC14` and `FW-DISC16` are held by draft FEPs and are not landed numbers.)* |
 
 "Formwork never runs a real workload in a grant-whatever-is-attempted mode" is not a separate requirement — it is the combined consequence of [FW-DISC1](#fw-disc1) and [FW-DISC4](#fw-disc4), stated as a guarantee in [FW-INV10](#fw-inv10). Sticky learning within a trust boundary is the recommended workflow: accumulate proposals across runs, auto-accept only inside the operator-drawn zone, review everything else — discovery does the tedious enumeration; the human keeps the perimeter.
 
@@ -594,6 +598,14 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 
 <a id="fw-e2e-085"></a>**FW-E2E-085: Discovery of hosts and channels (both).** `learn` runs a millisecond workload that requests `blocked.test` through the proxy and touches the clipboard, and a second that requests `169.254.169.254`. Pass: `allow:blocked.test` and `channels = ["clipboard"]` are proposed; the metadata address produces a withheld line. Fail: the metadata address is proposed, or a proposal is missing.
 
+<a id="fw-e2e-199"></a>**FW-E2E-199: A credential variable's file is withheld ([FW-DISC15](#fw-disc15); both).** A closed-mode blueprint whose auto-widen zone covers a key file; `learn -- cat <key>` with `GOOGLE_APPLICATION_CREDENTIALS` naming that file; then `run -- cat <key>` with the variable unset. Pass: the denial is withheld with type `gcp`, the key is in neither the proposal nor the discovered layer, and the later run is denied. Fail: the key is proposed or self-granted, or the later run reads it.
+
+<a id="fw-e2e-209"></a>**FW-E2E-209: The feed is not a file ([FW-DISC17](#fw-disc17); Linux).** `learn` under the default profile with a temp root of its own. The workload lists the temp root, appends a well-formed trace line to every file it finds there, and writes the same line to new files in the temp root, the session temp directory and the launch directory. Pass: the listing holds only the session's own directories, the proposal has no candidate for the forged path, and the run's own floor denial is still withheld. Fail: a feed file is found, or the forged path is a candidate.
+
+<a id="fw-e2e-210"></a>**FW-E2E-210: Discovered-layer keys ([FW-DISC18](#fw-disc18)).** The discovered layer `accept` writes for a path, a host rule and a channel loads. The same layer with one added key outside the set — `discovery.auto-widen`, `extends`, `mode`, `net`, `exec`, `env`, `allow-credentials`, `isolate`, `mcp`, `fs.read-mode`, `fs.writes-no-create`, `fs.subtract`, `fs.write-subtract`, `channels.deny`, one at a time — is refused naming that key. Dry-run on any host. Fail: any of them loads.
+
+<a id="fw-e2e-211"></a>**FW-E2E-211: Accept names and bounds its effect ([FW-DISC19](#fw-disc19), [FW-DISC11](#fw-disc11), [FW-DISC12](#fw-disc12)).** Driven through the CLI on a fabricated proposal. Pass: `--list` prints the discovered layer an accept would write; an accept prints each accepted entry; a proposal that names another blueprint is refused for `--list`, `--accept` and `--accept-all`, with and without `--proposal`, naming both blueprints and writing neither layer; with `--proposal` naming a file elsewhere, the layer written is the resolved blueprint's; a selector that matches no needs-review entry refuses the whole accept and writes nothing; a `tunnel:` or `deny:` rule, a wildcard or restricted host, a path glob, and an any-depth path pattern are each refused. Dry-run on any host. Fail: a layer other than the resolved blueprint's is written, a selector is dropped without a refusal, or an entry of a kind discovery never proposes is accepted.
+
 ### 7.10 Adversarial
 
 <a id="fw-adv-001"></a>**FW-ADV-001: Sandbox shedding.** The confined process attempts, in sequence: `execve` of a setuid binary, `prctl` to clear `NO_NEW_PRIVS`, and re-exec to try to drop the seccomp filter. Pass: all fail; confinement persists across every attempt. Fail: any attempt restores access or relaxes the filter.
@@ -641,6 +653,8 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 <a id="fw-adv-023"></a>**FW-ADV-023: Address classes.** Under `allow:*.test`, the resolver fixture answers `127.0.0.1`, `10.0.0.1`, `100.100.100.200`, `168.63.129.16`, `::ffff:169.254.169.254`, `64:ff9b::a9fe:a9fe`, `2002:a9fe:a9fe::1`, `fe80::1`, a public address mixed with `10.0.0.1`, an address of the runner's own interfaces, and the Gateway's own listener address. Then, under the exact rule `allow:allowed.test`, it answers `127.0.0.1` and then `169.254.169.254`. Pass: every wildcard case and the exact-name metadata case are refused with `address-class`, and the exact-name loopback case is admitted. Fail: any other outcome.
 
 <a id="fw-adv-024"></a>**FW-ADV-024: Parser battery ([FW-INV15](#fw-inv15)).** Heads carrying both `Content-Length` and `Transfer-Encoding`, two differing `Content-Length` values, obsolete line folding, a bare LF, a NUL in a header value, an invalid method token, a head over **head-limit**, CONNECT authorities with userinfo, a path, a zone identifier, a percent-encoded dot, or a numeric spelling (`2130706433`, `0x7f.1`, `127.1`), and a truncated ClientHello. Pass: the fixture upstream receives no byte from any of them. Fail: any byte arrives.
+
+<a id="fw-adv-058"></a>**FW-ADV-058: A workload writes to its own learn result ([FW-DISC17](#fw-disc17); Linux).** Under `learn` with the default profile, the workload appends a well-formed trace line to every file in the temp root and the session temp directory, to the blueprint and proposal in the launch directory, to new files in each of those places, to every descriptor it holds, and to descriptors 0–11 of each of its ancestors through `/proc`. Pass: the proposal has no candidate for the forged path. Fail: the forged path is a candidate.
 
 ### 7.11 Host-service channels & isolation
 
@@ -1037,8 +1051,12 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-DISC4](#fw-disc4) Auto-widen zone | [FW-E2E-052](#fw-e2e-052) | 054 |
 | [FW-DISC5](#fw-disc5) Review diff | [FW-E2E-051](#fw-e2e-051), 063 | 053 |
 | [FW-DISC6](#fw-disc6) Provenance | [FW-E2E-053](#fw-e2e-053) | 063 |
-| [FW-DISC11](#fw-disc11) Loop drivability | [FW-E2E-063](#fw-e2e-063) | 062 |
-| [FW-DISC12](#fw-disc12) Host and channel discovery | [FW-E2E-085](#fw-e2e-085) | 105 |
+| [FW-DISC11](#fw-disc11) Loop drivability | [FW-E2E-063](#fw-e2e-063) | 062, 211 |
+| [FW-DISC12](#fw-disc12) Host and channel discovery | [FW-E2E-085](#fw-e2e-085) | 105, 211 |
+| [FW-DISC15](#fw-disc15) Launcher denies are floored | [FW-E2E-199](#fw-e2e-199) | — |
+| [FW-DISC17](#fw-disc17) Feed integrity | [FW-E2E-209](#fw-e2e-209), [FW-ADV-058](#fw-adv-058) | — |
+| [FW-DISC18](#fw-disc18) Discovered-layer keys | [FW-E2E-210](#fw-e2e-210) | — |
+| [FW-DISC19](#fw-disc19) Accept names its effect | [FW-E2E-211](#fw-e2e-211) | — |
 | [FW-EGR1](#fw-egr1) Host-scoped egress | [FW-E2E-029](#fw-e2e-029) | 075, 098 |
 | [FW-EGR2](#fw-egr2) Empty means deny | [FW-E2E-030](#fw-e2e-030) | 104 |
 | [FW-EGR3](#fw-egr3) Hostname canonicalization | [FW-ADV-007](#fw-adv-007) | ADV-024 |

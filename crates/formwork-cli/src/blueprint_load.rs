@@ -679,23 +679,57 @@ pub fn canonicalize_for_enforcement(blueprint: &Blueprint) -> Result<Blueprint> 
     Ok(out)
 }
 
-/// The discovered layer is machine-written and narrowly shaped: no `extends`, and every grant
-/// must carry provenance (FW-DISC6) so audit can always distinguish learned from authored.
+/// FW-DISC18: the keys a discovered layer may hold -- the ones provenance is checked for
+/// (FW-DISC6). Every other key is authoring: `auto-widen`, `allow-credentials`, a posture, a deny.
+/// A layer carrying one is refused naming it, because nothing could attribute what it grants.
+pub fn refuse_unlearned_keys(layer: &toml::Value, path: &Path) -> Result<()> {
+    const LEARNED: &[(&str, &[&str])] = &[
+        ("channels", &["allow"]),
+        ("discovery", &["provenance"]),
+        ("fs", &["reads", "writes"]),
+        ("rules", &[]),
+    ];
+    let mut unlearned = Vec::new();
+    for (key, value) in layer.as_table().into_iter().flatten() {
+        let Some((_, inner)) = LEARNED.iter().find(|(learned, _)| learned == key) else {
+            unlearned.push(key.clone());
+            continue;
+        };
+        for (subkey, _) in value.as_table().into_iter().flatten() {
+            if !inner.contains(&subkey.as_str()) {
+                unlearned.push(format!("{key}.{subkey}"));
+            }
+        }
+    }
+    if !unlearned.is_empty() {
+        bail!(
+            "discovered layer {} carries {}, which no learning run writes; a discovered layer \
+             holds only fs.reads, fs.writes, host rules, channel lifts and discovery.provenance \
+             (FW-DISC18). Author anything else in the blueprint.",
+            path.display(),
+            unlearned
+                .iter()
+                .map(|key| format!("`{key}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The discovered layer is machine-written and narrowly shaped: a closed key set (FW-DISC18),
+/// and every grant must carry provenance (FW-DISC6) so audit can always distinguish learned from
+/// authored.
 fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading discovered layer {}", path.display()))?;
     let mut value: toml::Value = toml::from_str(&text)
         .with_context(|| format!("parsing discovered layer {}", path.display()))?;
+    refuse_unlearned_keys(&value, path)?;
     sigils.expand_value(&mut value);
     let mut layer: BlueprintLayer = value
         .try_into()
         .with_context(|| format!("interpreting discovered layer {}", path.display()))?;
-    if !layer.extends.is_empty() {
-        bail!(
-            "discovered layer {} must not use extends; learned grants only",
-            path.display()
-        );
-    }
     for grant in layer.fs.reads.iter().chain(layer.fs.writes.iter()) {
         if !layer.discovery.provenance.contains_key(&grant.canonical()) {
             bail!(
@@ -732,12 +766,6 @@ fn parse_discovered_layer(path: &Path, sigils: &Sigils) -> Result<BlueprintLayer
         }
     }
     if let Some(channels) = &layer.channels {
-        if !channels.denied().is_empty() {
-            bail!(
-                "discovered layer {} denies channels; a learned layer only lifts",
-                path.display()
-            );
-        }
         for channel in channels.allowed() {
             if !layer
                 .discovery
@@ -790,11 +818,13 @@ pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -
 /// lives in the launcher's own environment -- impure -- so this is loader-edge code; the result
 /// joins the blueprint's subtract set before enforcement-time canonicalization. A set value we
 /// cannot faithfully render into a deny fails loud: leaving the referenced file readable while
-/// claiming the type enforced would be a silent fail-open (FW-INV6).
+/// claiming the type enforced would be a silent fail-open (FW-INV6). Each deny keeps its type and
+/// is resolved to the kernel's coordinates here, so `learn` can hold an observed denial against
+/// it (FW-DISC15).
 pub fn env_file_ref_denies(
     catalog: &formwork_blueprint::ResolvedCatalog,
     allow: &[String],
-) -> Result<Vec<PathPattern>> {
+) -> Result<Vec<formwork_blueprint::LauncherDeny>> {
     let cwd = std::env::current_dir().context("resolving cwd for env-file-ref denies")?;
     let mut out = Vec::new();
     for (type_name, entry) in catalog.enforced_types(allow) {
@@ -819,9 +849,13 @@ pub fn env_file_ref_denies(
             let pattern = absolute
                 .to_str()
                 .ok_or_else(|| anyhow!("{var} resolves to a non-UTF-8 path; refusing (FW-INV6)"))?;
-            out.push(PathPattern::parse(pattern).with_context(|| {
+            let pattern = PathPattern::parse(pattern).with_context(|| {
                 format!("{var} (credential type {type_name}) does not name a deniable path")
-            })?);
+            })?;
+            out.push(formwork_blueprint::LauncherDeny {
+                pattern: canon_pattern(&pattern)?,
+                credential_type: type_name.to_string(),
+            });
         }
     }
     Ok(out)

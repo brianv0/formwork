@@ -108,7 +108,8 @@ def test_auto_widen_zone_boundary(learned):
 
 @pytest.mark.fw_e2e("FW-E2E-053")
 def test_provenance_recorded_and_distinguishable(learned):
-    accept = learned.cli("learn", "--proposal", learned.proposal,
+    accept = learned.cli("learn", "--blueprint", learned.blueprint,
+                         "--proposal", learned.proposal,
                          "--accept", f"{learned.toolchain.resolve()}/**")
     assert accept.code == 0, accept.stderr
     discovered = learned.discovered.read_text()
@@ -214,7 +215,7 @@ def test_discovery_confused_deputy(tmp_path, cli):
         f'[[candidates]]\npattern = "{key}"\naccess = "read"\ntag = "needs-review"\n'
         f'run-id = "learn-evil-1"\n'
     )
-    refused = cli("learn", "--proposal", forged, "--accept-all", env=env)
+    refused = cli("learn", "--blueprint", bp, "--proposal", forged, "--accept-all", env=env)
     assert refused.code != 0
     assert "credential floor" in refused.stderr
 

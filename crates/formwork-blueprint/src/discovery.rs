@@ -57,10 +57,22 @@ pub struct WithheldEntry {
     pub credential_type: String,
 }
 
+/// A deny the Launcher added to one session for a credential type: the file a Catalog
+/// `env-file-refs` variable names (FW-CRED3). The path has no Catalog shape, so discovery floors
+/// on these beside the Catalog (FW-DISC15).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LauncherDeny {
+    pub pattern: PathPattern,
+    pub credential_type: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProposalOutcome {
     pub candidates: Vec<Candidate>,
     pub withheld: Vec<WithheldEntry>,
+    /// Denied paths with a `**` component. A grant spells that component as a pattern, so no
+    /// grant covers the literal path alone; itemized to the operator, never proposed.
+    pub unproposable: Vec<String>,
 }
 
 /// Denials -> tagged candidates. Deterministic: inputs are deduped and sorted; sibling paths
@@ -69,19 +81,39 @@ pub struct ProposalOutcome {
 pub fn reverse_compile(
     records: &[DenialRecord],
     catalog: &ResolvedCatalog,
+    launcher_denies: &[LauncherDeny],
     allow: &[String],
     auto_widen: &[PathPattern],
 ) -> ProposalOutcome {
     let mut seen = std::collections::BTreeSet::new();
     let mut withheld = Vec::new();
+    let mut unproposable = Vec::new();
     let mut granular: Vec<(PathPattern, DenialAccess)> = Vec::new();
 
     for record in records {
+        // The confined process chooses its own file names: parsed as a pattern, a denied
+        // `/srv/**/config` would become an any-depth grant that no kernel record asked for.
+        if record.path.split('/').any(|component| component == "**") {
+            unproposable.push(record.path.clone());
+            continue;
+        }
         let Ok(pattern) = PathPattern::parse(&record.path) else {
             // Not an absolute kernel path (malformed log line); nothing enforceable to propose.
             continue;
         };
         if !seen.insert((pattern.canonical(), record.access)) {
+            continue;
+        }
+        // FW-DISC15: the Launcher's own denies come first, so the entry names the type whose
+        // variable pointed at the file.
+        if let Some(deny) = launcher_denies
+            .iter()
+            .find(|deny| crate::catalog::floor_hit(&deny.pattern, &pattern))
+        {
+            withheld.push(WithheldEntry {
+                path: record.path.clone(),
+                credential_type: deny.credential_type.clone(),
+            });
             continue;
         }
         // The floor (FW-DISC3/FW-INV8): catalog-matched denials are withheld, never proposed.
@@ -140,10 +172,13 @@ pub fn reverse_compile(
     }
     candidates.sort_by_key(|c| (c.pattern.canonical(), c.access));
     withheld.sort_by(|a, b| a.path.cmp(&b.path));
+    unproposable.sort();
+    unproposable.dedup();
 
     ProposalOutcome {
         candidates,
         withheld,
+        unproposable,
     }
 }
 
@@ -156,8 +191,9 @@ pub fn synthesize_blueprint(
     catalog: &ResolvedCatalog,
     allow: &[String],
 ) -> Blueprint {
-    // No auto-widen zone: synthesis is a full grant set, not a proposal to tag/review.
-    let outcome = reverse_compile(records, catalog, allow, &[]);
+    // No auto-widen zone: synthesis is a full grant set, not a proposal to tag/review. No
+    // Launcher denies either: a recording is not a launched session.
+    let outcome = reverse_compile(records, catalog, &[], allow, &[]);
     let mut reads = Vec::new();
     let mut writes = Vec::new();
     for candidate in &outcome.candidates {
@@ -315,6 +351,49 @@ pub fn propose_host_rules(
     out
 }
 
+/// Is this a host rule [`propose_host_rules`] can produce? `accept` reads the proposal as
+/// untrusted input (FW-DISC3), so a rule of any other kind -- a `tunnel:` or `deny:` grade, a
+/// wildcard host, a restricted destination, a path glob -- is an authoring decision that does not
+/// pass through the review door (FW-DISC12). The error says which.
+pub fn proposable_host_rule(rule: &crate::HostRule) -> Result<(), String> {
+    use crate::{canonicalize_host, is_restricted_ip, HostAccess, HostPattern, PathGlob};
+    let restricted = match &rule.host {
+        HostPattern::Exact(name) => canonicalize_host(name)
+            .map(|host| host.is_restricted())
+            .unwrap_or(true),
+        HostPattern::Ip(ip) => is_restricted_ip(*ip),
+        HostPattern::Wildcard(_) => {
+            return Err("discovery proposes exact hosts, never a wildcard".to_string())
+        }
+    };
+    if restricted {
+        return Err(
+            "a metadata, private, loopback or special-purpose destination is never proposed \
+             (FW-EGR19)"
+                .to_string(),
+        );
+    }
+    let proposed = match &rule.access {
+        HostAccess::Tunnel => return Err("discovery never proposes a `tunnel:` grade".to_string()),
+        HostAccess::Deny { .. } => {
+            return Err("discovery never proposes a `deny:` rule".to_string())
+        }
+        HostAccess::Inspected { methods, path } if methods.is_empty() => *path == PathGlob::any(),
+        HostAccess::Inspected { methods, path } => {
+            methods.len() == 1 && !path.as_str().contains('*')
+        }
+    };
+    if proposed {
+        Ok(())
+    } else {
+        Err(
+            "discovery proposes `allow:` for a whole host or one method on one literal path, \
+             never a path glob"
+                .to_string(),
+        )
+    }
+}
+
 /// FW-DISC12: channels a run was refused -> the ones not already lifted, deduplicated and sorted.
 pub fn propose_channels(
     observed: &[crate::Channel],
@@ -412,7 +491,7 @@ mod tests {
             .take(50)
             .collect();
         let zone = vec![pp("/home/x/**")]; // adversarially broad
-        let out = reverse_compile(&records, &catalog(), &[], &zone);
+        let out = reverse_compile(&records, &catalog(), &[], &[], &zone);
         assert!(out.candidates.is_empty(), "{:?}", out.candidates);
         assert_eq!(out.withheld.len(), 1, "deduped, then withheld");
         assert_eq!(out.withheld[0].credential_type, "ssh");
@@ -425,7 +504,7 @@ mod tests {
             read("/opt/toolchain/lib.py"),
         ];
         let zone = vec![pp("/work/project/**")];
-        let out = reverse_compile(&records, &catalog(), &[], &zone);
+        let out = reverse_compile(&records, &catalog(), &[], &[], &zone);
         let by_tag = |t: CandidateTag| -> Vec<String> {
             out.candidates
                 .iter()
@@ -446,7 +525,7 @@ mod tests {
     #[test]
     fn siblings_fold_to_parent_subtree() {
         let records = vec![read("/opt/toolchain/one.py"), read("/opt/toolchain/two.py")];
-        let out = reverse_compile(&records, &catalog(), &[], &[]);
+        let out = reverse_compile(&records, &catalog(), &[], &[], &[]);
         assert_eq!(out.candidates.len(), 1);
         assert_eq!(out.candidates[0].pattern, pp("/opt/toolchain/**"));
     }
@@ -455,7 +534,7 @@ mod tests {
     fn fold_that_would_swallow_a_floor_path_stays_granular() {
         // Two denials directly in the fake home: folding to /home/x/** would cover ~/.ssh.
         let records = vec![read("/home/x/one.txt"), read("/home/x/two.txt")];
-        let out = reverse_compile(&records, &catalog(), &[], &[]);
+        let out = reverse_compile(&records, &catalog(), &[], &[], &[]);
         let patterns: Vec<String> = out
             .candidates
             .iter()
@@ -477,7 +556,7 @@ mod tests {
             read("/srv/app/b.txt"),
         ];
         let zone = vec![pp("/srv/app/**")]; // drawn over the dir: a fold here would auto-accept
-        let out = reverse_compile(&records, &catalog(), &[], &zone);
+        let out = reverse_compile(&records, &catalog(), &[], &[], &zone);
 
         assert_eq!(out.withheld.len(), 1);
         assert_eq!(out.withheld[0].path, "/srv/app/id_rsa");
@@ -504,8 +583,8 @@ mod tests {
     #[test]
     fn output_is_deterministic_and_deduped() {
         let records = vec![read("/b/file"), read("/a/file"), read("/b/file")];
-        let a = reverse_compile(&records, &catalog(), &[], &[]);
-        let b = reverse_compile(&records, &catalog(), &[], &[]);
+        let a = reverse_compile(&records, &catalog(), &[], &[], &[]);
+        let b = reverse_compile(&records, &catalog(), &[], &[], &[]);
         assert_eq!(a, b);
         assert_eq!(a.candidates.len(), 2);
         assert!(a.candidates[0].pattern.canonical() < a.candidates[1].pattern.canonical());
@@ -516,7 +595,7 @@ mod tests {
         // FW-CRED5 is the one lift: with aws excluded, an aws-path denial may be proposed
         // (it is an ordinary path for this session), while ssh stays floored.
         let records = vec![read("/home/x/.aws/config"), read("/home/x/.ssh/config")];
-        let out = reverse_compile(&records, &catalog(), &["aws".to_string()], &[]);
+        let out = reverse_compile(&records, &catalog(), &[], &["aws".to_string()], &[]);
         let patterns: Vec<String> = out
             .candidates
             .iter()
@@ -524,6 +603,104 @@ mod tests {
             .collect();
         assert_eq!(patterns, vec!["/home/x/.aws/config"]);
         assert_eq!(out.withheld.len(), 1);
+    }
+
+    /// The file a credential variable named has no Catalog shape, so only the Launcher's deny
+    /// for it marks its denial as a credential's: withheld with the type, even inside the zone,
+    /// and never folded back in through a sibling subtree.
+    #[test]
+    fn fw_disc15_a_launcher_deny_is_withheld_with_its_type() {
+        let records = vec![
+            read("/work/keys/sa.json"),
+            read("/work/keys/a.txt"),
+            read("/work/keys/b.txt"),
+        ];
+        let zone = vec![pp("/work/**")];
+        let denies = vec![LauncherDeny {
+            pattern: pp("/work/keys/sa.json"),
+            credential_type: "gcp".to_string(),
+        }];
+
+        let out = reverse_compile(&records, &catalog(), &denies, &[], &zone);
+        assert_eq!(
+            out.withheld,
+            vec![WithheldEntry {
+                path: "/work/keys/sa.json".to_string(),
+                credential_type: "gcp".to_string(),
+            }]
+        );
+        let patterns: Vec<String> = out
+            .candidates
+            .iter()
+            .map(|c| c.pattern.canonical())
+            .collect();
+        assert_eq!(patterns, vec!["/work/keys/a.txt", "/work/keys/b.txt"]);
+
+        // Without the Launcher's deny the same denial is an ordinary in-zone candidate: the
+        // path alone does not say the file is a credential.
+        let unfloored = reverse_compile(&records, &catalog(), &[], &[], &zone);
+        assert!(unfloored.withheld.is_empty());
+        assert!(unfloored
+            .candidates
+            .iter()
+            .any(|c| c.tag == CandidateTag::AutoAccepted && c.pattern.covers(&denies[0].pattern)));
+    }
+
+    /// A denied path is a literal. With a `**` component it would read back from the proposal as
+    /// an any-depth or subtree pattern, a grant wider than anything the kernel refused.
+    #[test]
+    fn fw_disc2_an_observed_path_is_a_literal_never_a_pattern() {
+        let records = vec![
+            write("/srv/**/config"),
+            write("/srv/data/**"),
+            read("/srv/ok**/x"),
+        ];
+        let zone = vec![pp("/srv/**")];
+        let out = reverse_compile(&records, &catalog(), &[], &[], &zone);
+        assert_eq!(out.unproposable, vec!["/srv/**/config", "/srv/data/**"]);
+        let patterns: Vec<String> = out
+            .candidates
+            .iter()
+            .map(|c| c.pattern.canonical())
+            .collect();
+        assert_eq!(
+            patterns,
+            vec!["/srv/ok**/x"],
+            "`**` inside a name is a name"
+        );
+        assert!(out
+            .candidates
+            .iter()
+            .all(|c| !c.pattern.is_any_depth() && !c.pattern.is_subtree()));
+    }
+
+    /// `accept` holds a proposal's host rules to what [`propose_host_rules`] can produce.
+    #[test]
+    fn fw_disc12_only_the_rule_kinds_discovery_proposes_are_proposable() {
+        let rule = |raw: &str| raw.parse::<crate::HostRule>().unwrap();
+        for proposed in [
+            "allow:blocked.test",
+            "allow:registry.test:8443",
+            "post:api.github.com/repos/acme/x/issues",
+            "allow:93.184.216.34",
+        ] {
+            assert_eq!(proposable_host_rule(&rule(proposed)), Ok(()), "{proposed}");
+        }
+        for (forged, why) in [
+            ("tunnel:git.corp.example", "tunnel"),
+            ("deny:wiki.corp.example", "deny"),
+            ("deny:wiki.corp.example/admin/**", "deny"),
+            ("allow:*.corp.example", "wildcard"),
+            ("allow:169.254.169.254", "FW-EGR19"),
+            ("allow:metadata.google.internal", "FW-EGR19"),
+            ("allow:10.0.0.7", "FW-EGR19"),
+            ("allow:api.github.com/repos/**", "path glob"),
+            ("get:api.github.com/repos/*/x", "path glob"),
+            ("get,post:api.github.com/repos/acme/x", "path glob"),
+        ] {
+            let refusal = proposable_host_rule(&rule(forged)).unwrap_err();
+            assert!(refusal.contains(why), "{forged}: {refusal}");
+        }
     }
 
     fn obs(host: &str, port: u16, req: Option<(&str, &str)>) -> EgressObservation {
