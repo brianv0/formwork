@@ -257,6 +257,7 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 | <a id="fw-fid11"></a>**FW-FID11** Explain for hosts and channels | `explain` shall accept a URL, a channel or group name, or a socket path as a positional argument and print the verdict, the deciding rule and layer, the grade for a host, and host reachability for a channel; `explain --hosts` shall print every effective host once with its grade, methods, paths, broker binding and deciding layer. |
 | <a id="fw-fid12"></a>**FW-FID12** Egress refusal reasons | Every egress violation record shall carry exactly one reason from the closed set listed below. |
 | <a id="fw-fid13"></a>**FW-FID13** Egress grant records | For each admitted tunnel and inspected request, the Gateway shall emit a grant record with host, grade, method, canonical path, status, byte counts and duration, and no header value, body byte or query string. |
+| <a id="fw-fid34"></a>**FW-FID34** ABI-gated write rows | For a Linux host below Landlock ABI 3, the compiler shall report `tamper-vectors` and `fs-write` as `Partial`, naming truncation. |
 
 The FEP-5 report lines extend the `per_capability` map with the keys `net-host-scope`, `net-inspection`, `net-udp`, `net-unix-socket`, `net-resolver`, `credential-broker`, `isolate-processes`, `isolate-ipc`, `private-tmp`, `channel-<name>`, `privileged-interfaces` and `process-environment`; a channel entry carries `{ verdict, reason, host: { present, via } }`, and rules the backend could not install are listed under `withheld` ([FW-FID8](#fw-fid8)). An egress violation record carries the capability (`net-host-scope`, `net-inspection` or `credential-broker`), the host, port, method and canonical path when known, the deciding rule and its layer, a timestamp, and exactly one reason ([FW-FID12](#fw-fid12)): `host-not-listed` or `host-denied` (host decision); `resolution` or `address-class` (destination); `not-tls`, `sni-mismatch` or `alpn` (ClientHello); `malformed` or `limit` (any parse); `host-mismatch`, `method` or `path` (inspected request); `placeholder` or `reflection` (brokering); `upstream-tls` (upstream certificate verification). Neither shape carries a header value, a body or a query string. Both are Data-model surfaces and version with the report. A real-time violation stream for embedding hosts ([FW-FID5](docs/fep-1.md#fw-fid5)) stays deferred.
 
@@ -533,6 +534,8 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 <a id="fw-e2e-087"></a>**FW-E2E-087: Host-session detection (both).** Pass on a bare Linux runner: `detect` reports each channel `not present on this host`. Pass with the FEP-5 §6.1 fixture session: `detect` names the bus, user-manager and display sockets, `run` prints the matching `Partial` line, and the same run under supervised connect prints `Enforced`. Pass on macOS: `detect` reports the GUI-session verdict and the channel lines match [FW-E2E-081](#fw-e2e-081). Fail: a present facility is reported absent or the reverse.
 
 <a id="fw-e2e-089"></a>**FW-E2E-089: Launcher-owned paths under `closed` (both).** A blueprint with `mode = "unveil"` and only `readwrite:$CWD/**`. Pass: `$TMPDIR` is set inside the session and writable, and on macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)` resolves beneath it; a grandchild reads the session CA bundle, `/proc/self/status` and `/etc/hosts`; `explain` names the tmp directory and the CA path. Fail: any read is denied or a path is undisclosed.
+
+<a id="fw-e2e-214"></a>**FW-E2E-214: Write rows follow the Landlock ABI ([FW-FID34](#fw-fid34); pure compile).** A blueprint with a write grant and a write-subtract row is compiled for Linux hosts at Landlock ABI 1, 2 and 3. Pass: at ABI 1 and ABI 2 `tamper-vectors` and `fs-write` are `Partial` and each reason names truncation; at ABI 3 both are `Enforced`. Fail: either row is `Enforced` below ABI 3, or a `Partial` reason does not name truncation.
 
 ### 7.7 Blueprint model & format
 
@@ -849,7 +852,7 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 
 **Linux — Landlock + seccomp (+ optional netns for the gateway side).**
 
-- Filesystem read/write scope: Landlock filesystem access rights (available since ABI v1). Clean.
+- Filesystem read/write scope: Landlock filesystem access rights (available since ABI v1). The truncate right arrives at ABI v3 (Linux 6.2); below it `truncate(2)`, and `open(2)` with `O_TRUNC` on a read-only open, can empty a file whose own permissions allow writing, whatever the write grants and write-subtract rows say, so `fs-write` and `tamper-vectors` are `Partial` there ([FW-FID34](#fw-fid34)).
 - Exec restriction: Landlock `FS_EXECUTE` on allowed paths, or seccomp on `execve`. Optional ([FW-ISO4](#fw-iso4)).
 - Net default-deny: seccomp denies inet `socket(2)` creation by family (TCP, UDP and raw) at every Landlock ABI, because Landlock net governs TCP only; Landlock net carries the port tier alone (`docs/linux-backend.md`).
 - Net port allowlist: Landlock `ACCESS_NET_CONNECT_TCP` (ABI v4+, port-only, no host filtering). Reported Unenforceable below v4.
@@ -874,7 +877,9 @@ A reuse-heavy workload ([FW-E2E-020](#fw-e2e-020)/021) must complete within a sm
 
 | Capability | Linux | macOS |
 |---|---|---|
-| fs read/write scope | Enforced | Enforced |
+| fs read scope | Enforced | Enforced |
+| fs write scope | Enforced (ABI v3+); Partial below (truncation not governed, [FW-FID34](#fw-fid34)) | Enforced |
+| tamper vectors (write-subtract, [FW-TRA7](#fw-tra7)) | absolute rows Enforced (ABI v3+), Partial below (truncation, [FW-FID34](#fw-fid34)); Partial where any-depth rows are withheld | Enforced |
 | net default-deny | Enforced | Partial (the loopback-callback listener also accepts on the host's other addresses, C1) |
 | net host allowlist (host rules) | Enforced (connect supervisor + gateway); Partial with a `tunnel:` host | Enforced (gateway listener, credential + peer check, C2); Partial with a `tunnel:` host |
 | TLS inspection (`allow:` and method rules) | Enforced (gateway) | Enforced (gateway); Security.framework clients fail closed |
@@ -994,6 +999,7 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-FID11](#fw-fid11) Explain for hosts and channels | [FW-E2E-088](#fw-e2e-088), 089 | 098 |
 | [FW-FID12](#fw-fid12) Egress refusal reasons | [FW-ADV-022](#fw-adv-022) | ADV-023, 098 |
 | [FW-FID13](#fw-fid13) Egress grant records | tests named for it (`formwork-gateway/tests`) | — |
+| [FW-FID34](#fw-fid34) ABI-gated write rows | [FW-E2E-214](#fw-e2e-214) | — |
 | [FW-ENV1](#fw-env1) Environment axis | [FW-E2E-036](#fw-e2e-036) | [FW-FID1](#fw-fid1) |
 | [FW-ENV2](#fw-env2) Default secret-shaped scrub | [FW-E2E-036](#fw-e2e-036) | [FW-TRA2](#fw-tra2) |
 | [FW-BP1](#fw-bp1) One model, many surfaces | [FW-E2E-043](#fw-e2e-043), 060 | 042 |

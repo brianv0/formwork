@@ -299,17 +299,28 @@ pub fn compile_for_session(
 }
 
 /// The Partial reason for a row set Landlock can only partly root: its any-depth rows are withheld,
-/// and its absolute rows are named as enforced only when it has some -- the backstop and the
-/// default tamper vectors are any-depth throughout, and the clause would read as an enforcement
-/// claim for them (FW-INV5).
-fn any_depth_withheld(has_absolute: bool, cite: &str) -> String {
+/// and its absolute rows are named as enforced only when it has some the host enforces whole --
+/// the backstop and the default tamper vectors are any-depth throughout, and the clause would read
+/// as an enforcement claim for them (FW-INV5).
+fn any_depth_withheld(absolute_enforced: bool, cite: &str) -> String {
     format!(
         "any-depth (`**/`) rows cannot be rooted Landlock rules and are withheld on Linux{} ({cite})",
-        if has_absolute {
+        if absolute_enforced {
             "; absolute rows are enforced"
         } else {
             ""
         }
+    )
+}
+
+/// The Partial reason for a write row below Landlock's truncate ABI (FW-FID34). `files` names what
+/// the row protects.
+fn truncation_ungoverned(abi: u32, files: &str) -> String {
+    format!(
+        "Landlock ABI v{abi} cannot govern truncation (the truncate right needs ABI v{}): \
+         truncate(2), and open(2) with O_TRUNC on a read-only open, can empty {files} where the \
+         file's own permissions allow writing",
+        linux::LANDLOCK_TRUNCATE_ABI
     )
 }
 
@@ -482,10 +493,23 @@ fn compile_linux(
         backend: Backend::Landlock,
     };
 
+    // FW-FID34: a write deny does not stop truncation below the truncate ABI.
+    let truncation_gap = has_landlock && abi < linux::LANDLOCK_TRUNCATE_ABI;
+
     // Filesystem read/write require Landlock. Report honestly if it is absent.
     if has_landlock {
         caps.insert(Capability::FsRead, landlock());
-        caps.insert(Capability::FsWrite, landlock());
+        caps.insert(
+            Capability::FsWrite,
+            if truncation_gap {
+                Fidelity::Partial {
+                    backend: Backend::Landlock,
+                    reason: truncation_ungoverned(abi, "a file outside the write grants"),
+                }
+            } else {
+                landlock()
+            },
+        );
     } else {
         let reason =
             "Landlock unavailable on this host; filesystem scope cannot be enforced".to_string();
@@ -616,16 +640,25 @@ fn compile_linux(
         .cloned()
         .partition(|p| !p.is_any_depth());
     if !input.write_subtract.is_empty() {
+        let withheld_rows = (!any_depth_ws.is_empty()).then(|| {
+            any_depth_withheld(
+                !write_subtract.is_empty() && !truncation_gap,
+                "see `withheld`",
+            )
+        });
+        let truncation =
+            truncation_gap.then(|| truncation_ungoverned(abi, "a write-protected file"));
+        let gaps: Vec<String> = withheld_rows.into_iter().chain(truncation).collect();
         let fidelity = if !has_landlock {
             Fidelity::Unenforceable {
                 reason: "Landlock unavailable on this host".to_string(),
             }
-        } else if any_depth_ws.is_empty() {
+        } else if gaps.is_empty() {
             landlock()
         } else {
             Fidelity::Partial {
                 backend: Backend::Landlock,
-                reason: any_depth_withheld(!write_subtract.is_empty(), "see `withheld`"),
+                reason: gaps.join("; "),
             }
         };
         caps.insert(Capability::TamperVectors, fidelity);

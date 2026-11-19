@@ -116,7 +116,7 @@ and wiring for Claude Code, codex, and opencode.
 
 | Capability | macOS | Linux |
 |---|---|---|
-| Filesystem read/write walls (`run`, `gateway`) | ✅ Seatbelt | ✅ Landlock + seccomp (kernel 5.13+) |
+| Filesystem read/write walls (`run`, `gateway`) | ✅ Seatbelt | ✅ Landlock + seccomp (kernel 5.13+; before 6.2 the kernel cannot stop a file being truncated, which the report states) |
 | Credential files matched by name in any directory (`.env`, `credentials`, `id_rsa`) | ✅ | reported, not enforced: Landlock cannot match a name at any depth (known credential locations are still denied) |
 | Default-deny network | ✅ (a login flow's loopback listener also accepts on the host's other addresses) | ✅ |
 | Port tier (direct TCP to listed ports) | ✅ | ✅ on kernel 6.7+ (elsewhere egress fails closed); names do not resolve |

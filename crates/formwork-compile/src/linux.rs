@@ -13,6 +13,9 @@ use crate::policy::{LinuxNetPlan, SeccompPlan, SocketFamily};
 /// Landlock ABI at which TCP network rules (`ACCESS_NET_CONNECT_TCP`) become available.
 pub const LANDLOCK_NET_ABI: u32 = 4;
 
+/// Landlock ABI at which the truncate right (`ACCESS_FS_TRUNCATE`) becomes available (Linux 6.2).
+pub const LANDLOCK_TRUNCATE_ABI: u32 = 3;
+
 /// Escalation and confinement-shedding syscalls denied outright (EPERM). Sorted for byte-identical
 /// output (FW-FID4); none is touched by an ordinary build/test/vcs toolchain.
 const BASELINE_DENY: &[&str] = &[

@@ -101,6 +101,15 @@ Key decisions:
 - **UNIX-socket / signal scoping (ABI ≥ v6):** the `Scope` handle (`.scope(Scope::from_all(abi))`)
   blocks abstract-UNIX-socket and signal reach-out of the domain ([FW-ADV-006](../formwork.md#fw-adv-006)). Coarse (domain-
   relative, not per-path); reported Partial at v6+, Unenforceable below — matches the compiler.
+- **Truncation (ABI ≥ v3):** `AccessFs::from_all(abi)` carries `Truncate` from ABI v3 (Linux 6.2).
+  Below it the ruleset cannot handle the right, so `truncate(2)` on any path, and `open(2)` with
+  `O_TRUNC` on a read-only open, are not governed: a confined process can empty a file whose own
+  permissions allow writing, whether or not a write grant covers it or a `write-subtract` row names
+  it. That is every kernel from 5.13 through 6.1, the 5.15 and 6.1 long-term series among them. The
+  compiler reports `fs-write` and `tamper-vectors` `Partial` there and the reason names truncation
+  ([FW-FID34](../formwork.md#fw-fid34)). An open for writing still needs the write right at every
+  ABI. `Refer` arrives at ABI v2; at ABI v1 Landlock refuses every rename or link across
+  directories (`EXDEV`), which denies more than the blueprint asks and weakens no report row.
 - **ABI negotiation vs honesty:** the compiler already accounted fidelity from `host.landlock_abi`.
   Enforce at exactly `landlock_abi_target`. Prefer `CompatLevel::HardRequirement` so a missing
   access right is an error (fail-closed), *not* `BestEffort` (which would silently drop enforcement
