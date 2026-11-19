@@ -1,8 +1,8 @@
 //! HTTP/1.1 on the egress engine's sockets (FEP-6 §4.4, §4.9): strict message heads, body framing
 //! (`Content-Length` or chunked, never both -- FW-EGR11), bodies streamed with a bounded buffer
 //! (FW-EGR21), and the reflection guard that ends a response before it releases a byte that begins
-//! a brokered credential (FW-CRED17). Anything the parser cannot read is refused, never forwarded
-//! (FW-INV15).
+//! a brokered credential (FW-CRED17) or the operator's proxy credential (FW-CRED36). Anything the
+//! parser cannot read is refused, never forwarded (FW-INV15).
 
 use std::io;
 use std::time::Duration;
@@ -127,6 +127,33 @@ pub(crate) fn framed(headers: &[(String, String)], framing: Framing) -> Vec<(Str
     }
     out.extend(decided);
     out
+}
+
+/// `text` with each `%XX` escape decoded once, the way an origin reads a request target. A `%`
+/// that two hex digits do not follow is kept, and decoded bytes that are not UTF-8 become U+FFFD,
+/// which leaves every ASCII byte where a search for an ASCII marker finds it.
+pub(crate) fn percent_decoded(text: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escape = match bytes.get(i..i + 3) {
+            Some([b'%', hi, lo]) => hex(*hi).zip(hex(*lo)),
+            _ => None,
+        };
+        match escape {
+            Some((hi, lo)) => {
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// RFC 9110 `tchar`, the bytes of a method or header name.
@@ -354,7 +381,7 @@ pub(crate) fn response_framing(
 pub(crate) enum BodyError {
     Io(io::Error),
     Malformed(&'static str),
-    /// The reflection guard found a brokered credential (FW-CRED17).
+    /// The reflection guard found a credential it guards (FW-CRED17, FW-CRED36).
     Reflected,
 }
 
@@ -364,9 +391,10 @@ impl From<io::Error> for BodyError {
     }
 }
 
-/// The reflection guard (FW-CRED17): scans a response to a request that carried a presented
-/// credential for every wire encoding of it, holding back only the longest suffix of the stream
-/// that is a proper prefix of an encoding, so no released byte begins a match.
+/// The reflection guard (FW-CRED17, FW-CRED36): scans a response to a request that carried a
+/// credential the confined process does not hold for every wire encoding of it, holding back only
+/// the longest suffix of the stream that is a proper prefix of an encoding, so no released byte
+/// begins a match.
 pub(crate) struct Guard {
     encodings: Vec<Vec<u8>>,
     held: Vec<u8>,
@@ -821,6 +849,18 @@ mod tests {
         assert_eq!((r.status, r.reason.as_str()), (404, "Not Found"));
         assert!(parse_response_head(b"HTTP/1.1 20 X\r\n\r\n").is_err());
         assert!(check_line_endings(b"GET / HTTP/1.1\nHost: a\r\n").is_err());
+    }
+
+    /// FW-CRED37: one decoding, strict about what an escape is.
+    #[test]
+    fn fw_cred37_percent_escapes_decode_once() {
+        assert_eq!(percent_decoded("/a?k=%66wcred%2Dx"), "/a?k=fwcred-x");
+        assert_eq!(percent_decoded("%2566wcred-x"), "%66wcred-x");
+        assert_eq!(percent_decoded("100%"), "100%");
+        assert_eq!(percent_decoded("%4"), "%4");
+        assert_eq!(percent_decoded("%+f%zz%4G"), "%+f%zz%4G");
+        assert_eq!(percent_decoded("%41%4a%4A"), "AJJ");
+        assert_eq!(percent_decoded("%fffwcred-x"), "\u{fffd}fwcred-x");
     }
 
     #[test]

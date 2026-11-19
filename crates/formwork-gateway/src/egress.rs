@@ -15,7 +15,8 @@
 //! Every refusal is one violation record with a reason from a closed set (FW-FID12) and one
 //! operator line naming the rule and the `explain` invocation that reproduces it (FW-FID9), while
 //! the client gets a generic refusal (FW-CRED7). Every admitted tunnel and request is a grant
-//! record (FW-FID13).
+//! record (FW-FID13). A connection attempt the listener turns away before it admits a request is
+//! counted by reason instead (FW-FID35).
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io;
@@ -147,6 +148,36 @@ pub struct Grant {
     pub bytes_up: u64,
     pub bytes_down: u64,
     pub duration_ms: u64,
+}
+
+/// Why the listener turned a connection attempt away before admitting a request (FW-FID35): a
+/// stable string in the record schema. The set is closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ListenerRefusalReason {
+    /// The request head did not carry the session credential.
+    Unauthenticated,
+    /// A connection FW-EGR9 does not admit: its source port was not registered by the supervisor
+    /// (Linux), or no session process holds its client end (macOS).
+    UnregisteredPeer,
+}
+
+impl ListenerRefusalReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ListenerRefusalReason::Unauthenticated => "unauthenticated",
+            ListenerRefusalReason::UnregisteredPeer => "unregistered-peer",
+        }
+    }
+}
+
+/// The attempts the listener turned away for one reason (FW-FID35). One record per reason, so a
+/// flood of attempts displaces no violation record.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ListenerRefusal {
+    pub reason: ListenerRefusalReason,
+    pub count: u64,
 }
 
 /// A refusal on its way to a record: the engine's typed error for a connection or request it will
@@ -316,6 +347,21 @@ impl EgressProxy {
             .unwrap_or_default()
     }
 
+    /// The connection attempts the listener turned away so far, one record per reason that has
+    /// occurred (FW-FID35).
+    pub fn listener_refusals(&self) -> Vec<ListenerRefusal> {
+        self.shared
+            .records
+            .lock()
+            .map(|r| {
+                r.listener_refusals
+                    .iter()
+                    .map(|(&reason, &count)| ListenerRefusal { reason, count })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The admitted tunnels and requests recorded so far, oldest first (FW-FID13).
     pub fn grants(&self) -> Vec<Grant> {
         self.shared
@@ -358,6 +404,7 @@ impl Drop for EgressProxy {
 #[derive(Default)]
 struct Records {
     violations: VecDeque<Violation>,
+    listener_refusals: BTreeMap<ListenerRefusalReason, u64>,
     grants: VecDeque<Grant>,
     ca_rejections: Vec<(CanonicalHost, u16)>,
 }
@@ -447,6 +494,19 @@ impl Shared {
         }
     }
 
+    /// Count a connection attempt the listener turned away (FW-FID35) and emit its operator line.
+    fn turn_away(&self, reason: ListenerRefusalReason, peer: SocketAddr, detail: &str) {
+        tracing::warn!(
+            reason = reason.as_str(),
+            peer = %peer,
+            "formwork: the egress listener {detail}"
+        );
+        if let Ok(mut records) = self.records.lock() {
+            let count = records.listener_refusals.entry(reason).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
     pub(crate) fn grant(&self, g: Grant) {
         tracing::debug!(
             host = %g.host,
@@ -505,10 +565,10 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                 .map(|mut r| r.remove(&peer.port()))
                 .unwrap_or(false);
             if !registered {
-                tracing::warn!(
-                    peer = %peer,
-                    "formwork: the egress listener closed a connection the session's supervisor \
-                     did not make (FW-EGR9)"
+                shared.turn_away(
+                    ListenerRefusalReason::UnregisteredPeer,
+                    peer,
+                    "closed a connection the session's supervisor did not make (FW-EGR9)",
                 );
                 continue;
             }
@@ -526,15 +586,15 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                 if !admitted {
                     // FW-EGR9: a process outside the session that learned the port and the
                     // credential is dropped before a byte is read.
-                    tracing::warn!(
-                        peer = %peer,
-                        "formwork: the egress listener closed a connection no session process \
-                         holds (FW-EGR9)"
+                    shared.turn_away(
+                        ListenerRefusalReason::UnregisteredPeer,
+                        peer,
+                        "closed a connection no session process holds (FW-EGR9)",
                     );
                     return;
                 }
             }
-            if let Err(e) = serve(stream, shared).await {
+            if let Err(e) = serve(stream, peer, shared).await {
                 tracing::debug!(error = %e, "egress connection ended");
             }
         });
@@ -551,7 +611,7 @@ fn same_secret(a: &str, b: &str) -> bool {
 }
 
 /// The front door (FEP-6 §4.2 stages 1-2): the only stage that knows how the connection arrived.
-async fn serve(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
+async fn serve(stream: TcpStream, peer: SocketAddr, shared: Arc<Shared>) -> io::Result<()> {
     let mut client = Buffered::new(stream, Vec::new());
     let head = match client
         .raw_head(Some(crate::http::HEAD_TIMEOUT))
@@ -572,6 +632,12 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     };
     let presented = head.header("Proxy-Authorization").unwrap_or("");
     if !same_secret(presented, &shared.expected_auth) {
+        shared.turn_away(
+            ListenerRefusalReason::Unauthenticated,
+            peer,
+            "answered 407 to a request without the session's proxy credential; a client that \
+             drops the credentials of its proxy URL is the likely cause",
+        );
         return respond(
             &mut client.s,
             "407 Proxy Authentication Required",

@@ -9,6 +9,8 @@ use std::net::IpAddr;
 
 use formwork_blueprint::{canonicalize_host, split_host_port, CanonicalHost};
 
+use crate::http::percent_decoded;
+
 /// One proxy: where it listens and the `Proxy-Authorization` value its URL's userinfo gives. NTLM
 /// and Kerberos proxies are not supported.
 #[derive(Clone, PartialEq, Eq)]
@@ -53,7 +55,7 @@ impl ProxyEndpoint {
             .to_string();
         let authorization = userinfo.map(|u| {
             let (user, password) = u.split_once(':').unwrap_or((u, ""));
-            crate::inspect::basic_value(&percent_decode(user), &percent_decode(password))
+            crate::inspect::basic_value(&percent_decoded(user), &percent_decoded(password))
         });
         Ok(ProxyEndpoint {
             host,
@@ -70,30 +72,6 @@ impl ProxyEndpoint {
             format!("{}:{}", self.host, self.port)
         }
     }
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let hex = bytes
-            .get(i + 1..i + 3)
-            .filter(|_| bytes[i] == b'%')
-            .and_then(|h| std::str::from_utf8(h).ok())
-            .and_then(|h| u8::from_str_radix(h, 16).ok());
-        match hex {
-            Some(b) => {
-                out.push(b);
-                i += 3;
-            }
-            None => {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
