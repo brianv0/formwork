@@ -24,14 +24,46 @@ under test.
   `CAP_PERFMON` (a root container) gets past that refusal; host detection records those capabilities and
   `CAP_SYS_PTRACE`, and the report says `Partial` then. `isolate = ["processes"]` closes it
   regardless, with a fresh procfs.
-- **Net-deny is carried by seccomp, not Landlock.** Landlock net governs only TCP; carrying deny with
-  it left UDP/raw open (an exfil channel). Deny now denies inet `socket(2)` creation at the family
-  level (TCP + UDP + raw), matching macOS `(deny network*)`. Landlock net carries the port tier,
-  where per-port TCP *allow* is required -- but even there seccomp still denies inet DGRAM/RAW
-  `socket(2)` (type masked to `SOCK_TYPE_MASK`, STREAM allowed), so the TCP-only Landlock grant
-  cannot be sidestepped with a UDP/raw socket ([FW-ISO3](../formwork.md#fw-iso3),
-  [FW-INV3](../formwork.md#fw-inv3), [FW-ISO11](../formwork.md#fw-iso11)). Nothing inside the sandbox
-  resolves names under the port tier; host rules restore resolution through the Gateway.
+- **Net-deny is carried by seccomp, not Landlock, as an allow-list of socket families.** Landlock
+  net governs only TCP; carrying deny with it left UDP/raw open (an exfil channel). A deny-list of
+  four families (inet, inet6, packet, non-route netlink) replaced it and left every other family
+  to the kernel: an `AF_VSOCK` socket was created under `net = "deny"`, and an `IPPROTO_MPTCP`
+  stream under the port tier (verified on 6.18). `socket(2)` and
+  `socketpair(2)` now create only what the posture admits and return `EPERM` for the rest
+  ([FW-ISO28](../formwork.md#fw-iso28)), so a family a later kernel adds is refused with no change
+  here, and `net = "deny"` matches macOS `(deny network*)`:
+
+  | Posture | Admitted |
+  |---|---|
+  | `net = "deny"` | `AF_UNIX`; `AF_NETLINK` with protocol `NETLINK_ROUTE` |
+  | port tier, host rules | the above; `AF_INET` and `AF_INET6` of type `SOCK_STREAM` with protocol `0` or `IPPROTO_TCP` |
+
+  Landlock net carries the port tier, where per-port TCP *allow* is required. An inet socket there
+  is a TCP stream or nothing: the type is compared under `SOCK_TYPE_MASK`, so the
+  `SOCK_NONBLOCK`/`SOCK_CLOEXEC` bits neither admit a datagram socket nor refuse a stream, and a
+  stream with `IPPROTO_MPTCP` or `IPPROTO_SCTP` is refused because Landlock's port rules are TCP
+  rules ([FW-ISO3](../formwork.md#fw-iso3), [FW-INV3](../formwork.md#fw-inv3),
+  [FW-ISO11](../formwork.md#fw-iso11), [FW-ISO35](../formwork.md#fw-iso35)). Nothing inside the
+  sandbox resolves names under the port tier; host rules restore resolution through the Gateway.
+- **A send cannot open a connection.** `sendto`, `sendmsg` and `sendmmsg` with `MSG_FASTOPEN`
+  connect a TCP socket inside the send, and the kernel's connect hook -- where Landlock's port rule
+  sits -- does not run for it: under the port tier such a send opened a connection to a port that
+  `connect()` was refused (verified on 6.18, ABI 7). The second filter returns `EOPNOTSUPP` for the flag
+  ([FW-ISO29](../formwork.md#fw-iso29)), which is what a kernel without Fast Open answers, so a
+  client falls back to `connect()`. `setsockopt(TCP_FASTOPEN_CONNECT)` needs no rule: the client
+  still calls `connect()`.
+- **A descriptor cannot be executed under an exec allow-list.** Landlock judges the path being
+  executed, and an anonymous memory file has none: `execveat(fd, "", .., AT_EMPTY_PATH)`, which is
+  `fexecve`, ran an unlisted program from a memfd. Under an allow-list the second filter returns
+  `EACCES` for that flag ([FW-ISO31](../formwork.md#fw-iso31)); with exec unrestricted `fexecve`
+  is untouched. One descriptor route stays open: `execve("/proc/self/fd/N")` of a memfd still runs
+  under the allow-list (verified on 6.18, ABI 7), because seccomp cannot read the path string and
+  Landlock allows an object with no path. `memfd_create` is not refused: language runtimes use it.
+- **x32 syscall numbers are refused on x86_64.** A kernel built with `CONFIG_X86_X32_ABI` offers
+  every syscall a second time under a number with bit 30 set, and the baseline's rules are keyed
+  by the native number. The second filter returns `EPERM` for any number with that bit
+  ([FW-ISO33](../formwork.md#fw-iso33)), on every kernel: seccomp runs before dispatch, so where
+  the ABI is absent the errno changes from `ENOSYS` to `EPERM` and nothing else does.
 - **Abstract-UNIX-socket + signal scoping is enforced at ABI v6+** via the `Scope` handle — closing a
   pathless escape the fs rules cannot reach — matching the compiler's CrossDomainSocket = Partial.
 - **Device ioctls are *not* governed** (`IOCTL_DEV` excluded from `handled_fs`). Governing it denies
@@ -53,10 +85,11 @@ the finished artifacts in the `pre_exec` closure (which runs in the forked child
 
 1. **Parent, before `Command::pre_exec`:** expand the read/write sets against the filesystem
    (see below), open `PathFd`s, build the Landlock `RulesetCreated` (accumulates kernel state behind
-   a ruleset fd — does *not* restrict the parent until `restrict_self`), and compile the seccomp
-   `BpfProgram`. Move both into the closure.
+   a ruleset fd — does *not* restrict the parent until `restrict_self`), and compile the two seccomp
+   `BpfProgram`s. Move them into the closure.
 2. **Child, inside `pre_exec`:** `prctl(PR_SET_NO_NEW_PRIVS, 1)` → `ruleset.restrict_self()` →
-   `apply_filter(&bpf)`. These are syscalls only; no allocation. Then `execve` proceeds.
+   `apply_filter` for the baseline, then for the second filter (and, under host rules, the notify
+   filter last). These are syscalls only; no allocation. Then `execve` proceeds.
 
 Order matters: `NO_NEW_PRIVS` must precede both the Landlock `restrict_self` (kernel requires it for
 unprivileged restriction) and the seccomp `apply_filter` (required for an unprivileged filter).
@@ -89,15 +122,18 @@ Key decisions:
   access that isn't granted, so if `AccessFs::Execute` is in `handled_fs`, only explicitly-granted
   paths are executable. For the transparent default, exclude `Execute` from `handled_fs` entirely so
   `execve` is never checked. (When the blueprint requests an exec allow-list ([FW-ISO4](../formwork.md#fw-iso4)), `Execute` is
-  governed and granted only on the allow-list -- implemented here, though not yet exercised by a
-  kernel test.)
+  governed and granted only on the allow-list; [FW-E2E-188](../formwork.md#fw-e2e-188) runs a listed
+  program and is refused an unlisted one on the kernel. The ELF interpreter of a dynamically linked
+  program needs the right too.)
 - **Net default-deny via seccomp (all ABIs), *not* Landlock.** Landlock net governs only TCP, so a
-  Landlock-carried deny leaves UDP/raw open. Deny denies inet `socket(2)` at the family level instead
+  Landlock-carried deny leaves UDP/raw open. Deny admits no inet `socket(2)` instead
   (TCP + UDP + raw); Landlock net (`handle_access(AccessNet::from_all(abi))` + `NetPort` allows) is
   reserved for the **port tier** (ABI ≥ v4), which needs per-port TCP *allow*. The port tier still
-  seccomp-denies inet **DGRAM/RAW** `socket(2)` (type masked to `SOCK_TYPE_MASK` so
-  `SOCK_NONBLOCK`/`SOCK_CLOEXEC` cannot evade it) while allowing STREAM, so UDP/raw egress fails
-  closed and only the granted TCP ports connect ([FW-ISO3](../formwork.md#fw-iso3)/[FW-INV3](../formwork.md#fw-inv3)).
+  refuses inet **DGRAM/RAW** `socket(2)` (type masked to `SOCK_TYPE_MASK` so
+  `SOCK_NONBLOCK`/`SOCK_CLOEXEC` cannot evade it) while admitting a TCP STREAM, so UDP/raw egress fails
+  closed. Only the granted TCP ports connect, by `connect()` or by a send: the Landlock rule covers
+  the first and the `MSG_FASTOPEN` refusal the second
+  ([FW-ISO3](../formwork.md#fw-iso3)/[FW-INV3](../formwork.md#fw-inv3)/[FW-ISO29](../formwork.md#fw-iso29)).
 - **UNIX-socket / signal scoping (ABI ≥ v6):** the `Scope` handle (`.scope(Scope::from_all(abi))`)
   blocks abstract-UNIX-socket and signal reach-out of the domain ([FW-ADV-006](../formwork.md#fw-adv-006)). Coarse (domain-
   relative, not per-path); reported Partial at v6+, Unenforceable below — matches the compiler.
@@ -184,16 +220,39 @@ apply_filter(&prog)?;
 
 Deny-list shape: default `Allow`, listed syscalls → `Errno`. An empty rule vec is an unconditional
 deny; conditional denies use `SeccompRule::new(vec![SeccompCondition::new(arg, len, op, val)?])`.
-Syscall numbers come from `libc::SYS_*` (correct for the compiled arch). Socket-family deny:
+Syscall numbers come from `libc::SYS_*` (correct for the compiled arch).
+
+The socket allow-list ([FW-ISO28](../formwork.md#fw-iso28)) is written as its complement, because a
+rule names what is refused: rules on one syscall are ORed and a rule's conditions ANDed. One rule
+refuses a domain that equals none of the admitted ones; each admitted domain adds one rule per way
+to miss its predicate. The same rules sit on `socket` and `socketpair`.
 
 ```rust
-// deny socket(AF_INET/AF_INET6/AF_PACKET, ...) — arg0 is the domain
-rules.insert(libc::SYS_socket, vec![
-    SeccompRule::new(vec![SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, AF_INET as u64)?])?,
-    // ... INET6, PACKET ...
-]);
-// AF_UNIX / socketpair are absent from the list -> allowed (local IPC is not egress).
+// net = "deny": admitted = AF_UNIX, AF_NETLINK/NETLINK_ROUTE
+[domain != AF_UNIX, domain != AF_NETLINK]            // any other family, known or not
+[domain == AF_NETLINK, protocol != NETLINK_ROUTE]
+// port tier / host rules add, for AF_INET and again for AF_INET6:
+[domain == AF_INET, (type & bit) == (!SOCK_STREAM & bit)]   // one per bit of SOCK_TYPE_MASK
+[domain == AF_INET, protocol != 0, protocol != IPPROTO_TCP]
 ```
+
+`seccompiler` has no masked not-equal, so "the type is not `SOCK_STREAM`" is one rule per type bit
+that differs from `SOCK_STREAM`'s. Comparisons are 32-bit (`Dword`), as the kernel reads these
+`int` arguments.
+
+### The second filter
+
+`seccompiler` keys a rule by one syscall number and gives a filter one errno, so the refusals that
+need a number range or their own errno are a second, hand-written classic-BPF program installed
+after the baseline (`seccomp.rs`, `bound_filter`). Stacked filters all run and the kernel takes
+the most restrictive result. In order it: leaves a foreign architecture to the baseline, which
+kills it; on x86_64 refuses a number with bit 30 set ([FW-ISO33](../formwork.md#fw-iso33)); refuses
+`sendto`/`sendmsg`/`sendmmsg` whose flags carry `MSG_FASTOPEN` with `EOPNOTSUPP`
+([FW-ISO29](../formwork.md#fw-iso29)); and, under an exec allow-list, refuses `execveat` whose
+flags carry `AT_EMPTY_PATH` with `EACCES` ([FW-ISO31](../formwork.md#fw-iso31)). Each block's jumps
+are local to it. A unit test interprets both programs for chosen `(number, arguments)` pairs
+([FW-E2E-205](../formwork.md#fw-e2e-205)): CI kernels lack the x32 ABI, so no real call there
+reaches what the bound guards.
 
 ### Connect supervision and the isolation tier (FEP-5)
 
@@ -244,8 +303,8 @@ rules.insert(libc::SYS_socket, vec![
   Landlock is namespace-independent, so the userns grants no reachable capability. The `unshare`/
   `clone` `CLONE_NEWUSER` flag filter still blocks the common paths. Verified transparent to
   fork+exec on the kernel.
-- **netlink — resolved.** Only *non-route* `AF_NETLINK` is denied; `NETLINK_ROUTE` (what NSS /
-  `getaddrinfo` / `getifaddrs` use) stays allowed. Fork+exec transparency verified; full reuse-
+- **netlink — resolved.** Of `AF_NETLINK` only `NETLINK_ROUTE` (what NSS /
+  `getaddrinfo` / `getifaddrs` use) is admitted. Fork+exec transparency verified; full reuse-
   workload confirmation is still owed for pytest/npm name resolution under the *port tier*.
 - **`CLONE_NEWUSER` flag test** (`SeccompCmpOp::MaskedEq`, arg0) — verified on aarch64; the arch guard
   (`TargetArch::try_from`) rejects any arch where `clone`'s flags are not arg0.

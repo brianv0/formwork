@@ -78,7 +78,8 @@ creation break resolver/toolchain paths that pytest / npm actually hit (e.g. `ge
 NSS)? Net default-deny is carried by this seccomp inet-family filter at every ABI, so it depends on
 this being transparent enough.
 
-**Status.** Implemented and kernel-verified (ABI-v6): the plan (`SeccompPlan.deny_socket_families`)
+**Status.** Implemented and kernel-verified (ABI-v6), and since turned from a deny-list into an
+allow-list ([FW-ISO28](../formwork.md#fw-iso28)): the plan (`SeccompPlan.allow_socket_families`)
 is enforced and transparent to fork+exec. Still owed: confirming pytest/npm name resolution
 (`getaddrinfo`/NSS) stays clean under the port tier -- see docs/linux-backend.md.
 

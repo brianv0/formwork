@@ -26,6 +26,15 @@ fn supervision_available() -> bool {
     host.connect_supervision && host.seccomp && host.landlock_abi.is_some()
 }
 
+/// A test that cannot exercise its mechanism on this host says so; on a CI runner, where
+/// `FW_REQUIRE_EXERCISED=1`, that is a failure rather than a skip.
+fn not_exercised(reason: &str) {
+    if std::env::var("FW_REQUIRE_EXERCISED").as_deref() == Ok("1") {
+        panic!("not exercised on a CI runner: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
 /// A listener that counts the connections it accepts.
 struct Counting {
     addr: SocketAddr,
@@ -77,6 +86,8 @@ fn probe(name: &str) -> PathBuf {
         "udp" => PathBuf::from(env!("CARGO_BIN_EXE_fw-udp-probe")),
         "unix" => PathBuf::from(env!("CARGO_BIN_EXE_fw-unix-probe")),
         "race" => PathBuf::from(env!("CARGO_BIN_EXE_fw-race-probe")),
+        "family" => PathBuf::from(env!("CARGO_BIN_EXE_fw-family-probe")),
+        "tfo" => PathBuf::from(env!("CARGO_BIN_EXE_fw-tfo-probe")),
         other => panic!("no probe {other}"),
     }
 }
@@ -315,5 +326,60 @@ fn fw_adv_018_supervisor_race_cannot_redirect() {
     assert!(
         gateway.count() > 0,
         "the race probe did connect to the allowed destination"
+    );
+}
+
+/// FW-ISO28 / FW-ISO29 / FW-ISO35 under host rules, the other posture that admits stream sockets
+/// (the port tier is FW-E2E-185 and FW-E2E-187 in `linux_confine.rs`): an inet socket is created
+/// only as a TCP stream, and a `MSG_FASTOPEN` send to a listener the supervisor would refuse is
+/// answered by the filter and reaches nothing. The supervisor sees `sendto` alone; the flag
+/// refusal is what covers `sendmsg` and `sendmmsg` here.
+#[test]
+fn fw_iso28_fw_iso29_hold_under_supervised_connect() {
+    use std::io::{Read, Write};
+    if !supervision_available() {
+        not_exercised("connect supervision unavailable on this host");
+        return;
+    }
+    let work = Scratch::new("iso29");
+    let gateway = Counting::start();
+    let other = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let other_addr = other.local_addr().unwrap();
+    let registry = Arc::new(Mutex::new(HashSet::new()));
+    let pol = policy(&work.0, &[]);
+
+    let family = run(
+        &pol,
+        gateway.addr,
+        registry.clone(),
+        cmd(&probe("family"), &["stream"]),
+    );
+    assert_eq!(
+        family, 0,
+        "host rules admit an inet socket only as a TCP stream (10+n = check n of the probe's \
+         table answered wrongly); got {family}"
+    );
+
+    let tfo = run(
+        &pol,
+        gateway.addr,
+        registry,
+        cmd(&probe("tfo"), &[&other_addr.to_string()]),
+    );
+    assert_eq!(
+        tfo, 0,
+        "each MSG_FASTOPEN send must be refused with EOPNOTSUPP (40+n = send n opened a \
+         connection; 80+n = another errno); got {tfo}"
+    );
+    // The accept queue is in arrival order: a connection from the session would come out first.
+    std::net::TcpStream::connect(other_addr)
+        .unwrap()
+        .write_all(b"S")
+        .unwrap();
+    let mut first = [0u8; 1];
+    other.accept().unwrap().0.read_exact(&mut first).unwrap();
+    assert_eq!(
+        first[0], b'S',
+        "nothing from the session reached the listener"
     );
 }
