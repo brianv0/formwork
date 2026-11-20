@@ -769,6 +769,67 @@ impl<U: AsyncRead + Unpin, C: AsyncRead + Unpin> AsyncRead for Watched<'_, U, C>
     }
 }
 
+/// A stream that counts the bytes read from it and written to it, so a relay cut short still
+/// reports what crossed (FW-FID13, FW-FID28).
+pub(crate) struct Counted<'a, S> {
+    pub(crate) inner: &'a mut S,
+    pub(crate) read: u64,
+    pub(crate) written: u64,
+}
+
+impl<'a, S> Counted<'a, S> {
+    pub(crate) fn new(inner: &'a mut S) -> Self {
+        Counted {
+            inner,
+            read: 0,
+            written: 0,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Counted<'_, S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut *this.inner).poll_read(cx, buf);
+        this.read += (buf.filled().len() - before) as u64;
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<'_, S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut *this.inner).poll_write(cx, data);
+        if let std::task::Poll::Ready(Ok(n)) = polled {
+            this.written += n as u64;
+        }
+        polled
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 #[derive(Debug)]
 struct ClientGone;
 

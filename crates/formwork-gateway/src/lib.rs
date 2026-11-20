@@ -22,15 +22,17 @@ pub mod ca;
 pub mod egress;
 mod http;
 mod inspect;
+mod marker;
 pub mod opener;
 mod upstream;
 
 pub use ca::{native_roots, native_roots_source, SessionCa};
 pub use egress::{
-    Admission, EgressConfig, EgressProxy, Grant, ListenerRefusal, ListenerRefusalReason, PeerCheck,
-    Resolver, Violation,
+    Admission, EgressConfig, EgressProxy, Grant, HostAccount, ListenerRefusal,
+    ListenerRefusalReason, PeerCheck, Resolver, Violation, OTHER_HOSTS,
 };
 pub use inspect::{Broker, Inspection, PLACEHOLDER_PREFIX};
+pub use marker::{Marker, MARKER_MIN};
 pub use opener::{OpenRecord, OpenerService};
 pub use upstream::{ProxyEndpoint, UpstreamProxy};
 

@@ -4,7 +4,8 @@
 //! writing it upstream from what matched (FW-EGR22). Plain HTTP to an inspected rule runs the same
 //! request pipeline without TLS. Brokered credentials are presented here, over TLS only
 //! (FW-CRED11, FW-CRED18, FW-CRED19), and a response that would echo one, or the operator's proxy
-//! credential, is ended (FW-CRED17, FW-CRED36).
+//! credential, is ended (FW-CRED17, FW-CRED36). A request head that carries a derived marker is
+//! refused before anything else reads it (FW-EGR34).
 //! Upstream connections come from a per-session keep-alive pool, each reused only for the host it
 //! was opened for.
 
@@ -33,7 +34,7 @@ use crate::egress::{
 use crate::http::{
     connection_tokens, end_to_end, framed, is_client_gone, parse_head, parse_response_head,
     percent_decoded, render_request, render_response, request_framing, respond, response_framing,
-    BodyError, BoxIo, Buffered, Framing, Guard, Head, HeadError, Watched, HEAD_TIMEOUT,
+    BodyError, BoxIo, Buffered, Counted, Framing, Guard, Head, HeadError, Watched, HEAD_TIMEOUT,
     IDLE_TIMEOUT, READ_CHUNK,
 };
 
@@ -377,6 +378,25 @@ async fn exchange(
             .plain(plain)
     };
 
+    // FW-EGR34: first, so no refusal below can record a method, path or host that carries one.
+    if let Some(found) = shared.search.head(&head) {
+        let mut refusal = found.refusal().plain(plain);
+        match scope {
+            Scope::Tls(dest) => refusal = refusal.at(&dest.host, dest.port),
+            Scope::Plain if !found.in_request_line => {
+                let host = split_absolute(&head.target).and_then(|(authority, _)| {
+                    let (h, p) = split_host_port(authority).ok()?;
+                    Some((canonicalize_host(h).ok()?, p.unwrap_or(DEFAULT_HTTP_PORT)))
+                });
+                if let Some((host, port)) = host {
+                    refusal = refusal.at(&host, port);
+                }
+            }
+            Scope::Plain => {}
+        }
+        return refused(client, shared, refusal, None).await;
+    }
+
     // Where the request goes.
     let (host, port, path_and_query) = match scope {
         Scope::Tls(dest) => {
@@ -419,6 +439,21 @@ async fn exchange(
         Ok(p) => p,
         Err(why) => return refused(client, shared, malformed(&why).at(&host, port), None).await,
     };
+    // FW-EGR34: removing dot-segments joins what was apart, and the path goes upstream as joined.
+    if let Some(found) = shared.search.find(path.as_str().as_bytes()) {
+        let r = crate::marker::HeadMatch {
+            found,
+            site: "the request target once canonicalized".to_string(),
+            in_request_line: true,
+        };
+        return refused(
+            client,
+            shared,
+            r.refusal().plain(plain).at(&host, port),
+            None,
+        )
+        .await;
+    }
     let at = |r: Refusal| {
         r.at(&host, port)
             .request(&head.method, path.as_str())
@@ -583,6 +618,7 @@ async fn exchange(
     };
     let mut pooled = shared.pool.take(&key).await;
     let mut bytes_up: u64;
+    let mut entered = false;
     let (mut up, response) = loop {
         let reused = pooled.is_some();
         let mut conn = match pooled.take() {
@@ -608,17 +644,27 @@ async fn exchange(
             respond(&mut client.s, "502 Bad Gateway", "", true).await?;
             return Ok(Next::Close);
         }
+        if !entered {
+            shared.forwarded(&host, port, "inspected", &head.headers);
+            entered = true;
+        }
         if expect_continue {
             client.s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
             client.s.flush().await?;
         }
-        match client.copy_body(framing, &mut conn.s, None).await {
+        let mut counted = Counted::new(&mut conn.s);
+        let copied = client.copy_body(framing, &mut counted, None).await;
+        // FW-FID28: a body cut short still crossed in part, unsearched.
+        let cut = counted.written;
+        match copied {
             Ok(n) => bytes_up = n,
             Err(BodyError::Malformed(why)) => {
+                shared.crossed(&host, port, cut);
                 shared.refuse(at(malformed(why)));
                 return Ok(Next::Close);
             }
             Err(BodyError::Io(e)) => {
+                shared.crossed(&host, port, cut);
                 tracing::info!(host = %host, error = %e, "egress request body did not pass through");
                 return Ok(Next::Close);
             }
@@ -700,16 +746,21 @@ async fn exchange(
                     "the upgraded stream carried {guarded}"
                 ))));
             }
-            shared.grant(grant(
-                &host,
-                port,
-                &head.method,
-                &path,
-                101,
-                bytes_up + spliced.up,
-                spliced.down,
-                started,
-            ));
+            // FW-FID28: the body and everything after the upgrade went unsearched.
+            let up = bytes_up + spliced.up;
+            shared.grant(
+                grant(
+                    &host,
+                    port,
+                    &head.method,
+                    &path,
+                    101,
+                    up,
+                    spliced.down,
+                    started,
+                ),
+                up,
+            );
             return Ok(Next::Close);
         }
         if (100..200).contains(&response.status) {
@@ -809,16 +860,20 @@ async fn exchange(
             return Ok(Next::Close);
         }
     };
-    shared.grant(grant(
-        &host,
-        port,
-        &head.method,
-        &path,
-        response.status,
+    // FW-FID28: the head was searched (FW-EGR34); no request body is.
+    shared.grant(
+        grant(
+            &host,
+            port,
+            &head.method,
+            &path,
+            response.status,
+            bytes_up,
+            bytes_down,
+            started,
+        ),
         bytes_up,
-        bytes_down,
-        started,
-    ));
+    );
     if !server_close && framing_down != Framing::UntilClose {
         shared.pool.put(key, up);
     }

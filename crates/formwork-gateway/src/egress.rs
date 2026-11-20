@@ -16,11 +16,14 @@
 //! operator line naming the rule and the `explain` invocation that reproduces it (FW-FID9), while
 //! the client gets a generic refusal (FW-CRED7). Every admitted tunnel and request is a grant
 //! record (FW-FID13). A connection attempt the listener turns away before it admits a request is
-//! counted by reason instead (FW-FID35).
+//! counted by reason instead (FW-FID35). Every request head is searched for the session's derived
+//! markers first (FW-EGR34), and what reached each host is kept as its egress account, with the
+//! bytes no search read (FW-FID28, FW-FID29).
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,8 +37,11 @@ use formwork_blueprint::{
 };
 use formwork_compile::Capability;
 
-use crate::http::{parse_head, parse_response_head, respond, BoxIo, Buffered, Head, HeadError};
+use crate::http::{
+    parse_head, parse_response_head, respond, BoxIo, Buffered, Counted, Head, HeadError,
+};
 use crate::inspect::{basic_value, singleton_fields, Broker, Inspection, Pool};
+use crate::marker::{Marker, Search};
 use crate::upstream::{ProxyEndpoint, UpstreamProxy};
 use crate::GatewayError;
 
@@ -47,6 +53,12 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Records kept for an embedder or test to read back; older ones are dropped.
 const MAX_KEPT_RECORDS: usize = 1024;
+/// Hosts the egress account keeps apart; traffic to any further host is summed under
+/// [`OTHER_HOSTS`], so the account stays bounded and still counts every byte.
+const MAX_ACCOUNTED_HOSTS: usize = 1024;
+pub const OTHER_HOSTS: &str = "(other hosts)";
+/// **header-names-kept** (FEP-12 §5): distinct request header names kept per host.
+const HEADER_NAMES_KEPT: usize = 64;
 /// The reproduction for a refusal that names no destination.
 const EXPLAIN_HOSTS: &str = "formwork explain --hosts";
 
@@ -99,6 +111,8 @@ pub struct EgressConfig {
     pub host_addresses: Vec<IpAddr>,
     /// The operator's upstream proxy, from `formwork run`'s own environment (FW-EGR26).
     pub upstream_proxy: Option<UpstreamProxy>,
+    /// Values the session is never given, which no request head may carry (FW-EGR33).
+    pub markers: Vec<Marker>,
 }
 
 /// One refusal (FW-FID5, FW-FID12): the capability refused, one reason from the closed set, what
@@ -148,6 +162,31 @@ pub struct Grant {
     pub bytes_up: u64,
     pub bytes_down: u64,
     pub duration_ms: u64,
+}
+
+/// What one host received from the session (FW-FID29): an aggregate of the requests the Gateway
+/// forwarded to it, never a per-request log. Header values, bodies and query strings stay out, as
+/// in a grant record (FW-FID13).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HostAccount {
+    /// The host, or [`OTHER_HOSTS`] (port 0) for traffic past the hosts the account keeps apart.
+    pub host: String,
+    pub port: u16,
+    /// The grades its traffic took (`inspected`, `tunnel`), sorted.
+    pub grades: Vec<&'static str>,
+    /// Requests whose head was forwarded to it; a tunnel counts as one.
+    pub requests: u64,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    /// Requests to it whose head carried a marker (FW-EGR34), each refused.
+    pub disclosures: u64,
+    /// Request bytes forwarded to it without a marker search: every tunnel byte, every request
+    /// body byte and every byte after an upgrade (FW-FID28).
+    pub unscanned: u64,
+    /// The distinct request header names it was sent, lower-case and sorted: the first
+    /// **header-names-kept** seen.
+    pub header_names: Vec<String>,
 }
 
 /// Why the listener turned a connection attempt away before admitting a request (FW-FID35): a
@@ -212,6 +251,7 @@ impl Refusal {
                 Capability::NetInspection
             }
             R::Placeholder | R::Reflection => Capability::CredentialBroker,
+            R::Marker => Capability::NetInspection,
         };
         Refusal(Box::new(RefusalParts {
             reason,
@@ -241,6 +281,12 @@ impl Refusal {
 
     pub(crate) fn plain(mut self, plain: bool) -> Refusal {
         self.0.plain = plain;
+        self
+    }
+
+    /// What decided a refusal no host rule did.
+    pub(crate) fn decided_by(mut self, what: String) -> Refusal {
+        self.0.rule = Some(what);
         self
     }
 
@@ -279,9 +325,11 @@ impl EgressProxy {
                 gateway: vec![addr],
                 host: config.host_addresses.clone(),
             },
+            search: Search::new(&config.markers),
             config,
             pool: Pool::default(),
             records: Mutex::new(Records::default()),
+            in_flight: AtomicUsize::new(0),
         });
         let serving = shared.clone();
         let thread = std::thread::Builder::new()
@@ -313,6 +361,14 @@ impl EgressProxy {
                 });
             })?;
         tracing::info!(listener = %addr, "gateway egress listener started (FW-EGR14)");
+        if !shared.search.names().is_empty() {
+            tracing::info!(
+                markers = ?shared.search.names(),
+                "request heads are searched for {} derived markers; one that carries a marker is \
+                 refused (FW-EGR34)",
+                shared.search.names().len()
+            );
+        }
         if let Some(proxy) = &shared.config.upstream_proxy {
             tracing::info!(
                 upstream = %proxy.describe(),
@@ -371,6 +427,31 @@ impl EgressProxy {
             .unwrap_or_default()
     }
 
+    /// The egress account (FW-FID29): one entry per host the Gateway forwarded a request or a
+    /// tunnel to, sorted by host and port. It first waits up to `settle` for the connections in
+    /// flight to end, since a client can read its last response before the Gateway counts it.
+    pub fn account(&self, settle: Duration) -> Vec<HostAccount> {
+        let deadline = Instant::now() + settle;
+        while self.shared.in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.shared
+            .records
+            .lock()
+            .map(|r| {
+                r.account
+                    .values()
+                    .filter(|a| a.requests > 0)
+                    .cloned()
+                    .map(|mut a| {
+                        a.header_names.sort();
+                        a
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Inspected hosts whose clients rejected the session CA, which only a `tunnel:` rule serves.
     pub fn ca_rejections(&self) -> Vec<(CanonicalHost, u16)> {
         self.shared
@@ -407,6 +488,26 @@ struct Records {
     listener_refusals: BTreeMap<ListenerRefusalReason, u64>,
     grants: VecDeque<Grant>,
     ca_rejections: Vec<(CanonicalHost, u16)>,
+    account: BTreeMap<(String, u16), HostAccount>,
+}
+
+impl Records {
+    fn account_for(&mut self, host: &str, port: u16) -> &mut HostAccount {
+        let key = if self.account.contains_key(&(host.to_string(), port))
+            || self.account.len() < MAX_ACCOUNTED_HOSTS
+        {
+            (host.to_string(), port)
+        } else {
+            (OTHER_HOSTS.to_string(), 0)
+        };
+        self.account
+            .entry(key.clone())
+            .or_insert_with(|| HostAccount {
+                host: key.0,
+                port: key.1,
+                ..HostAccount::default()
+            })
+    }
 }
 
 fn keep<T>(list: &mut VecDeque<T>, item: T) {
@@ -430,7 +531,27 @@ pub(crate) struct Shared {
     /// The listener endpoint and the host's addresses, for classification (FW-EGR18/EGR19).
     pub(crate) local: LocalAddresses,
     pub(crate) pool: Pool,
+    /// Every request head is searched for these before anything acts on it (FW-EGR34).
+    pub(crate) search: Search,
     records: Mutex<Records>,
+    /// Connections being served, so the account can wait for the last of them.
+    in_flight: AtomicUsize,
+}
+
+/// One connection in flight, for as long as it is served.
+struct Serving(Arc<Shared>);
+
+impl Serving {
+    fn enter(shared: &Arc<Shared>) -> Serving {
+        shared.in_flight.fetch_add(1, Ordering::SeqCst);
+        Serving(shared.clone())
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Shared {
@@ -490,6 +611,11 @@ impl Shared {
             need,
         };
         if let Ok(mut records) = self.records.lock() {
+            if v.reason == R::Marker {
+                if let (Some(host), Some(port)) = (&v.host, v.port) {
+                    records.account_for(host, port).disclosures += 1;
+                }
+            }
             keep(&mut records.violations, v);
         }
     }
@@ -507,7 +633,43 @@ impl Shared {
         }
     }
 
-    pub(crate) fn grant(&self, g: Grant) {
+    /// Enter a forwarded request head, or a tunnel's ClientHello, in the host's account
+    /// (FW-FID29), with the header names the session sent.
+    pub(crate) fn forwarded(
+        &self,
+        host: &CanonicalHost,
+        port: u16,
+        grade: &'static str,
+        headers: &[(String, String)],
+    ) {
+        if let Ok(mut records) = self.records.lock() {
+            let a = records.account_for(&host.to_string(), port);
+            a.requests += 1;
+            if !a.grades.contains(&grade) {
+                a.grades.push(grade);
+                a.grades.sort();
+            }
+            for (name, _) in headers {
+                let name = name.to_ascii_lowercase();
+                if a.header_names.len() < HEADER_NAMES_KEPT && !a.header_names.contains(&name) {
+                    a.header_names.push(name);
+                }
+            }
+        }
+    }
+
+    /// Add bytes that crossed to a host outside a grant: a request body cut short (FW-FID28).
+    pub(crate) fn crossed(&self, host: &CanonicalHost, port: u16, up: u64) {
+        if let Ok(mut records) = self.records.lock() {
+            let a = records.account_for(&host.to_string(), port);
+            a.bytes_up += up;
+            a.unscanned += up;
+        }
+    }
+
+    /// Record an admitted tunnel or request (FW-FID13) and add its bytes to the host's account,
+    /// `unscanned` of them sent with no marker search (FW-FID28).
+    pub(crate) fn grant(&self, g: Grant, unscanned: u64) {
         tracing::debug!(
             host = %g.host,
             port = g.port,
@@ -521,6 +683,10 @@ impl Shared {
             "egress granted (FW-FID13)"
         );
         if let Ok(mut records) = self.records.lock() {
+            let a = records.account_for(&g.host, g.port);
+            a.bytes_up += g.bytes_up;
+            a.bytes_down += g.bytes_down;
+            a.unscanned += unscanned;
             keep(&mut records.grants, g);
         }
     }
@@ -575,7 +741,9 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         }
         let _ = stream.set_nodelay(true);
         let shared = shared.clone();
+        let serving = Serving::enter(&shared);
         tokio::spawn(async move {
+            let _serving = serving;
             if let Some(check) = shared.config.admission.peer_check.clone() {
                 let Ok(local) = stream.local_addr() else {
                     return;
@@ -659,6 +827,12 @@ async fn serve_connect(
     head: Head,
     shared: Arc<Shared>,
 ) -> io::Result<()> {
+    // FW-EGR34: the CONNECT authority is resolved and becomes the server name, so a marker in it
+    // would leave by DNS or in the ClientHello; and no record may carry it.
+    if let Some(found) = shared.search.request_line(&head) {
+        shared.refuse(found.refusal());
+        return respond(&mut client.s, "403 Forbidden", "", true).await;
+    }
     let target = &head.target;
     let authority = split_host_port(target)
         .map_err(|e| e.to_string())
@@ -740,20 +914,26 @@ async fn tunnel(
         }
     };
     upstream.write_all(&hello.raw).await?;
-    let (up, down) = tokio::io::copy_bidirectional(&mut client.s, &mut upstream)
-        .await
-        .unwrap_or((0, 0));
-    shared.grant(Grant {
-        host: host.to_string(),
-        port,
-        grade: "tunnel",
-        method: None,
-        path: None,
-        status: None,
-        bytes_up: up + hello.raw.len() as u64,
-        bytes_down: down,
-        duration_ms: started.elapsed().as_millis() as u64,
-    });
+    shared.forwarded(&host, port, "tunnel", &[]);
+    // Counted at the upstream side, so a tunnel that ends in an error still reports its bytes.
+    let mut counted = Counted::new(&mut upstream);
+    let _ = tokio::io::copy_bidirectional(&mut client.s, &mut counted).await;
+    let up = counted.written + hello.raw.len() as u64;
+    shared.grant(
+        Grant {
+            host: host.to_string(),
+            port,
+            grade: "tunnel",
+            method: None,
+            path: None,
+            status: None,
+            bytes_up: up,
+            bytes_down: counted.read,
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
+        // FW-FID28: the Gateway reads a tunnel's ClientHello and none of what it carries.
+        up,
+    );
     Ok(())
 }
 

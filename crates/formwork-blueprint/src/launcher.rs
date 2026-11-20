@@ -21,6 +21,51 @@ pub struct EnvConstruction {
     pub locator_stripped: Vec<String>,
 }
 
+/// The catalog variables the floor strips (FW-CRED4), each with its credential type, sorted.
+fn strip_set(catalog: &ResolvedCatalog, allow: &[String]) -> Vec<(String, String)> {
+    let mut strip: Vec<(String, String)> = Vec::new();
+    for (type_name, entry) in catalog.enforced_types(allow) {
+        for var in &entry.envs {
+            strip.push((var.clone(), type_name.to_string()));
+        }
+    }
+    strip.sort();
+    strip.dedup();
+    strip
+}
+
+/// The `(name, value)` of each variable in `vars` that [`construct_env`] strips under the same
+/// catalog and exclusions. The Gateway searches requests for these values (FW-EGR33): the session
+/// never holds them, so one in a request crossed the floor by a route Formwork did not close.
+/// The values are secrets; they go to the Gateway and nowhere else.
+pub fn stripped_values(
+    catalog: &ResolvedCatalog,
+    allow: &[String],
+    vars: &[(String, String)],
+) -> Vec<(String, String)> {
+    let strip = strip_set(catalog, allow);
+    let mut values: Vec<(String, String)> = vars
+        .iter()
+        .filter(|(name, _)| strip.iter().any(|(s, _)| s == name))
+        .cloned()
+        .collect();
+    values.sort();
+    values
+}
+
+/// Whether a stripped value is a location rather than a secret: a path, or the value of a
+/// variable the catalog lists as naming a file (`env-file-refs`). A location is not a derived
+/// marker (FW-EGR33): a refusal would confirm a guessable value to the session, which FW-INV9
+/// forbids, and the floor already denies the file it names (FW-CRED3).
+pub fn is_location(catalog: &ResolvedCatalog, name: &str, value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with("~/")
+        || catalog
+            .types
+            .values()
+            .any(|entry| entry.env_file_refs.iter().any(|v| v == name))
+}
+
 /// Build the confined child's environment. The catalog strip is the floor, so it partitions
 /// FIRST -- a catalog variable is stripped and attributed to its type no matter what the posture
 /// would have said (FW-CRED4; the FW-CRED7 detector names the type, not the heuristic that also
@@ -35,15 +80,7 @@ pub fn construct_env(
     channels: &ChannelPolicy,
     vars: Vec<(String, String)>,
 ) -> EnvConstruction {
-    let mut strip: Vec<(String, String)> = Vec::new();
-    for (type_name, entry) in catalog.enforced_types(allow) {
-        for var in &entry.envs {
-            strip.push((var.clone(), type_name.to_string()));
-        }
-    }
-    strip.sort();
-    strip.dedup();
-
+    let strip = strip_set(catalog, allow);
     let (stripped_pairs, remainder): (Vec<_>, Vec<_>) = vars
         .into_iter()
         .partition(|(name, _)| strip.iter().any(|(s, _)| s == name));
@@ -165,6 +202,51 @@ mod tests {
         let kept: Vec<&str> = out.kept.iter().map(|(k, _)| k.as_str()).collect();
         assert!(kept.contains(&"DISPLAY") && kept.contains(&"WAYLAND_DISPLAY"));
         assert!(!kept.contains(&"DBUS_SESSION_BUS_ADDRESS"));
+    }
+
+    #[test]
+    fn fw_egr33_stripped_values_are_exactly_what_the_strip_removes() {
+        let env = vars(&[
+            ("AWS_SECRET_ACCESS_KEY", "aws-secret-value"),
+            ("GITHUB_TOKEN", "ghp_0123456789abcdef"),
+            ("ANTHROPIC_API_KEY", "sk-ant-lifted"),
+            ("PATH", "/usr/bin"),
+        ]);
+        let allow = ["anthropic".to_string()];
+        let out = construct_env(&EnvPosture::Passthrough, &catalog(), &allow, env.clone());
+        let values = super::stripped_values(&catalog(), &allow, &env);
+        let names: Vec<&str> = values.iter().map(|(n, _)| n.as_str()).collect();
+        let stripped: Vec<&str> = out.stripped.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, stripped);
+        assert_eq!(names, vec!["AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"]);
+        assert_eq!(values[1].1, "ghp_0123456789abcdef");
+    }
+
+    #[test]
+    fn fw_egr33_a_location_is_not_a_marker() {
+        let c = catalog();
+        assert!(super::is_location(
+            &c,
+            "GITHUB_TOKEN",
+            "/home/x/.config/token"
+        ));
+        assert!(super::is_location(&c, "GITHUB_TOKEN", "~/.config/token"));
+        assert!(super::is_location(&c, "KUBECONFIG", "kube.conf"));
+        assert!(super::is_location(
+            &c,
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "creds"
+        ));
+        assert!(!super::is_location(
+            &c,
+            "GITHUB_TOKEN",
+            "ghp_0123456789abcdef"
+        ));
+        assert!(!super::is_location(
+            &c,
+            "AWS_SECRET_ACCESS_KEY",
+            "wJalr/K7MDENG+bPxRfi"
+        ));
     }
 
     #[test]

@@ -24,6 +24,9 @@
 //!   the target times that factor, clamped to [1, 3]: a node faster than the reference gets the
 //!   targets as written, and no node gets more than three times them.
 //!
+//! Every session carries **MARKERS** derived markers, so the head search (FW-EGR34) is inside each
+//! measurement, and the reused-connection row sends a head with the fields a client sends.
+//!
 //! They measure release builds only, one at a time, in their own CI step:
 //! `cargo test --release -p formwork-gateway --test latency -- --ignored --nocapture
 //! --test-threads=1`.
@@ -36,7 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use formwork_blueprint::{BrokerScheme, CanonicalHost};
-use formwork_gateway::{Broker, EgressProxy, SessionCa};
+use formwork_gateway::{Broker, EgressProxy, Marker, SessionCa};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -62,6 +65,17 @@ const EVENTS_PER_STREAM: usize = 250;
 const EVENT_GAP_MS: u64 = 20;
 const EVENT_BUDGET_US: f64 = 20_000.0;
 const PLACEHOLDER: &str = "fwcred-anthropic-perf";
+/// Derived markers per session: more than the Catalog strips variables of, so the search is
+/// measured at a load no real session exceeds (FW-EGR33).
+const MARKERS: usize = 32;
+
+fn markers() -> Vec<Marker> {
+    (0..MARKERS)
+        .map(|i| {
+            Marker::stripped(&format!("VAR_{i}"), &format!("tok_{i:02}_9Xb2Qe7Lm/5Vw+Ra")).unwrap()
+        })
+        .collect()
+}
 const SECRET: &str = "sk-ant-PERF-SECRET-0001";
 
 fn release_only(test: &str) {
@@ -91,11 +105,12 @@ async fn fw_e2e_096_latency_budget() {
     let mut report = Vec::new();
 
     // Tunnel grade: a new connection each time, to the first response byte.
-    let (tunnel_proxy, _) = Session::new(
+    let mut tunnel_session = Session::new(
         &[format!("tunnel:tunnel.test:{}", up.port)],
         resolver(&[("tunnel.test", "127.0.0.1")]),
-    )
-    .start();
+    );
+    tunnel_session.markers = markers();
+    let (tunnel_proxy, _) = tunnel_session.start();
     let mut tunnel = TunnelNew {
         proxy: tunnel_proxy,
         port: up.port,
@@ -118,6 +133,7 @@ async fn fw_e2e_096_latency_budget() {
         resolver(&[("api.test", "127.0.0.1")]),
     );
     session.upstream_roots = Some(vec![tls.root.clone()]);
+    session.markers = markers();
     let (proxy, ca) = session.start();
     let ca = ca.unwrap();
     let target = format!("api.test:{}", up.port);
@@ -126,7 +142,12 @@ async fn fw_e2e_096_latency_budget() {
     let direct = handshake(tcp(up.port).await, &fixture_client, "api.test").await;
     let mut reused = InspectedReused {
         _proxy: proxy,
-        request: format!("GET /lat HTTP/1.1\r\nHost: {target}\r\n\r\n"),
+        request: format!(
+            "GET /lat?page=2&per_page=100 HTTP/1.1\r\nHost: {target}\r\n\
+             User-Agent: agent/1.4.2 (linux; x86_64) node/22.21.0\r\nAccept: application/json\r\n\
+             Accept-Encoding: gzip, deflate, br\r\nAuthorization: Bearer eyJhbGciOiJIUzI1NiJ9.e30.ZRrHA1JJJW8opsbCGfG_HACGpVUMN_a9IV7pAx_Zmeo\r\n\
+             X-Request-Id: 7f3e9b2a-41c6-4d8e-9a0f-1b2c3d4e5f60\r\n\r\n"
+        ),
         through,
         direct,
     };
@@ -184,6 +205,7 @@ async fn fw_e2e_093_streamed_events_arrive_within_20_ms() {
         resolver(&[("api.test", "127.0.0.1")]),
     );
     session.upstream_roots = Some(vec![tls.root.clone()]);
+    session.markers = markers();
     // A brokered credential on the host, so every response runs through the reflection guard.
     session.brokers = vec![Broker {
         name: "anthropic".into(),
@@ -479,6 +501,7 @@ impl Pair for InspectedFirst {
                 .collect();
             let mut session = Session::new(&rules, resolver(&entries));
             session.upstream_roots = Some(vec![self.upstream_root.clone()]);
+            session.markers = markers();
             let (proxy, ca) = session.start();
             let ca: Arc<SessionCa> = ca.unwrap();
             self.session = Some((proxy, latency_client(&[ca.cert_der()])));
