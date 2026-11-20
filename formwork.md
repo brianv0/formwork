@@ -171,6 +171,8 @@ Every requirement, invariant, and end-to-end test in this document carries a sta
 | <a id="fw-xr9"></a>**FW-XR9** Surface fail-fast | A subcommand that cannot deliver its promise on the current host fails *before* consuming the user's work (their run, their time), naming the missing mechanism and the nearest alternative. The command-surface sibling of [FW-INV5](#fw-inv5)/[FW-INV6](#fw-inv6): enforcement honesty reports a wall it cannot install, and this refuses up front a *feature* it cannot deliver here — running an entire workload and only then announcing the command was impossible is a silent overpromise even when every byte was logged. [FW-E2E-062](#fw-e2e-062) pins the `learn` instance; the rule governs every future observe/probe/stream surface. |
 | <a id="fw-xr10"></a>**FW-XR10** Wrapper transparency | Wrapper subcommands shall exit with the workload's status and write nothing of their own to stdout. |
 | <a id="fw-xr11"></a>**FW-XR11** Failure attribution | A Formwork failure after the workload is spawned shall exit `125` and emit one `formwork:`-prefixed line on stderr attributing the failure to Formwork. |
+| <a id="fw-xr12"></a>**FW-XR12** Signal forwarding | The Launcher shall pass each `SIGINT`, `SIGTERM`, `SIGHUP` and `SIGQUIT` it receives after spawn to the workload — to the workload's process group where the workload leads one other than the Launcher's, else to the workload process — except an interrupt or quit the terminal already delivered to its foreground process group, and shall exit only after the workload has. A signal the Launcher was started ignoring stays ignored. (On macOS, which does not mark a terminal-generated signal, an interrupt or quit received while the Launcher is in its terminal's foreground process group is taken for the terminal's.) |
+| <a id="fw-xr13"></a>**FW-XR13** Termination bound | The Launcher shall send `SIGKILL` to the workload, addressed as in [FW-XR12](#fw-xr12), when the workload has not exited **term-grace** (10 s) after the Launcher first forwarded `SIGTERM` to it, and at once when a terminal `SIGINT` arrives within that interval. |
 
 ### 5.2 Capability model (FW-CAP)
 
@@ -238,8 +240,12 @@ Note (stability, not a security property per §3): the gateway parses newline-de
 | <a id="fw-tra6"></a>**FW-TRA6** Low overhead | Confinement setup and per-operation overhead stay within the section 8 performance target so interactive agent loops remain responsive. |
 | <a id="fw-tra7"></a>**FW-TRA7** Execution-vector write protection | A default write-subtract set masks code-execution and policy-tampering vectors even inside writable grants — `.git/hooks/**`, `.git/config`, `.mcp.json`, editor/agent-config dirs (`.vscode`/`.idea`/`.claude`/…), shell rc files — so a confined agent cannot plant something that later runs unsandboxed. Deny wins over the write grant; the paths stay readable so tooling is unbroken. |
 | <a id="fw-tra8"></a>**FW-TRA8** Agent-state & local-secret coverage | The sensitive set covers agent-tool state holding OAuth creds/transcripts (`~/.claude*`, `~/.codex/**`, `~/.gemini/**`, `~/.cursor/**`, the whole `~/.docker/**`) and project-local secrets (`**/.env`), denied even under a broad read grant. |
-| <a id="fw-tra9"></a>**FW-TRA9** Launcher-owned paths | Paths the Launcher creates for a session (the session scratch holding the CA bundle, the private temporary directory, the opener shim directory) shall be granted in every read mode, read-only except the temporary directory, and named in the resolved-input disclosure ([FW-FID7](#fw-fid7)). |
-| <a id="fw-tra10"></a>**FW-TRA10** Private temporary directory | The Launcher shall create a per-session temporary directory and set `TMPDIR`, `TMP` and `TEMP` to it in the confined environment. |
+| <a id="fw-tra9"></a>**FW-TRA9** Launcher-owned paths | Paths the Launcher creates for a session in its session root ([FW-TRA18](#fw-tra18): the trust directory holding the CA bundle, the private temporary directory, the opener shim directory) shall be granted in every read mode, read-only except the temporary directory, and named in the resolved-input disclosure ([FW-FID7](#fw-fid7)). |
+| <a id="fw-tra10"></a>**FW-TRA10** Private temporary directory | The Launcher shall create a per-session temporary directory, `tmp` in the session root ([FW-TRA18](#fw-tra18)), and set `TMPDIR`, `TMP` and `TEMP` to it in the confined environment. |
+| <a id="fw-tra18"></a>**FW-TRA18** Session root | The Launcher shall create every path of [FW-TRA9](#fw-tra9) inside one directory, the **session root** `<runtime>/formwork/<id>`, which it creates with mode 0700 and names with 128 bits from the OS random source; `<runtime>` is `$XDG_RUNTIME_DIR` (on macOS the per-user `$TMPDIR`) where that is an absolute directory of the invoking uid with mode 0700, and `~/.local/state` otherwise. The Launcher shall refuse to start, naming the directory, where `<runtime>/formwork` is not a directory of the invoking uid that no other uid can write. |
+| <a id="fw-tra19"></a>**FW-TRA19** Session roots are disjoint | Every policy the Launcher compiles for a session shall deny read and write on every session root other than its own, including roots created after the policy is installed, whatever the blueprint grants. |
+| <a id="fw-tra20"></a>**FW-TRA20** Session root removal | The Launcher shall remove the session root before it exits, on every exit path in which a Launcher process outlives the workload. |
+| <a id="fw-tra21"></a>**FW-TRA21** Stale roots | Before it creates a session root, the Launcher shall remove every session root whose session lock it can acquire, and every session root that has no lock. |
 
 ### 5.6 Operability & fidelity (FW-FID)
 
@@ -400,6 +406,8 @@ These hold for every session under every backend, and are the properties the tes
 
 <a id="fw-inv15"></a>**FW-INV15 — Unparsed is unforwarded.** No byte from a confined process reaches an upstream unless the engine parsed it as part of an admitted TLS ClientHello, an admitted request head, or the body or tunnel that follows one.
 
+<a id="fw-inv23"></a>**FW-INV23 — No cross-session write.** A confined process shall not be able to create, modify, replace or remove any path inside another session's session root ([FW-TRA18](#fw-tra18)).
+
 (The env-shading honesty guarantee — that the report discloses launcher-contingency — is carried by [FW-CRED8](#fw-cred8) rather than a standalone invariant, and is a specialization of [FW-INV5](#fw-inv5) report-soundness.)
 
 ## 7. End-to-end tests
@@ -534,6 +542,18 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 
 <a id="fw-e2e-089"></a>**FW-E2E-089: Launcher-owned paths under `closed` (both).** A blueprint with `mode = "unveil"` and only `readwrite:$CWD/**`. Pass: `$TMPDIR` is set inside the session and writable, and on macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)` resolves beneath it; a grandchild reads the session CA bundle, `/proc/self/status` and `/etc/hosts`; `explain` names the tmp directory and the CA path. Fail: any read is denied or a path is undisclosed.
 
+<a id="fw-e2e-191"></a>**FW-E2E-191: A second session against a first one's root (both).** Two concurrent sessions under `builtin:default` with `readwrite:$CWD/**` and a host rule, with the runtime directory inside `$CWD`, so the blueprint grants every session root for writing. The second tries to replace the first's `opener/xdg-open`, to append to and read its `trust/ca-bundle.pem`, and to create a file in and list its `tmp/`. Pass: each attempt is refused, the first session's shim directory and bundle are byte-identical afterwards, and the first then runs its shim and reaches the Launcher's opener. Fail: any attempt succeeds, or the first session runs anything but the Launcher's shim.
+
+<a id="fw-e2e-192"></a>**FW-E2E-192: A grant over the fallback location (both).** As [FW-E2E-191](#fw-e2e-191), with `readwrite:~/**` and a runtime variable that names no private directory, so the roots fall back to `~/.local/state/formwork` inside the granted tree. Pass: the same attempts are refused, and the operator channel names the Launcher deny ([FW-TRA19](#fw-tra19)) and the directory it covers. Fail: any attempt succeeds, or the deny is not named.
+
+<a id="fw-e2e-193"></a>**FW-E2E-193: A signal to the Launcher (both).** `SIGTERM` to `formwork run` while a workload that exits 7 on `SIGTERM` runs; then `SIGINT` while a workload that handles `SIGINT` and continues runs, later exiting 5. Pass: the first workload receives the signal, `run` exits 7, the workload process is gone and no session root remains; the second receives one interrupt, `run` keeps waiting while it runs and exits 5 once it does. Fail: the workload outlives the Launcher, the code differs, or a root remains.
+
+<a id="fw-e2e-194"></a>**FW-E2E-194: A workload that ignores `SIGTERM` (both).** `SIGTERM` to `formwork run` while the workload ignores it. Pass: the workload is killed **term-grace** after the signal, within 2 s, and `run` exits 137 with no session root left. Fail: the Launcher waits indefinitely, kills early, or exits with another code.
+
+<a id="fw-e2e-195"></a>**FW-E2E-195: No root left behind (both).** With the runtime and host temp directories pointed at scratch directories: `run --confine-self` with a host rule (refused), `gateway` with a host rule (refused), `run` brokering a credential whose variable is unset (refused), `run` with a host rule and a `socks5://` upstream proxy (refused after the session root exists), and a `learn` run. Pass: after each, no session root and nothing of the session remain in either directory; a successful `run --confine-self` leaves its root, says so on the operator channel, and the next `run` removes it. Fail: anything else remains.
+
+<a id="fw-e2e-196"></a>**FW-E2E-196: A dead session's root (both).** A `run` while another session runs; then `SIGKILL` to that session's Launcher, and another `run`. Pass: the concurrent `run` leaves the live session's root in place; the next `run` after the kill removes the dead session's root, says so on the operator channel, and runs. Fail: a live root is removed, or a dead one survives the next `run`.
+
 ### 7.7 Blueprint model & format
 
 <a id="fw-e2e-041"></a>**FW-E2E-041: Rename regression.** *(Retired with the `--spec` compat alias. This was a transitional regression guard for the spec → Blueprint rename — never tied to a numbered requirement — and its number stays retired now that the alias is gone. Byte-deterministic compile is covered by [FW-E2E-026](#fw-e2e-026)/027.)*
@@ -641,6 +661,8 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 <a id="fw-adv-023"></a>**FW-ADV-023: Address classes.** Under `allow:*.test`, the resolver fixture answers `127.0.0.1`, `10.0.0.1`, `100.100.100.200`, `168.63.129.16`, `::ffff:169.254.169.254`, `64:ff9b::a9fe:a9fe`, `2002:a9fe:a9fe::1`, `fe80::1`, a public address mixed with `10.0.0.1`, an address of the runner's own interfaces, and the Gateway's own listener address. Then, under the exact rule `allow:allowed.test`, it answers `127.0.0.1` and then `169.254.169.254`. Pass: every wildcard case and the exact-name metadata case are refused with `address-class`, and the exact-name loopback case is admitted. Fail: any other outcome.
 
 <a id="fw-adv-024"></a>**FW-ADV-024: Parser battery ([FW-INV15](#fw-inv15)).** Heads carrying both `Content-Length` and `Transfer-Encoding`, two differing `Content-Length` values, obsolete line folding, a bare LF, a NUL in a header value, an invalid method token, a head over **head-limit**, CONNECT authorities with userinfo, a path, a zone identifier, a percent-encoded dot, or a numeric spelling (`2130706433`, `0x7f.1`, `127.1`), and a truncated ClientHello. Pass: the fixture upstream receives no byte from any of them. Fail: any byte arrives.
+
+<a id="fw-adv-053"></a>**FW-ADV-053: A session root by rename and link ([FW-INV23](#fw-inv23)).** Placed as in [FW-E2E-191](#fw-e2e-191), a second session tries to rename the first's root in place and into its own `tmp/`, to rename the roots' parent and the runtime directory, to hard-link a file of its own into the first's `tmp/` and `opener/`, to plant a symlink and a directory under session-id-shaped names beside the roots, and on Linux to link an `O_TMPFILE` into the first's `tmp/` and `opener/`. Pass: every attempt fails, the first session's shim directory and bundle are byte-identical afterwards, and nothing is left beside the roots. Fail: any attempt succeeds.
 
 ### 7.11 Host-service channels & isolation
 
@@ -935,8 +957,10 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-XR7](#fw-xr7) Mediated transport | [FW-E2E-075](#fw-e2e-075), 076 | ADV-005, ADV-006, [FW-ADV-018](#fw-adv-018), 091 |
 | [FW-XR8](#fw-xr8) No agent-influenced escalation | [FW-ADV-001](#fw-adv-001) | [FW-E2E-005](#fw-e2e-005), INV1 |
 | [FW-XR9](#fw-xr9) Surface fail-fast | [FW-E2E-062](#fw-e2e-062) | INV5, INV6 |
-| [FW-XR10](#fw-xr10) Wrapper transparency | [FW-E2E-086](#fw-e2e-086) | — |
+| [FW-XR10](#fw-xr10) Wrapper transparency | [FW-E2E-086](#fw-e2e-086) | [FW-E2E-193](#fw-e2e-193) |
 | [FW-XR11](#fw-xr11) Failure attribution | [FW-E2E-086](#fw-e2e-086) (first half; the second is not reachable black-box) | — |
+| [FW-XR12](#fw-xr12) Signal forwarding | [FW-E2E-193](#fw-e2e-193) | the terminal half: tests named for it (`fep15_run.rs`) |
+| [FW-XR13](#fw-xr13) Termination bound | [FW-E2E-194](#fw-e2e-194) | the terminal half: tests named for it (`fep15_run.rs`) |
 | [FW-CAP1](#fw-cap1) Enumerable vocabulary | [FW-E2E-013](#fw-e2e-013), 001 | — |
 | [FW-CAP2](#fw-cap2) Monotonic narrowing | [FW-E2E-005](#fw-e2e-005) | INV1 |
 | [FW-CAP3](#fw-cap3) Subtractive default profile | [FW-E2E-003](#fw-e2e-003), 020 | 021, 022 |
@@ -982,6 +1006,10 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-TRA8](#fw-tra8) Agent-state & local-secret coverage | [FW-E2E-038](#fw-e2e-038) | [FW-E2E-003](#fw-e2e-003) |
 | [FW-TRA9](#fw-tra9) Launcher-owned paths | [FW-E2E-089](#fw-e2e-089) | — |
 | [FW-TRA10](#fw-tra10) Private temporary directory | [FW-E2E-089](#fw-e2e-089) | 079 |
+| [FW-TRA18](#fw-tra18) Session root | tests named for it (`fep15_run.rs`) | [FW-E2E-191](#fw-e2e-191) |
+| [FW-TRA19](#fw-tra19) Session roots are disjoint | [FW-E2E-191](#fw-e2e-191), 192 | [FW-ADV-053](#fw-adv-053), INV23; tests named for it (`linux_confine.rs`, `sbpl.rs`) |
+| [FW-TRA20](#fw-tra20) Session root removal | [FW-E2E-195](#fw-e2e-195) | 191, 193, 194 |
+| [FW-TRA21](#fw-tra21) Stale roots | [FW-E2E-196](#fw-e2e-196) | 195 |
 | [FW-FID1](#fw-fid1) Per-capability report | [FW-E2E-024](#fw-e2e-024) | 025 |
 | [FW-FID2](#fw-fid2) Dry-run / audit | [FW-E2E-026](#fw-e2e-026) | 027 |
 | [FW-FID3](#fw-fid3) Runtime observability | [FW-E2E-024](#fw-e2e-024) | — |

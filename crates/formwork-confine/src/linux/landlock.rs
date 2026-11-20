@@ -60,11 +60,14 @@ fn abi_of(v: u32) -> ABI {
 /// A concrete (absolute) subtract hole. Any-depth `**/` patterns are handled separately (they cannot
 /// be a rooted Landlock rule); the caller rejects them so nothing is silently missed. A `prefix`
 /// hole withholds every directory entry whose path starts with `base` as a string -- the numbered
-/// device nodes of a denied channel (`/dev/video0`, `/dev/video1`, FW-ISO13).
+/// device nodes of a denied channel (`/dev/video0`, `/dev/video1`, FW-ISO13). An `except` hole
+/// withholds everything below `base` but the subtree at `except`, whatever is created there
+/// later -- the other sessions' roots (FW-TRA19).
 struct Hole {
     base: PathBuf,
     subtree: bool,
     prefix: bool,
+    except: Option<PathBuf>,
 }
 
 fn holes_of(patterns: &[PathPattern]) -> Result<Vec<Hole>, ConfineError> {
@@ -81,6 +84,7 @@ fn holes_of(patterns: &[PathPattern]) -> Result<Vec<Hole>, ConfineError> {
                     base: p.base().to_path_buf(),
                     subtree: p.is_subtree(),
                     prefix: false,
+                    except: None,
                 })
             }
         })
@@ -88,8 +92,26 @@ fn holes_of(patterns: &[PathPattern]) -> Result<Vec<Hole>, ConfineError> {
 }
 
 impl Hole {
+    /// Everything below `base` except the subtree at `except`, which lies below `base`.
+    fn all_but(base: &PathPattern, except: &PathPattern) -> Hole {
+        Hole {
+            base: base.base().to_path_buf(),
+            subtree: true,
+            prefix: false,
+            except: Some(except.base().to_path_buf()),
+        }
+    }
+
     /// The hole denies `path` outright (it is the hole, or lies within a subtree hole).
     fn covers(&self, path: &Path) -> bool {
+        if let Some(except) = &self.except {
+            // `base` and the directories leading to `except` are split, never covered: granting
+            // one whole would grant what is created beside `except` afterwards.
+            return path != self.base
+                && path.starts_with(&self.base)
+                && !path.starts_with(except)
+                && !except.starts_with(path);
+        }
         if self.prefix {
             return path
                 .to_str()
@@ -105,6 +127,9 @@ impl Hole {
     }
     /// The hole sits strictly below `dir` -- so `dir` must be split, not granted whole.
     fn strictly_under(&self, dir: &Path) -> bool {
+        if let Some(except) = &self.except {
+            return except != dir && except.starts_with(dir);
+        }
         if self.prefix {
             // The entries sit in the prefix's parent directory, so every ancestor of that
             // directory (and the directory itself) must be split.
@@ -222,6 +247,7 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
             base: PathBuf::from(p),
             subtree: false,
             prefix: true,
+            except: None,
         })
     };
     let mut read_holes = holes_of(&policy.subtract)?;
@@ -229,6 +255,12 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     let mut write_holes = holes_of(&policy.subtract)?;
     write_holes.extend(holes_of(&policy.write_subtract)?); // write-subtract denies writes only
     write_holes.extend(device_holes());
+    if let Some(roots) = &policy.session_roots {
+        // FW-TRA19: of the session roots only this session's is readable, and of that only the
+        // temporary directory is writable, whatever root the blueprint grants above them.
+        read_holes.push(Hole::all_but(&roots.parent, &roots.own));
+        write_holes.push(Hole::all_but(&roots.parent, &roots.tmp));
+    }
 
     let mut read_roots: Vec<PathBuf> = policy.reads.iter().map(root_of).collect();
     if policy.read_mode == ReadMode::Closed {

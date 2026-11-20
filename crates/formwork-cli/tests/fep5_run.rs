@@ -122,7 +122,10 @@ printf '%s' "$TMPDIR"
     let run = formwork(dir.path(), &["run", "--", "/bin/sh", "-c", script], &[]);
     assert_eq!(run.code, 0, "stdout={} stderr={}", run.stdout, run.stderr);
     let tmp = run.stdout.trim();
-    assert!(tmp.contains("formwork-session-"), "{tmp}");
+    assert!(
+        tmp.ends_with("/tmp") && tmp.contains("/formwork/"),
+        "the temp directory is `tmp` in the session root (FW-TRA18): {tmp}"
+    );
     assert!(
         !Path::new(tmp).exists(),
         "the session temp directory must be removed after the run"

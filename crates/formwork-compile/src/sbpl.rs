@@ -12,7 +12,7 @@ use formwork_blueprint::{
     ReadMode,
 };
 
-use crate::CompileInput;
+use crate::{CompileInput, SessionRoots};
 
 /// Pure and deterministic.
 pub fn render(input: &CompileInput) -> String {
@@ -51,6 +51,9 @@ pub fn render(input: &CompileInput) -> String {
         (!input.keychain_lifted).then_some(input.keyring_services.as_slice()),
     );
     render_isolate(&mut b, &input.isolate);
+    if let Some(roots) = &input.session_roots {
+        render_session_roots(&mut b, roots);
+    }
     if let Some(marker) = &input.session_marker {
         // Last, so no rule above shadows either half (FW-EGR9).
         b.push_str("\n;; session marker for the egress listener's peer check (FW-EGR9)\n");
@@ -478,6 +481,42 @@ fn render_writes(
     }
 }
 
+/// FW-TRA19: every session root but this one is closed to reads and writes, and of this one only
+/// the temporary directory is writable. Rendered after every fs allow, so no grant, exemption or
+/// rule order lifts it. The read deny starts below `parent`: resolving a path into the session's
+/// own root stats `parent` itself. The write deny includes `parent`, and names each ancestor as
+/// a literal, because a rename is checked against the renamed directory's own path: moving an
+/// ancestor would carry every root out from under a deny written on the paths beneath it.
+fn render_session_roots(b: &mut String, roots: &SessionRoots) {
+    let subpath =
+        |p: &PathPattern| format!("(subpath \"{}\")", escape(&p.base().display().to_string()));
+    let parent = roots.parent.base();
+    let others = format!(
+        "(require-all (regex #\"^{}/\") (require-not {}))",
+        regex_escape(&parent.display().to_string()),
+        subpath(&roots.own)
+    );
+    b.push_str(
+        "\n;; session roots (FW-TRA19): other sessions' closed, this one's read-only but tmp\n",
+    );
+    b.push_str(&format!("(deny file-read* {others})\n"));
+    b.push_str(&format!("(deny file-read-metadata {others})\n"));
+    b.push_str(&format!(
+        "(deny file-write* (require-all {} (require-not {})))\n",
+        subpath(&roots.parent),
+        subpath(&roots.tmp)
+    ));
+    let ancestors: Vec<String> = parent
+        .ancestors()
+        .skip(1)
+        .filter(|a| a.parent().is_some())
+        .map(|a| format!("(literal \"{}\")", escape(&a.display().to_string())))
+        .collect();
+    if !ancestors.is_empty() {
+        b.push_str(&format!("(deny file-write* {})\n", ancestors.join(" ")));
+    }
+}
+
 fn render_exec(b: &mut String, exec: &ExecPosture) {
     if let ExecPosture::Allowlist(paths) = exec {
         b.push_str("\n;; exec allow-list (FW-ISO4)\n");
@@ -597,6 +636,7 @@ mod tests {
             gateway_port: None,
             session_marker: None,
             deny_tag: None,
+            session_roots: None,
             unix_socket_grants: Vec::new(),
             brokered: false,
             keyring_lifted: false,
@@ -896,5 +936,45 @@ mod tests {
             s.contains(r#"(deny file-write* (regex #"/\.git/hooks(/|$)"))"#),
             "{s}"
         );
+    }
+
+    #[test]
+    fn fw_tra19_session_roots_are_denied_after_every_fs_allow() {
+        // A grant over the roots, a floor exemption and an exec allow-list all render before the
+        // deny, so under last-match-wins none of them lifts it.
+        let mut i = input();
+        i.effective_reads = vec![pp("/run/u/**")];
+        i.writes = vec![pp("/run/u/**")];
+        i.floor = vec![pp("**/credentials")];
+        i.floor_exempt = vec![pp("/run/u/**")];
+        i.exec = ExecPosture::Allowlist(vec![pp("/run/u/**")]);
+        i.session_roots = Some(SessionRoots {
+            parent: pp("/run/u/form.work"),
+            own: pp("/run/u/form.work/aa"),
+            tmp: pp("/run/u/form.work/aa/tmp"),
+        });
+        let s = render(&i);
+        let others = r#"(require-all (regex #"^/run/u/form\.work/") (require-not (subpath "/run/u/form.work/aa")))"#;
+        let read_deny = s.find(&format!("(deny file-read* {others})")).expect(&s);
+        assert!(
+            s.contains(&format!("(deny file-read-metadata {others})")),
+            "{s}"
+        );
+        // Of this session's root only tmp is writable, and the parent itself cannot be renamed.
+        let write_deny = s
+            .find(
+                r#"(deny file-write* (require-all (subpath "/run/u/form.work") (require-not (subpath "/run/u/form.work/aa/tmp"))))"#,
+            )
+            .expect(&s);
+        // Each ancestor is write-denied as a literal: creating beneath it stays allowed.
+        assert!(
+            s.contains(r#"(deny file-write* (literal "/run/u") (literal "/run"))"#),
+            "{s}"
+        );
+        let last_allow = |op: &str| s.rfind(&format!("(allow {op}")).expect(op);
+        assert!(last_allow("file-read") < read_deny, "{s}");
+        assert!(last_allow("file-write") < write_deny, "{s}");
+        // A dry run names no session root and renders none of this.
+        assert!(!render(&input()).contains("require-not"));
     }
 }
