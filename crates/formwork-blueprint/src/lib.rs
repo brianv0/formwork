@@ -34,7 +34,7 @@ pub use egress::{
     LocalAddresses, Naming, PathGlob, RefusalReason, RequestDecision, DEFAULT_HTTPS_PORT,
     DEFAULT_HTTP_PORT, HTTP_ATOMS, METADATA_HOSTNAMES,
 };
-pub use launcher::{construct_env, EnvConstruction};
+pub use launcher::{construct_env, is_location, stripped_values, EnvConstruction};
 pub use layer::{merge, BlueprintLayer, DiscoveryLayer, FsLayer, ProvenanceEntry};
 pub use narrow::intersect_grants;
 pub use path::{canonicalize_set, canonicalize_write_set, PathError, PathPattern};

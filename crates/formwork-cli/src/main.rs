@@ -1259,7 +1259,7 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
         Some(t) => (t.env, Some(t.inspection), t.brokers),
         None => (Vec::new(), None, Vec::new()),
     };
-    let egress = start_egress(&blueprint, &host, purpose, inspection, brokers)?;
+    let egress = start_egress(&blueprint, &catalog, &host, purpose, inspection, brokers)?;
     let spec = formwork_compile::SessionSpec {
         gateway: egress.as_ref().map(|e| formwork_compile::SessionGateway {
             port: e.proxy.addr().port(),
@@ -1410,6 +1410,7 @@ fn prepare_inspection(
 /// connect supervision.
 fn start_egress(
     blueprint: &Blueprint,
+    catalog: &ResolvedCatalog,
     host: &HostProfile,
     purpose: Purpose,
     inspection: Option<formwork_gateway::Inspection>,
@@ -1449,6 +1450,7 @@ fn start_egress(
         );
         Vec::new()
     });
+    let markers = derived_markers(blueprint, catalog, &brokers);
     let proxy = formwork_gateway::EgressProxy::start(formwork_gateway::EgressConfig {
         table: table.clone(),
         resolver: formwork_gateway::Resolver::System,
@@ -1461,6 +1463,7 @@ fn start_egress(
         brokers,
         host_addresses,
         upstream_proxy: upstream_proxy()?,
+        markers,
     })
     .context("starting the Gateway egress listener")?;
     for rule in &table.rules {
@@ -1471,6 +1474,88 @@ fn start_egress(
         registry,
         marker,
     }))
+}
+
+/// FW-EGR33: the values the session is never given -- each brokered secret, and the value of each
+/// variable the floor strips from the same environment `apply_env` builds the child's from, unless
+/// it names a location -- for the Gateway to refuse in a request head. Only their names reach a
+/// log.
+fn derived_markers(
+    blueprint: &Blueprint,
+    catalog: &ResolvedCatalog,
+    brokers: &[formwork_gateway::Broker],
+) -> Vec<formwork_gateway::Marker> {
+    use formwork_gateway::Marker;
+    let vars: Vec<(String, String)> = std::env::vars().collect();
+    let stripped =
+        formwork_blueprint::stripped_values(catalog, &blueprint.exposed_credentials(), &vars);
+    let mut markers: Vec<Marker> = brokers.iter().filter_map(Marker::brokered).collect();
+    let (mut short, mut locations) = (Vec::new(), Vec::new());
+    for (name, value) in &stripped {
+        // FW-INV9: refusing a guessable value would confirm it to the session.
+        if formwork_blueprint::is_location(catalog, name, value) {
+            locations.push(name.as_str());
+            continue;
+        }
+        match Marker::stripped(name, value) {
+            Some(m) => markers.push(m),
+            None => short.push(name.as_str()),
+        }
+    }
+    if !short.is_empty() {
+        tracing::info!(
+            variables = ?short,
+            "stripped values shorter than marker-min ({} bytes) are not searched for (FW-EGR33)",
+            formwork_gateway::MARKER_MIN
+        );
+    }
+    if !locations.is_empty() {
+        tracing::info!(
+            variables = ?locations,
+            "stripped values that name a location are not searched for; the floor denies the \
+             file itself (FW-EGR33, FW-INV9)"
+        );
+    }
+    markers
+}
+
+/// FW-FID29: what left the session, host by host, on the operator channel once the workload has
+/// exited. Counts and header names only: no value, body or query string is kept to print.
+fn log_egress_account(proxy: &formwork_gateway::EgressProxy) {
+    let account = proxy.account(std::time::Duration::from_millis(500));
+    if account.is_empty() {
+        tracing::info!("formwork: egress account: no request or tunnel reached a host");
+        return;
+    }
+    for a in &account {
+        let grades = a.grades.join(",");
+        let unit = if a.grades == ["tunnel"] {
+            "tunnels"
+        } else {
+            "requests"
+        };
+        let headers = a.header_names.join(", ");
+        tracing::info!(
+            host = %a.host,
+            port = a.port,
+            grades = %grades,
+            requests = a.requests,
+            bytes_up = a.bytes_up,
+            bytes_down = a.bytes_down,
+            disclosures = a.disclosures,
+            unscanned = a.unscanned,
+            headers = %headers,
+            "formwork: egress account: {}:{} {grades} {} {unit}, up {} B, down {} B, \
+             disclosures {}, unscanned {} B",
+            a.host,
+            a.port,
+            a.requests,
+            a.bytes_up,
+            a.bytes_down,
+            a.disclosures,
+            a.unscanned
+        );
+    }
 }
 
 /// FW-EGR9 on macOS: the listener admits a connection only when a process carrying the session's
@@ -1751,6 +1836,7 @@ fn spawn_confined_child(
         if !egress.proxy.is_alive() {
             formwork_failure("the Gateway egress listener stopped during the session");
         }
+        log_egress_account(&egress.proxy);
     }
     Ok(status)
 }

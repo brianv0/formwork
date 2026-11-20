@@ -482,6 +482,8 @@ pub enum RefusalReason {
     Placeholder,
     Reflection,
     UpstreamTls,
+    /// A request head carried a derived marker (FW-EGR34).
+    Marker,
 }
 
 impl RefusalReason {
@@ -502,6 +504,7 @@ impl RefusalReason {
             RefusalReason::Placeholder => "placeholder",
             RefusalReason::Reflection => "reflection",
             RefusalReason::UpstreamTls => "upstream-tls",
+            RefusalReason::Marker => "marker",
         }
     }
 }
@@ -1544,6 +1547,7 @@ mod tests {
             RefusalReason::AddressClass,
             RefusalReason::SniMismatch,
             RefusalReason::UpstreamTls,
+            RefusalReason::Marker,
         ] {
             assert_eq!(
                 serde_json::to_value(r).unwrap(),

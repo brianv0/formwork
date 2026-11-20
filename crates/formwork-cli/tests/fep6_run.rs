@@ -1054,3 +1054,319 @@ fn fw_e2e_104_blueprints_the_compiler_refuses() {
         }
     }
 }
+
+/// What a stripped `GITHUB_TOKEN` holds on the launching host in the FEP-12 tests below.
+const STRIPPED_TOKEN: &str = "ghp_RunLevelT0ken/5a9c+d2e";
+
+/// The marker-encodings of `value` a log line could carry (FEP-12 §3.2: raw, percent-encoded,
+/// hex, JSON-escaped, and base64 at each alignment in both alphabets), and every run of 8 of its
+/// raw bytes.
+fn marker_encodings(value: &str) -> Vec<Vec<u8>> {
+    let v = value.as_bytes();
+    let b64 = |data: &[u8], alphabet: &[u8; 64]| -> Vec<u8> {
+        let mut out = Vec::new();
+        for group in data.chunks(3) {
+            let n =
+                group.iter().fold(0u32, |acc, &b| (acc << 8) | b as u32) << (8 * (3 - group.len()));
+            for i in 0..=group.len() {
+                out.push(alphabet[((n >> (18 - 6 * i)) & 63) as usize]);
+            }
+        }
+        out
+    };
+    let std = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let url = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let pct = |upper: bool| -> Vec<u8> {
+        v.iter()
+            .flat_map(|&b| {
+                if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                    vec![b]
+                } else if upper {
+                    format!("%{b:02X}").into_bytes()
+                } else {
+                    format!("%{b:02x}").into_bytes()
+                }
+            })
+            .collect()
+    };
+    let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
+    let json = serde_json::to_string(value).unwrap();
+    let mut out = vec![
+        pct(true),
+        pct(false),
+        hex.clone().into_bytes(),
+        hex.to_ascii_uppercase().into_bytes(),
+        json.as_bytes()[1..json.len() - 1].to_vec(),
+    ];
+    for alphabet in [std, url] {
+        for lead in 0..3usize {
+            let mut aligned = vec![0u8; lead];
+            aligned.extend_from_slice(v);
+            let text = b64(&aligned, alphabet);
+            out.push(text[(lead * 8).div_ceil(6)..aligned.len() * 8 / 6].to_vec());
+        }
+    }
+    out.extend(v.windows(8).map(<[u8]>::to_vec));
+    out
+}
+
+/// FEP-12's draft invariant on markers, over a run's output: no encoding of `value` on stdout or
+/// on the operator channel at the trace level.
+fn assert_marker_withheld(out: &Output, value: &str) {
+    let both = format!("{}{}", out.stdout, out.stderr);
+    for e in marker_encodings(value) {
+        assert!(
+            !both.as_bytes().windows(e.len()).any(|w| w == e.as_slice()),
+            "{:?}, an encoding of the marker, is in the run's output",
+            String::from_utf8_lossy(&e)
+        );
+    }
+}
+
+/// FW-E2E-172 through `run` (both): the Launcher strips `GITHUB_TOKEN` and registers its value as
+/// a marker, and registers the secret of the credential it brokers (FW-EGR33). Both reach the
+/// session by another route, a file in the project. The stripped value is sent to a granted
+/// inspected host in a `User-Agent` and in a query, and the secret in its own header to its bound
+/// host: each is refused with a `marker` record naming its marker, and the fixture receives none
+/// of them; the same requests without the values pass, the placeholder presented as the secret.
+/// At the trace level nothing the run writes carries either value or an encoding of it.
+#[test]
+fn fw_e2e_172_a_stripped_credential_is_refused_through_run() {
+    let dir = Scratch::new("fep12-stripped");
+    if !session_host(dir.path(), &["curl"]) {
+        return;
+    }
+    let cert = fixture_cert(dir.path(), &["127.0.0.1"]);
+    let up = TlsFixture::start(&cert);
+    blueprint(
+        dir.path(),
+        &[format!("allow:127.0.0.1:{}", up.port)],
+        "allow-credentials = [{ name = \"model-fixture\", env = \"FIXTURE_MODEL_KEY\", \
+         hosts = [\"127.0.0.1\"], scheme = \"header:x-api-key\" }]\n",
+    );
+    let secret = "sk-fx-3c8e2b7d1a9f4e06";
+    std::fs::write(dir.path().join("found.txt"), STRIPPED_TOKEN).unwrap();
+    std::fs::write(dir.path().join("found-key.txt"), secret).unwrap();
+    let m = up.port;
+    let script = format!(
+        r#"v=$(cat found.txt)
+printf 'env=%s\n' "${{GITHUB_TOKEN:-absent}}"
+curl -sS -m 10 -o /dev/null -w 'key=%{{http_code}}\n' -H "x-api-key: $(cat found-key.txt)" https://127.0.0.1:{m}/key
+curl -sS -m 10 -H "x-api-key: $FIXTURE_MODEL_KEY" https://127.0.0.1:{m}/key-ok
+curl -sS -m 10 -o /dev/null -w 'ua=%{{http_code}}\n' -A "agent/1 ($v)" https://127.0.0.1:{m}/ua
+curl -sS -m 10 -o /dev/null -w 'query=%{{http_code}}\n' "https://127.0.0.1:{m}/q?t=$v"
+curl -sS -m 10 -A "agent/1" https://127.0.0.1:{m}/clean-ua
+curl -sS -m 10 "https://127.0.0.1:{m}/q?t=public"
+"#
+    );
+    let out = formwork(
+        dir.path(),
+        &["run", "--", "/bin/sh", "-c", &script],
+        &[
+            ("SSL_CERT_FILE", cert.root.to_str().unwrap()),
+            ("GITHUB_TOKEN", STRIPPED_TOKEN),
+            ("FIXTURE_MODEL_KEY", secret),
+            ("RUST_LOG", "trace"),
+        ],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    for line in [
+        "env=absent",
+        "key=403",
+        "ok:/key-ok",
+        "ua=403",
+        "query=403",
+        "ok:/clean-ua",
+        "ok:/q",
+    ] {
+        assert!(
+            out.stdout.contains(line),
+            "{line}: {}\n{}",
+            out.stdout,
+            out.stderr
+        );
+    }
+    let seen = up.seen();
+    let paths: Vec<String> = seen.iter().map(|s| s.path()).collect();
+    assert_eq!(
+        paths,
+        vec!["/key-ok", "/clean-ua", "/q?t=public"],
+        "{paths:?}"
+    );
+    assert_eq!(seen[0].header("x-api-key").as_deref(), Some(secret));
+    let refusals = |marker: &str| {
+        out.stderr
+            .lines()
+            .filter(|l| l.contains("reason=\"marker\"") && l.contains(marker))
+            .count()
+    };
+    assert_eq!(refusals("stripped:GITHUB_TOKEN"), 2, "{}", out.stderr);
+    assert_eq!(refusals("brokered:model-fixture"), 1, "{}", out.stderr);
+    assert_marker_withheld(&out, STRIPPED_TOKEN);
+    assert_marker_withheld(&out, secret);
+}
+
+/// FW-E2E-175 through `run` (both): after a run that reached three hosts -- two inspected, one
+/// tunnelled -- and was refused at a fourth, the Launcher writes one account line per contacted
+/// host with its grade, request count, bytes and header names, and none for the refused host
+/// (FW-FID29). The tunnel's bytes are all unscanned (FW-FID28), and the request that carried the
+/// stripped value counts as a disclosure at the host that refused it.
+#[test]
+fn fw_e2e_175_the_launcher_writes_the_egress_account() {
+    let dir = Scratch::new("fep12-account");
+    if !session_host(dir.path(), &["curl"]) {
+        return;
+    }
+    let cert = fixture_cert(dir.path(), &["127.0.0.1", "localhost"]);
+    let (a, b, t) = (
+        TlsFixture::start(&cert),
+        TlsFixture::start(&cert),
+        TlsFixture::start(&cert),
+    );
+    let (pa, pb, pt) = (a.port, b.port, t.port);
+    blueprint(
+        dir.path(),
+        &[
+            format!("allow:127.0.0.1:{pa}"),
+            format!("allow:localhost:{pb}"),
+            format!("tunnel:127.0.0.1:{pt}"),
+        ],
+        "",
+    );
+    std::fs::write(dir.path().join("found.txt"), STRIPPED_TOKEN).unwrap();
+    let root = cert.root.to_str().unwrap();
+    let script = format!(
+        r#"curl -sS -m 10 -H 'X-Probe: hidden-value' https://127.0.0.1:{pa}/one
+curl -sS -m 10 -o /dev/null -A "agent ($(cat found.txt))" https://127.0.0.1:{pa}/leak
+curl -sS -m 10 https://localhost:{pb}/two
+curl -sS -m 10 --cacert {root} https://127.0.0.1:{pt}/three
+curl -sS -m 10 https://localhost:{pa}/refused; echo "refused=$?"
+"#
+    );
+    let out = formwork(
+        dir.path(),
+        &["run", "--", "/bin/sh", "-c", &script],
+        &[
+            ("SSL_CERT_FILE", root),
+            ("GITHUB_TOKEN", STRIPPED_TOKEN),
+            ("RUST_LOG", "trace"),
+        ],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    for body in ["ok:/one", "ok:/two", "ok:/three"] {
+        assert!(out.stdout.contains(body), "{body}: {}", out.stdout);
+    }
+    assert_eq!(
+        a.seen().len(),
+        1,
+        "the request carrying the value never arrived"
+    );
+    let account: Vec<&str> = out
+        .stderr
+        .lines()
+        .filter(|l| l.contains("formwork: egress account: "))
+        .collect();
+    assert_eq!(account.len(), 3, "{account:#?}\n{}", out.stderr);
+    let line = |host: &str| {
+        *account
+            .iter()
+            .find(|l| l.contains(&format!("egress account: {host} ")))
+            .unwrap_or_else(|| panic!("no account line for {host}: {account:#?}"))
+    };
+    let first = line(&format!("127.0.0.1:{pa}"));
+    assert!(first.contains(" inspected 1 requests"), "{first}");
+    assert!(first.contains("disclosures 1"), "{first}");
+    assert!(first.contains("x-probe"), "{first}");
+    let second = line(&format!("localhost:{pb}"));
+    assert!(second.contains(" inspected 1 requests"), "{second}");
+    assert!(second.contains("disclosures 0"), "{second}");
+    let tunnelled = line(&format!("127.0.0.1:{pt}"));
+    assert!(tunnelled.contains(" tunnel 1 tunnels"), "{tunnelled}");
+    let field = |l: &str, name: &str| -> u64 {
+        l.split(&format!(" {name}="))
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no {name} in {l}"))
+    };
+    assert!(field(tunnelled, "unscanned") > 0, "{tunnelled}");
+    assert_eq!(
+        field(tunnelled, "unscanned"),
+        field(tunnelled, "bytes_up"),
+        "{tunnelled}"
+    );
+    assert!(
+        !account
+            .iter()
+            .any(|l| l.contains(&format!("localhost:{pa}"))),
+        "the refused host has no line: {account:#?}"
+    );
+    assert!(account.iter().all(|l| !l.contains("hidden-value")));
+    assert_marker_withheld(&out, STRIPPED_TOKEN);
+}
+
+/// FW-EGR33 through `run` (both), for FW-INV9: a stripped variable whose value is a location is
+/// not a marker, so sending that path is admitted and tells the session nothing about the
+/// variable, while a stripped token in the same run is a marker and is refused. The registered
+/// markers the operator channel lists hold the token's variable and not the path's.
+#[test]
+fn fw_egr33_a_stripped_path_is_not_a_marker_through_run() {
+    let dir = Scratch::new("fep12-location");
+    if !session_host(dir.path(), &["curl"]) {
+        return;
+    }
+    let cert = fixture_cert(dir.path(), &["127.0.0.1"]);
+    let up = TlsFixture::start(&cert);
+    blueprint(dir.path(), &[format!("allow:127.0.0.1:{}", up.port)], "");
+    let kube = dir.path().join("kube").join("config");
+    std::fs::create_dir_all(kube.parent().unwrap()).unwrap();
+    std::fs::write(&kube, "apiVersion: v1\n").unwrap();
+    let kube = kube.to_str().unwrap().to_string();
+    std::fs::write(dir.path().join("path.txt"), &kube).unwrap();
+    std::fs::write(dir.path().join("found.txt"), STRIPPED_TOKEN).unwrap();
+    let m = up.port;
+    let script = format!(
+        r#"curl -sS -m 10 -o /dev/null -w 'path=%{{http_code}}\n' -A "agent ($(cat path.txt))" https://127.0.0.1:{m}/path
+curl -sS -m 10 -o /dev/null -w 'token=%{{http_code}}\n' -A "agent ($(cat found.txt))" https://127.0.0.1:{m}/token
+"#
+    );
+    let out = formwork(
+        dir.path(),
+        &["run", "--", "/bin/sh", "-c", &script],
+        &[
+            ("SSL_CERT_FILE", cert.root.to_str().unwrap()),
+            ("GITHUB_TOKEN", STRIPPED_TOKEN),
+            ("KUBECONFIG", kube.as_str()),
+        ],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    for line in ["path=200", "token=403"] {
+        assert!(
+            out.stdout.contains(line),
+            "{line}: {}\n{}",
+            out.stdout,
+            out.stderr
+        );
+    }
+    let seen = up.seen();
+    let paths: Vec<String> = seen.iter().map(|s| s.path()).collect();
+    assert_eq!(paths, vec!["/path"], "{paths:?}");
+    assert_eq!(
+        seen[0].header("user-agent"),
+        Some(format!("agent ({kube})"))
+    );
+    let registered = out
+        .stderr
+        .lines()
+        .find(|l| l.contains("derived markers"))
+        .unwrap_or_else(|| panic!("no marker line: {}", out.stderr));
+    assert!(registered.contains("stripped:GITHUB_TOKEN"), "{registered}");
+    assert!(!registered.contains("stripped:KUBECONFIG"), "{registered}");
+    assert!(
+        out.stderr
+            .lines()
+            .any(|l| l.contains("name a location") && l.contains("KUBECONFIG")),
+        "{}",
+        out.stderr
+    );
+}
