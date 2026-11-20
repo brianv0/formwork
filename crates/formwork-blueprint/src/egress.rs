@@ -700,13 +700,15 @@ pub const HTTP_ATOMS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "head", "options", "tunnel",
 ];
 
-/// FW-BP16: a rule target is a path pattern when it begins with `/`, `~`, `$` (a sigil) or `**` (an
-/// any-depth pattern, which no host can start with), and a host target otherwise.
+/// FW-BP16: a rule target is a path pattern when it begins with `/`, `~`, `$` (a sigil), `**` (an
+/// any-depth pattern, which no host can start with) or `./` (a path under the launch directory,
+/// FW-BP30), and a host target otherwise.
 pub fn target_is_host(target: &str) -> bool {
     !(target.starts_with('/')
         || target.starts_with('~')
         || target.starts_with('$')
-        || target.starts_with("**"))
+        || target.starts_with("**")
+        || target.starts_with("./"))
 }
 
 /// The host grammar, stated once for every refusal that needs it.
@@ -901,7 +903,7 @@ fn parse_target(target: &str) -> Result<(HostPattern, Option<u16>, Option<PathGl
             // host, so it is refused rather than read as one.
             CanonicalHost::Name(n) if !n.contains('.') && n != "localhost" => {
                 return Err(refuse(format!(
-                    "{n:?} has no dot; a path target starts with /, ~ or $CWD"
+                    "{n:?} has no dot; a path target starts with /, ~, $CWD or ./"
                 )))
             }
             CanonicalHost::Name(n) => HostPattern::Exact(n),

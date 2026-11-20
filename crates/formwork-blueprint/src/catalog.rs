@@ -88,6 +88,8 @@ impl Catalog {
     /// Expand `~` against `home` and parse every pattern. Fails loud on an unparsable pattern
     /// (a hole that silently failed to match would be a fail-open of the floor, FW-INV6).
     pub fn resolve(&self, home: &str) -> Result<ResolvedCatalog, PathError> {
+        // The home directory is a concrete path spliced into a pattern (FW-BP29).
+        let home = PathPattern::escape(home);
         let expand = |s: &str| -> Result<PathPattern, PathError> {
             let expanded = if s == "~" {
                 home.to_string()
@@ -271,6 +273,17 @@ mod tests {
         assert!(resolved.types["secrets-mount"]
             .paths
             .contains(&PathPattern::parse("/run/secrets/**").unwrap()));
+    }
+
+    /// FW-BP29: the home directory is a path, not pattern text. A home whose name carries a glob
+    /// character or a backslash resolves, and its rows name that directory.
+    #[test]
+    fn fw_bp29_a_home_directory_is_never_read_as_grammar() {
+        let home = std::path::Path::new("/home/a[b] *?\\x");
+        let resolved = Catalog::builtin().resolve(home.to_str().unwrap()).unwrap();
+        assert!(resolved.types["aws"]
+            .paths
+            .contains(&PathPattern::subtree(&home.join(".aws")).unwrap()));
     }
 
     #[test]

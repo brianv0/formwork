@@ -218,10 +218,22 @@ pub fn compile_for_session(
     let mut per_capability: BTreeMap<Capability, Fidelity> = BTreeMap::new();
     let mut withheld: Vec<String> = Vec::new();
 
-    let (confiner, direct_tcp_ports) = match host.os {
+    let (mut confiner, direct_tcp_ports) = match host.os {
         Os::MacOs => compile_macos(&input, host, &mut per_capability),
         Os::Linux => compile_linux(&input, host, &mut per_capability, &mut withheld),
     };
+    // FW-BP28: a caller that did not ask `refusal` first still gets no policy to enforce, and a
+    // report that claims no filesystem scope.
+    if let Some(reason) = refusal(&blueprint, host) {
+        for cap in [Capability::FsRead, Capability::FsWrite, Capability::Exec] {
+            if let Some(fidelity) = per_capability.get_mut(&cap) {
+                *fidelity = Fidelity::Unenforceable {
+                    reason: reason.clone(),
+                };
+            }
+        }
+        confiner = ConfinerPolicy::Unavailable { reason };
+    }
     let supervised = supervised(&input, host);
     egress_rows(&input, host, supervised, &mut per_capability);
     let channels = baseline_rows(&input, host, supervised, &mut per_capability);
@@ -296,6 +308,64 @@ pub fn compile_for_session(
         gateway,
         report,
     }
+}
+
+/// FW-BP28: why a blueprint cannot be compiled for this host, or `None` when it can. A Landlock
+/// rule attaches to one opened file or directory, so an any-depth pattern has nothing to attach
+/// to. The credential floor's and the tamper vectors' any-depth rows are withheld and reported
+/// (FW-CRED9); a grant or a deny the operator wrote is refused, because withholding it would
+/// leave a blueprint that grants or denies something other than what it says. Every door that
+/// compiles asks this first and refuses with the text returned.
+pub fn refusal(blueprint: &Blueprint, host: &HostProfile) -> Option<String> {
+    if host.os != Os::Linux {
+        return None;
+    }
+    let blueprint = blueprint.canonicalize();
+    let exec: &[PathPattern] = match &blueprint.exec {
+        ExecPosture::Allowlist(paths) => paths,
+        ExecPosture::Unrestricted => &[],
+    };
+    // A read row counts only if the policy would carry it: the ambient read mode and a covering
+    // write grant both make it redundant on either backend.
+    let mut read_surface = blueprint.fs.reads.clone();
+    read_surface.extend(blueprint.fs.writes.iter().cloned());
+    read_surface.extend(blueprint.fs.writes_no_create.iter().cloned());
+    if blueprint.fs.read_mode == ReadMode::AmbientMinusSubtract {
+        read_surface.push(PathPattern::parse("/**").expect("constant pattern"));
+    }
+    let read_surface = canonicalize_set(&read_surface);
+    let reads: Vec<PathPattern> = blueprint
+        .fs
+        .reads
+        .iter()
+        .filter(|p| read_surface.contains(p))
+        .cloned()
+        .collect();
+    let rows: Vec<String> = [
+        ("read", &reads[..]),
+        ("write", &blueprint.fs.writes[..]),
+        ("modify", &blueprint.fs.writes_no_create[..]),
+        ("exec", exec),
+        ("deny", &blueprint.fs.subtract[..]),
+    ]
+    .iter()
+    .flat_map(|(verb, patterns)| {
+        patterns
+            .iter()
+            .filter(|p| p.is_any_depth())
+            .map(move |p| format!("`{verb}:{p}`"))
+    })
+    .collect();
+    (!rows.is_empty()).then(|| {
+        format!(
+            "this blueprint cannot be enforced on Linux: {} {} an any-depth (`**/`) pattern, and \
+             Landlock attaches a rule to one file or directory, so it can neither grant nor deny \
+             a name wherever it appears. Write an absolute path or a subtree (`/dir/**`) instead; \
+             the blueprint is enforceable as written on macOS only (FW-BP28)",
+            rows.join(", "),
+            if rows.len() == 1 { "is" } else { "are" }
+        )
+    })
 }
 
 /// The Partial reason for a row set Landlock can only partly root: its any-depth rows are withheld,
@@ -973,7 +1043,12 @@ fn unix_socket_grants(input: &CompileInput, host: &HostProfile) -> Vec<PathPatte
         paths.extend(f.session_bus.iter().cloned());
     }
     let mut grants = input.unix_socket_grants.clone();
-    grants.extend(paths.iter().filter_map(|p| PathPattern::parse(p).ok()));
+    // A socket `detect` found is one concrete path, never pattern text (FW-BP29).
+    grants.extend(
+        paths
+            .iter()
+            .filter_map(|p| PathPattern::literal(std::path::Path::new(p)).ok()),
+    );
     grants
 }
 

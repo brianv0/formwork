@@ -5,6 +5,10 @@
 //! Normalization (lexical `.`/`..`, collapsed slashes, no trailing slash) makes equal scopes
 //! compare equal, which keeps compilation deterministic and narrowing exact. `~` is expanded by
 //! the CLI, not here.
+//!
+//! Those two `**` forms are the whole wildcard grammar (FW-BP4). A `*`, `?` or `[` anywhere else
+//! is refused (FW-BP29): read as part of a file name it would be a rule that matches nothing the
+//! author meant. A file whose name does contain one is written with a backslash before it.
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -32,7 +36,26 @@ pub enum PathError {
     Empty,
     #[error("path pattern escapes root with '..': {0:?}")]
     EscapesRoot(String),
+    #[error(
+        "path pattern `{pattern}` contains `{found}`, which is not a wildcard here: a path pattern \
+         matches by a trailing `/**` (everything beneath a directory) or a `**/` (any depth) and \
+         nothing else. {hint}"
+    )]
+    GlobCharacter {
+        pattern: String,
+        found: char,
+        hint: String,
+    },
+    #[error(
+        "path pattern `{0}` has a `\\` that escapes nothing: a backslash goes before a `*`, `?`, \
+         `[` or `\\` that is part of a file name"
+    )]
+    DanglingEscape(String),
 }
+
+/// The characters a shell glob gives meaning to and this grammar does not (FW-BP29), and the
+/// escape itself.
+const ESCAPED: [char; 4] = ['*', '?', '[', '\\'];
 
 impl PathPattern {
     pub fn parse(input: &str) -> Result<Self, PathError> {
@@ -50,8 +73,7 @@ impl PathPattern {
             if suffix.is_empty() || suffix == "**" {
                 return Err(PathError::Empty);
             }
-            let base = normalize_relative(suffix)
-                .ok_or_else(|| PathError::EscapesRoot(input.to_string()))?;
+            let base = normalize_relative(suffix, input)?;
             return Ok(PathPattern {
                 base,
                 subtree,
@@ -76,15 +98,11 @@ impl PathPattern {
             if suffix_part.is_empty() {
                 return Err(PathError::Empty);
             }
-            let anchor = normalize_absolute(if prefix_part.is_empty() {
-                "/"
-            } else {
-                prefix_part
-            })
-            .filter(|a| !a.components().any(|c| c.as_os_str() == "**"))
-            .ok_or_else(|| PathError::EscapesRoot(input.to_string()))?;
-            let base = normalize_relative(suffix_part)
-                .ok_or_else(|| PathError::EscapesRoot(input.to_string()))?;
+            if prefix_part.split('/').any(|c| c == "**") {
+                return Err(PathError::EscapesRoot(input.to_string()));
+            }
+            let anchor = normalize_absolute(prefix_part, input)?;
+            let base = normalize_relative(suffix_part, input)?;
             // A root anchor adds nothing over the plain form; normalize so equal scopes compare equal.
             let anchor = (anchor != Path::new("/")).then_some(anchor);
             return Ok(PathPattern {
@@ -107,14 +125,48 @@ impl PathPattern {
             return Err(PathError::NotAbsolute(input.to_string()));
         }
 
-        let base = normalize_absolute(path_part)
-            .ok_or_else(|| PathError::EscapesRoot(input.to_string()))?;
+        let base = normalize_absolute(path_part, input)?;
         Ok(PathPattern {
             base,
             subtree,
             any_depth: false,
             anchor: None,
         })
+    }
+
+    /// The pattern for one concrete path. No character of it is read as grammar, so a path the
+    /// kernel reported or the Launcher built names exactly that object, never a subtree or an
+    /// any-depth match (FW-BP31).
+    pub fn literal(path: &Path) -> Result<Self, PathError> {
+        Ok(PathPattern {
+            base: concrete(path)?,
+            subtree: false,
+            any_depth: false,
+            anchor: None,
+        })
+    }
+
+    /// Everything at and beneath one concrete directory, read as [`Self::literal`] reads a path.
+    pub fn subtree(dir: &Path) -> Result<Self, PathError> {
+        Ok(PathPattern {
+            base: concrete(dir)?,
+            subtree: true,
+            any_depth: false,
+            anchor: None,
+        })
+    }
+
+    /// A concrete path spelled so that [`Self::parse`] reads every character of it as itself
+    /// (FW-BP29): for text spliced into a pattern, such as an expanded sigil or a resolved anchor.
+    pub fn escape(path: &str) -> String {
+        let mut out = String::with_capacity(path.len());
+        for c in path.chars() {
+            if ESCAPED.contains(&c) {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
     }
 
     pub fn base(&self) -> &Path {
@@ -137,23 +189,25 @@ impl PathPattern {
         self.anchor.as_deref()
     }
 
-    /// Round-trips through `parse`.
+    /// Round-trips through `parse`: the fixed parts are spelled escaped (FW-BP29).
     pub fn canonical(&self) -> String {
+        let spell = |p: &Path| Self::escape(&p.display().to_string());
+        let base = spell(&self.base);
         if self.any_depth {
             match (&self.anchor, self.subtree) {
-                (Some(a), true) => format!("{}/**/{}/**", a.display(), self.base.display()),
-                (Some(a), false) => format!("{}/**/{}", a.display(), self.base.display()),
-                (None, true) => format!("**/{}/**", self.base.display()),
-                (None, false) => format!("**/{}", self.base.display()),
+                (Some(a), true) => format!("{}/**/{base}/**", spell(a)),
+                (Some(a), false) => format!("{}/**/{base}", spell(a)),
+                (None, true) => format!("**/{base}/**"),
+                (None, false) => format!("**/{base}"),
             }
         } else if self.subtree {
             if self.base == Path::new("/") {
                 "/**".to_string()
             } else {
-                format!("{}/**", self.base.display())
+                format!("{base}/**")
             }
         } else {
-            self.base.display().to_string()
+            base
         }
     }
 
@@ -235,51 +289,127 @@ impl PathPattern {
 }
 
 /// Purely lexical (no filesystem access); real-path canonicalization is deferred to enforce time.
-fn normalize_absolute(path: &str) -> Option<PathBuf> {
-    let mut out: Vec<&std::ffi::OsStr> = Vec::new();
-    for comp in Path::new(path).components() {
+fn normalize_absolute(path: &str, input: &str) -> Result<PathBuf, PathError> {
+    let mut out: Vec<String> = Vec::new();
+    for comp in path.split('/') {
         match comp {
-            Component::RootDir => {}
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop()?; // `..` above root -> escape
+            "" | "." => {}
+            ".." => {
+                // `..` above root -> escape
+                out.pop()
+                    .ok_or_else(|| PathError::EscapesRoot(input.to_string()))?;
             }
-            Component::Normal(c) => out.push(c),
-            Component::Prefix(_) => return None,
+            name => out.push(unescape(name, input)?),
         }
     }
     let mut buf = PathBuf::from("/");
     for c in out {
         buf.push(c);
     }
-    Some(buf)
+    Ok(buf)
 }
 
 /// The relative suffix of a `**/`-anchored pattern: normal components only -- no root, no `..`, no
-/// interior `**`. Returns a relative `PathBuf` with at least one component, else `None`.
-fn normalize_relative(path: &str) -> Option<PathBuf> {
-    let mut out: Vec<&std::ffi::OsStr> = Vec::new();
-    for comp in Path::new(path).components() {
-        match comp {
-            Component::CurDir => {}
-            Component::Normal(c) => {
-                if c == "**" {
-                    return None; // interior `**` is unsupported; only a single leading `**/`
-                }
-                out.push(c);
-            }
-            // Root, `..`, and Windows prefixes are all invalid inside a suffix.
-            _ => return None,
-        }
-    }
-    if out.is_empty() {
-        return None;
+/// interior `**` (only one `**/` is supported). A relative `PathBuf` with at least one component.
+fn normalize_relative(path: &str, input: &str) -> Result<PathBuf, PathError> {
+    let escapes = || PathError::EscapesRoot(input.to_string());
+    if path.starts_with('/') {
+        return Err(escapes());
     }
     let mut buf = PathBuf::new();
-    for c in out {
-        buf.push(c);
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." | "**" => return Err(escapes()),
+            name => buf.push(unescape(name, input)?),
+        }
     }
-    Some(buf)
+    if buf.as_os_str().is_empty() {
+        return Err(escapes());
+    }
+    Ok(buf)
+}
+
+/// One `/`-separated component of an authored pattern, read as a file name: an escaped character
+/// stands for itself, and an unescaped `*`, `?` or `[` is refused (FW-BP29).
+fn unescape(component: &str, input: &str) -> Result<String, PathError> {
+    let mut out = String::with_capacity(component.len());
+    let mut chars = component.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(next) if ESCAPED.contains(&next) => out.push(next),
+                _ => return Err(PathError::DanglingEscape(input.to_string())),
+            },
+            '*' | '?' | '[' => {
+                return Err(PathError::GlobCharacter {
+                    pattern: input.to_string(),
+                    found: c,
+                    hint: glob_hint(component, input),
+                })
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
+/// The nearest patterns that are valid: the subtree of the directory the component sits in, and
+/// the component taken as a file name.
+fn glob_hint(component: &str, input: &str) -> String {
+    let mut escaped = String::with_capacity(component.len() + 1);
+    let mut chars = component.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // An escape the author already wrote stays as written.
+            '\\' => {
+                escaped.push(c);
+                escaped.extend(chars.next());
+            }
+            '*' | '?' | '[' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            other => escaped.push(other),
+        }
+    }
+    let at = input.find(component).unwrap_or(0);
+    let (before, after) = (&input[..at], &input[at + component.len()..]);
+    let named = format!(
+        "For the file or directory whose name contains the character, write \
+         `{before}{escaped}{after}`."
+    );
+    if before.starts_with('/') && !before.contains("**") {
+        format!(
+            "To cover everything in the directory, write `{}/**`. {named}",
+            before.trim_end_matches('/')
+        )
+    } else {
+        named
+    }
+}
+
+/// A concrete absolute path, normalized as [`normalize_absolute`] normalizes an authored one and
+/// with nothing unescaped: every component is the file name it is.
+fn concrete(path: &Path) -> Result<PathBuf, PathError> {
+    let refused = || PathError::EscapesRoot(path.display().to_string());
+    if !path.is_absolute() {
+        return Err(PathError::NotAbsolute(path.display().to_string()));
+    }
+    let mut out = PathBuf::from("/");
+    for comp in path.components() {
+        match comp {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err(refused());
+                }
+            }
+            Component::Normal(c) => out.push(c),
+            Component::Prefix(_) => return Err(refused()),
+        }
+    }
+    Ok(out)
 }
 
 impl fmt::Display for PathPattern {
@@ -383,6 +513,124 @@ mod tests {
             Err(PathError::EscapesRoot(_))
         ));
         assert!(matches!(PathPattern::parse(""), Err(PathError::Empty)));
+    }
+
+    /// FW-BP29: a glob character outside the two `**` forms is refused in every part of every
+    /// form, and the refusal carries the nearest patterns that are valid.
+    #[test]
+    fn fw_bp29_a_glob_character_is_refused_with_the_valid_spellings() {
+        for input in [
+            "/srv/keys/*.pem",
+            "/srv/keys/prod?.pem",
+            "/srv/[a-z]/x",
+            "/srv/k*/**",
+            "/srv/*/**/id_rsa",
+            "/srv/**/*.pem",
+            "**/*.pem",
+            "**/k?ys/**",
+            "/srv/keys**",
+            "/srv/**keys",
+            "/*",
+        ] {
+            match PathPattern::parse(input) {
+                Err(PathError::GlobCharacter { pattern, found, .. }) => {
+                    assert_eq!(pattern, input);
+                    assert!(matches!(found, '*' | '?' | '['), "{input}: {found}");
+                }
+                other => panic!("{input} must be refused as a glob, got {other:?}"),
+            }
+        }
+        let refusal = PathPattern::parse("/srv/keys/*.pem")
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("`/srv/keys/**`"), "{refusal}");
+        assert!(refusal.contains(r"`/srv/keys/\*.pem`"), "{refusal}");
+        // No directory to offer for an any-depth name: only the escaped spelling.
+        let refusal = PathPattern::parse("**/*.pem").unwrap_err().to_string();
+        assert!(refusal.contains(r"`**/\*.pem`"), "{refusal}");
+        assert!(!refusal.contains("To cover everything"), "{refusal}");
+    }
+
+    /// FW-BP29: an escaped character is part of the file name, in every form, and the canonical
+    /// string spells it escaped again so a pattern survives a round trip.
+    #[test]
+    fn fw_bp29_an_escaped_character_names_the_file_and_round_trips() {
+        let star = p(r"/srv/keys/\*.pem");
+        assert!(!star.is_subtree() && !star.is_any_depth());
+        assert_eq!(star.base(), Path::new("/srv/keys/*.pem"));
+        assert!(star.matches_path(Path::new("/srv/keys/*.pem")));
+        assert!(!star.matches_path(Path::new("/srv/keys/prod.pem")));
+        assert_eq!(star.canonical(), r"/srv/keys/\*.pem");
+
+        for input in [
+            r"/a/\?/b\[1]/c\\d/**",
+            r"/a\*/**/b\?/**",
+            r"**/\[id]/page.tsx",
+            r"/a/\*\*",
+            r"/a/\*\*/**",
+            r"/\*\*/x",
+        ] {
+            let pattern = p(input);
+            assert_eq!(pattern.canonical(), input);
+            assert_eq!(p(&pattern.canonical()), pattern);
+            let json = serde_json::to_string(&pattern).unwrap();
+            assert_eq!(serde_json::from_str::<PathPattern>(&json).unwrap(), pattern);
+        }
+        // An escaped `**` is a file named `**`, never the subtree or any-depth marker.
+        assert_eq!(p(r"/a/\*\*").base(), Path::new("/a/**"));
+        assert!(!p(r"/a/\*\*").is_subtree());
+        assert!(!p(r"/\*\*/x").is_any_depth());
+
+        for dangling in [r"/a/b\", r"/a/\b", r"/a\/b", r"**/x\"] {
+            assert!(
+                matches!(
+                    PathPattern::parse(dangling),
+                    Err(PathError::DanglingEscape(_))
+                ),
+                "{dangling}"
+            );
+        }
+    }
+
+    /// FW-BP31: a concrete path becomes a pattern for that path alone, whatever its characters.
+    #[test]
+    fn fw_bp31_a_concrete_path_is_never_read_as_grammar() {
+        for path in [
+            "/srv/**/config",
+            "/srv/**",
+            "/**",
+            "/srv/*.pem",
+            "/srv/a?b",
+            "/srv/[id]/x",
+            r"/srv/a\*b",
+            r"/srv/a\\b",
+        ] {
+            let literal = PathPattern::literal(Path::new(path)).unwrap();
+            assert!(!literal.is_subtree() && !literal.is_any_depth(), "{path}");
+            assert_eq!(literal.base(), Path::new(path));
+            assert!(literal.matches_path(Path::new(path)));
+            assert!(!literal.matches_path(&Path::new(path).join("child")));
+            // The spelling `parse` reads back as the same single path.
+            assert_eq!(p(&literal.canonical()), literal, "{path}");
+            assert_eq!(p(&PathPattern::escape(path)), literal, "{path}");
+
+            let subtree = PathPattern::subtree(Path::new(path)).unwrap();
+            assert!(subtree.is_subtree() && !subtree.is_any_depth(), "{path}");
+            assert_eq!(subtree.base(), Path::new(path));
+            assert_eq!(p(&subtree.canonical()), subtree, "{path}");
+        }
+        assert_eq!(
+            PathPattern::literal(Path::new("/a//b/./c/../d")).unwrap(),
+            p("/a/b/d")
+        );
+        assert!(matches!(
+            PathPattern::literal(Path::new("rel/x")),
+            Err(PathError::NotAbsolute(_))
+        ));
+        assert!(matches!(
+            PathPattern::literal(Path::new("/../x")),
+            Err(PathError::EscapesRoot(_))
+        ));
     }
 
     #[test]

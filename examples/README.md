@@ -97,15 +97,30 @@ formwork compile --blueprint examples/blueprints/rules-demo.toml --target macos 
 
 # The same vocabulary on the CLI, layered over any base blueprint — a deny narrows from anywhere:
 formwork run --blueprint examples/blueprints/claude-code.toml \
-  --rule 'deny:$CWD/secrets' -- <agent> <flags>
+  --rule 'deny:$CWD/secrets/**' -- <agent> <flags>
 ```
 
 Quote `$CWD` rules in single quotes: Formwork expands the sigil itself, and an unset shell `$CWD`
 in double quotes would turn `readwrite:$CWD/**` into `readwrite:/**`.
 
-The same `rules` list carries egress. A target that does not begin with `/`, `~`, `$` or `**` is a
-host, `host[:port][/path-glob]` (port 443 by default; `*.example.com` matches subdomains, not the
-apex):
+A path pattern has two wildcards and no others. A trailing `/**` is a directory and everything
+beneath it; `**/name` (or `<prefix>/**/name`) is that name at any depth. Without either, a pattern
+names one object: `deny:$CWD/.env` is that file, and a directory named the same way is the
+directory entry alone, not the files in it, so deny or grant a directory as `$CWD/secrets/**`
+(`run` warns when a literal names a directory). `*`, `?` and
+`[` are not wildcards, and a pattern that contains one is refused with the nearest valid spelling;
+for a file whose name has one, put a backslash before it (`'deny:$CWD/keys/\*.pem'`, or
+`"deny:$CWD/keys/\\*.pem"` in a TOML basic string). An any-depth pattern in a grant or a `deny`
+of your own compiles for macOS only: Landlock rules attach to one file or directory, so a Linux
+target refuses the blueprint and names the rule.
+
+A file in the launch directory can be written `./name` (the same as `$CWD/name`). Use that form
+for a name with a dot in it: `deny:secrets.json` is a rule about a host called `secrets.json`,
+and Formwork refuses it when a file of that name is there to be confused with.
+
+The same `rules` list carries egress. A target that does not begin with `/`, `~`, `$`, `**` or
+`./` is a host, `host[:port][/path-glob]` (port 443 by default; `*.example.com` matches
+subdomains, not the apex):
 
 | Host rule | Grants |
 |---|---|
@@ -135,7 +150,7 @@ compiled-in default with `extends = ["builtin:default"]`, no repo checkout neede
 ```sh
 # Add extra denies for one run — safe from any layer, since deny is terminal:
 formwork run --blueprint examples/blueprints/claude-code.toml \
-  --rule 'deny:$CWD/secrets' --rule 'deny:$CWD/.env.production' -- claude --dangerously-skip-permissions
+  --rule 'deny:$CWD/secrets/**' --rule 'deny:$CWD/.env.production' -- claude --dangerously-skip-permissions
 
 # Let the agent EDIT existing files but not CREATE new ones (the create/write split):
 formwork run --blueprint examples/blueprints/claude-code.toml \

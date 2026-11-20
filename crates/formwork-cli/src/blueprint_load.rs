@@ -474,18 +474,21 @@ fn desugar_rules(layer: &mut BlueprintLayer, sigils: &Sigils) -> Result<()> {
         if host_target && !egress_only && !both_axes {
             bail!(
                 "rule {raw:?}: `{verb}` is not an egress verb (egress atoms: {}; on both axes: \
-                 allow, deny); a path target starts with /, ~ or $CWD",
+                 allow, deny); a path target starts with /, ~, $CWD or ./",
                 formwork_blueprint::HTTP_ATOMS.join(", ")
             );
         }
         if egress_only || (both_axes && host_target) {
+            if both_axes {
+                sigils.refuse_host_named_like_an_entry(verb, target)?;
+            }
             let rule = formwork_blueprint::HostRule::parse(verb, target)
                 .map_err(|e| anyhow!("rule {raw:?}: {e}"))?;
             layer.hosts.push(rule);
             continue;
         }
-        let pat =
-            PathPattern::parse(&sigils.expand(target)).with_context(|| format!("rule {raw:?}"))?;
+        let pat = PathPattern::parse(&sigils.expand_target(target))
+            .with_context(|| format!("rule {raw:?}"))?;
         let fs = fs_atoms(&atoms).map_err(|e| anyhow!("rule {raw:?}: {e}"))?;
         if fs.deny {
             layer.fs.subtract.push(pat);
@@ -617,16 +620,56 @@ impl<'a> Sigils<'a> {
     /// Expand a leading sigil in one string. A value that starts with neither sigil is returned
     /// untouched, so a tool name is only rewritten if it literally begins with `~`/`~/`/`$CWD`/`$CWD/`.
     pub fn expand(&self, s: &str) -> String {
+        self.expand_spelled(s, str::to_string)
+    }
+
+    /// [`Self::expand`] for a string that is parsed as a path pattern. The expansion is a concrete
+    /// directory, so the characters of it the pattern grammar reserves are escaped (FW-BP29):
+    /// a launch directory named `app[v2]` stays a directory, not a refused pattern.
+    pub fn expand_pattern(&self, s: &str) -> String {
+        self.expand_spelled(s, PathPattern::escape)
+    }
+
+    /// A rule's path target (FW-BP30): `./name` is `$CWD/name`, so a file in the launch directory
+    /// has a spelling that FW-BP16 cannot read as a host.
+    pub fn expand_target(&self, target: &str) -> String {
+        match target.strip_prefix("./") {
+            Some(rest) => self.expand_pattern(&format!("$CWD/{rest}")),
+            None => self.expand_pattern(target),
+        }
+    }
+
+    /// FW-BP30: `allow:` and `deny:` take a path or a host and the target's spelling picks
+    /// (FW-BP16), so `deny:secrets.json` is a rule about a host. With an entry of that name in the
+    /// launch directory the two readings close different things, and the rule is refused.
+    fn refuse_host_named_like_an_entry(&self, verb: &str, target: &str) -> Result<()> {
+        let bare = !target.contains('/') && !target.contains(':');
+        if !bare || Path::new(self.cwd).join(target).symlink_metadata().is_err() {
+            return Ok(());
+        }
+        let port_note = if verb == "deny" {
+            " (with a port the deny covers that port only)"
+        } else {
+            ""
+        };
+        bail!(
+            "rule \"{verb}:{target}\" is a host rule, and the launch directory has an entry named \
+             `{target}`: for the file write `{verb}:./{target}`, for the host write \
+             `{verb}:{target}:443`{port_note}"
+        )
+    }
+
+    fn expand_spelled(&self, s: &str, spell: fn(&str) -> String) -> String {
         if s == "~" {
-            self.home.to_string()
+            spell(self.home)
         } else if let Some(rest) = s.strip_prefix("~/") {
-            format!("{}/{}", self.home.trim_end_matches('/'), rest)
+            format!("{}/{}", spell(self.home.trim_end_matches('/')), rest)
         } else if s == "$CWD" {
             self.warn_if_broad_cwd();
-            self.cwd.to_string()
+            spell(self.cwd)
         } else if let Some(rest) = s.strip_prefix("$CWD/") {
             self.warn_if_broad_cwd();
-            format!("{}/{}", self.cwd.trim_end_matches('/'), rest)
+            format!("{}/{}", spell(self.cwd.trim_end_matches('/')), rest)
         } else {
             s.to_string()
         }
@@ -647,12 +690,27 @@ impl<'a> Sigils<'a> {
         }
     }
 
-    /// Walk a parsed TOML value, expanding every string leaf. Only leading sigils are touched.
+    /// Walk a parsed layer, expanding every string leaf. Only leading sigils are touched. Every
+    /// field that takes a sigil is a path pattern except `extends`, which names files.
     fn expand_value(&self, value: &mut toml::Value) {
         match value {
-            toml::Value::String(s) => *s = self.expand(s),
-            toml::Value::Array(a) => a.iter_mut().for_each(|v| self.expand_value(v)),
-            toml::Value::Table(t) => t.iter_mut().for_each(|(_, v)| self.expand_value(v)),
+            toml::Value::Table(t) => t.iter_mut().for_each(|(key, v)| {
+                let spell: fn(&Self, &str) -> String = if key == "extends" {
+                    Self::expand
+                } else {
+                    Self::expand_pattern
+                };
+                self.expand_leaves(v, spell)
+            }),
+            other => self.expand_leaves(other, Self::expand_pattern),
+        }
+    }
+
+    fn expand_leaves(&self, value: &mut toml::Value, spell: fn(&Self, &str) -> String) {
+        match value {
+            toml::Value::String(s) => *s = spell(self, s),
+            toml::Value::Array(a) => a.iter_mut().for_each(|v| self.expand_leaves(v, spell)),
+            toml::Value::Table(t) => t.iter_mut().for_each(|(_, v)| self.expand_leaves(v, spell)),
             _ => {}
         }
     }
@@ -780,7 +838,7 @@ pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -
         blueprint
             .fs
             .write_subtract
-            .push(PathPattern::parse(rendered).with_context(|| format!("protecting {rendered}"))?);
+            .push(PathPattern::literal(&input).with_context(|| format!("protecting {rendered}"))?);
     }
     Ok(())
 }
@@ -819,7 +877,7 @@ pub fn env_file_ref_denies(
             let pattern = absolute
                 .to_str()
                 .ok_or_else(|| anyhow!("{var} resolves to a non-UTF-8 path; refusing (FW-INV6)"))?;
-            out.push(PathPattern::parse(pattern).with_context(|| {
+            out.push(PathPattern::literal(Path::new(pattern)).with_context(|| {
                 format!("{var} (credential type {type_name}) does not name a deniable path")
             })?);
         }
@@ -858,29 +916,32 @@ fn canon_pattern(p: &PathPattern) -> Result<PathPattern> {
                 p.canonical()
             )
         })?;
+        // The resolved anchor and the suffix are file names, spelled back into a pattern (FW-BP29).
         let rendered = format!(
             "{}/**/{}{}",
-            resolved.trim_end_matches('/'),
-            p.base().display(),
+            PathPattern::escape(resolved.trim_end_matches('/')),
+            PathPattern::escape(&p.base().display().to_string()),
             if p.is_subtree() { "/**" } else { "" }
         );
         return Ok(PathPattern::parse(&rendered).unwrap_or_else(|_| p.clone()));
     }
     let base = canonicalize_existing_prefix(p.base());
     // `to_str`, not `to_string_lossy`: refuse to enforce a path we cannot render faithfully (FW-INV6).
-    let base = base.to_str().ok_or_else(|| {
-        anyhow!(
+    if base.to_str().is_none() {
+        bail!(
             "refusing to enforce: resolved path for {} is not valid UTF-8 and cannot be rendered \
              into a policy rule without risking a silent mismatch (FW-INV6)",
             p.canonical()
-        )
-    })?;
-    let mut s = base.to_string();
-    if p.is_subtree() {
-        s.push_str("/**");
+        );
     }
-    // Re-parse; if canonicalization produced something unparsable, keep the original.
-    Ok(PathPattern::parse(&s).unwrap_or_else(|_| p.clone()))
+    // The resolved path is concrete: none of its characters is pattern grammar (FW-BP29). If
+    // canonicalization produced something that is not a pattern, keep the original.
+    let resolved = if p.is_subtree() {
+        PathPattern::subtree(&base)
+    } else {
+        PathPattern::literal(&base)
+    };
+    Ok(resolved.unwrap_or_else(|_| p.clone()))
 }
 
 fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
@@ -1027,6 +1088,160 @@ mod tests {
         .unwrap();
         let bp = load(&dir.path().join("ok.toml"), "/home/x").unwrap();
         assert_eq!(bp.net.host_table().unwrap().rules.len(), 2);
+    }
+
+    /// FW-BP30: `./name` is a path under the launch directory on every fs verb, so a dotted file
+    /// name has a spelling FW-BP16 cannot read as a host.
+    #[test]
+    fn fw_bp30_a_dot_slash_target_is_a_path_under_the_launch_directory() {
+        let sigils = Sigils::new("/home/x", "/work/proj");
+        let mut layer = BlueprintLayer {
+            rules: vec![
+                "deny:./secrets.json".into(),
+                "deny:./state/**".into(),
+                "read:./docs/**".into(),
+                "allow:./out/**".into(),
+                "modify:./app.log".into(),
+                "deny:./".into(),
+            ],
+            ..Default::default()
+        };
+        desugar_rules(&mut layer, &sigils).unwrap();
+        assert!(layer.hosts.is_empty(), "{:?}", layer.hosts);
+        assert_eq!(
+            layer.fs.subtract,
+            vec![
+                pp("/work/proj/secrets.json"),
+                pp("/work/proj/state/**"),
+                pp("/work/proj")
+            ]
+        );
+        assert_eq!(layer.fs.reads, vec![pp("/work/proj/docs/**")]);
+        assert_eq!(layer.fs.writes, vec![pp("/work/proj/out/**")]);
+        assert_eq!(layer.fs.writes_no_create, vec![pp("/work/proj/app.log")]);
+        // An egress verb still takes a host, never a path.
+        let mut layer = BlueprintLayer {
+            rules: vec!["get:./secrets.json".into()],
+            ..Default::default()
+        };
+        assert!(desugar_rules(&mut layer, &sigils).is_err());
+    }
+
+    /// FW-BP30: `allow:` or `deny:` with a bare dotted name is a host rule, and is refused when
+    /// the launch directory has an entry of that name, naming both spellings. With a port, a
+    /// path, or no such entry the rule is unambiguous and loads as a host rule.
+    #[test]
+    fn fw_bp30_a_host_rule_naming_a_launch_directory_entry_is_refused() {
+        let dir = Scratch::new("host-or-file");
+        std::fs::write(dir.path().join("secrets.json"), "{}").unwrap();
+        std::fs::create_dir(dir.path().join("github.com")).unwrap();
+        std::os::unix::fs::symlink("nowhere", dir.path().join("dangling.env")).unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let sigils = Sigils::new("/home/x", cwd);
+        let desugar = |rule: &str| {
+            let mut layer = BlueprintLayer {
+                rules: vec![rule.into()],
+                ..Default::default()
+            };
+            desugar_rules(&mut layer, &sigils).map(|()| layer)
+        };
+        for (rule, file, host) in [
+            (
+                "deny:secrets.json",
+                "`deny:./secrets.json`",
+                "`deny:secrets.json:443`",
+            ),
+            (
+                "allow:github.com",
+                "`allow:./github.com`",
+                "`allow:github.com:443`",
+            ),
+            (
+                "deny:dangling.env",
+                "`deny:./dangling.env`",
+                "`deny:dangling.env:443`",
+            ),
+        ] {
+            let refusal = format!("{:#}", desugar(rule).unwrap_err());
+            assert!(
+                refusal.contains(file) && refusal.contains(host),
+                "{refusal}"
+            );
+        }
+        for host_rule in [
+            "deny:secrets.json:443",
+            "allow:github.com:443",
+            "allow:github.com/acme/**",
+            "deny:absent.example.com",
+            // An egress-only verb cannot mean the file.
+            "tunnel:github.com",
+            "get:github.com",
+        ] {
+            let layer = desugar(host_rule).unwrap_or_else(|e| panic!("{host_rule}: {e:#}"));
+            assert_eq!(layer.hosts.len(), 1, "{host_rule}");
+            assert!(layer.fs.subtract.is_empty() && layer.fs.writes.is_empty());
+        }
+        assert_eq!(
+            desugar("deny:./secrets.json").unwrap().fs.subtract,
+            vec![PathPattern::literal(&dir.path().join("secrets.json")).unwrap()]
+        );
+    }
+
+    /// FW-BP29: the directory a sigil expands to is a path, not pattern text. A launch or home
+    /// directory whose name has a glob character or a backslash still loads, on every surface,
+    /// and its rules name that directory.
+    #[test]
+    fn fw_bp29_a_sigil_expansion_is_never_read_as_grammar() {
+        let dir = Scratch::new("sigil-escape");
+        let odd = dir.path().join("app[v2] *?\\x");
+        std::fs::create_dir_all(&odd).unwrap();
+        let odd_str = odd.to_str().unwrap();
+        std::fs::write(odd.join("base.toml"), "net = \"deny\"\n").unwrap();
+        let file = odd.join("bp.toml");
+        std::fs::write(
+            &file,
+            "extends = [\"$CWD/base.toml\"]\n\
+             rules = [\"readwrite:$CWD/**\", \"deny:./secret\", \"read:~/**/notes\"]\n\
+             [fs]\nreads = [\"~/docs/**\"]\nsubtract = [\"$CWD/.env\"]\n",
+        )
+        .unwrap();
+        let sigils = Sigils::new(odd_str, odd_str);
+        let sets = ["[fs]\nwrite-subtract = [\"$CWD/locked\"]".to_string()];
+        let bp = load_stack(&file, &sets, BlueprintLayer::default(), &sigils).unwrap();
+        assert_eq!(bp.fs.writes, vec![PathPattern::subtree(&odd).unwrap()]);
+        assert!(bp
+            .fs
+            .reads
+            .contains(&PathPattern::subtree(&odd.join("docs")).unwrap()));
+        assert_eq!(
+            bp.fs.subtract,
+            vec![
+                PathPattern::literal(&odd.join(".env")).unwrap(),
+                PathPattern::literal(&odd.join("secret")).unwrap(),
+            ]
+        );
+        assert_eq!(
+            bp.fs.write_subtract,
+            vec![PathPattern::literal(&odd.join("locked")).unwrap()]
+        );
+        let anchored = bp.fs.reads.iter().find(|p| p.is_any_depth()).unwrap();
+        assert_eq!(anchored.anchor(), Some(odd.as_path()));
+
+        // The session's own additions and the enforcement-time resolution keep the same path.
+        let mut session = bp.clone();
+        protect_policy_inputs(&mut session, &file).unwrap();
+        assert!(session
+            .fs
+            .write_subtract
+            .contains(&PathPattern::literal(&file).unwrap()));
+        let resolved = canonicalize_for_enforcement(&bp).unwrap();
+        let real = std::fs::canonicalize(&odd).unwrap();
+        assert_eq!(
+            resolved.fs.writes,
+            vec![PathPattern::subtree(&real).unwrap()]
+        );
+        let anchored = resolved.fs.reads.iter().find(|p| p.is_any_depth()).unwrap();
+        assert_eq!(anchored.anchor(), Some(real.as_path()));
     }
 
     #[test]

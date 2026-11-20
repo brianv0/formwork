@@ -61,6 +61,12 @@ fn abi_of(v: u32) -> ABI {
 /// be a rooted Landlock rule); the caller rejects them so nothing is silently missed. A `prefix`
 /// hole withholds every directory entry whose path starts with `base` as a string -- the numbered
 /// device nodes of a denied channel (`/dev/video0`, `/dev/video1`, FW-ISO13).
+///
+/// A literal hole on a directory denies more here than the pattern names (FW-BP27): the expansion
+/// drops the directory, and nothing beneath a dropped directory is granted. Granting its entries
+/// one by one would match the pattern exactly, and would open files that a deny on their
+/// directory has always closed on this backend; the wider deny is kept, and `run` and `explain`
+/// name it.
 struct Hole {
     base: PathBuf,
     subtree: bool,
@@ -230,19 +236,20 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
     write_holes.extend(holes_of(&policy.write_subtract)?); // write-subtract denies writes only
     write_holes.extend(device_holes());
 
-    let mut read_roots: Vec<PathBuf> = policy.reads.iter().map(root_of).collect();
+    let reads = grants_of(&policy.reads)?;
+    let writes = grants_of(&policy.writes)?;
+    let mut read_roots = reads.subtrees;
     if policy.read_mode == ReadMode::Closed {
         read_roots.extend(READ_ESSENTIALS.iter().map(PathBuf::from));
         read_roots.extend(RW_DEVICES.iter().map(PathBuf::from)); // readable; write handled below
     }
     let read_paths = expand_all(&read_roots, &read_holes);
-    let write_paths = expand_all(
-        &policy.writes.iter().map(root_of).collect::<Vec<_>>(),
-        &write_holes,
-    );
+    let write_paths = expand_all(&writes.subtrees, &write_holes);
 
     created = add_path_rules(created, &read_paths, read_access)?;
+    created = add_literal_rules(created, &reads.literals, &read_holes, read_access)?;
     created = add_path_rules(created, &write_paths, write_access)?;
+    created = add_literal_rules(created, &writes.literals, &write_holes, write_access)?;
     // The create/write split (FW-CAP9): the write bits minus `Make*`. `Make*` stays in `handled_fs`,
     // so governed-but-ungranted == denied. Same holes as `writes`.
     if !policy.writes_no_create.is_empty() {
@@ -253,15 +260,11 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
             | AccessFs::MakeFifo
             | AccessFs::MakeBlock
             | AccessFs::MakeChar;
-        let write_nc_paths = expand_all(
-            &policy
-                .writes_no_create
-                .iter()
-                .map(root_of)
-                .collect::<Vec<_>>(),
-            &write_holes,
-        );
-        created = add_path_rules(created, &write_nc_paths, write_access & !make_bits)?;
+        let no_create = grants_of(&policy.writes_no_create)?;
+        let access = write_access & !make_bits;
+        let write_nc_paths = expand_all(&no_create.subtrees, &write_holes);
+        created = add_path_rules(created, &write_nc_paths, access)?;
+        created = add_literal_rules(created, &no_create.literals, &write_holes, access)?;
     }
     // The safe device nodes are writable regardless of mode (e.g. `cmd > /dev/null`).
     let dev_paths: Vec<PathBuf> = RW_DEVICES.iter().map(PathBuf::from).collect();
@@ -275,8 +278,10 @@ pub fn build(policy: &LinuxPolicy) -> Result<Option<Built>, ConfineError> {
         // Execute only, not ReadFile: macOS `process-exec*` confers no read, so bundling it would
         // make the same `exec:` grant readable on Linux but not macOS (FW-XR6). `readexec`/`allow`
         // carry their own read grant; a binary the loader must re-open needs read on either backend.
-        let exec_paths = expand_all(&paths.iter().map(root_of).collect::<Vec<_>>(), &[]);
+        let exec = grants_of(paths)?;
+        let exec_paths = expand_all(&exec.subtrees, &[]);
         created = add_path_rules(created, &exec_paths, AccessFs::Execute.into())?;
+        created = add_literal_rules(created, &exec.literals, &[], AccessFs::Execute.into())?;
     }
 
     // --- net grants ---
@@ -325,10 +330,73 @@ fn expand_all(roots: &[PathBuf], holes: &[Hole]) -> Vec<PathBuf> {
     out
 }
 
-/// A grant pattern's root directory. Subtree `/a/**` and literal `/a` both root at `/a`; Landlock
-/// governs the path and everything beneath it either way.
-fn root_of(p: &PathPattern) -> PathBuf {
-    p.base().to_path_buf()
+/// A grant set split by extent (FW-BP27): a subtree roots an expansion, and a literal names one
+/// object and nothing beneath it.
+#[derive(Default)]
+struct Grants {
+    subtrees: Vec<PathBuf>,
+    literals: Vec<PathBuf>,
+}
+
+fn grants_of(patterns: &[PathPattern]) -> Result<Grants, ConfineError> {
+    let mut grants = Grants::default();
+    for p in patterns {
+        // The compiler refuses an any-depth grant for Linux (FW-BP28). One that arrives anyway
+        // fails here: its base is a relative suffix, and a rule opened from it would bind to
+        // whatever the launch directory holds under that name.
+        if p.is_any_depth() {
+            return Err(fail(format!(
+                "any-depth pattern {p} cannot be a rooted Landlock rule, so it cannot be a grant \
+                 on Linux (FW-BP28)"
+            )));
+        }
+        if p.is_subtree() {
+            grants.subtrees.push(p.base().to_path_buf());
+        } else {
+            grants.literals.push(p.base().to_path_buf());
+        }
+    }
+    Ok(grants)
+}
+
+/// FW-BP27: a literal grant confers its object and nothing beneath it. A file takes the rights
+/// that apply to a file. A directory takes no rule: every right Landlock grants on a directory
+/// also holds for what lies beneath it (`ReadDir` lists each nested directory), so the widest rule
+/// that grants nothing beneath is none. The type is read from the opened object, so the rule
+/// cannot land on a directory that took the file's place after a check by name.
+fn add_literal_rules(
+    ruleset: RulesetCreated,
+    paths: &[PathBuf],
+    holes: &[Hole],
+    access: BitFlags<AccessFs>,
+) -> Result<RulesetCreated, ConfineError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut ruleset = ruleset;
+    let effective = access & file_applicable();
+    for path in paths {
+        if effective.is_empty() || holes.iter().any(|h| h.covers(path)) {
+            continue;
+        }
+        // A missing grant path is skipped, as in `add_path_rules`.
+        let Ok(object) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(path)
+        else {
+            continue;
+        };
+        let is_dir = object
+            .metadata()
+            .map_err(|e| fail(format!("reading the type of {}: {e}", path.display())))?
+            .is_dir();
+        if is_dir {
+            continue;
+        }
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(object, effective))
+            .map_err(|e| fail(format!("landlock add rule for {}: {e}", path.display())))?;
+    }
+    Ok(ruleset)
 }
 
 /// Directory-only access rights (`ReadDir`, `MakeReg`, ...) are rejected when applied to a regular
