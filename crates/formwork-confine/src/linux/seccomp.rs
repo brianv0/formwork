@@ -34,6 +34,30 @@ pub struct Built {
     bound: BpfProgram,
 }
 
+#[cfg(test)]
+impl Built {
+    /// The verdict of both programs for one call, as the kernel combines them. CI kernels are not
+    /// built with the x32 ABI, so no call there reaches what the number bound guards; the other
+    /// rules are also probed on the kernel (tests/linux_confine.rs).
+    pub(super) fn verdict(&self, nr: libc::c_long, args: [u64; 6]) -> u32 {
+        use super::bpf_eval::{eval, most_restrictive};
+        let arch = super::supervise::AUDIT_ARCH;
+        most_restrictive(
+            [&self.baseline, &self.bound].map(|prog| eval(prog, arch, nr as u32, args)),
+        )
+    }
+
+    /// The baseline's verdict and the second filter's, for one call.
+    pub(super) fn verdicts(&self, nr: libc::c_long, args: [u64; 6]) -> (u32, u32) {
+        use super::bpf_eval::eval;
+        let arch = super::supervise::AUDIT_ARCH;
+        (
+            eval(&self.baseline, arch, nr as u32, args),
+            eval(&self.bound, arch, nr as u32, args),
+        )
+    }
+}
+
 /// Compile the plan into its two BPF programs (allocation happens here, in the parent).
 pub fn build(plan: &SeccompPlan) -> Result<Built, ConfineError> {
     Ok(Built {
@@ -274,6 +298,7 @@ fn syscall_number(name: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::bpf_eval::eval;
     use super::super::supervise::AUDIT_ARCH;
     use super::*;
     use formwork_blueprint::{Blueprint, ExecPosture, NetPosture, PathPattern, ResolvedCatalog};
@@ -285,14 +310,6 @@ mod tests {
     };
 
     const ALLOW: u32 = libc::SECCOMP_RET_ALLOW;
-    const LD: u32 = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
-    const AND: u32 = libc::BPF_ALU | libc::BPF_AND | libc::BPF_K;
-    const JA: u32 = libc::BPF_JMP | libc::BPF_JA;
-    const JEQ: u32 = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
-    const JGT: u32 = libc::BPF_JMP | libc::BPF_JGT | libc::BPF_K;
-    const JGE: u32 = libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K;
-    const JSET: u32 = libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K;
-    const RET: u32 = libc::BPF_RET | libc::BPF_K;
 
     fn errno(e: libc::c_int) -> u32 {
         libc::SECCOMP_RET_ERRNO | e as u32
@@ -324,51 +341,9 @@ mod tests {
         built(NetPosture::Ports(vec![443]), ExecPosture::Unrestricted)
     }
 
-    /// A classic-BPF interpreter over the instructions the two programs use, fed a
-    /// `seccomp_data`. CI kernels are not built with the x32 ABI, so no call there reaches what
-    /// the number bound guards; the other rules are also probed on the kernel
-    /// (tests/linux_confine.rs).
-    fn eval(prog: &[sock_filter], arch: u32, nr: u32, args: [u64; 6]) -> u32 {
-        let mut data = [0u8; 64];
-        data[0..4].copy_from_slice(&nr.to_le_bytes());
-        data[4..8].copy_from_slice(&arch.to_le_bytes());
-        for (i, arg) in args.iter().enumerate() {
-            data[16 + 8 * i..24 + 8 * i].copy_from_slice(&arg.to_le_bytes());
-        }
-        let (mut acc, mut pc) = (0u32, 0usize);
-        loop {
-            let ins = &prog[pc];
-            pc += 1;
-            let k = ins.k;
-            match u32::from(ins.code) {
-                LD => {
-                    let at = k as usize;
-                    acc = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
-                }
-                AND => acc &= k,
-                JA => pc += k as usize,
-                RET => return k,
-                code @ (JEQ | JGT | JGE | JSET) => {
-                    let taken = match code {
-                        JEQ => acc == k,
-                        JGT => acc > k,
-                        JGE => acc >= k,
-                        _ => acc & k != 0,
-                    };
-                    pc += usize::from(if taken { ins.jt } else { ins.jf });
-                }
-                other => panic!("instruction {other:#x} is outside the interpreted subset"),
-            }
-        }
-    }
-
     /// What the kernel answers with both filters installed: the most restrictive action.
     fn verdict(built: &Built, nr: libc::c_long, args: [u64; 6]) -> u32 {
-        [&built.baseline, &built.bound]
-            .into_iter()
-            .map(|prog| eval(prog, AUDIT_ARCH, nr as u32, args))
-            .min_by_key(|v| (v & libc::SECCOMP_RET_ACTION_FULL) as i32)
-            .unwrap()
+        built.verdict(nr, args)
     }
 
     /// Whether `socket(domain, ty, protocol)` is admitted; `socketpair` must answer the same.

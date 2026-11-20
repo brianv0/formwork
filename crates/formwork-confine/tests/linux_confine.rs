@@ -847,6 +847,77 @@ fn fw_e2e_188_exec_by_descriptor_is_refused_under_an_exec_allowlist() {
     );
 }
 
+/// FW-ADV-050 (Linux): the stated limit of an exec allow-list. Under the allow-list of FW-E2E-188,
+/// `execve` of `/proc/self/fd/N` for a memfd holding an unlisted program's bytes runs it, and so
+/// does the granted ELF interpreter started on the unlisted file; the compiled report says `exec`
+/// is `Partial` and names both routes (FW-FID32). A route that stops running here means the table
+/// in `docs/linux-backend.md` and the reason can say it is closed.
+#[test]
+fn fw_adv_050_the_open_exec_routes_run_and_the_report_says_partial() {
+    use formwork_blueprint::ExecPosture;
+    use formwork_compile::{Capability, Fidelity};
+    if !have_landlock() {
+        not_exercised("no Landlock on this host; the exec allow-list is unenforceable");
+        return;
+    }
+    let probe = PathBuf::from(env!("CARGO_BIN_EXE_fw-memfd-exec-probe"));
+    let fx = Fixture::new("adv050");
+    let unlisted = fx.granted().join("unlisted");
+    fs::copy(&probe, &unlisted).unwrap();
+    let unlisted = unlisted.to_str().unwrap();
+    let reads = vec![pp(probe.parent().unwrap()), pp(&fx.granted())];
+    if unconfined(probe_with(&probe, &["procfd", unlisted])) != 42 {
+        not_exercised("exec of /proc/self/fd/N does not run on this host even unconfined");
+        return;
+    }
+    let loader = dynamic_loader();
+    let mut listed = vec![PathPattern::parse(probe.to_str().unwrap()).unwrap()];
+    listed.extend(
+        loader
+            .iter()
+            .map(|l| PathPattern::parse(l.to_str().unwrap()).unwrap()),
+    );
+    let mut blueprint = closed_blueprint(reads);
+    blueprint.exec = ExecPosture::Allowlist(listed);
+    let allowlist = compile(&blueprint, &detect());
+    match &allowlist.report.per_capability[&Capability::Exec] {
+        Fidelity::Partial { reason, .. } => {
+            for route in [
+                "execve of /proc/self/fd/N",
+                "a granted loader runs an unlisted file",
+            ] {
+                assert!(
+                    reason.contains(route),
+                    "the exec reason names {route:?}: {reason}"
+                );
+            }
+        }
+        other => panic!("exec under an allow-list must be Partial, got {other:?}"),
+    }
+    assert_eq!(
+        run(&allowlist, probe_with(&probe, &["path", unlisted])),
+        7,
+        "control: the unlisted copy is refused by path"
+    );
+    assert_eq!(
+        run(&allowlist, probe_with(&probe, &["procfd", unlisted])),
+        42,
+        "execve of /proc/self/fd/N ran the unlisted bytes (7 = refused: the route closed)"
+    );
+    match loader {
+        Some(loader) => {
+            let mut through_loader = Command::new(&loader);
+            through_loader.args([unlisted, "ran"]);
+            assert_eq!(
+                run(&allowlist, through_loader),
+                42,
+                "the granted loader ran the unlisted file"
+            );
+        }
+        None => not_exercised("a static probe has no loader to start the unlisted file with"),
+    }
+}
+
 /// FW-E2E-205 (Linux x86_64), kernel half: a syscall number in the x32 range is refused with
 /// EPERM (FW-ISO33). The filter answers before the kernel dispatches, so this holds whether or
 /// not the kernel has the x32 ABI; without the filter the probe sees ENOSYS, or the call runs.

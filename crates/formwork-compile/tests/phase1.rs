@@ -96,14 +96,21 @@ fn fw_e2e_028_cross_platform_equivalence_dry_run() {
          a missing key)"
     );
 
-    // (b) Both backends carry net-default-deny: Linux enforces it; macOS denies every outbound
-    // connection but reports Partial, because the loopback-callback listener FW-EGR15 grants also
-    // accepts on the host's other addresses (characterization C1) -- the difference is in the
-    // report, with its reason, as (c) requires. Every capability enforced on both denies the same
-    // way (semantics match), so observable behavior matches across platforms for the intersection.
+    // (b) Both backends carry net-default-deny: Linux refuses every inet socket the session
+    // creates, and reports Partial because a socket from outside the session is outside that rule
+    // (FW-FID32); macOS denies every outbound connection but reports Partial, because the
+    // loopback-callback listener FW-EGR15 grants also accepts on the host's other addresses
+    // (characterization C1) -- each difference is in the report, with its reason, as (c)
+    // requires. Every capability enforced on both denies the same way (semantics match), so
+    // observable behavior matches across platforms for the intersection.
     assert!(
-        linux.report.per_capability[&Capability::NetDefaultDeny].is_enforced(),
-        "net-default-deny must be enforced on Linux"
+        matches!(
+            &linux.report.per_capability[&Capability::NetDefaultDeny],
+            Fidelity::Partial { backend: formwork_compile::Backend::Seccomp, reason }
+                if reason.contains("a socket the session did not create")
+        ),
+        "net-default-deny is carried by seccomp on Linux and names its open entry point: {:?}",
+        linux.report.per_capability[&Capability::NetDefaultDeny]
     );
     assert!(
         matches!(

@@ -11,6 +11,10 @@ use std::os::unix::process::CommandExt;
 use super::*;
 use formwork_compile::{ConfinerPolicy, LinuxPolicy};
 
+#[cfg(test)]
+mod bpf_eval;
+#[cfg(test)]
+mod entry_points;
 pub mod isolate;
 mod landlock;
 mod seccomp;
