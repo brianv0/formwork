@@ -1,6 +1,6 @@
 //! FEP-15 black-box tests of the Launcher's session state against the real kernel: where the
-//! session root lives and who may touch it (FW-TRA18, FW-TRA19, FW-INV23), and when the root goes
-//! away (FW-TRA20, FW-TRA21).
+//! session root lives and who may touch it (FW-TRA18, FW-TRA19, FW-INV23), what a signal to the
+//! Launcher does (FW-XR12, FW-XR13), and when the root goes away (FW-TRA20, FW-TRA21).
 //!
 //! Every cross-session test puts the session roots inside a tree the blueprint grants for
 //! writing, so placement protects nothing and only the compiled deny stands between two sessions.
@@ -8,8 +8,10 @@
 #![cfg(unix)]
 
 use std::fs::File;
-use std::os::fd::AsRawFd;
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -58,7 +60,7 @@ fn session_roots(runtime: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Longer than any wait these tests expect of a Launcher.
+/// Longer than any wait these tests expect of a Launcher, **term-grace** included.
 const LAUNCHER_LIMIT: Duration = Duration::from_secs(60);
 
 fn appears(path: &Path, secs: u64) -> bool {
@@ -94,6 +96,17 @@ impl Workload {
         // SAFETY: signal 0 only checks that the process exists.
         unsafe { libc::kill(self.0, 0) == 0 }
     }
+
+    fn gone(&self, secs: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if !self.alive() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
 }
 
 impl Drop for Workload {
@@ -108,13 +121,30 @@ fn signal(pid: u32, signo: libc::c_int) {
     assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signo) }, 0);
 }
 
-/// `formwork` in `dir` with the runtime directory at `runtime`, running in the background.
+/// `formwork` in `dir` with the runtime directory at `runtime`, running in the background, in a
+/// state that does not depend on how the test runner was started. The forwarded signals are at
+/// their default dispositions: a runner started as a shell's background job ignores SIGINT, and
+/// the Launcher keeps an inherited ignore. The Launcher leads a session of its own, with no
+/// controlling terminal: where only the terminal tells the keyboard's interrupt from `kill(2)`,
+/// a runner in a terminal's foreground would have the test's interrupt taken for the keyboard's.
 fn background(dir: &Path, runtime: &Path, args: &[&str]) -> Command {
     let runtime = runtime.to_str().unwrap();
     let mut cmd = formwork_command(dir, args, &[(RUNTIME_VAR, runtime)], &[]);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // SAFETY: signal(2) and setsid(2) are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            for signo in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+                libc::signal(signo, libc::SIG_DFL);
+            }
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     cmd
 }
 
@@ -513,6 +543,107 @@ fn fw_tra18_the_session_root_is_private_or_the_run_is_refused() {
     );
 }
 
+const HANDLES_TERM: &str = r#"trap 'echo term >> out/log; exit 7' TERM
+echo $$ > out/pid
+while :; do sleep 0.1; done
+"#;
+
+const HANDLES_INT: &str = r#"trap 'echo int >> out/log' INT
+echo $$ > out/pid
+while [ ! -e out/stop ]; do sleep 0.1; done
+exit 5
+"#;
+
+/// FW-E2E-193 (both; FW-XR12, FW-XR10, FW-TRA20): `SIGTERM` to the Launcher reaches the workload,
+/// the Launcher exits with the workload's status, no process of the session remains and no
+/// session root is left. `SIGINT` against a workload that handles it and continues: the Launcher
+/// keeps waiting, and reports the status the workload exits with later.
+#[test]
+fn fw_e2e_193_a_signal_to_the_launcher_reaches_the_workload() {
+    let (dir, runtime) = project("sigterm", WRITABLE_PROJECT);
+    if !confiner_host(dir.path()) {
+        return;
+    }
+    let run = ["run", "--", "/bin/sh", "-c"];
+    let launcher = background(dir.path(), &runtime, &[&run[..], &[HANDLES_TERM]].concat())
+        .spawn()
+        .unwrap();
+    let workload = Workload::started(dir.path());
+    assert_eq!(session_roots(&runtime).len(), 1);
+    signal(launcher.id(), libc::SIGTERM);
+    let out = finish(launcher);
+    assert_eq!(
+        out.code, 7,
+        "the Launcher exits with the workload's status: {}",
+        out.stderr
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out/log")).unwrap(),
+        "term\n"
+    );
+    assert!(workload.gone(5), "the workload outlived its Launcher");
+    assert!(session_roots(&runtime).is_empty(), "the root was left");
+
+    std::fs::remove_file(dir.path().join("out/pid")).unwrap();
+    std::fs::remove_file(dir.path().join("out/log")).unwrap();
+    let mut launcher = background(dir.path(), &runtime, &[&run[..], &[HANDLES_INT]].concat())
+        .spawn()
+        .unwrap();
+    let workload = Workload::started(dir.path());
+    signal(launcher.id(), libc::SIGINT);
+    assert!(
+        appears(&dir.path().join("out/log"), 10),
+        "the workload never received the interrupt"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        launcher.try_wait().unwrap().is_none() && workload.alive(),
+        "the Launcher keeps waiting while the workload runs"
+    );
+    std::fs::write(dir.path().join("out/stop"), "stop").unwrap();
+    let out = finish(launcher);
+    assert_eq!(out.code, 5, "{}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out/log")).unwrap(),
+        "int\n"
+    );
+    assert!(session_roots(&runtime).is_empty(), "the root was left");
+}
+
+const IGNORES_TERM: &str = r#"trap '' TERM INT
+echo $$ > out/pid
+while :; do sleep 0.1; done
+"#;
+
+/// FW-E2E-194 (both; FW-XR13): a workload that ignores `SIGTERM` is killed **term-grace** (10 s)
+/// after the forward, within 2 s, and the Launcher exits 137 with no root left.
+#[test]
+fn fw_e2e_194_a_workload_that_ignores_sigterm_is_killed_after_the_grace_period() {
+    let (dir, runtime) = project("grace", WRITABLE_PROJECT);
+    if !confiner_host(dir.path()) {
+        return;
+    }
+    let launcher = background(
+        dir.path(),
+        &runtime,
+        &["run", "--", "/bin/sh", "-c", IGNORES_TERM],
+    )
+    .spawn()
+    .unwrap();
+    let workload = Workload::started(dir.path());
+    let sent = Instant::now();
+    signal(launcher.id(), libc::SIGTERM);
+    let out = finish(launcher);
+    let waited = sent.elapsed();
+    assert_eq!(out.code, 137, "{}", out.stderr);
+    assert!(
+        waited >= Duration::from_secs(8) && waited <= Duration::from_secs(12),
+        "killed {waited:?} after the forward, not 10 s"
+    );
+    assert!(workload.gone(5), "the workload survived the kill");
+    assert!(session_roots(&runtime).is_empty(), "the root was left");
+}
+
 /// FW-E2E-195 (FW-TRA20): the invocations that left a session directory behind -- a refused
 /// `--confine-self`, a refused `gateway`, a refused broker, a `learn` run -- leave none, and
 /// neither does a refusal after the root exists (an unsupported upstream proxy). A successful `--confine-self` has no Launcher left to remove its root: it says so, and the next
@@ -685,4 +816,109 @@ fn fw_e2e_196_the_next_launcher_removes_a_dead_sessions_root() {
         Vec::<PathBuf>::new(),
         "the dead session's root is still there"
     );
+}
+
+/// A [`background`] command as the foreground job of a new pseudo-terminal, which becomes its
+/// session's controlling terminal and its stdin. Returns the terminal's other end: a byte written
+/// there is typed at the session.
+fn on_a_terminal(mut command: Command) -> (Child, File) {
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty writes two descriptors, owned below.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: fresh descriptors from openpty, owned from here on.
+    let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+    // SAFETY: fcntl on a descriptor owned above; the session must not hold the master.
+    unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    command
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: ioctl(2) on the child's own stdin, between fork and exec, after `background` made
+    // it a session leader.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    (command.spawn().unwrap(), master)
+}
+
+const COUNTS_INT: &str = r#"trap 'echo int >> out/log' INT
+echo $$ > out/pid
+while [ ! -e out/stop ]; do :; done
+"#;
+
+/// FW-XR12, the terminal half: ^C at the terminal signals the whole foreground group, the
+/// workload included, so the Launcher does not deliver it a second time -- a second interrupt is
+/// how an operator ends a tool that asks for confirmation on the first.
+#[test]
+fn fw_xr12_a_terminal_interrupt_reaches_the_workload_once() {
+    let (dir, runtime) = project("tty-int", WRITABLE_PROJECT);
+    if !confiner_host(dir.path()) {
+        return;
+    }
+    let (launcher, mut terminal) = on_a_terminal(background(
+        dir.path(),
+        &runtime,
+        &["run", "--", "/bin/sh", "-c", COUNTS_INT],
+    ));
+    let workload = Workload::started(dir.path());
+    terminal.write_all(b"\x03").unwrap();
+    assert!(
+        appears(&dir.path().join("out/log"), 10),
+        "the interrupt never reached the workload"
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out/log")).unwrap(),
+        "int\n",
+        "the Launcher forwarded an interrupt the terminal had already delivered"
+    );
+    assert!(workload.alive());
+    signal(launcher.id(), libc::SIGTERM);
+    let out = finish(launcher);
+    assert_eq!(out.code, 143, "the workload dies of the forwarded SIGTERM");
+    assert!(session_roots(&runtime).is_empty(), "the root was left");
+}
+
+/// FW-XR13, the terminal half: during the grace period an interrupt from the terminal ends the
+/// wait at once.
+#[test]
+fn fw_xr13_a_terminal_interrupt_during_the_grace_period_kills_at_once() {
+    let (dir, runtime) = project("tty-grace", WRITABLE_PROJECT);
+    if !confiner_host(dir.path()) {
+        return;
+    }
+    let (launcher, mut terminal) = on_a_terminal(background(
+        dir.path(),
+        &runtime,
+        &["run", "--", "/bin/sh", "-c", IGNORES_TERM],
+    ));
+    let workload = Workload::started(dir.path());
+    signal(launcher.id(), libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(workload.alive(), "the workload ignores SIGTERM");
+    let typed = Instant::now();
+    terminal.write_all(b"\x03").unwrap();
+    let out = finish(launcher);
+    assert_eq!(out.code, 137);
+    assert!(
+        typed.elapsed() < Duration::from_secs(5),
+        "the Launcher waited out the grace period: {:?}",
+        typed.elapsed()
+    );
+    assert!(workload.gone(5));
+    assert!(session_roots(&runtime).is_empty(), "the root was left");
 }

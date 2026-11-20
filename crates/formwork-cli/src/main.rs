@@ -25,6 +25,7 @@ mod blueprint_load;
 mod learn;
 mod render;
 mod session_root;
+mod signals;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -1032,6 +1033,9 @@ struct Session {
     blueprint_path: PathBuf,
     /// The session root (FW-TRA18), removed when the spawned child exits (FW-TRA20).
     root: session_root::SessionRoot,
+    /// The signal forwarder (FW-XR12), in the spawn posture, from before the root exists until
+    /// it is removed.
+    signals: Option<signals::Forwarder>,
     /// The Gateway egress listener, when the blueprint carries host rules (FW-EGR14).
     egress: Option<Egress>,
     /// Variables the Launcher sets for inspection and brokering: the trust-bundle variables
@@ -1158,6 +1162,14 @@ fn prepare_opener(
 }
 
 fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) -> Result<Session> {
+    // FW-XR12: caught from before the session root exists, so a signal that arrives while the
+    // session is prepared is acted on at the spawn, not by ending this process with a root behind.
+    let signals = match purpose {
+        Purpose::Spawn => {
+            Some(signals::Forwarder::install().context("installing the signal forwarder")?)
+        }
+        Purpose::ConfineSelf | Purpose::GatewayBackend => None,
+    };
     let resolved = args.resolve()?;
     let mut blueprint = args.load(&resolved.path, &home())?;
     refuse_unavailable_isolation(&blueprint, &host, purpose)?;
@@ -1234,6 +1246,7 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
         policy,
         blueprint_path: resolved.path,
         root,
+        signals,
         egress,
         egress_env,
         opener,
@@ -1676,6 +1689,11 @@ fn spawn_confined_child(
         // The session holds the descriptor open until after the spawn.
         formwork_confine::inherit_fd(&mut command, opener.session_fd);
     }
+    // A signal that arrived while the session was prepared ends it here, before a workload exists.
+    if let Some(signo) = session.signals.as_mut().and_then(|s| s.pending()) {
+        session.root.remove();
+        signals::die_of(signo);
+    }
     tracing::info!(program = %program, "spawning confined command");
     let child = command.spawn();
     let lifted = session
@@ -1721,8 +1739,16 @@ fn spawn_confined_child(
             formwork_failure(&format!("the connect supervisor failed to start: {e}"));
         }
     }
-    let status = child.wait();
+    // FW-XR12: this process hosts the session's Gateway and owns its root, so it outlives the
+    // workload whatever signal it is sent.
+    let status = match session.signals.as_mut() {
+        Some(signals) => signals.wait(&mut child),
+        None => child.wait(),
+    };
     session.root.remove();
+    // With the workload gone and the root removed, a signal ends this process as it would any
+    // other; a learning run's collection after this point stays interruptible.
+    session.signals = None;
     let status = status.context("waiting for the confined command")?;
     // The opener logs each URL from its own thread; let it drain before the session ends, or the
     // line for a URL handed over just before the workload exited races this process's exit.
