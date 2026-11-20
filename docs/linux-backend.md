@@ -149,14 +149,46 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
    `mode = "unveil"`, the behavior matches unveil exactly: ancestors of a grant are traversable, not
    listable.) Decided in FEP-5 review; `docs/fep-5-plan.md` §3.
 
-### Any-depth rows are withheld
+### A literal row names one object
+
+A Landlock rule is attached to one opened file or directory, and a right granted on a directory
+holds for everything beneath it. A pattern ending in `/**` is therefore a rule on its directory. A
+literal pattern is not ([FW-BP27](../formwork.md#fw-bp27)):
+
+- **A literal grant on a file** is a rule on that file, with the rights that apply to a file.
+- **A literal grant on a directory installs no rule.** The rights that concern the directory itself
+  are `ReadDir` and the `Make*`/`Remove*` family, and each of them also applies in every directory
+  beneath: a rule carrying only `ReadDir` lists the nested directories
+  (`landlock_directory_rights_reach_nested_directories` records this on the kernel). No rule
+  expresses "this directory and nothing beneath it", so the confiner grants neither, where
+  Seatbelt's `(literal …)` grants the entry. The type is read from the opened object, not from the name. `run`
+  names each such grant with the `/**` spelling, and `explain <dir>` says "not granted on this
+  host".
+- **A literal deny on a directory denies what lies beneath it as well.** The expansion drops the
+  directory, and nothing beneath a dropped directory is granted by the root that covered it.
+  Seatbelt's `(deny … (literal …))` covers the entry alone and leaves the files readable, so the
+  portable spelling is `<dir>/**`; `run` warns when a literal deny names an existing directory, and
+  `explain <path>` under one says "denied on this host". A grant rooted beneath the directory is a
+  rule of its own and is not affected, on either backend.
+
+### Any-depth rows: refused when the operator wrote them, withheld otherwise
 
 The expansion needs a rooted hole. An any-depth row (`**/.env`, `**/credentials`, the anchored
 `<prefix>/**/<suffix>`) names a file wherever it appears, and Landlock rules attach to opened
-files and directories, so such a row has nothing to attach to. The compiler withholds these rows
-from the Linux policy: the credential floor's any-depth rows (the generic backstop is all of them)
-and any-depth `write-subtract` rows. It lists each one under `withheld` in the fidelity report and
-marks the affected credential types, the backstop and `tamper-vectors` Partial
+files and directories, so such a row has nothing to attach to.
+
+An any-depth pattern in a grant (`reads`, `writes`, `writes-no-create`, the exec allow-list) or in
+an operator `subtract` is refused for a Linux target, naming the row
+([FW-BP28](../formwork.md#fw-bp28)): `compile`, `explain` and `run` give the same message, and a
+compile that was not asked first yields an unavailable confiner. Withholding such a row would
+leave a blueprint that grants or denies something other than what it says, and the operator can
+rewrite it. Installed as written it was worse: the pattern's base is a relative suffix, and a rule
+opened from it bound to whatever the launch directory held under that name. `formwork-confine`
+rejects an any-depth grant for that reason, whatever produced the policy.
+
+The rows the operator did not write are withheld from the Linux policy: the credential floor's
+any-depth rows (the generic backstop is all of them) and any-depth `write-subtract` rows. The
+compiler lists each one under `withheld` in the fidelity report and marks the affected credential types, the backstop and `tamper-vectors` Partial
 ([FW-CRED9](../formwork.md#fw-cred9), [FW-INV5](../formwork.md#fw-inv5)). A confined process on
 Linux can therefore read a `credentials` file inside a granted directory, where Seatbelt denies it
 with a regex. `formwork explain` says so in its backstop line and names the affected types apart

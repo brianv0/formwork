@@ -77,7 +77,7 @@ pub fn reverse_compile(
     let mut granular: Vec<(PathPattern, DenialAccess)> = Vec::new();
 
     for record in records {
-        let Ok(pattern) = PathPattern::parse(&record.path) else {
+        let Ok(pattern) = PathPattern::literal(std::path::Path::new(&record.path)) else {
             // Not an absolute kernel path (malformed log line); nothing enforceable to propose.
             continue;
         };
@@ -113,7 +113,7 @@ pub fn reverse_compile(
 
     let mut candidates = Vec::new();
     for ((parent, access), members) in by_parent {
-        let folded = PathPattern::parse(&format!("{}/**", parent.trim_end_matches('/')));
+        let folded = PathPattern::subtree(std::path::Path::new(&parent));
         let fold = match folded {
             // FW-INV8 defense-in-depth: never fold into a subtree that would cover a path the floor
             // just withheld. Enforcement (deny beats allow) is the primary wall -- it denies the
@@ -185,9 +185,9 @@ pub fn synthesize_blueprint(
 /// FW-INV8: would this folded subtree grant cover a path the floor withheld? A `true` keeps the
 /// members granular so a withheld credential is never re-granted through a covering subtree.
 fn fold_would_cover_withheld(folded: &PathPattern, withheld: &[WithheldEntry]) -> bool {
-    withheld
-        .iter()
-        .any(|w| PathPattern::parse(&w.path).is_ok_and(|p| folded.covers(&p)))
+    withheld.iter().any(|w| {
+        PathPattern::literal(std::path::Path::new(&w.path)).is_ok_and(|p| folded.covers(&p))
+    })
 }
 
 fn tag_candidate(

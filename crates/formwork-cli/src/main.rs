@@ -202,9 +202,11 @@ struct BlueprintArgs {
     #[arg(long)]
     net: Option<String>,
     /// Append a flat capability rule "<verb>:<target>" (repeatable), the same vocabulary as a file
-    /// `rules` line (FW-BP1). A target starting with `/`, `~`, `$` or `**` is a path, and takes
-    /// read/readonly, readwrite, modify (write without create), allow, readexec, exec or deny,
-    /// e.g. --rule "deny:~/.ssh". Any other target is a host, host[:port][/glob] (FW-BP13/FW-BP16),
+    /// `rules` line (FW-BP1). A target starting with `/`, `~`, `$`, `**` or `./` is a path, and
+    /// takes read/readonly, readwrite, modify (write without create), allow, readexec, exec or
+    /// deny, e.g. --rule 'deny:~/.ssh/**'. A path without `/**` names one object, never a
+    /// directory's contents, and `*`, `?` and `[` are not wildcards (FW-BP27, FW-BP29). Any other
+    /// target is a host, host[:port][/glob] (FW-BP13/FW-BP16),
     /// and puts all egress behind the session Gateway: allow:host (every method, TLS inspected),
     /// HTTP method verbs such as get,post:github.com/acme/**, tunnel:host[:port] (TLS passed
     /// through, not inspected; no path), or deny:host[:port][/glob].
@@ -316,7 +318,8 @@ impl BlueprintArgs {
             values
                 .iter()
                 .map(|v| {
-                    PathPattern::parse(&sigils.expand(v)).with_context(|| format!("--{flag} {v:?}"))
+                    PathPattern::parse(&sigils.expand_pattern(v))
+                        .with_context(|| format!("--{flag} {v:?}"))
                 })
                 .collect()
         };
@@ -486,6 +489,7 @@ fn main() -> Result<()> {
             let resolved = blueprint.resolve()?;
             let blueprint = blueprint.load(&resolved.path, &home())?;
             let host = resolve_host(&host, &target)?;
+            refuse_unenforceable(&blueprint, &host)?;
             let catalog = ResolvedCatalog::builtin_for_home(&home())
                 .context("resolving credential catalog")?;
             let policy = compile(&blueprint, &host, &catalog);
@@ -622,6 +626,7 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
     let catalog =
         ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
     let host = detect();
+    refuse_unenforceable(&blueprint, &host)?;
     // Channel verdicts and the per-path host notes come from the compiled policy, so both say what
     // this host's kernel is given, not what the model says (FW-INV5).
     let policy = compile(&blueprint, &host, &catalog);
@@ -672,8 +677,9 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
                 .to_string_lossy()
                 .into_owned()
         };
-        let target =
-            PathPattern::parse(&expanded).with_context(|| format!("explaining {path:?}"))?;
+        // The argument is one path, not a pattern: none of its characters is grammar (FW-BP29).
+        let target = PathPattern::literal(std::path::Path::new(&expanded))
+            .with_context(|| format!("explaining {path:?}"))?;
         let floor = catalog.floor_type_of(&blueprint.exposed_credentials(), &target);
         let shape = floor
             .as_deref()
@@ -725,6 +731,10 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
                  write-subtract row, so writes here are not denied by the kernel"
                     .to_string(),
             );
+        } else if let formwork_compile::ConfinerPolicy::Linux(linux) = &policy.confiner {
+            if landlock_withholds {
+                explanation.host_note = landlock_literal_note(linux, &explanation, target.base());
+            }
         }
         rows.push((explanation, floor, shape, floor_here));
     }
@@ -762,6 +772,83 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
         }
     }
     Ok(())
+}
+
+/// FW-FID31: what the Linux policy does with a literal row where that differs from the model's
+/// verdict for `path` (FW-BP27). Landlock grants a directory only together with what lies beneath
+/// it, so a literal grant naming a directory installs no rule, and a literal deny naming one
+/// takes everything beneath it out of the grant that covers it.
+fn landlock_literal_note(
+    linux: &formwork_compile::LinuxPolicy,
+    explanation: &formwork_blueprint::Explanation,
+    path: &std::path::Path,
+) -> Option<String> {
+    let literal = |p: &&PathPattern| !p.is_subtree() && !p.is_any_depth();
+    // The subtree grants that reach the path, and the literal deny, if any, that sits between
+    // every one of them and the path.
+    let cut_off = |grants: &[&[PathPattern]], holes: &[&[PathPattern]]| -> Option<PathPattern> {
+        let above = |hole: &&PathPattern, root: &PathPattern| {
+            hole.base() != path
+                && path.starts_with(hole.base())
+                && hole.base().starts_with(root.base())
+        };
+        let holes: Vec<&PathPattern> = holes
+            .iter()
+            .flat_map(|h| h.iter())
+            .filter(literal)
+            .collect();
+        let mut roots = grants
+            .iter()
+            .flat_map(|g| g.iter())
+            .filter(|p| p.is_subtree() && path.starts_with(p.base()))
+            .peekable();
+        roots.peek()?;
+        let mut deciding = None;
+        for root in roots {
+            deciding = Some(holes.iter().find(|hole| above(hole, root))?);
+        }
+        deciding.map(|hole| (*hole).clone())
+    };
+    let reaches = |grants: &[&[PathPattern]]| {
+        grants
+            .iter()
+            .flat_map(|g| g.iter())
+            .any(|p| p.is_subtree() && path.starts_with(p.base()))
+    };
+    let on = |v: &Verdict| matches!(v, Verdict::Granted { .. } | Verdict::Ambient);
+    let (reads, writes): (&[&[PathPattern]], &[&[PathPattern]]) =
+        (&[&linux.reads], &[&linux.writes, &linux.writes_no_create]);
+    let beneath = |what: &str, hole: PathPattern| {
+        let subtree = PathPattern::subtree(hole.base()).map(|p| p.to_string());
+        format!(
+            "{what} denied on this host -- `{hole}` denies a directory above this path, and \
+             Landlock drops everything beneath a denied directory; the rule itself covers the \
+             directory entry only, so write `{}` to deny its contents on every host",
+            subtree.unwrap_or_else(|_| format!("{hole}/**"))
+        )
+    };
+    if on(&explanation.read) {
+        if let Some(hole) = cut_off(reads, &[&linux.subtract]) {
+            return Some(beneath("read and write", hole));
+        }
+    }
+    if on(&explanation.write) {
+        if let Some(hole) = cut_off(writes, &[&linux.subtract, &linux.write_subtract]) {
+            return Some(beneath("write", hole));
+        }
+    }
+    let literal_only = (matches!(explanation.read, Verdict::Granted { .. }) && !reaches(reads))
+        || (matches!(explanation.write, Verdict::Granted { .. }) && !reaches(writes));
+    if literal_only && path.is_dir() {
+        let subtree = PathPattern::subtree(path).map(|p| p.to_string());
+        return Some(format!(
+            "not granted on this host -- the rule names this directory alone, and Landlock grants \
+             a directory only together with everything beneath it, so no rule is installed; write \
+             `{}` to grant its contents",
+            subtree.unwrap_or_else(|_| format!("{}/**", path.display()))
+        ));
+    }
+    None
 }
 
 /// One URL's egress verdict (FW-FID11): the host's grade, which methods the path admits, the
@@ -986,6 +1073,7 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
         None => return Err(no_blueprint_error()),
     };
     let blueprint = args.load(&resolved.path, &home())?;
+    refuse_unenforceable(&blueprint, &host)?;
     let catalog =
         ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
     let policy = compile(&blueprint, &host, &catalog);
@@ -1152,16 +1240,15 @@ fn grant_launcher_dir(
     dir: &std::path::Path,
     executable: bool,
 ) -> Result<()> {
-    let rendered = dir
-        .to_str()
-        .ok_or_else(|| anyhow!("session directory is not valid UTF-8 (FW-INV6)"))?;
-    let subtree =
-        PathPattern::parse(&format!("{rendered}/**")).context("granting a session directory")?;
+    if dir.to_str().is_none() {
+        bail!("session directory is not valid UTF-8 (FW-INV6)");
+    }
+    let subtree = PathPattern::subtree(dir).context("granting a session directory")?;
     blueprint.fs.reads.push(subtree.clone());
     blueprint
         .fs
         .write_subtract
-        .push(PathPattern::parse(rendered).context("write-protecting a session directory")?);
+        .push(PathPattern::literal(dir).context("write-protecting a session directory")?);
     blueprint.fs.write_subtract.push(subtree.clone());
     if executable {
         if let formwork_blueprint::ExecPosture::Allowlist(allowed) = &mut blueprint.exec {
@@ -1212,7 +1299,9 @@ fn prepare_opener(blueprint: &mut Blueprint, tmp: &mut SessionTmp) -> Result<Ope
 fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) -> Result<Session> {
     let resolved = args.resolve()?;
     let mut blueprint = args.load(&resolved.path, &home())?;
+    refuse_unenforceable(&blueprint, &host)?;
     refuse_unavailable_isolation(&blueprint, &host, purpose)?;
+    warn_literal_directory_rows(&blueprint, &host);
     let catalog =
         ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
     // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
@@ -1232,14 +1321,13 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
     announce_split_root(&blueprint, &resolved.path, &host);
     // FW-TRA9/FW-TRA10: the Launcher-owned temporary directory is a write grant in every read mode.
     let tmp_dir = SessionTmp::create()?;
-    let tmp_rendered = tmp_dir
-        .path
-        .to_str()
-        .ok_or_else(|| anyhow!("session temp directory is not valid UTF-8 (FW-INV6)"))?;
-    blueprint.fs.writes.push(
-        PathPattern::parse(&format!("{tmp_rendered}/**"))
-            .context("granting the session temp directory")?,
-    );
+    if tmp_dir.path.to_str().is_none() {
+        bail!("session temp directory is not valid UTF-8 (FW-INV6)");
+    }
+    blueprint
+        .fs
+        .writes
+        .push(PathPattern::subtree(&tmp_dir.path).context("granting the session temp directory")?);
     tracing::info!(tmp = %tmp_dir.path.display(), "session temp directory (TMPDIR/TMP/TEMP)");
     let mut tmp_dir = tmp_dir;
     let tls = prepare_inspection(&mut blueprint, &catalog, &mut tmp_dir, purpose)?;
@@ -1580,6 +1668,61 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 fn formwork_failure(what: &str) -> ! {
     eprintln!("formwork: {what}");
     std::process::exit(125);
+}
+
+/// FW-BP28: every door that compiles refuses the same blueprints, with the compiler's own text.
+fn refuse_unenforceable(blueprint: &Blueprint, host: &HostProfile) -> Result<()> {
+    match formwork_compile::refusal(blueprint, host) {
+        Some(reason) => bail!(reason),
+        None => Ok(()),
+    }
+}
+
+/// FW-BP27 on the operator channel. A literal names one object, and its author usually meant the
+/// directory's contents: a deny on a directory leaves the files beneath it readable on macOS, and
+/// a grant on one installs no Landlock rule. Each such row is named once with the spelling that
+/// covers the contents.
+fn warn_literal_directory_rows(blueprint: &Blueprint, host: &HostProfile) {
+    let directories = |sets: &[&[PathPattern]]| -> std::collections::BTreeSet<PathPattern> {
+        sets.iter()
+            .flat_map(|set| set.iter())
+            .filter(|p| !p.is_subtree() && !p.is_any_depth() && p.base().is_dir())
+            .cloned()
+            .collect()
+    };
+    let contents = |p: &PathPattern| {
+        PathPattern::subtree(p.base())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| format!("{p}/**"))
+    };
+    for p in directories(&[&blueprint.fs.subtract]) {
+        tracing::warn!(
+            "`deny:{p}` names a directory and covers only the directory entry: on macOS the \
+             files beneath it stay reachable, while Landlock on Linux drops them with it. Write \
+             `deny:{}` to cover its contents on both (FW-BP27)",
+            contents(&p)
+        );
+    }
+    if host.os != formwork_detect::Os::Linux {
+        return;
+    }
+    let exec: &[PathPattern] = match &blueprint.exec {
+        formwork_blueprint::ExecPosture::Allowlist(paths) => paths,
+        formwork_blueprint::ExecPosture::Unrestricted => &[],
+    };
+    for p in directories(&[
+        &blueprint.fs.reads,
+        &blueprint.fs.writes,
+        &blueprint.fs.writes_no_create,
+        exec,
+    ]) {
+        tracing::warn!(
+            "the grant `{p}` names a directory alone, and Landlock grants a directory only \
+             together with everything beneath it, so nothing is granted for it on this host. \
+             Write `{}` to grant its contents (FW-BP27)",
+            contents(&p)
+        );
+    }
 }
 
 /// FW-XR9: an isolation member the host cannot provide is refused before the workload starts,

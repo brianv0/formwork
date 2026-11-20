@@ -16,5 +16,5 @@ rules = [
     "readwrite:$CWD/**",        # the project: read + write + create
     "modify:/var/log/app.log",  # append to an existing shared log, but never create new files
     "deny:$CWD/.env",           # deny is terminal -- wins inside the readwrite grant above
-    "deny:~/.ssh",
+    "deny:~/.ssh/**",           # a directory is denied with `/**`; without it, the entry alone
 ]
