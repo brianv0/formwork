@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use formwork_blueprint::{
     merge_with_provenance, Blueprint, BlueprintLayer, ExecPosture, PathPattern, Provenance,
-    RuleSource,
+    ResolvedCatalog, ResolvedReference, RuleSource,
 };
 
 /// The blueprint file every subcommand looks for when `--blueprint` is not given.
@@ -287,12 +287,12 @@ fn load_layers(
     sigils: &Sigils,
 ) -> Result<Vec<(RuleSource, BlueprintLayer)>> {
     let mut layers = Vec::new();
-    let mut visiting = Vec::new();
+    let mut walk = ExtendsWalk::default();
     resolve_file(
         path,
         RuleSource::File(path.display().to_string()),
         sigils,
-        &mut visiting,
+        &mut walk,
         &mut layers,
     )?;
     // Relative `extends` in a CLI override (no file to sit beside) resolve against the launch
@@ -305,14 +305,7 @@ fn load_layers(
         let layer: BlueprintLayer = value
             .try_into()
             .with_context(|| format!("interpreting --set fragment {fragment:?}"))?;
-        resolve_layer(
-            layer,
-            RuleSource::Cli,
-            cwd,
-            sigils,
-            &mut visiting,
-            &mut layers,
-        )?;
+        resolve_layer(layer, RuleSource::Cli, cwd, sigils, &mut walk, &mut layers)?;
     }
     // A discovered layer sits beside its blueprint and applies from the next run on
     // (FW-DISC4/6). It loads above the file (learned refinements) and below CLI overrides, and
@@ -331,15 +324,55 @@ fn load_layers(
             layer,
         ));
     }
-    resolve_layer(
-        sugar,
-        RuleSource::Cli,
-        cwd,
-        sigils,
-        &mut visiting,
-        &mut layers,
-    )?;
+    resolve_layer(sugar, RuleSource::Cli, cwd, sigils, &mut walk, &mut layers)?;
     Ok(layers)
+}
+
+/// What one stack load carries across its `extends` walk.
+#[derive(Default)]
+struct ExtendsWalk {
+    /// The chain of files being resolved, for cycle detection (FW-BP3).
+    visiting: Vec<PathBuf>,
+    /// Bases the ownership notice has looked at, so one reached twice is named once (FW-BP32).
+    noted: Vec<PathBuf>,
+}
+
+/// FW-BP32: a base the operator's blueprint names is loaded as written -- a file outside the
+/// sandbox is the operator's to protect -- and one that another account can rewrite is named, so
+/// a policy someone else can change is not in force unannounced.
+fn note_base_others_can_change(base: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(base) else {
+        return;
+    };
+    // SAFETY: geteuid is a trivial always-successful syscall with no memory effects.
+    let invoking = unsafe { libc::geteuid() };
+    if let Some(why) = base_others_can_change(meta.uid(), meta.mode(), invoking) {
+        tracing::warn!(
+            base = %base.display(),
+            "this `extends` base {why}; it is loaded as written, and whoever can write it can \
+             change this session's policy (FW-BP32)"
+        );
+    }
+}
+
+/// Why a base owned by `owner` with permission bits `mode` is not the invoking user's alone to
+/// change, if it is not. Root can change any file, so a root-owned base is not named for its
+/// owner.
+fn base_others_can_change(owner: u32, mode: u32, invoking: u32) -> Option<String> {
+    let mut why = Vec::new();
+    if owner != invoking && owner != 0 {
+        why.push(format!(
+            "is owned by uid {owner}, neither the invoking user nor root"
+        ));
+    }
+    if mode & 0o022 != 0 {
+        why.push(format!(
+            "is group- or world-writable (mode {:04o})",
+            mode & 0o7777
+        ));
+    }
+    (!why.is_empty()).then(|| why.join(" and "))
 }
 
 /// Depth-first post-order: every base lands before the layer that extends it, so the extending
@@ -348,18 +381,22 @@ fn resolve_file(
     path: &Path,
     source: RuleSource,
     sigils: &Sigils,
-    visiting: &mut Vec<PathBuf>,
+    walk: &mut ExtendsWalk,
     out: &mut Vec<(RuleSource, BlueprintLayer)>,
 ) -> Result<()> {
     let canon = std::fs::canonicalize(path)
         .with_context(|| format!("resolving blueprint {}", path.display()))?;
-    if let Some(start) = visiting.iter().position(|p| p == &canon) {
-        let cycle: Vec<String> = visiting[start..]
+    if let Some(start) = walk.visiting.iter().position(|p| p == &canon) {
+        let cycle: Vec<String> = walk.visiting[start..]
             .iter()
             .chain(std::iter::once(&canon))
             .map(|p| p.display().to_string())
             .collect();
         bail!("blueprint `extends` cycle: {}", cycle.join(" -> "));
+    }
+    if matches!(source, RuleSource::Profile(_)) && !walk.noted.contains(&canon) {
+        note_base_others_can_change(&canon);
+        walk.noted.push(canon.clone());
     }
     let text = std::fs::read_to_string(&canon)
         .with_context(|| format!("reading blueprint {}", canon.display()))?;
@@ -371,9 +408,9 @@ fn resolve_file(
         .with_context(|| format!("interpreting blueprint {}", canon.display()))?;
     let base_dir = canon.parent().map(Path::to_path_buf).unwrap_or_default();
 
-    visiting.push(canon);
-    resolve_layer(layer, source, &base_dir, sigils, visiting, out)?;
-    visiting.pop();
+    walk.visiting.push(canon);
+    resolve_layer(layer, source, &base_dir, sigils, walk, out)?;
+    walk.visiting.pop();
     Ok(())
 }
 
@@ -384,7 +421,7 @@ fn resolve_layer(
     source: RuleSource,
     base_dir: &Path,
     sigils: &Sigils,
-    visiting: &mut Vec<PathBuf>,
+    walk: &mut ExtendsWalk,
     out: &mut Vec<(RuleSource, BlueprintLayer)>,
 ) -> Result<()> {
     for base in std::mem::take(&mut layer.extends) {
@@ -409,7 +446,7 @@ fn resolve_layer(
                 RuleSource::Profile(base.clone()),
                 base_dir,
                 sigils,
-                visiting,
+                walk,
                 out,
             )?;
             continue;
@@ -423,7 +460,7 @@ fn resolve_layer(
             &base_path,
             RuleSource::Profile(base.clone()),
             sigils,
-            visiting,
+            walk,
             out,
         )
         .with_context(|| format!("resolving extends {base:?}"))?;
@@ -816,14 +853,59 @@ pub fn protect_policy_inputs(blueprint: &mut Blueprint, blueprint_path: &Path) -
     Ok(())
 }
 
+/// The Catalog as this launching environment locates it: `~` against `home` (FW-CRED1), and each
+/// set `env-dir-refs` variable's store denied where the variable puts it (FW-CRED32). The values
+/// are read here, at the edge that reads `$HOME`, and the compiler takes the result. Every door
+/// builds its floor through this, so `compile` and `explain` state the floor a `run` from the
+/// same environment enforces.
+pub fn resolve_catalog(home: &str) -> Result<ResolvedCatalog> {
+    let mut catalog =
+        ResolvedCatalog::builtin_for_home(home).context("resolving credential catalog")?;
+    let cwd = std::env::current_dir().context("resolving cwd for relocated credential stores")?;
+    relocate_stores(&mut catalog, &cwd, |var| std::env::var_os(var))?;
+    Ok(catalog)
+}
+
+/// [`resolve_catalog`]'s relocation with the launching environment and directory passed in.
+/// Excluded types are rebased too: the exclusion then lifts the relocated store with the type
+/// (FW-CRED5), the way it lifts the `~` rows.
+fn relocate_stores(
+    catalog: &mut ResolvedCatalog,
+    cwd: &Path,
+    value_of: impl Fn(&str) -> Option<OsString>,
+) -> Result<()> {
+    for (type_name, entry) in catalog.types.iter_mut() {
+        let vars: Vec<String> = entry.env_dir_refs.iter().map(|r| r.var.clone()).collect();
+        for var in vars {
+            let Some(raw) = value_of(&var) else {
+                continue;
+            };
+            let value = reference_value(&var, type_name, &raw)?;
+            // Empty is how a tool spells unset, so its store is where the `~` rows already are.
+            if value.is_empty() {
+                continue;
+            }
+            let root = render_reference(&var, type_name, value, cwd)?;
+            entry.relocate(&var, &root).with_context(|| {
+                format!(
+                    "{var} (credential type {type_name}) does not name a deniable directory; \
+                     refusing to start with that store undenied (FW-INV6)"
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// FW-CRED3: an enforced env-points-to-file credential (`GOOGLE_APPLICATION_CREDENTIALS`,
 /// `KUBECONFIG`) is stripped as a variable AND the file its value names is denied. The value
 /// lives in the launcher's own environment -- impure -- so this is loader-edge code; the result
 /// joins the blueprint's subtract set before enforcement-time canonicalization. A set value we
 /// cannot faithfully render into a deny fails loud: leaving the referenced file readable while
-/// claiming the type enforced would be a silent fail-open (FW-INV6).
+/// claiming the type enforced would be a silent fail-open (FW-INV6). Each variable and the rows it
+/// added are recorded on its type for the report (FW-CRED35).
 pub fn env_file_ref_denies(
-    catalog: &formwork_blueprint::ResolvedCatalog,
+    catalog: &mut ResolvedCatalog,
     allow: &[String],
 ) -> Result<Vec<PathPattern>> {
     let cwd = std::env::current_dir().context("resolving cwd for env-file-ref denies")?;
@@ -832,63 +914,93 @@ pub fn env_file_ref_denies(
 
 /// [`env_file_ref_denies`] with the launching environment and directory passed in.
 fn env_file_ref_patterns(
-    catalog: &formwork_blueprint::ResolvedCatalog,
+    catalog: &mut ResolvedCatalog,
     allow: &[String],
     cwd: &Path,
     value_of: impl Fn(&str) -> Option<OsString>,
 ) -> Result<Vec<PathPattern>> {
     let mut out = Vec::new();
-    for (type_name, entry) in catalog.enforced_types(allow) {
-        for reference in &entry.env_file_refs {
+    let enforced = catalog
+        .types
+        .iter_mut()
+        .filter(|(name, _)| !allow.iter().any(|a| a == *name));
+    for (type_name, entry) in enforced {
+        for reference in entry.env_file_refs.clone() {
             let var = &reference.var;
             let Some(raw) = value_of(var) else {
                 continue;
             };
-            let value = raw.to_str().ok_or_else(|| {
-                anyhow!(
-                    "{var} (credential type {type_name}) holds a non-UTF-8 path; refusing to \
-                     enforce a deny that might silently not match (FW-INV6)"
-                )
-            })?;
+            let value = reference_value(var, type_name, &raw)?;
+            if value.is_empty() {
+                continue;
+            }
             // FW-CRED33: read whole, a list names one file that does not exist.
             let files: Vec<&str> = if reference.list {
                 value.split(':').collect()
             } else {
                 vec![value]
             };
+            let mut rows = 0;
             for file in files.into_iter().filter(|f| !f.is_empty()) {
-                let absolute = if Path::new(file).is_absolute() {
-                    PathBuf::from(file)
-                } else {
-                    cwd.join(file)
-                };
-                let absolute = fold_parent_components(&absolute).with_context(|| {
-                    format!(
-                        "{var} (credential type {type_name}) names a path whose `..` cannot be \
-                         resolved; refusing to start with that file undenied (FW-INV6)"
-                    )
-                })?;
-                let rendered = absolute.to_str().ok_or_else(|| {
-                    anyhow!("{var} resolves to a non-UTF-8 path; refusing (FW-INV6)")
-                })?;
-                let pattern = PathPattern::parse(rendered).with_context(|| {
-                    format!("{var} (credential type {type_name}) does not name a deniable path")
-                })?;
-                // FW-CRED34: the pattern grammar reads a `**` component as a wildcard, so the
-                // deny would not be the file named -- and an any-depth row is one Landlock
-                // withholds.
-                if pattern.is_subtree() || pattern.is_any_depth() {
-                    bail!(
-                        "{var} (credential type {type_name}) names a path with a `**` \
-                         component, which a path pattern cannot name as one file; refusing to \
-                         start with that file undenied (FW-INV6)"
-                    );
+                let pattern = render_reference(var, type_name, file, cwd)?;
+                if !out.contains(&pattern) {
+                    out.push(pattern);
+                    rows += 1;
                 }
-                out.push(pattern);
             }
+            entry.references.push(ResolvedReference {
+                var: var.clone(),
+                rows,
+            });
         }
     }
     Ok(out)
+}
+
+/// A set reference variable's value as text. FW-CRED34: a value that is not UTF-8 cannot be
+/// written into a rule that matches it.
+fn reference_value<'a>(var: &str, type_name: &str, raw: &'a std::ffi::OsStr) -> Result<&'a str> {
+    raw.to_str().ok_or_else(|| {
+        anyhow!(
+            "{var} (credential type {type_name}) holds a non-UTF-8 path; refusing to enforce a \
+             deny that might silently not match (FW-INV6)"
+        )
+    })
+}
+
+/// The one file or directory a reference variable names, as the pattern that names it: resolved
+/// against the launch directory when relative, `..` folded as the kernel will fold it.
+fn render_reference(var: &str, type_name: &str, location: &str, cwd: &Path) -> Result<PathPattern> {
+    let absolute = if Path::new(location).is_absolute() {
+        PathBuf::from(location)
+    } else {
+        cwd.join(location)
+    };
+    let absolute = fold_parent_components(&absolute).with_context(|| {
+        format!(
+            "{var} (credential type {type_name}) names a path whose `..` cannot be resolved; \
+             refusing to start with that location undenied (FW-INV6)"
+        )
+    })?;
+    let rendered = absolute
+        .to_str()
+        .ok_or_else(|| anyhow!("{var} resolves to a non-UTF-8 path; refusing (FW-INV6)"))?;
+    let pattern = PathPattern::parse(rendered).with_context(|| {
+        format!(
+            "{var} (credential type {type_name}) does not name a deniable path; refusing to \
+             start with that location undenied (FW-INV6)"
+        )
+    })?;
+    // FW-CRED34: the pattern grammar reads a `**` component as a wildcard, so the deny would not
+    // be the location named -- and an any-depth row is one Landlock withholds.
+    if pattern.is_subtree() || pattern.is_any_depth() {
+        bail!(
+            "{var} (credential type {type_name}) names a path with a `**` component, which a \
+             path pattern cannot name as one file or directory; refusing to start with that \
+             location undenied (FW-INV6)"
+        );
+    }
+    Ok(pattern)
 }
 
 /// Fold each `..` the way the kernel will when the workload opens the path: against the directory
@@ -1130,7 +1242,7 @@ mod tests {
                 RuleSource::Cli,
                 Path::new("/work"),
                 &sigils,
-                &mut Vec::new(),
+                &mut ExtendsWalk::default(),
                 &mut out,
             )
             .unwrap();
@@ -1423,9 +1535,9 @@ mod tests {
     /// The env-file-ref denies for one set variable, launched from `/work`.
     fn file_ref_denies(var: &str, value: &[u8], allow: &[String]) -> Result<Vec<String>> {
         use std::os::unix::ffi::OsStringExt;
-        let catalog = formwork_blueprint::ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let mut catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
         let value = OsString::from_vec(value.to_vec());
-        env_file_ref_patterns(&catalog, allow, Path::new("/work"), |name| {
+        env_file_ref_patterns(&mut catalog, allow, Path::new("/work"), |name| {
             (name == var).then(|| value.clone())
         })
         .map(|patterns| patterns.iter().map(PathPattern::canonical).collect())
@@ -1501,6 +1613,189 @@ mod tests {
                 String::from_utf8_lossy(value)
             );
         }
+    }
+
+    /// The Catalog for `/home/x`, launched from `/work`, with the given variables set.
+    fn relocated(env: &[(&str, &[u8])]) -> Result<ResolvedCatalog> {
+        use std::os::unix::ffi::OsStringExt;
+        let mut catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        relocate_stores(&mut catalog, Path::new("/work"), |name| {
+            env.iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| OsString::from_vec(value.to_vec()))
+        })?;
+        Ok(catalog)
+    }
+
+    fn rows_beyond_home(catalog: &ResolvedCatalog, allow: &[String]) -> Vec<String> {
+        let home = ResolvedCatalog::builtin_for_home("/home/x")
+            .unwrap()
+            .denied_paths(&[]);
+        catalog
+            .denied_paths(allow)
+            .iter()
+            .filter(|row| !home.contains(row))
+            .map(PathPattern::canonical)
+            .collect()
+    }
+
+    #[test]
+    fn fw_cred32_a_set_store_variable_rebases_its_types_rows() {
+        assert!(rows_beyond_home(&relocated(&[]).unwrap(), &[]).is_empty());
+        let catalog = relocated(&[
+            ("GNUPGHOME", b"/secure/gnupg/"),
+            // A relative value is the launch directory's, as a relative file reference is.
+            ("DOCKER_CONFIG", b"ci/docker"),
+            ("CARGO_HOME", b"/opt/rust/../cargo"),
+            // Empty is unset to the tools that read these.
+            ("CODEX_HOME", b""),
+            ("XDG_CONFIG_HOME", b"/xdg"),
+        ])
+        .unwrap();
+        assert_eq!(
+            rows_beyond_home(&catalog, &[]),
+            [
+                "/xdg/google-chrome/**",
+                "/opt/cargo/credentials.toml",
+                "/opt/cargo/credentials",
+                "/work/ci/docker/**",
+                "/xdg/gh/**",
+                "/secure/gnupg/**",
+            ]
+        );
+        // An excluded type's relocated store is lifted with it, and only it (FW-CRED5).
+        assert_eq!(
+            rows_beyond_home(&catalog, &["gpg".to_string(), "docker".to_string()]),
+            [
+                "/xdg/google-chrome/**",
+                "/opt/cargo/credentials.toml",
+                "/opt/cargo/credentials",
+                "/xdg/gh/**",
+            ]
+        );
+        assert!(catalog.types["codex"].references.is_empty());
+    }
+
+    /// A relocated store sits wherever the operator put it, so its `..` is folded as a file
+    /// reference's is: against the directory reached, symlinks resolved.
+    #[test]
+    fn fw_cred32_a_store_variable_is_folded_as_the_kernel_resolves_it() {
+        let dir = Scratch::new("store-dotdot");
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere/sub")).unwrap();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere/sub"), root.join("keys/link")).unwrap();
+        let value = format!("{}/keys/link/../gnupg", root.display());
+        let catalog = relocated(&[("GNUPGHOME", value.as_bytes())]).unwrap();
+        assert_eq!(
+            rows_beyond_home(&catalog, &[]),
+            [format!("{}/elsewhere/gnupg/**", root.display())]
+        );
+    }
+
+    #[test]
+    fn fw_cred34_an_unrenderable_store_variable_is_refused_naming_the_variable() {
+        let cases: &[(&str, &[u8])] = &[
+            ("GNUPGHOME", b"/secure/\xff/gnupg"),
+            ("XDG_CONFIG_HOME", b"\xff"),
+            // A `**` component would make the rebased rows a different set of paths.
+            ("DOCKER_CONFIG", b"/srv/**"),
+            ("CARGO_HOME", b"/srv/**/cargo"),
+            ("GH_CONFIG_DIR", b"**/gh"),
+        ];
+        for (var, value) in cases {
+            let refusal = relocated(&[(*var, *value)]).unwrap_err();
+            let msg = format!("{refusal:#}");
+            assert!(
+                msg.contains(var) && msg.contains("refusing"),
+                "{var}={:?}: {msg}",
+                String::from_utf8_lossy(value)
+            );
+        }
+    }
+
+    #[test]
+    fn fw_cred35_each_set_reference_is_recorded_with_the_rows_it_added() {
+        use std::os::unix::ffi::OsStringExt;
+        let env: &[(&str, &[u8])] = &[
+            ("KUBECONFIG", b"/k/a.yaml::/k/b.yaml:/k/a.yaml"),
+            ("AWS_CONFIG_FILE", b"/srv/aws/config"),
+            ("AWS_SHARED_CREDENTIALS_FILE", b"/srv/aws/config"),
+            ("NETRC", b""),
+            ("GOOGLE_APPLICATION_CREDENTIALS", b"/k/sa.json"),
+            ("CLOUDSDK_CONFIG", b"/srv/gcloud"),
+        ];
+        let value_of = |name: &str| {
+            env.iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| OsString::from_vec(value.to_vec()))
+        };
+        let mut catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        relocate_stores(&mut catalog, Path::new("/work"), value_of).unwrap();
+        let allow = ["kube".to_string()];
+        let denies =
+            env_file_ref_patterns(&mut catalog, &allow, Path::new("/work"), value_of).unwrap();
+        let recorded = |name: &str| -> Vec<(&str, usize)> {
+            catalog.types[name]
+                .references
+                .iter()
+                .map(|r| (r.var.as_str(), r.rows))
+                .collect()
+        };
+        // Both kinds land on the type, in the order they were resolved; a file two variables
+        // name is one row.
+        assert_eq!(
+            recorded("gcp"),
+            [
+                ("CLOUDSDK_CONFIG", 1),
+                ("GOOGLE_APPLICATION_CREDENTIALS", 1)
+            ]
+        );
+        assert_eq!(
+            recorded("aws"),
+            [("AWS_SHARED_CREDENTIALS_FILE", 1), ("AWS_CONFIG_FILE", 0)]
+        );
+        // An empty value names nothing, and an excluded type's reference adds no deny.
+        assert!(recorded("netrc").is_empty() && recorded("kube").is_empty());
+        assert_eq!(denies.len(), 2);
+
+        let mut catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        env_file_ref_patterns(&mut catalog, &[], Path::new("/work"), value_of).unwrap();
+        assert_eq!(
+            catalog.types["kube"].references,
+            [ResolvedReference {
+                var: "KUBECONFIG".to_string(),
+                rows: 2
+            }]
+        );
+    }
+
+    /// FW-BP32's test of a base: owned by the invoking user or root, and writable by its owner
+    /// alone. Either failing names the base; both failing is still one reason line.
+    #[test]
+    fn fw_bp32_a_base_others_can_change_is_named_and_one_that_is_private_is_not() {
+        const INVOKING: u32 = 1000;
+        for (owner, mode) in [(INVOKING, 0o100644), (0, 0o100644), (INVOKING, 0o100600)] {
+            assert_eq!(base_others_can_change(owner, mode, INVOKING), None);
+        }
+        // Root invoking: its own files are both the invoking user's and root's.
+        assert_eq!(base_others_can_change(0, 0o100644, 0), None);
+
+        let other = base_others_can_change(1001, 0o100644, INVOKING).unwrap();
+        assert!(other.contains("uid 1001"), "{other}");
+        for mode in [0o100664, 0o100646, 0o100666] {
+            let writable = base_others_can_change(INVOKING, mode, INVOKING).unwrap();
+            assert!(writable.contains("group- or world-writable"), "{writable}");
+            assert!(
+                base_others_can_change(0, mode, INVOKING).is_some(),
+                "a root-owned base others can write is still named"
+            );
+        }
+        let both = base_others_can_change(1001, 0o100666, INVOKING).unwrap();
+        assert!(
+            both.contains("uid 1001") && both.contains("mode 0666"),
+            "{both}"
+        );
     }
 
     #[test]

@@ -316,6 +316,20 @@ impl<'a> FloorArm<'a> {
     }
 }
 
+/// Each reference variable the launching environment set, as `(type, variable, deny rows added)`
+/// (FW-CRED35). Names and counts only: a value is where a credential store is.
+pub fn resolved_references(creds: &CredentialReport) -> Vec<(&str, &str, usize)> {
+    creds
+        .per_type
+        .iter()
+        .flat_map(|(name, f)| {
+            f.references
+                .iter()
+                .map(move |r| (name.as_str(), r.var.as_str(), r.rows))
+        })
+        .collect()
+}
+
 /// The fidelity report as prose: per-capability honesty plus the credential floor's shape. The
 /// full itemization stays in `compile --report-only`; this is the at-a-glance form.
 pub fn report_summary(report: &FidelityReport) -> String {
@@ -376,6 +390,17 @@ pub fn report_summary(report: &FidelityReport) -> String {
             creds.allowed.join(", ")
         }
     ));
+    let references = resolved_references(creds);
+    if !references.is_empty() {
+        let named: Vec<String> = references
+            .iter()
+            .map(|(name, var, rows)| format!("{var} ({name}, +{rows})"))
+            .collect();
+        out.push_str(&format!(
+            "credential locations from the environment (type, deny rows added): {}\n",
+            named.join(", ")
+        ));
+    }
     // The backstop denies inside the operator's own granted set, so it earns its own line with the
     // lift (FW-CRED6/CRED7); `None` means already lifted. A lift is offered only for a denial the
     // host makes.

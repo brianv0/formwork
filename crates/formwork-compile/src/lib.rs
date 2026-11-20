@@ -369,6 +369,7 @@ fn credential_report(
             CredentialFidelity {
                 path: (!entry.paths.is_empty()).then(|| path_fidelity_for(&entry.paths)),
                 env: (!entry.envs.is_empty()).then(|| env_fidelity.clone()),
+                references: entry.references.clone(),
             },
         );
     }
@@ -1534,6 +1535,130 @@ mod tests {
                 backend: Backend::Landlock
             })
         ));
+    }
+
+    /// A relocated store's rows are absolute, so both backends carry them and the type stays
+    /// `Enforced`; the report names the variable and its row count and holds the directory
+    /// nowhere, while the policy holds it as the deny it is.
+    #[test]
+    fn fw_cred35_the_report_names_a_resolved_reference_and_not_its_value() {
+        let mut catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        catalog
+            .types
+            .get_mut("gpg")
+            .unwrap()
+            .relocate("GNUPGHOME", &pp("/vault-7f3a/gnupg"))
+            .unwrap();
+        for host in [
+            HostProfile::synthetic_linux(Some(6)),
+            HostProfile::synthetic_macos(),
+        ] {
+            let policy = super::compile(&Blueprint::empty(), &host, &catalog);
+            let gpg = &policy.report.credentials.per_type["gpg"];
+            assert!(matches!(gpg.path, Some(Fidelity::Enforced { .. })));
+            let report = serde_json::to_value(&policy.report).unwrap();
+            assert_eq!(
+                report["credentials"]["per-type"]["gpg"]["references"],
+                serde_json::json!([{ "var": "GNUPGHOME", "rows": 1 }])
+            );
+            assert!(report["credentials"]["per-type"]["ssh"]
+                .get("references")
+                .is_none());
+            assert!(!report.to_string().contains("vault-7f3a"), "{report}");
+            let confiner = serde_json::to_string(&policy.confiner).unwrap();
+            assert!(confiner.contains("/vault-7f3a/gnupg"), "{confiner}");
+        }
+
+        // An excluded type has no row to carry the name, and no deny for it to count.
+        let mut lifted = Blueprint::empty();
+        lifted.allow_credentials = vec![formwork_blueprint::CredentialEntry::parse("gpg")];
+        let policy = super::compile(&lifted, &HostProfile::synthetic_linux(Some(6)), &catalog);
+        assert!(!policy.report.credentials.per_type.contains_key("gpg"));
+        let confiner = serde_json::to_string(&policy.confiner).unwrap();
+        assert!(!confiner.contains("vault-7f3a"), "{confiner}");
+    }
+
+    /// The name shapes the Catalog adopted are any-depth rows like the ones beside them: Seatbelt
+    /// carries each, and on Linux each is listed as withheld under a `Partial` verdict, never
+    /// counted into an `Enforced` one (FW-INV5).
+    #[test]
+    fn fw_cred9_the_adopted_name_shapes_are_withheld_on_linux_and_carried_on_macos() {
+        const DOTENV: [&str; 4] = [
+            "**/.env.development.local",
+            "**/.env.test.local",
+            "**/.env.staging.local",
+            "**/.env.production.local",
+        ];
+        const BACKSTOP: [&str; 4] = [
+            "**/.git-credentials",
+            "**/id_dsa",
+            "**/id_ecdsa_sk",
+            "**/id_ed25519_sk",
+        ];
+        let catalog = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        for row in DOTENV {
+            assert!(catalog.types["dotenv"].paths.contains(&pp(row)), "{row}");
+        }
+        for row in BACKSTOP {
+            assert!(catalog.backstop.contains(&pp(row)), "{row}");
+        }
+
+        let linux = super::compile(
+            &Blueprint::empty(),
+            &HostProfile::synthetic_linux(Some(6)),
+            &catalog,
+        );
+        for row in DOTENV.iter().chain(&BACKSTOP) {
+            assert!(
+                linux
+                    .report
+                    .withheld
+                    .contains(&format!("credential-floor {row}")),
+                "{row} is not reported withheld: {:?}",
+                linux.report.withheld
+            );
+        }
+        let creds = &linux.report.credentials;
+        assert!(matches!(creds.backstop, Some(Fidelity::Partial { .. })));
+        assert!(matches!(
+            creds.per_type["dotenv"].path,
+            Some(Fidelity::Partial { .. })
+        ));
+        // The shape did not join a typed row set, so no absolute type lost its verdict to it.
+        for absolute in ["github", "ssh"] {
+            assert!(matches!(
+                creds.per_type[absolute].path,
+                Some(Fidelity::Enforced { .. })
+            ));
+        }
+
+        let macos = super::compile(
+            &Blueprint::empty(),
+            &HostProfile::synthetic_macos(),
+            &catalog,
+        );
+        assert!(macos.report.withheld.is_empty());
+        assert!(matches!(
+            macos.report.credentials.backstop,
+            Some(Fidelity::Enforced { .. })
+        ));
+        let sbpl = match &macos.confiner {
+            ConfinerPolicy::Macos(m) => &m.sbpl,
+            other => panic!("expected a Seatbelt policy, got {other:?}"),
+        };
+        for name in [
+            "id_dsa",
+            "id_ecdsa_sk",
+            "id_ed25519_sk",
+            "git-credentials",
+            "production\\.local",
+        ] {
+            assert!(
+                sbpl.lines()
+                    .any(|l| l.starts_with("(deny file-read*") && l.contains(name)),
+                "no Seatbelt read deny carries {name}"
+            );
+        }
     }
 
     /// The Partial reason is what `explain` prints for the backstop, so it claims enforcement only

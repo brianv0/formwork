@@ -176,6 +176,11 @@ pub struct CredentialFidelity {
     /// Env-var locations -> the launcher strip (variable absent).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<Fidelity>,
+    /// The `env-file-refs` and `env-dir-refs` variables that were set when this policy was built,
+    /// each with the number of deny rows it added (FW-CRED35). Names only: a value is where a
+    /// credential store is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<formwork_blueprint::ResolvedReference>,
 }
 
 impl Capability {
