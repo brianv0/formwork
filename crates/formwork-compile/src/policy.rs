@@ -77,7 +77,8 @@ pub enum LinuxNetPlan {
     /// sandbox resolves names under this plan; host rules restore resolution through the Gateway.
     LandlockTcpSeccompDgramRawDeny { ports: Vec<u16> },
     /// The host-allowlist posture (FW-EGR7): inet STREAM sockets may be created, but every
-    /// `connect()` (and every addressed `sendto`) is delivered to the supervisor in the spawning
+    /// `connect()` (and every addressed `sendto`, every `sendmsg` and every `sendmmsg`, FW-ISO30) is
+    /// delivered to the supervisor in the spawning
     /// process, which performs the allowed ones itself -- only the session's Gateway listener and
     /// admitted pathname sockets. UDP and raw stay seccomp-denied (FW-ISO11). Every `listen()`
     /// goes to the supervisor too, which refuses it on an inet socket (FW-ISO34).

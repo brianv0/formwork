@@ -9,7 +9,9 @@
 //!   3   setup failed (bad arguments, unreadable file, no memfd)
 //!
 //! `argv[1] = memfd <file>` copies `<file>` into a memfd and execs the descriptor;
-//! `argv[1] = path <file>` execs `<file>` by path, the control the allow-list already refuses.
+//! `argv[1] = path <file>` execs `<file>` by path, the control the allow-list already refuses;
+//! `argv[1] = procfd <file>` copies `<file>` into a memfd and execs `/proc/self/fd/<n>`, a route
+//! the allow-list does not close (FW-ADV-050).
 //! Either way the new image is told `ran`, so a copy of this probe is the natural `<file>`.
 
 #[cfg(target_os = "linux")]
@@ -40,7 +42,7 @@ fn main() {
             // SAFETY: NUL-terminated strings and NULL-terminated arrays, alive for the call.
             unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
         }
-        "memfd" => {
+        "memfd" | "procfd" => {
             // <linux/memfd.h>, 6.3+: where `vm.memfd_noexec` makes a memfd non-executable by
             // default, the flag asks for an executable one. An older kernel rejects the flag.
             const MFD_EXEC: libc::c_uint = 0x10;
@@ -60,6 +62,15 @@ fn main() {
             let copied = File::open(file).and_then(|mut src| std::io::copy(&mut src, &mut memfd));
             if copied.is_err() {
                 exit(3);
+            }
+            if how == "procfd" {
+                let Ok(path) = CString::new(format!("/proc/self/fd/{}", memfd.as_raw_fd())) else {
+                    exit(3);
+                };
+                // SAFETY: as for execve above.
+                unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+                let refused = std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES);
+                exit(if refused { 7 } else { 8 });
             }
             // SAFETY: as for execve above; the empty path with AT_EMPTY_PATH names the fd itself.
             unsafe {

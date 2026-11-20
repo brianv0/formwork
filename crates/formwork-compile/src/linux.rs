@@ -11,6 +11,7 @@ use formwork_blueprint::NetPosture;
 use formwork_detect::HostProfile;
 
 use crate::policy::{LinuxNetPlan, SeccompPlan, SocketFamily};
+use crate::report::Capability;
 
 /// Landlock ABI at which TCP network rules (`ACCESS_NET_CONNECT_TCP`) become available.
 pub const LANDLOCK_NET_ABI: u32 = 4;
@@ -136,6 +137,60 @@ pub fn net_plan(host: &HostProfile, net: &NetPosture) -> (LinuxNetPlan, InetSecc
             PortTier::NotRequested,
         ),
     }
+}
+
+/// A socket the session did not create: the socket rules govern creation, `connect()`, `listen()`
+/// and addressed sends, and a descriptor that arrives from outside passes none of them.
+pub const OPEN_INHERITED_SOCKET: &str =
+    "a socket the session did not create -- one `formwork run` \
+     inherited from its caller, or one received over a UNIX socket -- is outside the socket rules, \
+     which govern creation, connect(), listen() and addressed sends";
+/// Landlock handles `BIND_TCP` under the port tier, so `bind()` is refused; `listen()` on an
+/// unbound socket binds it without that check (observed on 6.18, ABI 7).
+pub const OPEN_UNBOUND_LISTEN: &str = "listen() on an unbound socket binds itself to the wildcard \
+     address, so the session can accept connections from outside it";
+/// Landlock allows an object with no path, and seccomp cannot read the path string `execve` takes
+/// (observed on 6.18, ABI 7).
+pub const OPEN_PROC_FD_EXEC: &str =
+    "execve of /proc/self/fd/N runs a memory file the allow-list does not name";
+/// Landlock's execute right governs `execve`, not a mapping: a granted loader maps what it reads.
+pub const OPEN_LOADER: &str = "a granted loader runs an unlisted file it can read (ld.so <file>), \
+     and a readable file can be mapped executable with mmap or mprotect";
+/// `clone3` takes its flags in a `clone_args` structure seccomp cannot read.
+pub const OPEN_CLONE3_USERNS: &str = "clone3 with CLONE_NEWUSER creates a user namespace, whose \
+     flags seccomp cannot read; the namespace is inert because mount, setns and pivot_root stay \
+     refused";
+/// The baseline leaves these to the kernel's capability checks, which an unprivileged session
+/// fails and a session running as root in a container passes.
+pub const OPEN_CAPABILITY_HOLDER: &str = "a session that holds CAP_SYS_ADMIN, CAP_SYS_MODULE, \
+     CAP_SYS_TIME, CAP_SYS_BOOT, CAP_SYS_RAWIO, CAP_MKNOD, CAP_SYS_PACCT or CAP_SYSLOG, as root in \
+     a container does, can call umount2 and the fsopen mount API, delete_module, reboot, the clock \
+     setters, iopl and ioperm, mknod of a device node, swapon, sethostname, acct and syslog, which \
+     the baseline leaves to the kernel's capability checks";
+
+/// The entry points the entry-point table in `docs/linux-backend.md` marks open for a session
+/// (FW-ISO32), each with the report row it leaves `Partial` and the clause that names it
+/// (FW-FID32).
+pub fn open_entry_points(
+    plan: &LinuxNetPlan,
+    exec_allowlist: bool,
+) -> Vec<(Capability, &'static str)> {
+    let mut open = vec![
+        (Capability::NetDefaultDeny, OPEN_INHERITED_SOCKET),
+        (Capability::NetUdp, OPEN_INHERITED_SOCKET),
+        (Capability::NetUnixSocket, OPEN_INHERITED_SOCKET),
+        (Capability::CrossDomainSocket, OPEN_INHERITED_SOCKET),
+        (Capability::PrivilegedInterfaces, OPEN_CLONE3_USERNS),
+        (Capability::PrivilegedInterfaces, OPEN_CAPABILITY_HOLDER),
+    ];
+    if matches!(plan, LinuxNetPlan::LandlockTcpSeccompDgramRawDeny { .. }) {
+        open.push((Capability::NetDefaultDeny, OPEN_UNBOUND_LISTEN));
+    }
+    if exec_allowlist {
+        open.push((Capability::Exec, OPEN_PROC_FD_EXEC));
+        open.push((Capability::Exec, OPEN_LOADER));
+    }
+    open
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

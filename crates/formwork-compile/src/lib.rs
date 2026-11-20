@@ -225,6 +225,12 @@ pub fn compile_for_session(
     let supervised = supervised(&input, host);
     egress_rows(&input, host, supervised, &mut per_capability);
     let channels = baseline_rows(&input, host, supervised, &mut per_capability);
+    if let ConfinerPolicy::Linux(linux) = &confiner {
+        let exec_allowlist = matches!(linux.exec, ExecPlan::Allowlist { .. });
+        for (cap, clause) in linux::open_entry_points(&linux.net, exec_allowlist) {
+            mark_open(&mut per_capability, cap, clause);
+        }
+    }
 
     // Filesystem invisibility is never provided; document it as an explicit, reported fact.
     per_capability.insert(
@@ -295,6 +301,28 @@ pub fn compile_for_session(
         confiner,
         gateway,
         report,
+    }
+}
+
+/// FW-FID32: a row with an open entry point is `Partial`, and its reason names the entry point. A
+/// row the host cannot enforce at all stays `Unenforceable`.
+fn mark_open(caps: &mut BTreeMap<Capability, Fidelity>, cap: Capability, clause: &str) {
+    match caps.get_mut(&cap) {
+        Some(Fidelity::Enforced { backend }) => {
+            let backend = *backend;
+            caps.insert(
+                cap,
+                Fidelity::Partial {
+                    backend,
+                    reason: clause.to_string(),
+                },
+            );
+        }
+        Some(Fidelity::Partial { reason, .. }) if !reason.contains(clause) => {
+            reason.push_str("; ");
+            reason.push_str(clause);
+        }
+        _ => {}
     }
 }
 
@@ -1029,26 +1057,19 @@ fn egress_rows(
             };
             caps.insert(Capability::NetDefaultDeny, supervisor());
             caps.insert(Capability::NetResolver, supervisor());
-            let sendmsg_gap = "addressed sendmsg()/sendmmsg() on an AF_UNIX datagram socket is not mediated (its destination sits in memory seccomp cannot read); connect() and addressed sendto() are";
-            caps.insert(
-                Capability::NetUnixSocket,
-                Fidelity::Partial {
-                    backend: Backend::Supervisor,
-                    reason: sendmsg_gap.to_string(),
-                },
-            );
+            // FW-ISO30: every connect() and send that names a destination is supervised.
+            caps.insert(Capability::NetUnixSocket, supervisor());
             caps.insert(
                 Capability::CrossDomainSocket,
-                Fidelity::Partial {
-                    backend: Backend::Supervisor,
-                    reason: if host.landlock_abi.unwrap_or(0) >= 6 {
-                        format!("pathname and abstract connect() are supervised; {sendmsg_gap}")
-                    } else {
-                        format!(
-                            "pathname and abstract connect() are supervised; signals outside the \
-                              domain need Landlock ABI 6; {sendmsg_gap}"
-                        )
-                    },
+                if host.landlock_abi.unwrap_or(0) >= 6 {
+                    supervisor()
+                } else {
+                    Fidelity::Partial {
+                        backend: Backend::Supervisor,
+                        reason: "pathname and abstract connect() and sends are supervised; \
+                                 signals outside the domain need Landlock ABI 6"
+                            .to_string(),
+                    }
                 },
             );
         }
@@ -1340,23 +1361,26 @@ mod tests {
     }
 
     /// The report must NOT over-claim (FW-INV5): under the Landlock TCP port tier, net default-deny is
-    /// genuinely Enforced -- because the port tier now seccomp-denies inet UDP/raw (not TCP-only
-    /// Landlock, which would leave UDP open). And it degrades honestly to Unenforceable if the host
-    /// carries no seccomp to install that deny.
+    /// carried by seccomp -- the port tier seccomp-denies inet UDP/raw (not TCP-only Landlock, which
+    /// would leave UDP open) -- and is Partial for the entry points nothing mediates (FW-FID32). It
+    /// degrades honestly to Unenforceable if the host carries no seccomp to install that deny.
     #[test]
-    fn linux_port_tier_net_default_deny_is_honestly_enforced() {
+    fn linux_port_tier_net_default_deny_follows_the_host() {
         let blueprint = Blueprint {
             net: NetPosture::Ports(vec![443]),
             ..Blueprint::empty()
         };
-        // ABI 6 host with seccomp: UDP/raw are actually denied, so Enforced (via seccomp) is honest.
+        // ABI 6 host with seccomp: UDP/raw are denied and TCP connects are port-scoped, but an
+        // unbound socket can still listen, and a socket from outside is outside the rules.
         let policy = compile(&blueprint, &HostProfile::synthetic_linux(Some(6)));
-        assert_eq!(
-            policy.report.per_capability[&Capability::NetDefaultDeny],
-            Fidelity::Enforced {
-                backend: Backend::Seccomp
-            },
-            "net-deny under the port tier is carried by seccomp (UDP/raw) + Landlock (TCP)"
+        assert!(
+            matches!(
+                &policy.report.per_capability[&Capability::NetDefaultDeny],
+                Fidelity::Partial { backend: Backend::Seccomp, reason }
+                    if reason.contains(linux::OPEN_UNBOUND_LISTEN)
+                        && reason.contains(linux::OPEN_INHERITED_SOCKET)
+            ),
+            "net-deny under the port tier names its open entry points"
         );
         assert!(policy.report.per_capability[&Capability::NetPortTier].is_enforced());
         assert!(policy.report.net_is_fail_closed());
@@ -1451,7 +1475,11 @@ mod tests {
             ConfinerPolicy::Linux(l) => assert!(matches!(l.net, LinuxNetPlan::SeccompDenyInet)),
             other => panic!("expected Linux confiner, got {other:?}"),
         }
-        assert!(policy.report.per_capability[&Capability::NetDefaultDeny].is_enforced());
+        assert!(matches!(
+            &policy.report.per_capability[&Capability::NetDefaultDeny],
+            Fidelity::Partial { backend: Backend::Seccomp, reason }
+                if reason == linux::OPEN_INHERITED_SOCKET
+        ));
     }
 
     #[test]

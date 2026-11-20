@@ -59,6 +59,8 @@ under test.
   is untouched. One descriptor route stays open: `execve("/proc/self/fd/N")` of a memfd still runs
   under the allow-list (verified on 6.18, ABI 7), because seccomp cannot read the path string and
   Landlock allows an object with no path. `memfd_create` is not refused: language runtimes use it.
+  With a granted loader that maps an unlisted file, these routes leave `exec` `Partial`, and the
+  reason names each ([FW-FID32](../formwork.md#fw-fid32), [FW-ADV-050](../formwork.md#fw-adv-050)).
 - **x32 syscall numbers are refused on x86_64.** A kernel built with `CONFIG_X86_X32_ABI` offers
   every syscall a second time under a number with bit 30 set, and the baseline's rules are keyed
   by the native number. The second filter returns `EPERM` for any number with that bit
@@ -86,6 +88,118 @@ under test.
   write into an *unconfined* same-uid sibling; `ptrace` denial does not cover these).
 - **The child `apply` path is allocation-free on success** (only syscalls + raw-errno results), so a
   post-`fork` allocator poisoned by a multi-threaded parent cannot deadlock it.
+
+## Effects and entry points
+
+For each effect the Linux backend reports `Enforced` or `Partial`, this table lists every system
+call that produces it and the mechanism that mediates each call
+([FW-ISO32](../formwork.md#fw-iso32)). A row whose status is `open` names an entry point nothing
+mediates, and the quoted clause is part of the reason the compiler gives for each report row the
+row names, which is `Partial` for it on Linux ([FW-FID32](../formwork.md#fw-fid32)); a
+parenthesis limits the row to the postures named in it (`deny`, `ports`, `hosts`, `allow-list`
+for an exec allow-list). A change to the seccomp baseline, the second filter or the notify filter
+updates the table in the same change. `entry_points.rs` in `formwork-confine` parses it: each
+call a `mediated` row puts under the notify filter, the baseline, the second filter or the socket
+allow-list must get that verdict from the compiled filter, and each `open` clause must appear in
+the reason ([FW-E2E-190](../formwork.md#fw-e2e-190)). Empty leading cells continue the row above.
+
+<!-- entry-points: begin -->
+| Effect | Report rows | System calls | Mechanism | Status |
+|---|---|---|---|---|
+| Open an outbound TCP connection | `net-default-deny`, `net-port-tier`, `net-host-scope` | `connect` | allow-list under `deny` (no inet socket exists); Landlock `CONNECT_TCP` under the port tier; notify filter under host rules | mediated |
+| | | `sendto`, `sendmsg`, `sendmmsg` carrying `MSG_FASTOPEN` | second filter ([FW-ISO29](../formwork.md#fw-iso29)) | mediated |
+| | | `sendto` naming a destination, `sendmsg`, `sendmmsg` | notify filter under host rules ([FW-ISO30](../formwork.md#fw-iso30)); elsewhere the kernel ignores a TCP destination without `MSG_FASTOPEN` | mediated |
+| | | `io_uring_setup`, `io_uring_enter`, `io_uring_register` (`IORING_OP_CONNECT`) | baseline | mediated |
+| Accept an inbound connection | `net-default-deny` | `listen` | allow-list under `deny`; notify filter under host rules ([FW-ISO34](../formwork.md#fw-iso34)) | mediated |
+| | | `bind` | Landlock `BIND_TCP` under the port tier | mediated |
+| | | `listen` on an unbound socket, then `accept`, `accept4` | nothing under the port tier: Landlock checks `bind`, not the bind `listen` makes | open (ports): "listen() on an unbound socket binds itself to the wildcard address" |
+| Send a UDP or raw datagram | `net-udp` | `socket`, `socketpair` of an inet datagram or raw type | allow-list ([FW-ISO11](../formwork.md#fw-iso11)) | mediated |
+| Create a socket that reaches off the host | `net-default-deny` | `socket`, `socketpair` | allow-list ([FW-ISO28](../formwork.md#fw-iso28)) | mediated |
+| Use a socket from outside the session | `net-default-deny`, `net-udp`, `net-unix-socket`, `cross-domain-socket` | `accept`, `accept4`, `read`, `readv`, `write`, `writev`, `send`, `sendto`, `sendmsg`, `sendmmsg`, `recv`, `recvfrom`, `recvmsg`, `recvmmsg`, `sendfile`, `sendfile64`, `splice`, `vmsplice`, `tee` on a socket `formwork run` inherited or the session received with `SCM_RIGHTS` | nothing: the socket rules act on creation, `connect`, `listen` and addressed sends | open: "a socket the session did not create" |
+| Reach a pathname or abstract UNIX socket | `net-unix-socket`, `cross-domain-socket` | `connect`, `sendto` naming a destination, `sendmsg`, `sendmmsg` | notify filter under host rules ([FW-ISO12](../formwork.md#fw-iso12), [FW-ISO30](../formwork.md#fw-iso30)) | mediated |
+| | | the same calls under `deny` and the port tier | nothing for a pathname socket; Landlock's scope for an abstract one (ABI 6) | open (deny, ports): "pathname UNIX-socket connect() is unmediated without host rules" |
+| Signal a process outside the session | `cross-domain-socket` | `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `pidfd_send_signal` | Landlock's signal scope (ABI 6) | mediated |
+| Start a program outside the exec allow-list | `exec` | `execve`, `execveat` of a path | Landlock `EXECUTE` | mediated |
+| | | `execveat` with `AT_EMPTY_PATH` | second filter ([FW-ISO31](../formwork.md#fw-iso31)) | mediated |
+| | | `execve` of `/proc/self/fd/N` naming a memory file from `memfd_create` | nothing: Landlock allows an object with no path | open (allow-list): "execve of /proc/self/fd/N runs a memory file" |
+| | | `mmap`, `mmap_pgoff`, `mprotect`, `pkey_mprotect`, `remap_file_pages` with `PROT_EXEC`, `personality` with `READ_IMPLIES_EXEC`, `uselib`, by a granted loader (`ld.so <file>`) | nothing: Landlock's execute right governs `execve`, not a mapping | open (allow-list): "a granted loader runs an unlisted file it can read" |
+| Change a mount | `privileged-interfaces` | `mount`, `move_mount`, `mount_setattr`, `pivot_root` | baseline | mediated |
+| | | `umount` (`umount2`), `oldumount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `open_tree`, `open_tree_attr` | the kernel's `CAP_SYS_ADMIN` check | open: "a session that holds CAP_SYS_ADMIN" |
+| Change a namespace | `privileged-interfaces` | `unshare`, `clone` with `CLONE_NEWUSER` | baseline | mediated |
+| | | `setns` | baseline | mediated |
+| | | `clone3` with `CLONE_NEWUSER` | nothing: its flags sit behind a pointer | open: "clone3 with CLONE_NEWUSER creates a user namespace" |
+| Reach into another process | `privileged-interfaces`, `process-environment` | `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd` | baseline | mediated |
+| | | `openat` of `/proc/<pid>/mem` or `/proc/<pid>/environ`, `process_madvise`, `kcmp`, `migrate_pages`, `move_pages` | Landlock's ptrace scope; `process-environment` says `Partial` where the session holds `CAP_SYS_ADMIN` or `CAP_PERFMON` | mediated |
+| Load kernel code, or change kernel state | `privileged-interfaces` | `bpf`, `perf_event_open`, `init_module`, `finit_module`, `kexec_load`, `kexec_file_load`, `keyctl`, `add_key`, `request_key`, `open_by_handle_at` | baseline | mediated |
+| | | `delete_module`, `reboot`, `settimeofday`, `clock_settime`, `clock_settime32`, `adjtimex`, `adjtimex_time32`, `clock_adjtime`, `clock_adjtime32`, `stime`, `stime32`, `fanotify_init`, `fanotify_mark`, `iopl`, `ioperm`, `mknod`, `mknodat`, `swapon`, `swapoff`, `sethostname`, `setdomainname`, `acct`, `quotactl`, `quotactl_fd`, `syslog`, `vhangup` | the kernel's capability checks | open: "a session that holds CAP_SYS_ADMIN" |
+| Any effect above, under an x32 number | every row | every system call with bit 30 set | second filter ([FW-ISO33](../formwork.md#fw-iso33), x86_64) | mediated |
+| Any effect above, through the ia32 entry | every row | `socketcall`, `ipc` and every other call made through `int 0x80` | seccompiler's architecture check, which kills a foreign architecture | mediated |
+<!-- entry-points: end -->
+
+Under host rules the supervisor performs every call the notify filter delivers on its own copy of
+the socket and of the call's memory, and never answers `CONTINUE` (see "Supervised sends" below).
+The open rows are the ones known on 6.18 (x86_64, Landlock ABI 7): the port-tier `listen` and the
+`/proc/self/fd/N` exec were observed there; the capability-holder rows follow from the baseline
+not listing those calls, and no test issues them, because each acts on the host.
+
+<details>
+<summary>System calls with none of these effects (FW-ADV-051)</summary>
+
+Every other entry the x86_64 6.18 kernel exports as `__x64_sys_<name>`, compatibility and
+unimplemented entries included. [FW-ADV-051](../formwork.md#fw-adv-051) fails on a kernel that
+exports a name in neither the table nor this list, until one of them names it.
+Filesystem effects are outside this table.
+
+<!-- inert: begin -->
+```text
+access alarm arch_prctl brk cachestat capget capset chdir chmod chown chown16 chroot
+clock_getres clock_getres_time32 clock_gettime clock_gettime32 clock_nanosleep
+clock_nanosleep_time32 close close_range copy_file_range creat dup dup2 dup3 epoll_create
+epoll_create1 epoll_ctl epoll_pwait epoll_pwait2 epoll_wait eventfd eventfd2 exit exit_group
+faccessat faccessat2 fadvise64 fadvise64_64 fallocate fchdir fchmod fchmodat fchmodat2 fchown
+fchown16 fchownat fcntl fdatasync fgetxattr file_getattr file_setattr flistxattr flock fork
+fremovexattr fsetxattr fstat fstatfs fstatfs64 fsync ftruncate futex futex_requeue futex_time32
+futex_wait futex_waitv futex_wake futimesat futimesat_time32 get_mempolicy get_robust_list
+get_thread_area getcpu getcwd getdents getdents64 getegid getegid16 geteuid geteuid16 getgid
+getgid16 getgroups getgroups16 gethostname getitimer getpeername getpgid getpgrp getpid getppid
+getpriority getrandom getresgid getresgid16 getresuid getresuid16 getrlimit getrusage getsid
+getsockname getsockopt gettid gettimeofday getuid getuid16 getxattr getxattrat ia32_fadvise64
+ia32_fadvise64_64 ia32_fallocate ia32_ftruncate64 ia32_pread64 ia32_pwrite64 ia32_readahead
+ia32_sync_file_range ia32_truncate64 inotify_add_watch inotify_init inotify_init1
+inotify_rm_watch io_cancel io_destroy io_getevents io_getevents_time32 io_pgetevents
+io_pgetevents_time32 io_setup io_submit ioctl ioprio_get ioprio_set landlock_add_rule
+landlock_create_ruleset landlock_restrict_self lchown lchown16 lgetxattr link linkat listmount
+listxattr listxattrat llistxattr llseek lremovexattr lseek lsetxattr lsm_get_self_attr
+lsm_list_modules lsm_set_self_attr lstat madvise map_shadow_stack mbind membarrier memfd_secret
+mincore mkdir mkdirat mlock mlock2 mlockall modify_ldt mq_getsetattr mq_notify mq_open
+mq_timedreceive mq_timedreceive_time32 mq_timedsend mq_timedsend_time32 mq_unlink mremap mseal
+msgctl msgget msgrcv msgsnd msync munlock munlockall munmap name_to_handle_at nanosleep
+nanosleep_time32 newfstat newfstatat newlstat newstat newuname ni_syscall nice old_getrlimit
+old_msgctl old_readdir old_semctl old_shmctl olduname open openat2 pause pciconfig_iobase
+pciconfig_read pciconfig_write pidfd_open pipe pipe2 pkey_alloc pkey_free poll ppoll
+ppoll_time32 prctl pread64 preadv preadv2 prlimit64 process_mrelease pselect6 pselect6_time32
+pwrite64 pwritev pwritev2 readahead readlink readlinkat recvmmsg_time32 removexattr
+removexattrat rename renameat renameat2 restart_syscall rmdir rseq rt_sigaction rt_sigpending
+rt_sigprocmask rt_sigreturn rt_sigsuspend rt_sigtimedwait rt_sigtimedwait_time32 rtas s390_ipc
+s390_pci_mmio_read s390_pci_mmio_write sched_get_priority_max sched_get_priority_min
+sched_getaffinity sched_getattr sched_getparam sched_getscheduler sched_rr_get_interval
+sched_rr_get_interval_time32 sched_setaffinity sched_setattr sched_setparam sched_setscheduler
+sched_yield seccomp select semctl semget semop semtimedop semtimedop_time32 set_mempolicy
+set_mempolicy_home_node set_robust_list set_thread_area set_tid_address setfsgid setfsgid16
+setfsuid setfsuid16 setgid setgid16 setgroups setgroups16 setitimer setpgid setpriority setregid
+setregid16 setresgid setresgid16 setresuid setresuid16 setreuid setreuid16 setrlimit setsid
+setsockopt setuid setuid16 setxattr setxattrat sgetmask shmat shmctl shmdt shmget shutdown
+sigaltstack signal signalfd signalfd4 sigpending sigprocmask sigsuspend spu_create spu_run
+ssetmask stat statfs statfs64 statmount statx subpage_prot symlink symlinkat sync
+sync_file_range sync_file_range2 syncfs sysfs sysinfo time time32 timer_create timer_delete
+timer_getoverrun timer_gettime timer_gettime32 timer_settime timer_settime32 timerfd_create
+timerfd_gettime timerfd_gettime32 timerfd_settime timerfd_settime32 times truncate umask uname
+unlink unlinkat uprobe uretprobe userfaultfd ustat utime utime32 utimensat utimensat_time32
+utimes utimes_time32 vfork vm86 vm86old wait4 waitid waitpid
+```
+<!-- inert: end -->
+
+</details>
 
 ## Posture: build in the parent, apply in the child
 
@@ -267,8 +381,9 @@ reaches what the bound guards.
 
 - **Supervised connect ([FW-EGR7](../formwork.md#fw-egr7), [FW-ISO12](../formwork.md#fw-iso12)).**
   Under host rules a second seccomp filter returns `SECCOMP_RET_USER_NOTIF` for `connect`, for
-  `sendto` with a non-null destination, and for `listen` (x32 numbers are refused outright). The
-  listener is handed to the `formwork` process over a socketpair. For `connect` and `sendto` the
+  `sendto` with a non-null destination, for every `sendmsg` and `sendmmsg`, and for `listen` (x32
+  numbers are refused outright). The `formwork` process takes the listener (see "Supervised
+  sends"). For `connect` and `sendto` the
   supervisor copies the `sockaddr` once, re-checks the
   notification id, takes the socket with `pidfd_getfd` and performs the call itself, so a thread
   rewriting the address after the check changes nothing ([FW-ADV-018](../formwork.md#fw-adv-018)).
@@ -286,13 +401,48 @@ reaches what the bound guards.
   manager for `run-outside`, the display socket for `clipboard` and `screen`, the audio socket for
   `microphone`; the keyring sockets and the session bus when `os-keyring` is lifted), or when a
   session process bound it, which is decided from `sock_diag` or, on kernels without
-  `CONFIG_UNIX_DIAG`, `/proc/net/unix`. An abstract socket is refused. Addressed
-  `sendmsg`/`sendmmsg` on an AF_UNIX datagram socket is not mediated (its destination sits in memory
-  seccomp cannot read), and the report says so. A loopback server the session itself starts is
+  `CONFIG_UNIX_DIAG`, `/proc/net/unix`. An abstract socket is refused. Sends follow the same
+  rule (see "Supervised sends" below). A loopback server the session itself starts is
   refused too: its `listen` is refused, and a `connect` to it would be, because the supervisor
   admits inet only to the Gateway (FEP-6 §11, "In-session loopback";
   [FW-E2E-106](../formwork.md#fw-e2e-106) waits on it). Requires 5.6+ (`pidfd_getfd`) and
   Yama `ptrace_scope` 0 or 1; host detection probes all three.
+- **Supervised sends ([FW-ISO30](../formwork.md#fw-iso30)).** A `sendmsg` or `sendmmsg` can
+  name a destination in its `msghdr`, which seccomp cannot read, and a UNIX datagram socket sends
+  to any pathname or abstract socket it names: under host rules a session sent a datagram that
+  way to a socket `connect()` was refused (verified on 6.18). The notify filter therefore delivers
+  every `sendmsg` and `sendmmsg`, with or without a destination, alongside `connect`, `listen` and
+  a `sendto` whose destination pointer is set. The supervisor copies the `msghdr`, the
+  destination, the payload (up to 256 KiB a message; a stream send of more returns a short count,
+  a datagram of more `EMSGSIZE`) and the control messages out of the caller once, decides each
+  destination on that copy -- an inet one is refused, a pathname one is admitted as `connect()`
+  admits it, a route netlink one as the kernel admits it for a caller without `CAP_NET_ADMIN` --
+  and sends the copy itself on its duplicate of the socket. It never answers `CONTINUE`, for a
+  call that names no destination either: the kernel would then read the `msghdr` again, and look
+  the descriptor number up again, after the check. Probes rewriting the `msghdr` and swapping the
+  descriptor from a second thread delivered datagrams to a foreign socket against a build that
+  answered `CONTINUE` for those calls, and none against this one. A `sendmmsg` sends its entries
+  in order and stops at the first refused one, returning the count sent, as the kernel does at a
+  failing entry, and the supervisor writes each entry's `msg_len` back. Descriptors in an
+  `SCM_RIGHTS` message are replaced by the supervisor's duplicates of the caller's; an
+  `SCM_CREDENTIALS` message is dropped, because the kernel checks one against the sending
+  process, so a receiver sees the `formwork` process's credentials, as `SO_PEERCRED` already
+  names it for a connection the supervisor made. Each send is made non-blocking; a caller that
+  asked to block waits in a worker thread, which retries when the socket is writable for as long
+  as the notification is pending and honours `SO_SNDTIMEO`, so one blocked send does not hold up
+  the session's other calls. The send runs with `MSG_NOSIGNAL`, and the caller gets `SIGPIPE`
+  afterwards when it did not ask for that flag. `MSG_ZEROCOPY` is refused with `ENOBUFS`, on
+  which a zero-copy sender copies instead. The same rule governs a route netlink `connect()` or
+  send, which the supervisor once answered with `CONTINUE`: a probe flipping a descriptor number
+  between a netlink and a TCP socket connected the TCP socket to a listener the supervisor
+  refuses, in each of three runs on 6.18. The listener reaches the parent by a `write` of its
+  descriptor number, with the writer's credentials attached (`SO_PASSCRED`), and the parent takes
+  it with `pidfd_getfd` on a thread of its own while `Command::spawn` waits for the `execve`: the
+  `sendmsg` with `SCM_RIGHTS` the handoff used before would now wait on the supervisor it is
+  handing over. Cost: a `sendmsg` on a connected socket goes through the supervisor, about 35 to
+  45 µs a call against about 1 µs unsupervised on a 4-vCPU VM (6.18), of which about 26 µs is
+  the notification round trip itself. A send by `write`, `writev` or a `sendto` that names no
+  destination is not delivered: curl, Python, Node and Go send that way on TCP.
 - **Supervised listen ([FW-ISO34](../formwork.md#fw-iso34)).** The supervisor takes the caller's
   socket with `pidfd_getfd` after re-checking the notification id, as for `connect`, and reads
   `SO_DOMAIN` from its own copy. `AF_INET` and `AF_INET6` get `EACCES` and an operator line; a

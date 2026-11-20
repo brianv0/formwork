@@ -24,7 +24,7 @@ use formwork_confine::SupervisorConfig;
 use formwork_detect::detect;
 
 fn supervision_available() -> bool {
-    let host = detect();
+    let host = detected();
     host.connect_supervision && host.seccomp && host.landlock_abi.is_some()
 }
 
@@ -92,6 +92,7 @@ fn probe(name: &str) -> PathBuf {
         "tfo" => PathBuf::from(env!("CARGO_BIN_EXE_fw-tfo-probe")),
         "listen" => PathBuf::from(env!("CARGO_BIN_EXE_fw-listen-probe")),
         "registry" => PathBuf::from(env!("CARGO_BIN_EXE_fw-registry-probe")),
+        "send" => PathBuf::from(env!("CARGO_BIN_EXE_fw-send-probe")),
         other => panic!("no probe {other}"),
     }
 }
@@ -113,13 +114,40 @@ fn policy(work: &Path, literal_grants: &[&Path]) -> CompiledPolicy {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     formwork_compile::compile(
         &bp,
-        &detect(),
+        &detected(),
         &ResolvedCatalog::builtin_for_home(&home).unwrap(),
     )
 }
 
+/// Held across every fork this test process makes. Between `fork` and `execve` a child holds a
+/// copy of every descriptor of this process, the sockets a test binds "outside the session"
+/// included, and the supervisor counts a socket a descendant holds as bound in the session
+/// (FW-ISO12). A test whose refusals rest on that, and that must not see another test's spawn in
+/// the middle of its run, holds the lock for the whole run (`run_alone`).
+static FORKS: Mutex<()> = Mutex::new(());
+
+fn forks() -> std::sync::MutexGuard<'static, ()> {
+    FORKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `detect()`, which forks its probes.
+fn detected() -> formwork_detect::HostProfile {
+    let _fork = forks();
+    detect()
+}
+
 /// Start `cmd` confined and supervised, and leave it running.
 fn spawn(
+    policy: &CompiledPolicy,
+    gateway: SocketAddr,
+    registry: Arc<Mutex<HashSet<u16>>>,
+    cmd: Command,
+) -> Child {
+    let _fork = forks();
+    spawn_holding_forks(policy, gateway, registry, cmd)
+}
+
+fn spawn_holding_forks(
     policy: &CompiledPolicy,
     gateway: SocketAddr,
     registry: Arc<Mutex<HashSet<u16>>>,
@@ -154,6 +182,17 @@ fn run(
     exit_code(spawn(policy, gateway, registry, cmd))
 }
 
+/// `run`, with no other fork of this process from the spawn until the child exits.
+fn run_alone(
+    policy: &CompiledPolicy,
+    gateway: SocketAddr,
+    registry: Arc<Mutex<HashSet<u16>>>,
+    cmd: Command,
+) -> i32 {
+    let _fork = forks();
+    exit_code(spawn_holding_forks(policy, gateway, registry, cmd))
+}
+
 fn exit_code(mut child: Child) -> i32 {
     child.wait().unwrap().code().unwrap_or(-1)
 }
@@ -161,6 +200,7 @@ fn exit_code(mut child: Child) -> i32 {
 /// `cmd` with no confinement: the control that shows what a probe does where nothing refuses it.
 fn spawn_unconfined(mut cmd: Command) -> Child {
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    let _fork = forks();
     cmd.spawn().expect("control spawns")
 }
 
@@ -199,9 +239,11 @@ fn fw_e2e_075_gateway_is_the_sole_egress_path() {
     let other = Counting::start();
     let registry = Arc::new(Mutex::new(HashSet::new()));
     let pol = policy(&work.0, &[]);
+    // Carried by the supervisor; Partial only for a socket from outside the session (FW-FID32).
     assert!(matches!(
-        pol.report.per_capability[&Capability::NetDefaultDeny],
-        Fidelity::Enforced { .. }
+        &pol.report.per_capability[&Capability::NetDefaultDeny],
+        Fidelity::Partial { backend: formwork_compile::Backend::Supervisor, reason }
+            if reason.contains("a socket the session did not create")
     ));
 
     let to_gateway = run(
@@ -275,7 +317,7 @@ fn fw_e2e_076_pathname_sockets_are_mediated() {
     let unix = probe("unix");
     let s = |p: &Path| p.to_str().unwrap().to_string();
     assert_eq!(
-        run(
+        run_alone(
             &pol,
             gateway.addr,
             registry.clone(),
@@ -284,7 +326,7 @@ fn fw_e2e_076_pathname_sockets_are_mediated() {
         7
     );
     assert_eq!(
-        run(
+        run_alone(
             &pol,
             gateway.addr,
             registry.clone(),
@@ -293,7 +335,7 @@ fn fw_e2e_076_pathname_sockets_are_mediated() {
         0
     );
     assert_eq!(
-        run(
+        run_alone(
             &pol,
             gateway.addr,
             registry.clone(),
@@ -302,7 +344,7 @@ fn fw_e2e_076_pathname_sockets_are_mediated() {
         0
     );
     assert_eq!(
-        run(
+        run_alone(
             &pol,
             gateway.addr,
             registry.clone(),
@@ -311,7 +353,7 @@ fn fw_e2e_076_pathname_sockets_are_mediated() {
         7
     );
     assert_eq!(
-        run(
+        run_alone(
             &pol,
             gateway.addr,
             registry.clone(),
@@ -365,6 +407,34 @@ fn fw_adv_018_supervisor_race_cannot_redirect() {
     assert!(
         gateway.count() > 0,
         "the race probe did connect to the allowed destination"
+    );
+}
+
+/// FW-ADV-018: a `connect()` the supervisor checked on one socket cannot take effect on another
+/// presented under the same descriptor number. The probe flips a number between a route netlink
+/// socket, which the supervisor once left to the kernel, and a TCP socket, while connecting it to
+/// a listener the supervisor refuses.
+#[test]
+fn fw_adv_018_a_descriptor_swap_cannot_redirect_a_connect() {
+    if !supervision_available() {
+        not_exercised("connect supervision unavailable on this host");
+        return;
+    }
+    let work = Scratch::new("018swap");
+    let gateway = Counting::start();
+    let denied = Counting::start();
+    let pol = policy(&work.0, &[]);
+    let code = run(
+        &pol,
+        gateway.addr,
+        Arc::new(Mutex::new(HashSet::new())),
+        cmd(&probe("send"), &["nlswap", &denied.addr.to_string(), "300"]),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        (code, denied.count()),
+        (0, 0),
+        "a TCP socket connected past the supervisor (exit 23), or the probe failed (8)"
     );
 }
 
@@ -802,5 +872,354 @@ fn fw_e2e_213_a_failed_connect_leaves_no_registered_port() {
     );
     if in_progress == 2 {
         not_exercised("the non-blocking connect was refused before it returned");
+    }
+}
+
+/// A datagram socket bound outside the session, counting what reaches it.
+struct Inbox(UnixDatagram);
+
+impl Inbox {
+    fn bind(path: &Path) -> Inbox {
+        let s = UnixDatagram::bind(path).unwrap();
+        s.set_nonblocking(true).unwrap();
+        Inbox(s)
+    }
+    fn bind_abstract(name: &str) -> Inbox {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name).unwrap();
+        let s = UnixDatagram::bind_addr(&addr).unwrap();
+        s.set_nonblocking(true).unwrap();
+        Inbox(s)
+    }
+    /// Datagrams received since the last call.
+    fn take(&self) -> usize {
+        let mut buf = [0u8; 16];
+        std::iter::from_fn(|| self.0.recv(&mut buf).ok()).count()
+    }
+}
+
+/// FW-ISO30 / FW-ISO12: an addressed `sendmsg` or `sendmmsg` on a UNIX datagram socket is
+/// admitted by the rule `connect()` follows. Without supervision the kernel delivers each of them
+/// (the control), so a datagram that does not arrive was refused by the supervisor.
+#[test]
+fn fw_iso30_addressed_sendmsg_follows_the_connect_rule() {
+    if !supervision_available() {
+        not_exercised("connect supervision unavailable on this host");
+        return;
+    }
+    let work = Scratch::new("iso30");
+    let gateway = Counting::start();
+    let foreign_path = work.0.join("foreign.dgram");
+    let foreign = Inbox::bind(&foreign_path);
+    let granted_path = work.0.join("granted.dgram");
+    let granted = Inbox::bind(&granted_path);
+    let abstract_name = format!("fw-iso30-{}", std::process::id());
+    let hidden = Inbox::bind_abstract(&abstract_name);
+    let at_abstract = format!("@{abstract_name}");
+    let s = |p: &Path| p.to_str().unwrap().to_string();
+    let send = probe("send");
+    for (mode, to, inbox) in [
+        ("sendmsg", s(&foreign_path), &foreign),
+        ("sendmmsg1", s(&foreign_path), &foreign),
+        ("sendmsg", at_abstract.clone(), &hidden),
+    ] {
+        let code = exit_code(spawn_unconfined(cmd(&send, &[mode, &to])));
+        assert_eq!(
+            (code, inbox.take()),
+            (0, 1),
+            "control: {mode} to {to} unconfined"
+        );
+    }
+
+    let pol = policy(&work.0, &[&granted_path]);
+    let registry = || Arc::new(Mutex::new(HashSet::new()));
+    let confined = |args: &[&str]| run_alone(&pol, gateway.addr, registry(), cmd(&send, args));
+    for mode in ["sendmsg", "sendmmsg1"] {
+        assert_eq!(
+            confined(&[mode, &s(&foreign_path)]),
+            7,
+            "{mode} to a foreign socket"
+        );
+        assert_eq!(
+            confined(&[mode, &s(&granted_path)]),
+            0,
+            "{mode} to a granted socket"
+        );
+    }
+    assert_eq!(
+        confined(&["sendmsg", &at_abstract]),
+        7,
+        "an abstract socket"
+    );
+    assert_eq!(
+        confined(&["own", &s(&work.0.join("own.dgram"))]),
+        0,
+        "a socket the session bound"
+    );
+    assert_eq!(foreign.take(), 0, "a refused datagram arrived");
+    assert_eq!(
+        hidden.take(),
+        0,
+        "a refused datagram arrived at the abstract socket"
+    );
+    assert_eq!(granted.take(), 2, "both granted datagrams arrived");
+}
+
+/// FW-ISO30: a `sendmmsg` whose entries mix admitted and refused destinations sends the entries
+/// before the first refused one and returns their count, as the kernel does on a failing entry;
+/// entries that name no destination on a connected socket go to its peer.
+#[test]
+fn fw_iso30_sendmmsg_stops_at_the_first_refused_entry() {
+    if !supervision_available() {
+        not_exercised("connect supervision unavailable on this host");
+        return;
+    }
+    let work = Scratch::new("iso30m");
+    let gateway = Counting::start();
+    let foreign_path = work.0.join("foreign.dgram");
+    let foreign = Inbox::bind(&foreign_path);
+    let granted_path = work.0.join("granted.dgram");
+    let granted = Inbox::bind(&granted_path);
+    let s = |p: &Path| p.to_str().unwrap().to_string();
+    let send = probe("send");
+    let control = exit_code(spawn_unconfined(cmd(
+        &send,
+        &["mixed", &s(&granted_path), &s(&foreign_path)],
+    )));
+    assert_eq!(
+        control, 53,
+        "control: all three entries are sent unconfined"
+    );
+    assert_eq!((granted.take(), foreign.take()), (2, 1));
+
+    let pol = policy(&work.0, &[&granted_path]);
+    for mode in ["mixed", "mixed-connected"] {
+        let code = run_alone(
+            &pol,
+            gateway.addr,
+            Arc::new(Mutex::new(HashSet::new())),
+            cmd(&send, &[mode, &s(&granted_path), &s(&foreign_path)]),
+        );
+        assert_eq!(code, 51, "{mode}: one entry sent, then the refusal");
+        assert_eq!((granted.take(), foreign.take()), (1, 0), "{mode}");
+    }
+}
+
+/// FW-ISO30: an inet destination in a `sendmsg` or `sendmmsg` is refused with `EACCES`. On an
+/// unconnected TCP socket the kernel would answer `EPIPE` (the control); the probe passes only on
+/// the supervisor's answer.
+#[test]
+fn fw_iso30_an_inet_destination_is_refused() {
+    if !supervision_available() {
+        not_exercised("connect supervision unavailable on this host");
+        return;
+    }
+    let work = Scratch::new("iso30i");
+    let gateway = Counting::start();
+    let other = Counting::start();
+    let send = probe("send");
+    let to_other = other.addr.to_string();
+    let control = exit_code(spawn_unconfined(cmd(&send, &["inet", &to_other])));
+    assert_eq!(control, 21, "control: the kernel does not answer EACCES");
+    let pol = policy(&work.0, &[]);
+    for to in [&to_other, &gateway.addr.to_string()] {
+        let code = run_alone(
+            &pol,
+            gateway.addr,
+            Arc::new(Mutex::new(HashSet::new())),
+            cmd(&send, &["inet", to]),
+        );
+        assert_eq!(
+            code, 0,
+            "sendmsg and sendmmsg to {to} are refused with EACCES"
+        );
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!((other.count(), gateway.count()), (0, 0));
+}
+
+/// FW-ISO30: a send that names no destination behaves as without supervision -- on a TCP
+/// connection to the Gateway, with descriptors over a UNIX stream pair, to the route netlink
+/// kernel peer, blocked on a full socket while another thread's `connect()` is served, and to a
+/// closed peer, with and without `MSG_NOSIGNAL`. The control runs the same steps unconfined.
+#[test]
+fn fw_iso30_a_send_naming_no_destination_is_unchanged() {
+    if !supervision_available() {
+        not_exercised("connect supervision unavailable on this host");
+        return;
+    }
+    let work = Scratch::new("iso30c");
+    let gateway = draining_listener();
+    let send = probe("send");
+    let args = ["connected", &gateway.to_string()];
+    assert_eq!(exit_code(spawn_unconfined(cmd(&send, &args))), 0, "control");
+    let pol = policy(&work.0, &[]);
+    let code = run_alone(
+        &pol,
+        gateway,
+        Arc::new(Mutex::new(HashSet::new())),
+        cmd(&send, &args),
+    );
+    assert_eq!(
+        code, 0,
+        "a step behaved differently under supervision (11 TCP, 12 descriptors, 13 netlink, \
+         14 blocking, 15 broken pipe; a signal exit is the stall alarm)"
+    );
+}
+
+/// FW-ADV-018 for sends: a second thread rewriting the `msghdr` -- between no destination, an
+/// in-session socket and a foreign one -- while `sendmsg` is pending cannot land a datagram on
+/// the foreign socket. The control shows the race reaching it unconfined.
+#[test]
+fn fw_adv_018_a_rewritten_msghdr_cannot_redirect_a_send() {
+    if !supervision_available() {
+        not_exercised("connect supervision unavailable on this host");
+        return;
+    }
+    let work = Scratch::new("018msg");
+    let gateway = Counting::start();
+    let foreign_path = work.0.join("foreign.dgram");
+    let foreign = Inbox::bind(&foreign_path);
+    let s = |p: &Path| p.to_str().unwrap().to_string();
+    let send = probe("send");
+    let foreign_arg = s(&foreign_path);
+    let (own_control, own_confined) = (
+        s(&work.0.join("own-control.dgram")),
+        s(&work.0.join("own-confined.dgram")),
+    );
+    let control = ["rewrite", &own_control, &foreign_arg, "300"];
+    assert_eq!(exit_code(spawn_unconfined(cmd(&send, &control))), 0);
+    if foreign.take() == 0 {
+        not_exercised("the rewrite never reached the foreign socket unconfined");
+        return;
+    }
+    let pol = policy(&work.0, &[]);
+    let code = run_alone(
+        &pol,
+        gateway.addr,
+        Arc::new(Mutex::new(HashSet::new())),
+        cmd(&send, &["rewrite", &own_confined, &foreign_arg, "300"]),
+    );
+    assert_eq!(
+        (code, foreign.take()),
+        (0, 0),
+        "a rewritten msghdr redirected a send"
+    );
+}
+
+/// FW-ADV-018 for sends: a descriptor number flipped between a TCP connection and a UNIX
+/// datagram socket, or between a route netlink socket and a UNIX datagram socket, while the
+/// destination is flipped with it, cannot land a datagram on a foreign socket: the supervisor
+/// sends on the socket and to the destination it checked. The control shows the flips reaching
+/// it unconfined.
+#[test]
+fn fw_adv_018_a_descriptor_swap_cannot_redirect_a_send() {
+    if !supervision_available() {
+        not_exercised("connect supervision unavailable on this host");
+        return;
+    }
+    let work = Scratch::new("018fd");
+    let gateway = draining_listener();
+    let foreign_path = work.0.join("foreign.dgram");
+    let foreign = Inbox::bind(&foreign_path);
+    let to = foreign_path.to_str().unwrap();
+    let send = probe("send");
+    let gw = gateway.to_string();
+    let pol = policy(&work.0, &[]);
+    for argv in [
+        vec!["fdswap", to, &gw, "300"],
+        vec!["nlswap-send", to, "300"],
+    ] {
+        assert_eq!(exit_code(spawn_unconfined(cmd(&send, &argv))), 0);
+        if foreign.take() == 0 {
+            not_exercised(&format!(
+                "{}: the swap never reached the socket unconfined",
+                argv[0]
+            ));
+            continue;
+        }
+        let code = run_alone(
+            &pol,
+            gateway,
+            Arc::new(Mutex::new(HashSet::new())),
+            cmd(&send, &argv),
+        );
+        assert_eq!(
+            (code, foreign.take()),
+            (0, 0),
+            "{}: a swap redirected a send",
+            argv[0]
+        );
+    }
+}
+
+/// A Gateway stand-in that reads and discards everything each peer sends.
+fn draining_listener() -> SocketAddr {
+    use std::io::Read;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 1 << 16];
+                while stream.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+            });
+        }
+    });
+    addr
+}
+
+/// Not a requirement test: the cost of supervision to `sendmsg` on connected sockets, the hot
+/// path FW-ISO30 adds to the notify filter. Prints the mean per call unconfined and supervised,
+/// for a UNIX stream pair and a TCP connection to the Gateway stand-in. Run with `--ignored
+/// --nocapture`.
+#[test]
+#[ignore]
+fn connected_sendmsg_cost_under_supervision() {
+    if !supervision_available() {
+        not_exercised("connect supervision unavailable on this host");
+        return;
+    }
+    let work = Scratch::new("sendcost");
+    let gateway = draining_listener();
+    let pol = policy(&work.0, &[]);
+    let out = work.0.join("ns");
+    let send = probe("send");
+    let count = "20000";
+    let cases: [(&str, Vec<String>); 3] = [
+        ("unix pair, 64 B", vec!["pair".into(), "64".into()]),
+        (
+            "tcp to the Gateway, 1 KiB",
+            vec!["tcp".into(), gateway.to_string(), "1024".into()],
+        ),
+        (
+            "tcp to the Gateway, 16 KiB",
+            vec!["tcp".into(), gateway.to_string(), "16384".into()],
+        ),
+    ];
+    for (label, args) in cases {
+        let mut argv: Vec<&str> = vec!["bench"];
+        argv.extend(args.iter().map(String::as_str));
+        argv.extend([count, out.to_str().unwrap()]);
+        let mut times = Vec::new();
+        for confined in [false, true] {
+            let _ = fs::remove_file(&out);
+            let code = if confined {
+                run(
+                    &pol,
+                    gateway,
+                    Arc::new(Mutex::new(HashSet::new())),
+                    cmd(&send, &argv),
+                )
+            } else {
+                exit_code(spawn_unconfined(cmd(&send, &argv)))
+            };
+            assert_eq!(code, 0, "{label}: the bench ran (confined: {confined})");
+            times.push(fs::read_to_string(&out).unwrap());
+        }
+        println!(
+            "sendmsg {label}: unconfined {} ns, supervised {} ns",
+            times[0], times[1]
+        );
     }
 }
