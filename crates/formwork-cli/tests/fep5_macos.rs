@@ -855,7 +855,10 @@ printf '%s\n' "$TMPDIR"
     );
     assert!(out.stdout.contains("user-tmp-closed"), "{}", out.stdout);
     let tmp = out.stdout.lines().last().unwrap();
-    assert!(tmp.contains("formwork-session-"), "{tmp}");
+    assert!(
+        tmp.ends_with("/tmp") && tmp.contains("/formwork/"),
+        "the temp directory is `tmp` in the session root (FW-TRA18): {tmp}"
+    );
     assert!(
         !Path::new(tmp).exists(),
         "the session temp directory is removed"

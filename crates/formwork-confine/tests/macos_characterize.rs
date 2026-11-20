@@ -85,6 +85,7 @@ fn compile(blueprint: &Blueprint, gateway: Option<&SessionGateway>) -> CompiledP
         &SessionSpec {
             gateway: gateway.cloned(),
             deny_tag: None,
+            roots: None,
         },
     )
 }

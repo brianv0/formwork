@@ -62,6 +62,23 @@ pub struct LinuxPolicy {
     /// The isolation tier (FW-ISO10), applied before Landlock and seccomp.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub isolate: Vec<formwork_blueprint::IsolateMember>,
+    /// The Launcher's session roots (FW-TRA19); absent from a dry run, which has no session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_roots: Option<SessionRoots>,
+}
+
+/// Where the Launcher keeps per-session paths (FW-TRA18). A policy that carries this closes every
+/// session root but its own, whatever the blueprint grants (FW-TRA19): a Launcher deny, applied
+/// after the merge like the policy-input denies (FW-XR8). Each field is a literal path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SessionRoots {
+    /// The directory that holds every session's root.
+    pub parent: PathPattern,
+    /// This session's root: the one entry of `parent` it may read.
+    pub own: PathPattern,
+    /// The private temporary directory (FW-TRA10): the one part of `own` it may write.
+    pub tmp: PathPattern,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

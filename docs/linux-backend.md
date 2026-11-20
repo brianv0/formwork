@@ -149,6 +149,15 @@ Landlock is allow-list only, so two problems the macOS backend already solved re
    `mode = "unveil"`, the behavior matches unveil exactly: ancestors of a grant are traversable, not
    listable.) Decided in FEP-5 review; `docs/fep-5-plan.md` §3.
 
+   The session roots ([FW-TRA19](../formwork.md#fw-tra19)) are a hole of a third shape: everything
+   below `<runtime>/formwork` except one subtree, the session's own root for reads and its `tmp/`
+   for writes. The walk splits `<runtime>/formwork` and every directory leading to the kept
+   subtree, and grants the kept subtree whole, so a root another session creates after enforcement
+   is as closed as one that existed. Splitting the parent costs nothing, because sessions create
+   nothing there; where a blueprint grants a tree above it, the ancestors split as for any hole,
+   and a split directory cannot be renamed, so no session can carry the roots out from under the
+   rules.
+
 ### Any-depth rows are withheld
 
 The expansion needs a rooted hole. An any-depth row (`**/.env`, `**/credentials`, the anchored

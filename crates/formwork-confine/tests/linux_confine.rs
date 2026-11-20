@@ -622,6 +622,116 @@ fn fw_e2e_045_credential_floor_denies_catalog_path_linux() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// FW-TRA19 / FW-INV23 (Linux/Landlock): with every session root inside a subtree the blueprint
+/// grants for reading and writing, only this session's root is readable and only its temporary
+/// directory is writable. A root created after the rules were built -- a later session's -- is
+/// as closed as one that existed, and nothing can be created beside the roots.
+#[test]
+fn fw_tra19_a_grant_over_the_session_roots_reaches_only_this_sessions() {
+    if !have_landlock() {
+        eprintln!("skipping: no Landlock on this host");
+        return;
+    }
+    let fx = Fixture::new("roots");
+    let parent = fx.root.join("formwork");
+    for session in ["own", "other"] {
+        for dir in ["tmp", "opener"] {
+            fs::create_dir_all(parent.join(session).join(dir)).unwrap();
+        }
+        fs::write(parent.join(session).join("opener/shim"), b"launcher\n").unwrap();
+    }
+    let literal = |p: &Path| PathPattern::parse(p.to_str().unwrap()).unwrap();
+    let blueprint = Blueprint {
+        fs: FsBlueprint {
+            read_mode: ReadMode::Closed,
+            reads: vec![pp(&fx.root)],
+            writes: vec![pp(&fx.root)],
+            writes_no_create: Vec::new(),
+            subtract: Vec::new(),
+            write_subtract: Vec::new(),
+        },
+        ..Blueprint::empty()
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let policy = formwork_compile::compile_for_session(
+        &blueprint,
+        &detect(),
+        &ResolvedCatalog::builtin_for_home(&home).unwrap(),
+        &formwork_compile::SessionSpec {
+            roots: Some(formwork_compile::SessionRoots {
+                parent: literal(&parent),
+                own: literal(&parent.join("own")),
+                tmp: literal(&parent.join("own/tmp")),
+            }),
+            ..Default::default()
+        },
+    );
+    let probe = |script: String| {
+        let mut cmd = sh(&script);
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        formwork_confine::spawn_confined(&mut cmd, &policy).expect("confinement applies");
+        // Created between building the rules and running the workload, as a later session's is.
+        fs::create_dir_all(parent.join("late/tmp")).unwrap();
+        cmd.status().expect("child runs").code().unwrap_or(-1)
+    };
+    let p = parent.display();
+    let granted = fx.granted();
+    let allowed = [
+        (
+            "the grant itself",
+            format!("echo x > {}/new", granted.display()),
+        ),
+        (
+            "its own temp directory",
+            format!("echo x > {p}/own/tmp/new"),
+        ),
+        ("reading its own shim", format!("cat {p}/own/opener/shim")),
+    ];
+    for (what, script) in allowed {
+        assert_eq!(probe(script), 0, "{what} must stay reachable");
+    }
+    let denied = [
+        (
+            "writing its own shim",
+            format!("echo x >> {p}/own/opener/shim"),
+        ),
+        ("replacing its own shim", format!("rm {p}/own/opener/shim")),
+        (
+            "creating beside its own tmp",
+            format!("echo x > {p}/own/new"),
+        ),
+        ("reading another root", format!("cat {p}/other/opener/shim")),
+        ("listing another root", format!("ls {p}/other/tmp")),
+        (
+            "writing another root's tmp",
+            format!("echo x > {p}/other/tmp/new"),
+        ),
+        (
+            "replacing another root's shim",
+            format!("rm {p}/other/opener/shim"),
+        ),
+        ("renaming another root", format!("mv {p}/other {p}/moved")),
+        (
+            "writing a later root's tmp",
+            format!("echo x > {p}/late/tmp/new"),
+        ),
+        ("listing a later root", format!("ls {p}/late/tmp")),
+        ("creating a root", format!("mkdir {p}/planted")),
+        ("listing the roots", format!("ls {p}")),
+        (
+            "renaming the parent",
+            format!("mv {p} {}/moved", fx.root.display()),
+        ),
+    ];
+    for (what, script) in denied {
+        assert_ne!(probe(script), 0, "{what} must be denied");
+    }
+    assert_eq!(
+        fs::read(parent.join("other/opener/shim")).unwrap(),
+        b"launcher\n"
+    );
+}
+
 /// Sanity: the confiner really is the Linux one and targets the host's ABI, so the tests above are
 /// exercising the mechanism we think they are.
 #[test]

@@ -12,7 +12,7 @@ pub use sbpl::{channel_services, Service, CHANNEL_SERVICES, MACOS_RESOLVER_SOCKE
 
 pub use policy::{
     CompiledPolicy, ConfinerPolicy, ExecPlan, GatewayPolicy, LinuxNetPlan, LinuxPolicy,
-    MacosPolicy, SeccompPlan, SocketFamily,
+    MacosPolicy, SeccompPlan, SessionRoots, SocketFamily,
 };
 pub use report::{
     Backend, Capability, ChannelReport, CredentialFidelity, CredentialReport, DenialSemantics,
@@ -61,6 +61,8 @@ pub struct CompileInput {
     /// The tag every macOS deny carries into its Sandbox record (FW-DISC2); known only when
     /// compiling for a spawn.
     pub deny_tag: Option<String>,
+    /// The Launcher's session roots (FW-TRA19); known only when compiling for a session.
+    pub session_roots: Option<SessionRoots>,
     /// Pathname sockets granted by a literal write grant (FW-ISO12, FEP-5 §3.1.1).
     pub unix_socket_grants: Vec<PathPattern>,
     /// Whether any credential is brokered (FW-CRED11).
@@ -112,6 +114,7 @@ impl CompileInput {
             gateway_port: None,
             session_marker: None,
             deny_tag: None,
+            session_roots: None,
             brokered: blueprint.brokered_credentials().next().is_some(),
             keyring_lifted: exposed.iter().any(|t| t == formwork_blueprint::OS_KEYRING),
             keyring_services: keyring_services.clone(),
@@ -198,6 +201,8 @@ pub struct SessionSpec {
     /// records name the session that produced them (FW-DISC2). Distinct from the marker: a session
     /// that reads its own records learns this tag, never the marker.
     pub deny_tag: Option<String>,
+    /// The Launcher's session roots (FW-TRA18): every one but this session's is denied (FW-TRA19).
+    pub roots: Option<SessionRoots>,
 }
 
 /// [`compile`] for a session: the per-spawn Gateway listener and deny tag are not blueprint
@@ -214,6 +219,7 @@ pub fn compile_for_session(
     input.gateway_port = session.gateway.as_ref().map(|g| g.port);
     input.session_marker = session.gateway.as_ref().map(|g| g.marker.clone());
     input.deny_tag = session.deny_tag.clone();
+    input.session_roots = session.roots.clone();
 
     let mut per_capability: BTreeMap<Capability, Fidelity> = BTreeMap::new();
     let mut withheld: Vec<String> = Vec::new();
@@ -688,6 +694,7 @@ fn compile_linux(
         withhold_device_prefixes,
         unix_socket_grants: canonicalize_set(&unix_socket_grants(input, host)),
         isolate: input.isolate.clone(),
+        session_roots: input.session_roots.clone(),
     };
     (ConfinerPolicy::Linux(Box::new(policy)), direct_ports)
 }
