@@ -486,8 +486,7 @@ fn main() -> Result<()> {
             let resolved = blueprint.resolve()?;
             let blueprint = blueprint.load(&resolved.path, &home())?;
             let host = resolve_host(&host, &target)?;
-            let catalog = ResolvedCatalog::builtin_for_home(&home())
-                .context("resolving credential catalog")?;
+            let catalog = blueprint_load::resolve_catalog(&home())?;
             let policy = compile(&blueprint, &host, &catalog);
             let mut value = if report_only {
                 serde_json::to_value(&policy.report)?
@@ -602,9 +601,10 @@ fn attach_blueprint_info(value: &mut serde_json::Value, resolved: &ResolvedBluep
 /// Explain paths against the merged blueprint (FW-FID6), no enforcement. Evaluates the
 /// deny-terminal model (FW-CAP8) against the authored -- not enforcement-canonicalized -- grants,
 /// so the rule it names is the one the operator wrote. The credential floor is a built-in,
-/// un-liftable deny, resolved here the way `compile --report-only` resolves it. Scope matches
-/// `compile`: the session-only denies `prepare_session` adds (FW-CRED3 env-file refs, FW-XR8
-/// policy-input write-protection) are not applied -- explain reflects the blueprint, not a run.
+/// un-liftable deny, resolved here the way `compile --report-only` resolves it: as this
+/// environment locates it, relocated stores included (FW-CRED32). Scope matches `compile`: the
+/// session-only denies `prepare_session` adds (FW-CRED3 env-file refs, FW-XR8 policy-input
+/// write-protection) are not applied -- explain reflects the blueprint, not a run.
 /// With no path, summarizes the session instead: host capabilities plus the merged blueprint's
 /// fidelity report (host-only when no blueprint exists) -- the human door `detect`'s JSON never was.
 fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> Result<()> {
@@ -619,8 +619,7 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
     let (blueprint, provenance) = args.load_with_provenance(&resolved.path, &home)?;
     let cwd = cwd()?;
     let sigils = blueprint_load::Sigils::new(&home, &cwd);
-    let catalog =
-        ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
+    let catalog = blueprint_load::resolve_catalog(&home)?;
     let host = detect();
     // Channel verdicts and the per-path host notes come from the compiled policy, so both say what
     // this host's kernel is given, not what the model says (FW-INV5).
@@ -986,8 +985,7 @@ fn explain_summary(args: &BlueprintArgs, json: bool) -> Result<()> {
         None => return Err(no_blueprint_error()),
     };
     let blueprint = args.load(&resolved.path, &home())?;
-    let catalog =
-        ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
+    let catalog = blueprint_load::resolve_catalog(&home())?;
     let policy = compile(&blueprint, &host, &catalog);
     if json {
         let mut value = serde_json::json!({ "host": host, "report": policy.report });
@@ -1213,15 +1211,14 @@ fn prepare_session(args: &BlueprintArgs, purpose: Purpose, host: HostProfile) ->
     let resolved = args.resolve()?;
     let mut blueprint = args.load(&resolved.path, &home())?;
     refuse_unavailable_isolation(&blueprint, &host, purpose)?;
-    let catalog =
-        ResolvedCatalog::builtin_for_home(&home()).context("resolving credential catalog")?;
+    let mut catalog = blueprint_load::resolve_catalog(&home())?;
     // FW-CRED3: deny the files that enforced env-points-to-file credentials name, before the
     // blueprint's enforcement-time canonicalization resolves everything together.
     blueprint
         .fs
         .subtract
         .extend(blueprint_load::env_file_ref_denies(
-            &catalog,
+            &mut catalog,
             &blueprint.exposed_credentials(),
         )?);
     // The policy inputs are write-denied inside the session: a confined agent must not be able
@@ -2009,8 +2006,7 @@ fn learn_run_linux(
     // shim will enforce them (FW-DISC3/FW-DISC4).
     let blueprint = blueprint_load::canonicalize_for_enforcement(&loaded)
         .context("canonicalizing grant paths")?;
-    let catalog =
-        ResolvedCatalog::builtin_for_home(&home).context("resolving credential catalog")?;
+    let catalog = blueprint_load::resolve_catalog(&home)?;
     let catalog = blueprint_load::canonicalize_catalog_for_enforcement(&catalog)
         .context("canonicalizing credential catalog paths")?;
 
@@ -2141,6 +2137,16 @@ fn itemize_credential_floor(report: &formwork_compile::FidelityReport, catalog: 
         stripped_env_types = ?envs.enforced,
         "credential catalog floor, itemized"
     );
+    // FW-CRED35: which variables moved or named a credential location for this session, by name.
+    // The line varies with the launching environment, so it is not part of the debug roll-call.
+    let references = render::resolved_references(creds);
+    if !references.is_empty() {
+        tracing::info!(
+            resolved = ?references,
+            "credential catalog: locations taken from the launching environment (type, \
+             variable, deny rows added)"
+        );
+    }
     // The backstop is the one floor row that denies inside the operator's OWN granted set, so its
     // bare EACCES (FW-CRED7) has no visible cause -- name it at spawn (`None` means lifted). Where
     // the host withholds it (FW-CRED9), say that instead: there is no EACCES to explain.

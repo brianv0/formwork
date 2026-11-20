@@ -43,6 +43,11 @@ pub struct CatalogEntry {
     /// referenced file (FW-CRED3). Must be a subset of `envs`.
     #[serde(default)]
     pub env_file_refs: Vec<EnvFileRef>,
+    /// Env vars whose *value* is a directory a tool uses in place of one of this type's
+    /// `~`-relative roots (FW-CRED32). Not stripped: the variable is where the tool looks, and
+    /// the floor follows it there.
+    #[serde(default)]
+    pub env_dir_refs: Vec<EnvDirRef>,
     /// Service locations (FW-CRED13): `mach:<name>` on macOS, `bus:<name>` or
     /// `runtime:<socket under $XDG_RUNTIME_DIR>` on Linux. Denied like paths, by the channel
     /// mechanism of each backend.
@@ -99,6 +104,32 @@ impl Serialize for EnvFileRef {
         table.serialize_field("list", &self.list)?;
         table.end()
     }
+}
+
+/// One `env-dir-refs` entry (FW-CRED32): `replaces` is the `~`-relative root the variable's value
+/// stands in for, so each of the type's patterns below that root is denied below the value too.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvDirRef {
+    pub var: String,
+    pub replaces: String,
+}
+
+/// One `env-dir-refs` variable in the compiler-facing form: the type's patterns below the
+/// replaced root, each as the remainder after that root (`/**`, `/credentials.toml`). Taken from
+/// the Catalog's own rows, so rebasing one variable never feeds another.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StoreRelocation {
+    pub var: String,
+    pub below: Vec<String>,
+}
+
+/// One reference variable that was set in the launching environment (FW-CRED35): its name and the
+/// number of deny rows it added. The value locates a credential store and is never carried.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedReference {
+    pub var: String,
+    pub rows: usize,
 }
 
 /// One `{ hosts, scheme }` pair of a Catalog `broker` block (FEP-5 §3.2).
@@ -158,6 +189,21 @@ impl Catalog {
                         .collect::<Result<_, _>>()?,
                     envs: entry.envs.clone(),
                     env_file_refs: entry.env_file_refs.clone(),
+                    env_dir_refs: entry
+                        .env_dir_refs
+                        .iter()
+                        .map(|reference| StoreRelocation {
+                            var: reference.var.clone(),
+                            below: entry
+                                .paths
+                                .iter()
+                                .filter_map(|p| p.strip_prefix(reference.replaces.as_str()))
+                                .filter(|rest| rest.starts_with('/'))
+                                .map(str::to_string)
+                                .collect(),
+                        })
+                        .collect(),
+                    references: Vec::new(),
                     services: entry.services.clone(),
                     broker: entry.broker.clone(),
                 },
@@ -194,9 +240,46 @@ pub struct ResolvedEntry {
     pub envs: Vec<String>,
     pub env_file_refs: Vec<EnvFileRef>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env_dir_refs: Vec<StoreRelocation>,
+    /// What the launching environment's reference variables added for this type (FW-CRED35),
+    /// recorded by whoever resolved them -- the CLI edge, since the compiler reads no environment.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<ResolvedReference>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub broker: Vec<BrokerBlock>,
+}
+
+impl ResolvedEntry {
+    /// FW-CRED32: deny this type's store where `var` relocates it -- each pattern below the
+    /// replaced root, rebased onto `root`. The `~` rows stay, so a tool that ignores the variable
+    /// still finds nothing, and the rebased rows are the type's own: `allow-credentials` lifts
+    /// them with it (FW-CRED5). Records the variable and the rows it added (FW-CRED35); a row the
+    /// type already holds is not added twice.
+    pub fn relocate(&mut self, var: &str, root: &PathPattern) -> Result<(), PathError> {
+        let root = root.canonical();
+        let root = root.trim_end_matches('/');
+        let below: Vec<String> = self
+            .env_dir_refs
+            .iter()
+            .filter(|relocation| relocation.var == var)
+            .flat_map(|relocation| relocation.below.iter().cloned())
+            .collect();
+        let mut rows = 0;
+        for rest in below {
+            let rebased = PathPattern::parse(&format!("{root}{rest}"))?;
+            if !self.paths.contains(&rebased) {
+                self.paths.push(rebased);
+                rows += 1;
+            }
+        }
+        self.references.push(ResolvedReference {
+            var: var.to_string(),
+            rows,
+        });
+        Ok(())
+    }
 }
 
 impl ResolvedCatalog {
@@ -289,7 +372,7 @@ mod tests {
     #[test]
     fn builtin_catalog_parses_and_resolves() {
         let catalog = Catalog::builtin();
-        assert_eq!(catalog.version, 3);
+        assert_eq!(catalog.version, 4);
         // The FEP-named curated types are present.
         for t in [
             "aws",
@@ -368,6 +451,148 @@ mod tests {
             .map(|r| r.var.as_str())
             .collect();
         assert_eq!(lists, ["KUBECONFIG"]);
+    }
+
+    /// Each shipped `env-dir-refs` entry replaces a root the type has rows below, so a set
+    /// variable always has something to rebase; and no variable is both a directory and a file.
+    #[test]
+    fn fw_cred32_every_env_dir_ref_replaces_a_root_of_its_type() {
+        assert!(toml::from_str::<EnvDirRef>(r#"var = "X""#).is_err());
+        assert!(
+            toml::from_str::<EnvDirRef>("var = \"X\"\nreplaces = \"~/.x\"\nlist = true").is_err()
+        );
+        let resolved = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let mut seen = 0;
+        for (name, entry) in &Catalog::builtin().types {
+            let mut vars: Vec<&str> = entry.env_dir_refs.iter().map(|r| r.var.as_str()).collect();
+            vars.sort_unstable();
+            vars.dedup();
+            assert_eq!(
+                vars.len(),
+                entry.env_dir_refs.len(),
+                "{name}: a variable is listed twice"
+            );
+            for reference in &entry.env_dir_refs {
+                seen += 1;
+                let (var, root) = (&reference.var, &reference.replaces);
+                assert!(
+                    root.starts_with("~/") && !root.ends_with('/') && !root.contains("**"),
+                    "{name}: {var} replaces {root:?}, which is not a plain `~` directory"
+                );
+                assert!(
+                    !entry.env_file_refs.iter().any(|f| &f.var == var),
+                    "{name}: {var} is both an env-file-ref and an env-dir-ref"
+                );
+                let relocation = resolved.types[name]
+                    .env_dir_refs
+                    .iter()
+                    .find(|r| &r.var == var)
+                    .unwrap();
+                assert!(
+                    !relocation.below.is_empty(),
+                    "{name}: no path of the type lies below {root}, so {var} would rebase nothing"
+                );
+            }
+        }
+        assert!(seen > 0, "the shipped catalog carries env-dir-refs");
+    }
+
+    #[test]
+    fn fw_cred32_a_relocated_store_is_denied_beside_the_home_rows() {
+        let mut resolved = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let home_rows = resolved.denied_paths(&[]);
+        let at = |p: &str| PathPattern::parse(p).unwrap();
+
+        // A whole-directory type moves whole; a type of two files moves those two files only.
+        let entry = |c: &mut ResolvedCatalog, name: &str, var: &str, root: &str| {
+            c.types
+                .get_mut(name)
+                .unwrap()
+                .relocate(var, &at(root))
+                .unwrap();
+        };
+        entry(&mut resolved, "gpg", "GNUPGHOME", "/secure/gnupg");
+        entry(&mut resolved, "cargo", "CARGO_HOME", "/opt/cargo");
+        // Two variables of one type each rebase the Catalog's own rows, never each other's.
+        entry(
+            &mut resolved,
+            "github",
+            "GH_CONFIG_DIR",
+            "/home/x/.config/gh-work",
+        );
+        entry(&mut resolved, "github", "XDG_CONFIG_HOME", "/xdg");
+        // The directory moves; the file beside it in `~` is not below the replaced root.
+        entry(&mut resolved, "claude", "CLAUDE_CONFIG_DIR", "/claude");
+
+        let denied = resolved.denied_paths(&[]);
+        for row in &home_rows {
+            assert!(denied.contains(row), "{row} left the floor");
+        }
+        let added: Vec<String> = denied
+            .iter()
+            .filter(|row| !home_rows.contains(row))
+            .map(PathPattern::canonical)
+            .collect();
+        assert_eq!(
+            added,
+            [
+                "/opt/cargo/credentials.toml",
+                "/opt/cargo/credentials",
+                "/claude/**",
+                "/home/x/.config/gh-work/**",
+                "/xdg/gh/**",
+                "/secure/gnupg/**",
+            ]
+        );
+        let floor = |c: &ResolvedCatalog, allow: &[String], p: &str| c.floor_type_of(allow, &at(p));
+        assert_eq!(
+            floor(&resolved, &[], "/secure/gnupg/private-keys-v1.d/k.key").as_deref(),
+            Some("gpg")
+        );
+        assert_eq!(floor(&resolved, &[], "/opt/cargo/registry/index"), None);
+
+        // The typed exclude lifts the rebased rows with the type, and nothing adjacent (FW-CRED5).
+        let lifted = resolved.denied_paths(&["gpg".to_string()]);
+        assert!(!lifted.contains(&at("/secure/gnupg/**")));
+        assert!(lifted.contains(&at("/xdg/gh/**")));
+        assert_eq!(
+            floor(&resolved, &["gpg".to_string()], "/secure/gnupg/pubring.kbx"),
+            None
+        );
+    }
+
+    #[test]
+    fn fw_cred35_a_relocation_records_its_variable_and_the_rows_it_added() {
+        let mut resolved = ResolvedCatalog::builtin_for_home("/home/x").unwrap();
+        let at = |p: &str| PathPattern::parse(p).unwrap();
+        let cargo = resolved.types.get_mut("cargo").unwrap();
+        cargo.relocate("CARGO_HOME", &at("/opt/cargo")).unwrap();
+        let github = resolved.types.get_mut("github").unwrap();
+        // The default spelled out adds no row, and is still named: the variable was honoured.
+        github
+            .relocate("XDG_CONFIG_HOME", &at("/home/x/.config"))
+            .unwrap();
+        github.relocate("GH_CONFIG_DIR", &at("/work/gh")).unwrap();
+        let recorded = |name: &str| -> Vec<(String, usize)> {
+            resolved.types[name]
+                .references
+                .iter()
+                .map(|r| (r.var.clone(), r.rows))
+                .collect()
+        };
+        assert_eq!(recorded("cargo"), [("CARGO_HOME".to_string(), 2)]);
+        assert_eq!(
+            recorded("github"),
+            [
+                ("XDG_CONFIG_HOME".to_string(), 0),
+                ("GH_CONFIG_DIR".to_string(), 1)
+            ]
+        );
+        assert!(recorded("gpg").is_empty());
+        // The record holds the name and a count; the directory is in the deny rows and nowhere
+        // else.
+        let json = serde_json::to_string(&resolved.types["cargo"].references).unwrap();
+        assert_eq!(json, r#"[{"var":"CARGO_HOME","rows":2}]"#);
     }
 
     #[test]

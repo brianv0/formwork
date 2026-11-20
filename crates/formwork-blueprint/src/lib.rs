@@ -13,8 +13,8 @@ mod path;
 mod provenance;
 
 pub use catalog::{
-    BrokerBlock, Catalog, CatalogEntry, EnvFileRef, ResolvedCatalog, ResolvedEntry, BACKSTOP,
-    OS_KEYRING,
+    BrokerBlock, Catalog, CatalogEntry, EnvDirRef, EnvFileRef, ResolvedCatalog, ResolvedEntry,
+    ResolvedReference, StoreRelocation, BACKSTOP, OS_KEYRING,
 };
 pub use channel::{
     valid_channel_names, Channel, ChannelError, ChannelGroup, ChannelPolicy, IsolateMember,

@@ -158,6 +158,13 @@ formwork run --blueprint examples/blueprints/claude-code.toml \
 formwork run --blueprint examples/blueprints/claude-code.toml \
   --allow-cred aws --rule "readonly:$HOME/.aws/**" -- <agent>
 
+# Keep a project's .npmrc from the agent. The credential floor denies ~/.npmrc and no other:
+# projects commit an .npmrc with no secret in it, and installs read it. Where yours holds a token,
+# deny it by its place in the project. (An any-depth `deny:**/.npmrc` cannot be enforced on
+# Linux: Landlock cannot root it, and the session refuses to start rather than run without it.)
+formwork run --blueprint examples/blueprints/claude-code.toml \
+  --rule 'deny:$CWD/.npmrc' -- <agent> <flags>
+
 # Mix verb rules with a `--set` TOML fragment — both parse as the same model:
 formwork compile --blueprint examples/blueprints/rules-demo.toml \
   --set 'net = { ports = [443] }' --rule "deny:$HOME/.npmrc" --target linux-v6 --report-only

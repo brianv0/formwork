@@ -291,6 +291,9 @@ The Blueprint is one typed model with multiple surfaces (§4); these requirement
 | <a id="fw-bp14"></a>**FW-BP14** One host, one grade | The compiler shall reject a blueprint in which a tunnel rule and an inspected rule both match one host and port, or in which a path-scoped `deny` could match a host and port that a tunnel rule matches or that no inspected rule matches, naming the conflicting lines. |
 | <a id="fw-bp15"></a>**FW-BP15** Verb atoms | The verb position of a rule shall be a comma-separated list of atoms; for the fs axis the atoms shall be `read`, `write`, `modify` and `exec`, with the landed compound verbs accepted as aliases of the same meaning. |
 | <a id="fw-bp16"></a>**FW-BP16** Host target shape | The Blueprint parser shall read a rule target as a path pattern when it begins with `/`, `~`, `$` or `**`, and otherwise as a host target, which it shall accept only if the host contains a dot, is `localhost`, or is an IP literal. |
+| <a id="fw-bp32"></a>**FW-BP32** Base ownership notice | For each `extends` base file that is not owned by the invoking user or root, or that is group- or world-writable, the CLI shall write one operator line naming the file. |
+
+Numbers absent from this table's sequence are reserved by FEP drafts that have not landed. A base [FW-BP32](#fw-bp32) names is loaded as written: a file outside the sandbox is the operator's to protect, and Formwork reports what it sees there and refuses nothing.
 
 ### 5.9 Credential catalog & launcher (FW-CRED)
 
@@ -317,10 +320,12 @@ A versioned, typed catalog of credential **locations only** — dotfiles, well-k
 | <a id="fw-cred17"></a>**FW-CRED17** Reflection guard | For a response to a request on which it presented a brokered credential, the Gateway shall request identity content coding, refuse a response with another content coding, and end the response without releasing any byte that begins an occurrence of a wire encoding of the presented credential. |
 | <a id="fw-cred18"></a>**FW-CRED18** No credential on OPTIONS | The Gateway shall not present a brokered credential on an OPTIONS request. |
 | <a id="fw-cred19"></a>**FW-CRED19** No credential in cleartext | The Gateway shall present a brokered credential only on a request it forwards to the upstream over TLS. |
+| <a id="fw-cred32"></a>**FW-CRED32** Relocated stores | For each Catalog `env-dir-refs` variable set to a non-empty value in the launching environment, the Launcher shall deny, under the type's floor, every path pattern of the type below the replaced root, rebased onto the variable's value. |
 | <a id="fw-cred33"></a>**FW-CRED33** List-valued references | For an `env-file-refs` variable the Catalog marks as a list, the Launcher shall deny the file named by each non-empty `:`-separated element of its value. |
-| <a id="fw-cred34"></a>**FW-CRED34** Unrenderable references | The Launcher shall refuse to start, naming the variable, when the value of a set `env-file-refs` variable, or an element of a list-valued one, cannot be rendered into a path pattern that names one file. |
+| <a id="fw-cred34"></a>**FW-CRED34** Unrenderable references | The Launcher shall refuse to start, naming the variable, when the value of a set `env-file-refs` variable, or an element of a list-valued one, cannot be rendered into a path pattern that names one file, or the value of a set `env-dir-refs` variable into one that names one directory. |
+| <a id="fw-cred35"></a>**FW-CRED35** Resolved references are reported | The report shall name, per credential type, each `env-dir-refs` variable set in the launching environment and, for a session, each set `env-file-refs` variable, with the number of deny rows it added, and shall carry no value of any such variable. |
 
-Numbers absent from this table's sequence are reserved by FEP drafts that have not landed.
+Numbers absent from this table's sequence are reserved by FEP drafts that have not landed. A relocated store's `~` rows stay denied beside the rebased ones, the variable itself is passed to the session, and `allow-credentials` lifts both sets of rows with the type ([FW-CRED5](#fw-cred5)). `compile` and `explain` build the floor from the same environment as `run`, so they carry the rebased rows; the files `env-file-refs` variables name are denied for a session only ([FW-CRED3](#fw-cred3)), so a dry run reports none.
 
 ### 5.10 Discovery (FW-DISC)
 
@@ -560,6 +565,8 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 
 <a id="fw-e2e-059"></a>**FW-E2E-059: Explain names the winning rule and provenance ([FW-FID6](#fw-fid6)).** `explain <path>` over a layered blueprint reports, per path, the read/write/exec verdict, the deciding rule, and its origin: a granted path names the file rule; a `--rule` deny is terminal and attributed to `cli`; a credential-floor path is denied as `built-in`; an unlisted path under `unveil` is hidden, not ambient; an `exec:` grant shows execute even where read is closed (FW-ISO9/FW-XR6). Pass: each verdict names the right rule and origin without enforcing. Fail: a wrong rule/origin, or a deny that does not win.
 
+<a id="fw-e2e-218"></a>**FW-E2E-218: Base ownership notice (both; [FW-BP32](#fw-bp32)).** A blueprint extends a world-writable base, a group-writable base, a base only its owner can write, and a second layer that extends the world-writable base again; run as root, also a base owned by a third account, seen by root and by an unprivileged invoking user who owns one base beside a root-owned one. Pass: every base loads; each writable base and each base owned by neither the invoking user nor root produces exactly one operator line naming the file; a root-owned base and the invoking user's own base produce none. Fail: a base is refused, a line is missing or repeated, or a private base is named.
+
 <a id="fw-e2e-060"></a>**FW-E2E-060: CLI overrides compose with an `unveil` blueprint ([FW-BP1](#fw-bp1)/[FW-BP2](#fw-bp2)/[FW-BP7](#fw-bp7)).** Over an empty-universe (`unveil`) file, the CLI override surface behaves as an operator expects: a `--read`/`--write` sugar grant fills the closed universe (write implies read); `--rule exec:` closes exec to an allow-list on a separate axis (the listed binary runs but is unreadable, an unlisted one does not run); the `--mode unveil` flag flips a subtractive file to closed by last-wins (ambient-only path hidden, explicit grant kept); and the credential floor stays un-liftable under a broad `--read`. Pass: each verdict matches, dry-run on any host. Fail: a CLI grant that does not populate the universe, an exec allow-list that leaks, a mode flag that does not override, or a floor a `--read` lifts.
 
 <a id="fw-e2e-070"></a>**FW-E2E-070: Discovery walk stays inside the trust boundary ([FW-BP8](#fw-bp8)).** Dry-run on any host. A `FORMWORK.toml` planted (a) in an ancestor directory the invoking user does not own, (b) above a symlinked `$HOME` (the walk reaching territory a textual home comparison would miss), and (c) as a foreign-owned file inside the user's own directory. Pass: none of the planted files governs a session — (a) ends the walk unconsulted, (b) stops at the resolved home, (c) is refused with a warning and does not fall through to a farther match — while the user's own launch-directory file still resolves, and `--blueprint` still opens any file explicitly. Ownership is exercised with an injected predicate at the unit boundary (chown requires root; the same pure-substitution allowance as the compiler's HostProfile), the symlinked-home arm against the real filesystem. Fail: implicit policy from territory the user does not control.
@@ -578,9 +585,13 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 
 <a id="fw-e2e-050"></a>**FW-E2E-050: Report mechanism labeling.** Pass: FidelityReport marks env-kind types `enforced-via-launcher` and path-kind types `enforced-via-OS-sandbox`, carries the launcher-contingency note for env, and marks any-depth floor rows Partial where the host cannot root them ([FW-CRED9](#fw-cred9)). Fail: mislabeled or missing mechanism.
 
+<a id="fw-e2e-197"></a>**FW-E2E-197: Relocated store (both; [FW-CRED32](#fw-cred32), [FW-CRED35](#fw-cred35)).** For each `env-dir-refs` entry of the embedded Catalog, the variable names a scratch directory inside a `readwrite` grant that holds a fake credential at each place the type keeps one, beside a file outside the store. Pass: under enforcement each fake credential is denied and the file beside the store is readable; `explain` names the type; the report names the variable and the rows it added; with `--allow-cred <type>`, or with the variable unset, every file is readable and the report names nothing. Fail: a fake credential is readable while its variable is set, or the report omits the variable.
+
 <a id="fw-e2e-198"></a>**FW-E2E-198: List-valued file reference (both; [FW-CRED33](#fw-cred33)).** `KUBECONFIG` names one, two and three files, then a list with empty elements and a relative element, then an element that leaves a symlinked directory through `..`, each beside files the list does not name. Pass: under enforcement every file the list names is denied and every other is readable, and the variable is absent from the session; with the variable unset, or with `--allow-cred kube`, every file is readable. Fail: a file the list names is readable, or one it does not name is denied.
 
-<a id="fw-e2e-201"></a>**FW-E2E-201: Unrenderable file reference ([FW-CRED34](#fw-cred34)).** A single-file reference whose value holds a non-UTF-8 byte, a `KUBECONFIG` with a non-UTF-8 element, and a `KUBECONFIG` with an element the pattern grammar reads as a wildcard (`/srv/kube/**`, `/srv/**/config`). Pass: `run` exits non-zero before the workload starts, and the refusal names the variable. Fail: the workload starts.
+<a id="fw-e2e-201"></a>**FW-E2E-201: Unrenderable file reference ([FW-CRED34](#fw-cred34)).** A single-file reference whose value holds a non-UTF-8 byte, a `KUBECONFIG` with a non-UTF-8 element, a `KUBECONFIG` with an element the pattern grammar reads as a wildcard (`/srv/kube/**`, `/srv/**/config`), and a store variable (`GNUPGHOME`, `XDG_CONFIG_HOME`) with a non-UTF-8 byte or a `**` component. Pass: `run` exits non-zero before the workload starts, and the refusal names the variable. Fail: the workload starts.
+
+<a id="fw-e2e-202"></a>**FW-E2E-202: Relocation-variable canary ([FW-CRED32](#fw-cred32)).** A fixture lists, for each tool the agent examples document (`gh`, `git`, `docker`, `kubectl`, `aws`, `gcloud`, `npm`, `cargo`, `pip`, `gpg`, `ssh`) and each further tool whose type carries a reference, the variables the tool reads a configuration or credential location from. Pass: each is carried by the Catalog type the fixture names, or is listed as not modelled with a reason; each reference the Catalog carries is in the fixture; and each type with a path under an XDG base directory follows that directory's variable or is listed as exempt with a reason. Fail: a variable in neither list, or a Catalog reference the fixture does not claim.
 
 ### 7.9 Discovery
 
@@ -623,6 +634,8 @@ The injected-fd seam these tests verified was retired unwired (§2, [FW-GW6](#fw
 <a id="fw-adv-014"></a>**FW-ADV-014: Launcher-bypass honesty.** The agent is started *without* Formwork (bypassing the launcher). Pass: env vars are present as expected, and the report had already disclosed env-shading as launcher-contingent — i.e. the guarantee was never overclaimed ([FW-CRED8](#fw-cred8)). Fail: the documentation/report implied env-shading holds independent of the launcher.
 
 <a id="fw-adv-015"></a>**FW-ADV-015: Discovery fold cannot re-grant a credential ([FW-INV8](#fw-inv8)).** A credential-shaped file *outside* `$HOME` (`/srv/app/id_rsa`) sits alongside ordinary files that a learning run touches, with the auto-widen zone drawn over the directory. Pass: the key is withheld by the shape floor, its ordinary siblings stay granular (no `…/**` fold that would cover the key), nothing auto-accepted covers it, and a subsequent run still cannot read it — enforcement (deny beats allow) denies the key regardless, and the fold guard keeps the proposal itself honest. Fail: a fold or auto-widen grant transitively covers the withheld credential, or the key is readable in a later run.
+
+<a id="fw-adv-054"></a>**FW-ADV-054: Relocation sweep (both; [FW-CRED32](#fw-cred32), [FW-CRED35](#fw-cred35)).** Under `builtin:default` with every reference variable the Catalog models set at once -- each store variable to a directory inside a `readwrite` grant, each file variable to a file there -- a confined process reads the planted credential files by path and sweeps the directories the variables it inherits name. Pass: no planted file is readable; a file the type does not name inside a relocated store is; no variable's value appears in the report, in `explain`, or on the operator channel at debug level, and each names the variable and the rows it added. Fail: a planted file is read, or a value is printed.
 
 <a id="fw-adv-007"></a>**FW-ADV-007: Hostname bypass battery.** With `AllowHosts(["allowed.test"])` and `blocked.test` mapped to the blocked fixture, the agent requests, in turn: `allowed.test\x00.blocked.test`, `allowed%2etest.blocked.test`, `blocked.test#.allowed.test`, `allowed.test.` (trailing dot), `::ffff:127.0.0.1%allowed.test` (IPv6 zone-ID), and an IDN confusable of `allowed.test`. Pass: each canonicalizes to the genuine `allowed.test` or is rejected; none reaches the blocked fixture. Fail: any variant escapes the allowlist. (Mirrors the srt SOCKS5 null-byte disclosure.)
 
@@ -1021,15 +1034,16 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-BP14](#fw-bp14) One host, one grade | [FW-E2E-104](#fw-e2e-104) | tests named for it (`egress.rs`) |
 | [FW-BP15](#fw-bp15) Verb atoms | unit tests (`blueprint_load.rs`) | — |
 | [FW-BP16](#fw-bp16) Host target shape | [FW-E2E-104](#fw-e2e-104) | — |
+| [FW-BP32](#fw-bp32) Base ownership notice | [FW-E2E-218](#fw-e2e-218) | tests named for it (`blueprint_load.rs`) |
 | [FW-CRED1](#fw-cred1) Typed catalog | [FW-E2E-045](#fw-e2e-045), 046 | 049 |
 | [FW-CRED2](#fw-cred2) Two kinds, two arms | [FW-E2E-045](#fw-e2e-045), 046 | 050 |
 | [FW-CRED3](#fw-cred3) Env-points-to-file | [FW-E2E-047](#fw-e2e-047) | 198 |
 | [FW-CRED4](#fw-cred4) Deny-superset default | [FW-E2E-045](#fw-e2e-045), 046, 049 | — |
 | [FW-CRED5](#fw-cred5) Exclude-by-type | [FW-E2E-048](#fw-e2e-048) | ADV-013 |
-| [FW-CRED6](#fw-cred6) Generic backstop | [FW-E2E-049](#fw-e2e-049) | ADV-015 |
+| [FW-CRED6](#fw-cred6) Generic backstop | [FW-E2E-049](#fw-e2e-049) | ADV-015; tests named for [FW-CRED9](#fw-cred9) |
 | [FW-CRED7](#fw-cred7) Channel split | [FW-E2E-045](#fw-e2e-045), 046 | ADV-012, INV9 |
 | [FW-CRED8](#fw-cred8) Report mechanism | [FW-E2E-050](#fw-e2e-050) | ADV-014 |
-| [FW-CRED9](#fw-cred9) Floor enforceability | [FW-E2E-050](#fw-e2e-050) | INV5; Linux kernel enforcement deferred |
+| [FW-CRED9](#fw-cred9) Floor enforceability | [FW-E2E-050](#fw-e2e-050) | INV5; tests named for it (`formwork-compile`, `launch_environment.rs`); Linux kernel enforcement deferred |
 | [FW-CRED10](#fw-cred10) Brokered floor | [FW-E2E-078](#fw-e2e-078) | 099 |
 | [FW-CRED11](#fw-cred11) Credential presentation | [FW-E2E-078](#fw-e2e-078), 099 | 100, ADV-025 |
 | [FW-CRED12](#fw-cred12) Broker host closure | [FW-E2E-104](#fw-e2e-104) | — |
@@ -1040,8 +1054,10 @@ Each row names the tests that discharge a requirement; where a requirement is di
 | [FW-CRED17](#fw-cred17) Reflection guard | [FW-ADV-021](#fw-adv-021) | ADV-025 |
 | [FW-CRED18](#fw-cred18) No credential on OPTIONS | [FW-E2E-099](#fw-e2e-099) | — |
 | [FW-CRED19](#fw-cred19) No credential in cleartext | [FW-E2E-104](#fw-e2e-104) | — |
+| [FW-CRED32](#fw-cred32) Relocated stores | [FW-E2E-197](#fw-e2e-197), [FW-ADV-054](#fw-adv-054) | 202 |
 | [FW-CRED33](#fw-cred33) List-valued references | [FW-E2E-198](#fw-e2e-198) | — |
-| [FW-CRED34](#fw-cred34) Unrenderable references | [FW-E2E-201](#fw-e2e-201) | — |
+| [FW-CRED34](#fw-cred34) Unrenderable references | [FW-E2E-201](#fw-e2e-201) | tests named for it (`blueprint_load.rs`) |
+| [FW-CRED35](#fw-cred35) Resolved references are reported | [FW-ADV-054](#fw-adv-054) | 197 |
 | [FW-DISC1](#fw-disc1) Learning mode | [FW-E2E-051](#fw-e2e-051) | 054, 062, 064, 071 |
 | [FW-DISC2](#fw-disc2) Reverse compile | [FW-E2E-051](#fw-e2e-051) | 052, 053, 064, 071 |
 | [FW-DISC3](#fw-disc3) Catalog floor | [FW-ADV-013](#fw-adv-013), 015 | 051, INV8 |

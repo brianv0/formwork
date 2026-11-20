@@ -202,8 +202,9 @@ def test_every_file_of_a_kubeconfig_list_is_denied(cli, fake_home, tmp_path):
 @pytest.mark.fw_e2e("FW-E2E-201")
 def test_an_unrenderable_file_reference_refuses_to_start(cli, fake_home, tmp_path):
     """A set env-file reference that cannot be rendered into the path of one file -- a non-UTF-8
-    value, a non-UTF-8 list element, an element the pattern grammar reads as a wildcard -- stops
-    `run` before the workload starts, and the refusal names the variable (FW-CRED34)."""
+    value, a non-UTF-8 list element, an element the pattern grammar reads as a wildcard -- or a
+    store variable that cannot be rendered into the path of one directory stops `run` before the
+    workload starts, and the refusal names the variable (FW-CRED34)."""
     bp = _blueprint_for(fake_home, tmp_path)
     project = fake_home / "project"
     config = project / "cluster-a.yaml"
@@ -213,6 +214,9 @@ def test_an_unrenderable_file_reference_refuses_to_start(cli, fake_home, tmp_pat
         ("KUBECONFIG", f"{config}:" + os.fsdecode(b"/srv/\xff.yaml")),
         ("KUBECONFIG", f"{config}:/srv/kube/**"),
         ("KUBECONFIG", f"{config}:/srv/**/config"),
+        # A store variable (FW-CRED32) names one directory, under the same rule.
+        ("GNUPGHOME", os.fsdecode(b"/srv/\xff/gnupg")),
+        ("XDG_CONFIG_HOME", "/srv/**"),
     ]:
         res = cli("run", "--blueprint", bp, "--", "/bin/echo", "workload-started",
                   cwd=project, env={"HOME": str(fake_home), var: value})
