@@ -1,4 +1,4 @@
-# FEP-12 (proposal): egress disclosure records — markers, an account of what left, and the bytes nobody scanned
+# FEP-12 (proposal): tagged data at the egress door — tag regulated values, then audit or block them
 
 **Formwork Enhancement Proposal 12 — proposal, not landed.** Companion to `formwork.md`
 (design + end-to-end spec), `constitution.md` (doctrine), `docs/fep-5.md` (inspection and
@@ -6,225 +6,219 @@ brokering) and `docs/fep-6.md` (the egress engine).
 
 **Status.** Nothing in this document mutates the landed spec or the constitution. The §7
 amendments are apply-on-landing blocks. New identifiers are draft numbering, written as inline code
-so the requirements canary skips them, until they are anchored on landing. This FEP holds the
-reserved blocks `FW-EGR31`..`FW-EGR35`, `FW-FID27`..`FW-FID30`, `FW-BP26`, `FW-INV22`,
-`FW-E2E-169`..`FW-E2E-177` and `FW-ADV-046`..`FW-ADV-047`. They start above the blocks the open
-drafts hold (FEP-7 to `FW-E2E-116`, FEP-8 to `FW-E2E-132`, FEP-9 to `FW-E2E-144` and `FW-FID24`,
-FEP-10 to `FW-E2E-156` and `FW-EGR30`, FEP-11 to `FW-E2E-168`, `FW-FID26` and `FW-INV21`) and
-above the highest landed numbers. No code has landed.
+so the requirements canary skips them, until they are anchored on landing; each links to its
+definition below. This FEP holds the reserved blocks
+[`FW-EGR31`..`FW-EGR35`](#draft-fw-egr31), [`FW-FID27`..`FW-FID30`](#draft-fw-fid27),
+[`FW-BP26`](#draft-fw-bp26), [`FW-INV22`](#draft-fw-inv22),
+[`FW-E2E-169`..`FW-E2E-177`](#draft-fw-e2e-169) and
+[`FW-ADV-046`..`FW-ADV-047`](#draft-fw-adv-046). They start above the blocks the open drafts hold
+(FEP-7 to `FW-E2E-116`, FEP-8 to `FW-E2E-132`, FEP-9 to `FW-E2E-144` and `FW-FID24`, FEP-10 to
+`FW-E2E-156` and `FW-EGR30`, FEP-11 to `FW-E2E-168`, `FW-FID26` and `FW-INV21`) and above the
+highest landed numbers. Phase A (§6) is implemented in a pull request on the earlier vocabulary
+(`marker`, `observe`, `refuse`), which takes this document's names on adoption.
+
+**What this is.** Both observability and enforcement. A tagged value has an action: `audit`
+records where it went, and `block` stops the request. A blocked request is refused, but the claim
+stays `Partial` (§3.7): the search finds a value sent as written or in a common encoding, not one a
+session sets out to hide. This is not data-loss prevention and not a compliance claim.
 
 ---
 
 ## 1. Problem
 
-A host rule decides where a session may send. Nothing reports what it sent there.
+A session handles **regulated information**: credentials, and personal data in the sense of the
+GDPR ("any information relating to an identified or identifiable natural person", Art. 4(1)) and
+of NIST SP 800-122 (personally identifiable information, PII). The operator wants three things
+from Formwork:
 
-- **The grant record excludes the content by requirement.**
-  [FW-FID13](../formwork.md#fw-fid13) gives each admitted request a record of host, grade, method,
-  canonical path, status, byte counts and duration, "and no header value, body byte or query
-  string". The exclusion is correct: those fields hold secrets, and a record that copied them would
-  be a second place to leak them. Its consequence is that a value the operator never meant to leave
-  can sit in a header of every request to a granted host and no record shows it.
-- **The grant record reaches nobody.** `Shared::grant` emits it at `debug`
-  (`crates/formwork-gateway/src/egress.rs:454`) and keeps the last 1,024 in memory
-  (`MAX_KEPT_RECORDS`, `egress.rs:48`). `EgressProxy::grants` has no caller outside
-  `crates/formwork-gateway/tests/`. A `run` at the default log level ends with no account of which
-  hosts were contacted or how many bytes went to each.
-- **The only outbound content check covers one kind of value.** `scan_placeholders`
-  (`crates/formwork-gateway/src/inspect.rs:1054`) searches the request target and header values
-  for the per-session placeholder prefix ([FW-CRED14](../formwork.md#fw-cred14)). The reflection
-  guard ([FW-CRED17](../formwork.md#fw-cred17), `crates/formwork-gateway/src/http.rs:343`) searches
-  responses. Request bodies are forwarded unsearched.
-- **The Launcher discards what it could search for.** `construct_env` partitions the launching
-  environment and keeps the names and types of the variables it strips
-  (`crates/formwork-blueprint/src/launcher.rs:47-60`); the values are dropped. If a stripped
-  credential reaches the session by another route (a file outside the catalog, an MCP tool result,
-  a shell history line), its value leaving through a granted host looks like any other request.
+1. **Tag** it: say which values are regulated, and of what class.
+2. **Audit** it: learn when a tagged value leaves the session, to which host, and where in the
+   request.
+3. **Block** it, where the class or the operator says it must not leave.
 
-The case this FEP is written for is unintentional. A reported incident (Hacker News, November
-2026; summarized at `cellcog.ai/blog/claude-code-email-leak/`, which the drafting session could not
-fetch, so the details below are the search summary's and are unverified): a coding agent placed
-the account's email address in the `User-Agent` header of its web requests to third-party sites for
-about two months before anyone noticed. No rule was broken. Every destination was one the agent was
-allowed to reach, the value was not a credential, and the tool that sent it was doing what it was
-built to do. Under Formwork today the same session produces `debug`-level grant records naming the
-hosts and paths and nothing else.
+Formwork does none of this today. A host rule decides *where* a session may send; nothing looks at
+*what* it sends.
 
-The same shape recurs with other values: an absolute home path (which carries the login name) in a
-telemetry body, the machine's hostname in a crash report, a git author address in a package
-registry request, an access token in a query string. Each goes to a granted host.
+- **The grant record excludes content by requirement.** [FW-FID13](../formwork.md#fw-fid13) gives
+  each admitted request a record with no header value, body byte or query string, because those
+  fields hold secrets. A record looks like this:
 
-Who is hurt: the operator, who granted `api.example.com` for one purpose and has no way to learn
-that identifying data went with it; an embedding host, which cannot show its user what a session
-disclosed.
+  ```json
+  {"host":"crates.io","port":443,"grade":"inspected","method":"GET","path":"/api/v1/crates",
+   "status":200,"bytes_up":0,"bytes_down":10873,"duration_ms":38}
+  ```
+
+  For an inspected request `bytes_up` and `bytes_down` count body bytes (head excluded); for a
+  tunnel they count every byte each way. It is emitted at `debug` and read by nothing outside the
+  Gateway's tests.
+- **The Launcher discards what it could look for.** `construct_env` strips credential variables
+  and drops their values (`crates/formwork-blueprint/src/launcher.rs`). If one reaches the session
+  by another route (a file outside the catalog, an MCP tool result), its value leaves through a
+  granted host like any other request.
+- **The only outbound content check covers placeholders.** `scan_placeholders` searches the
+  request head for the per-session placeholder prefix ([FW-CRED14](../formwork.md#fw-cred14));
+  request bodies go unsearched.
+
+The case this FEP is written for is unintentional. A coding agent was reported to have put the
+account's email address in the `User-Agent` of its requests to third-party sites for about two
+months (Hacker News, November 2026; unverified, see `cellcog.ai/blog/claude-code-email-leak/`).
+Every destination was allowed. The same thing happens by prompt injection: a page that says "enter
+your email to continue", or a `401` that asks for an identity. The value is not a credential, but
+it is personal data. It sits in `~/.gitconfig` next to the user's full name, and it is normally
+kept from third parties. A home path (it carries the login name), the hostname and the git author
+name leave the same way. Tagging catches the value whatever made the session send it.
 
 ### 1.1 Constraints this FEP holds to
 
-- **No secret in any record** (constitution Boundaries). A record names a marker; it never carries
-  the marker's bytes, an encoding of them, or the surrounding content.
-- **The limit is stated in the report.** A search for known byte strings finds what was sent as
-  one of a closed set of encodings. A session that encrypts, splits or re-encodes a value passes
-  it. The capability is `Partial` on every host and the reason says why
-  ([FW-INV5](../formwork.md#fw-inv5)); nothing here is a data-loss-prevention claim.
-- **Memory stays bounded.** The search holds at most **body-buffer** bytes per direction
-  ([FW-EGR21](../formwork.md#fw-egr21)).
-- **The latency budget holds.** [FW-E2E-096](../formwork.md#fw-e2e-096) passes with the search on.
-- **No new dependency without a measurement** (constitution Growth). §3.3 states what is in the
-  tree today.
-- **Not an activity log.** Draft FEP-9 (`docs/fep-9.md` on its branch, §8) declines to record
-  every admitted request because "recording every admitted request would make the record an
-  activity log of every host contacted". This FEP keeps that decision: it adds one record per
-  *match* and one per-host *aggregate* at session end, not a per-request log.
+- **No tagged value in any record** (constitution Boundaries). A record names the tag; it never
+  carries the value, an encoding of it, or the bytes around it.
+- **The limit is in the report** ([FW-INV5](../formwork.md#fw-inv5)): `Partial` on every host,
+  never `Enforced`.
+- **No oracle** ([FW-INV9](../formwork.md#fw-inv9)): a block must not confirm a value the session
+  could have guessed (§3.1).
+- **Memory stays bounded** ([FW-EGR21](../formwork.md#fw-egr21)), and
+  [FW-E2E-096](../formwork.md#fw-e2e-096)'s latency budget holds with the search on.
+- **No new dependency without a measurement** (constitution Growth).
+- **Not an activity log.** Draft FEP-9 declines to record every admitted request. This FEP adds one
+  record per *match* and one per-host *aggregate* at session end.
 
 ## 2. Prior art
 
-- **Formwork's own two guards.** The placeholder scan refuses a placeholder outside its bound
-  host and header; the reflection guard ends a response that would return a brokered secret,
-  holding back "the longest suffix of the stream that is a proper prefix of an encoding"
-  (`http.rs:340-378`). Both search streams for known byte strings in bounded memory. This FEP
-  applies the same matcher to the request direction and to operator-named values.
-- **Secret scanners on the commit path** (gitleaks, trufflehog, GitHub push protection) search for
-  credential *shapes* by pattern. Formwork's env scrub already uses a shape heuristic, on
-  variable names ([FW-ENV2](../formwork.md#fw-env2)). Shapes produce false positives on request
-  bodies that carry code, which is most of what an agent sends to a model API; this FEP searches
-  for exact values instead and leaves shapes out (§8).
-- **Canary tokens** plant a value and alert when it appears somewhere else. A declared marker is
-  the same idea applied at the egress door: the operator names a value and learns where it went.
-- **Egress logging in hosted sandboxes** records destination and byte counts per connection. That
-  is the per-host aggregate in §3.6, which Formwork already computes and discards.
+- **NIST SP 800-53 Rev. 5** names the three parts: AC-16 *Security and Privacy Attributes* (tag
+  information), AC-4 *Information Flow Enforcement* (decide a flow by its attributes), and AU-2/AU-3
+  *Event Logging* and *Content of Audit Records* (record it). The PT family (*PII Processing and
+  Transparency*) frames personal data as its own class of controls.
+- **NIST SP 800-122** defines PII as information that can distinguish or trace an individual's
+  identity, alone or linked with other information. Name, email address and user identifiers are
+  its examples; that is why a home path or hostname counts when it carries a login.
+- **The GDPR** gives the class boundary and the vocabulary. Art. 4(1) and Recital 30 cover online
+  identifiers. Art. 4(2) counts "disclosure by transmission" as processing. Art. 5(1)(c) (data
+  minimisation) and Art. 25 (data protection by design and by default) are the reasons to block
+  personal data that has no purpose at a host. Art. 30 (records of processing) is the reason the
+  account in §3.6 exists. Formwork is a control and an audit trail; it does not make an operator
+  compliant.
+- **Commercial DLP** (sensitivity labels, classifier "info types") uses the same shape: classify,
+  then audit or block per class. It matches *shapes* (regexes, checksums). This FEP matches
+  *exact values* instead, because shapes fire on the source code an agent sends to a model API
+  (§8).
+- **Formwork's own guards** search byte streams for known values in bounded memory: the
+  placeholder scan and the reflection guard ([FW-CRED17](../formwork.md#fw-cred17)). This FEP
+  applies the same idea in the request direction.
 
 ## 3. Design
 
-### 3.1 Markers
+### 3.1 Tags and classes
 
-A **marker** is a named byte string the operator does not expect to leave the session. The Gateway
-holds markers the way it holds brokered secrets: read once by the Launcher, handed to the engine in
-memory, absent from the blueprint, the compiled policy, the report and every record.
+A **tag** names a value and gives it a **class**. The Gateway holds tagged values the way it holds
+brokered secrets: read once by the Launcher, handed to the engine in memory, absent from the
+blueprint, the compiled policy, the report and every record.
 
-Markers come from three sources.
+The classes are a closed set.
 
-| Source | Declared by | Default action |
-|---|---|---|
-| **stripped** — the value of each environment variable the Launcher strips under [FW-CRED4](../formwork.md#fw-cred4) | nobody; derived at spawn | `refuse` |
-| **brokered** — the secret of each brokered credential ([FW-CRED11](../formwork.md#fw-cred11)) | nobody; already in the vault | `refuse` |
-| **declared** — a value the blueprint points at | `[net] markers` | `observe` |
+| Class | Values | Declared by | Default action |
+|---|---|---|---|
+| `credential` | each variable the Launcher strips under [FW-CRED4](../formwork.md#fw-cred4), and each brokered secret ([FW-CRED11](../formwork.md#fw-cred11)) | nobody; derived at spawn | `block`, fixed |
+| `personal` | personal data: the `identity:` sources, or any `env:`/`file:` source the operator puts here | the blueprint | `audit` |
+| `confidential` | anything else the operator wants kept in: a project codename, an internal hostname | the blueprint | `audit` |
 
-A declared marker names where its value is read from, never the value:
+A `credential` value that names a **location** is not tagged: it starts with `/` or `~/`, or its
+variable is a catalog file reference (`KUBECONFIG`, `GOOGLE_APPLICATION_CREDENTIALS`, ...). A path
+is guessable, so blocking it would tell the session it guessed right ([FW-INV9](../formwork.md#fw-inv9)).
+It is also a location the floor already denies ([FW-CRED3](../formwork.md#fw-cred3)), not a secret.
 
-```toml
-[net]
-hosts   = ["allow:api.anthropic.com", "allow:GET:crates.io"]
-markers = [
-  "env:OPERATOR_EMAIL",             # read from the launching environment
-  "file:~/.config/formwork/markers", # one value per line, `name = value`
-  "identity:git-email",              # a closed set, below
-]
-```
-
-`identity:` takes exactly one of `home` (the home directory path), `hostname`, `git-email`
-(`user.email` from the operator's git configuration) and `login` (the login name). A source that
-yields no value is a load error naming the source ([FW-INV6](../formwork.md#fw-inv6)).
-
-Two limits apply at load. A value shorter than **marker-min** (8 bytes) is refused, because a
-short value matches unrelated content; `identity:login` is refused on most hosts for that reason
-and the error says so. A blueprint that resolves more than **marker-limit** (32) declared markers
-is refused, which bounds the search cost in §3.3.
-
-A marker may name hosts where the value is expected, so that a model API that receives working
-directory paths in every prompt does not report each one:
+A declared tag names where its value is read from, never the value:
 
 ```toml
-markers = ["identity:home except api.anthropic.com"]
+[net.tags]
+personal     = ["identity:git-email", "identity:git-name", "identity:home except api.anthropic.com"]
+confidential = ["env:PROJECT_CODENAME"]
+
+[net.tags.action]
+personal = "block"   # default "audit"
 ```
 
-`except` takes host patterns in the host-rule grammar ([FW-BP16](../formwork.md#fw-bp16)). A
-stripped or brokered marker has no `except`.
+- `identity:` takes exactly one of `home`, `hostname`, `login`, `git-email` (`user.email`) and
+  `git-name` (`user.name`).
+- `except` takes host patterns in the host-rule grammar ([FW-BP16](../formwork.md#fw-bp16)), for a
+  host where the value is expected: a model API that receives working-directory paths in every
+  prompt.
+- A source that yields no value is a load error naming the source
+  ([FW-INV6](../formwork.md#fw-inv6)).
+- A value shorter than **tag-min** (8 bytes) is refused, because a short value matches unrelated
+  content.
+- More than **tag-limit** (32) declared tags is refused; this bounds the search cost.
 
 ### 3.2 Encodings searched
 
-For each marker the Gateway searches for exactly these **marker-encodings**: the raw bytes; the
-percent-encoded form with upper-case and with lower-case hex digits; hex in lower and upper case;
-the JSON string-escaped form where it differs from the raw bytes; and base64 in the standard and
-URL-safe alphabets at each of the three byte alignments, trimmed to the characters the alignment
-fixes. The set is closed and part of the requirement (`FW-EGR31`), so the report's reason can list
-it and a test can enumerate it.
+For each value the Gateway searches exactly these **tag-encodings**:
+- raw;
+- percent-encoded with upper- and lower-case hex;
+- hex in lower and upper case;
+- JSON string-escaped;
+- base64 in the standard and URL-safe alphabets at each of the three byte alignments, trimmed to
+  the characters the alignment fixes.
+
+The set is closed and part of the requirement, so the report's reason can name it and a test can
+enumerate it. Matching is exact; whether `git-email` should fold ASCII case is open (§9).
 
 ### 3.3 Where the search runs
 
-| Traffic | Head (target and header values) | Body |
+| Traffic | Head | Body |
 |---|---|---|
-| Inspected request ([FW-EGR10](../formwork.md#fw-egr10)) | searched before the head is forwarded | searched as it streams |
-| Plain HTTP request | same | same |
+| Inspected request ([FW-EGR10](../formwork.md#fw-egr10)) or plain HTTP | the CONNECT line, the method, the target as sent and decoded, every header name and value, the canonical path | searched as it streams |
 | Body with a `Content-Encoding` other than `identity` | searched | **unscanned**, counted |
 | Bytes after a `101` upgrade | — | **unscanned**, counted |
 | `tunnel:` host | — | **unscanned**, counted |
 | MCP `tools/call` params, agent to backend (phase C) | — | searched per frame |
 
-The search runs on the bytes the session wrote, before `present` substitutes a brokered secret
-(`inspect.rs:1112`), so the Gateway never matches its own substitution.
+The canonical path is searched because removing dot-segments can join a value split across
+segments. The search reads the bytes the session wrote, before a brokered secret is substituted
+in, so the Gateway never matches its own substitution.
 
-In `observe` the body search needs no hold-back: bytes are forwarded as they arrive and a match is
-recorded when it completes. In `refuse` it uses the reflection guard's contract: no byte that
-begins an occurrence is released, and the request ends.
+`audit` needs no hold-back in the body: bytes go through as they arrive, and a match is recorded
+when it completes. `block` uses the reflection guard's contract: no byte that begins an occurrence
+is released, and the request ends.
 
-**Cost.** `Guard::scan` compares every encoding at every offset (`http.rs:358-362`). That is
-acceptable for two encodings of one credential on a response. With 32 declared markers and the
-stripped and brokered ones, at about a dozen encodings each, it is several hundred patterns over a
-request body that [FW-E2E-092](../formwork.md#fw-e2e-092) sizes at 256 MiB. The matcher is
-therefore replaced by one that indexes patterns by first byte and uses `memchr`, which `serde_json`
-already brings into every crate. `aho-corasick` is in `Cargo.lock` as an optional dependency of
-`regex` and is not compiled today (`cargo tree -i aho-corasick` prints nothing); enabling it is a
-Growth decision this FEP defers to a measurement (§9).
+**Cost.** The matcher indexes patterns by first byte (std only). Phase A measured about 9 µs on a
+350-byte head with 32 values. Whether body search at **tag-limit** needs `aho-corasick` (in
+`Cargo.lock`, not compiled) is measured in phase B (§9).
 
-### 3.4 The disclosure record
+### 3.4 The audit record
 
-Each request in which the search finds a marker emits one **disclosure** record:
+Each request in which the search finds a tagged value emits one **disclosure** record per tag and
+location:
 
 | Field | Value |
 |---|---|
-| `marker` | the marker's name (`env:OPERATOR_EMAIL`, `stripped:GITHUB_TOKEN`, `brokered:anthropic`) |
+| `tag`, `class` | the tag's name (`env:PROJECT_CODENAME`, `identity:git-email`, `stripped:GITHUB_TOKEN`) and class |
 | `host`, `port`, `grade` | as in the grant record |
-| `method`, `path` | canonical path; no query string |
+| `method`, `path` | canonical path, no query string |
 | `location` | `target`, `header:<lower-case name>` or `body` |
-| `encoding` | one name from the closed set in §3.2 |
-| `count` | occurrences in this request |
-| `action` | `observed` or `refused` |
-| `timestamp` | milliseconds |
+| `encoding` | one name from §3.2 |
+| `count`, `action`, `timestamp` | occurrences; `audited` or `blocked`; milliseconds |
 
-It carries no byte of the marker and no byte of the request around it. The header *name* is
-recorded; [FW-FID13](../formwork.md#fw-fid13) excludes header values, and stays as it is. The
-record is emitted at `warn` on the operator channel with the wording of
-[FW-FID9](../formwork.md#fw-fid9) lines, and kept for the end-of-run account.
-
-For the incident in §1 the operator declares `identity:git-email` or `env:OPERATOR_EMAIL` and the
-first request prints:
+It is emitted at `warn` on the operator channel:
 
 ```
-formwork: disclosure observed: env:OPERATOR_EMAIL in header:user-agent (raw) to crates.io:443 GET /api/v1/crates
+formwork: disclosure audited: personal identity:git-email in header:user-agent (raw) to crates.io:443 GET /api/v1/crates
 ```
 
-### 3.5 Refusing
+### 3.5 Blocking
 
-A marker whose action is `refuse` turns a match into a refusal. In the head, the request is not
-forwarded and the session receives the generic refusal. In the body, the stream ends at the match
-and the upstream connection is closed, not returned to the pool. Both emit a violation record with
-the new reason `marker` in the closed set of [FW-FID12](../formwork.md#fw-fid12).
+In the head, a blocked request is not forwarded and the session receives the generic refusal. In
+the body, the stream ends at the match and the upstream connection is closed, not pooled. Both
+emit a violation record with the new reason `tagged` in the closed set of
+[FW-FID12](../formwork.md#fw-fid12).
 
-Stripped and brokered markers default to `refuse`. A session holds neither value by construction:
-the Launcher removed the one and the Gateway never disclosed the other
-([FW-CRED16](../formwork.md#fw-cred16)). Either value in an outbound request means the floor was
-crossed by a route Formwork did not close, and forwarding it would complete the disclosure. A
-credential the blueprint lifts with `allow-credentials` is not stripped and is not a marker.
-
-Declared markers default to `observe`; `action = "refuse"` on a marker, or `--set
-net.markers-action=refuse`, changes it.
+`credential` values are always blocked. The session holds neither kind by construction
+([FW-CRED16](../formwork.md#fw-cred16)), so one in a request means the floor was crossed by a route
+Formwork did not close, and no working flow depends on sending it. A credential the blueprint
+lifts with `allow-credentials` is not stripped and is not tagged.
 
 ### 3.6 The account at session end
 
-When a `run` ends, the Launcher writes one **egress account** on the operator channel at `info`:
-for each host contacted, the number of requests, bytes up and down, the grades used, the number of
-disclosures, the number of **unscanned** bytes sent, and the distinct request header names seen
-(names only, the first **header-names-kept** (64) per host).
+When a `run` ends, the Launcher writes one **egress account** on the operator channel at `info`,
+one line per host the Gateway forwarded a request or tunnel to:
 
 ```
 formwork: egress account
@@ -234,150 +228,125 @@ formwork: egress account
   github.com:443         tunnel       3 tunnels   up 48 KiB   down 2.0 MiB  disclosures -  unscanned 48 KiB
 ```
 
-The account is an aggregate of counters the engine already keeps per grant. It is the per-host
-form of the data FEP-9 declines to record per request, and it is what makes an unexpected upload
-(a 40 MiB `up` to a documentation host) visible without a marker. If FEP-9's session record lands,
-disclosures and the account are rows in it and the JSON shape is defined there; until then they
-are operator lines and an `EgressProxy` accessor for embedders.
+This is the record of what left (GDPR Art. 30's question, per session), and it shows an unexpected
+upload (40 MiB up to a documentation host) without any tag. It aggregates counters the engine
+already keeps; header names only, the first **header-names-kept** (64) per host.
 
 ### 3.7 The report row
 
-`compile` gains the capability `net-disclosure`, present when the blueprint resolves at least one
-marker or brokers or strips a credential.
+`compile` gains the capability `net-disclosure`, present when the blueprint declares a tag or
+strips or brokers a credential.
 
 | Condition | Verdict | Reason names |
 |---|---|---|
 | every host rule is inspected or plain | `Partial` | the closed encoding set; coded bodies and upgraded streams are unscanned |
-| at least one `tunnel:` rule | `Partial` | the same, and the tunnelled hosts by rule |
-| markers declared and no Gateway carries egress (`net = "allow"`, a port tier, `--confine-self`) | `Unenforceable` | no door to search at |
+| at least one `tunnel:` rule | `Partial` | the same, and the tunnelled hosts |
+| tags declared and no Gateway carries egress (`net = "allow"`, a port tier, `--confine-self`) | `Unenforceable` | no door to search at |
 
-The row is never `Enforced`.
+### 3.8 What remains open
 
-### 3.8 Asymmetries that remain
-
-- **Tunnelled hosts are unsearched on both platforms.** The account counts their bytes; nothing
-  else is known about them.
-- **An MCP backend with its own network grant is a second door.** Phase C searches what the agent
-  sends the backend. What the backend then sends elsewhere is governed by the Confiner the backend
-  runs under (constitution Concepts, **Session**), not by this FEP.
-- **Direct egress under a port tier bypasses the Gateway**, so no search runs; §3.7 reports it.
-- **A value the session transforms is not found.** `FW-ADV-047` asserts this, so the limit is a
-  tested statement and not an omission.
+- Tunnelled hosts are unsearched; the account counts their bytes.
+- An MCP backend with its own network grant is a second door; phase C searches what the agent
+  sends it, and the backend's own Confiner governs the rest.
+- A value the session transforms (encrypts, splits, re-encodes) passes, and
+  [`FW-ADV-047`](#draft-fw-adv-047) asserts it.
 
 ## 4. Surface changes (each measured against Growth)
 
 | Change | Existing concept searched first | Why it does not fit |
 |---|---|---|
-| Blueprint: `[net] markers`, `[net] markers-action` | `allow-credentials` and the Catalog name credential *locations* to deny or broker | a marker is a value to recognise, is not a credential, and is not denied to the session |
-| Vocabulary: **marker**, **disclosure**, **unscanned** | **placeholder** is the stand-in the session holds; **reflection** is the response direction | neither names an operator-chosen value in the request direction |
-| Violation reason `marker` | `placeholder`, `reflection` | the value is neither |
-| Capability `net-disclosure` in the report | `net-inspection` reports whether TLS is terminated | whether content is searched, and for what, is a separate claim with a separate verdict |
-| Operator lines: disclosure, egress account | FW-FID9 refusal lines | these are not refusals |
-| Launcher keeps stripped values in memory until the engine has them | none | today they are dropped at partition |
-| Dependencies | — | none added; `memchr` is already compiled into every crate |
-
-No new concept: markers are held and searched for by the **Gateway**, declared in the
-**Blueprint**, read by the **Launcher**, and reported by the **FidelityReport**. No new requirement
-family.
+| Blueprint: `[net.tags]`, `[net.tags.action]` | `allow-credentials` and the Catalog name credential *locations* | a tag names a value to recognise, which the session may hold |
+| Vocabulary: **tag**, **class**, **disclosure**, **unscanned** | **placeholder**, **reflection** | neither names an operator-classified value in the request direction |
+| Violation reason `tagged` | `placeholder`, `reflection` | the value is neither |
+| Capability `net-disclosure` | `net-inspection` (whether TLS is terminated) | whether content is searched is a separate claim |
+| Operator lines: disclosure, egress account | FW-FID9 refusal lines | an audit is not a refusal |
+| Dependencies | — | none |
 
 ## 5. Proposed requirements (draft numbering — anchored on landing)
 
 | ID | Statement |
 |---|---|
-| `FW-BP26` Marker declarations | The CLI shall accept `[net] markers` entries whose source is exactly one of `env:`, `file:` and `identity:` (`home`, `hostname`, `git-email`, `login`), and shall refuse at load a source that yields no value, a value shorter than **marker-min** bytes, and a blueprint that resolves more than **marker-limit** declared markers. |
-| `FW-EGR31` Head search | Before forwarding the head of an inspected or plain-HTTP request, the Gateway shall search the request target and every header value for each **marker-encoding** (exactly the set in FEP-12 §3.2) of each marker not excepted for the request's host. |
-| `FW-EGR32` Body search | The Gateway shall search the body of every inspected or plain-HTTP request with identity content coding for the same encodings as it streams, holding at most **body-buffer** bytes. |
-| `FW-EGR33` Derived markers | The Launcher shall register as a marker the value of every environment variable it strips under FW-CRED4 and the secret of every brokered credential, where the value is at least **marker-min** bytes. |
-| `FW-EGR34` Marker refusal | For a marker whose action is `refuse`, the Gateway shall not forward a request head in which the search finds it, and shall end a request body without releasing any byte that begins an occurrence of it. |
-| `FW-EGR35` MCP frames | The Gateway shall search the `params` of every `tools/call` request it forwards to a backend for the same encodings, and shall refuse the call where a matched marker's action is `refuse`. |
-| `FW-FID27` Disclosure record | For each request in which the search finds a marker, the Gateway shall emit exactly one record per marker and location carrying the marker's name, host, port, grade, method, canonical path, location, encoding name, count, action and timestamp. |
-| `FW-FID28` Unscanned bytes | The Gateway shall count per host the request bytes it forwards without searching (a tunnel, a body with a content coding other than identity, a stream after an upgrade). |
-| `FW-FID29` Egress account | At the end of a `run` that carried egress through the Gateway, the Launcher shall write for each contacted host the request count, bytes up, bytes down, grades, disclosure count, unscanned byte count and at most **header-names-kept** distinct request header names. |
-| `FW-FID30` Disclosure verdict | The compiler shall report `net-disclosure` as `Partial`, naming the encoding set and every `tunnel:` rule, where a Gateway carries the session's egress, and as `Unenforceable` where markers are declared and no Gateway does. |
-| `FW-INV22` Markers stay in the Gateway | No record, report, log line at any level, error message or response to the session shall contain the bytes of a marker or a marker-encoding of them. |
+| <a id="draft-fw-bp26"></a>`FW-BP26` Tag declarations | The CLI shall accept `[net.tags]` entries under exactly the classes `personal` and `confidential`, each with a source of exactly `env:`, `file:` or `identity:` (`home`, `hostname`, `login`, `git-email`, `git-name`) and optional `except` host patterns, and an action of `audit` or `block` per class; and shall refuse at load a source that yields no value, a value shorter than **tag-min** bytes, and more than **tag-limit** declared tags. |
+| <a id="draft-fw-egr31"></a>`FW-EGR31` Head search | Before forwarding the head of an inspected or plain-HTTP request, the Gateway shall search the CONNECT request line, the method, the target as sent and percent-decoded, every header name and value, and the canonical path for each **tag-encoding** (exactly the set in FEP-12 §3.2) of each tagged value not excepted for the request's host. |
+| <a id="draft-fw-egr32"></a>`FW-EGR32` Body search | The Gateway shall search the body of every inspected or plain-HTTP request with identity content coding for the same encodings as it streams, holding at most **body-buffer** bytes. |
+| <a id="draft-fw-egr33"></a>`FW-EGR33` Credential tags | The Launcher shall tag as `credential` the value of every environment variable it strips under FW-CRED4, unless the value names a location, and the secret of every brokered credential, where the value is at least **tag-min** bytes. |
+| <a id="draft-fw-egr34"></a>`FW-EGR34` Blocking | For a tagged value whose action is `block`, the Gateway shall not forward a request head in which the search finds it, and shall end a request body without releasing any byte that begins an occurrence of it. |
+| <a id="draft-fw-egr35"></a>`FW-EGR35` MCP frames | The Gateway shall search the `params` of every `tools/call` request it forwards to a backend for the same encodings, and shall refuse the call where a matched tag's action is `block`. |
+| <a id="draft-fw-fid27"></a>`FW-FID27` Disclosure record | For each request in which the search finds a tagged value, the Gateway shall emit exactly one record per tag and location carrying the tag's name and class, host, port, grade, method, canonical path, location, encoding name, count, action and timestamp. |
+| <a id="draft-fw-fid28"></a>`FW-FID28` Unscanned bytes | The Gateway shall count per host the request bytes it forwards without searching (a tunnel, a body with a content coding other than identity, a stream after an upgrade). |
+| <a id="draft-fw-fid29"></a>`FW-FID29` Egress account | At the end of a `run` that carried egress through the Gateway, the Launcher shall write on the operator channel, for each host the Gateway forwarded a request head or a tunnel to, the request count, bytes up, bytes down, grades, disclosure count, unscanned byte count and at most **header-names-kept** distinct request header names. |
+| <a id="draft-fw-fid30"></a>`FW-FID30` Disclosure verdict | The compiler shall report `net-disclosure` as `Partial`, naming the encoding set and every `tunnel:` rule, where a Gateway carries the session's egress, and as `Unenforceable` where tags are declared and no Gateway does. |
+| <a id="draft-fw-inv22"></a>`FW-INV22` Tagged values stay in the Gateway | No record, report, log line at any level, error message or response to the session shall contain a tagged value or a tag-encoding of it. |
 
-**Parameters**, defined once: **marker-min** = 8 bytes; **marker-limit** = 32;
+**Parameters**, defined once: **tag-min** = 8 bytes; **tag-limit** = 32;
 **header-names-kept** = 64; **body-buffer** as landed.
 
 ## 6. Verification plan
 
 Fixtures are the loopback HTTPS upstreams of `crates/formwork-gateway/tests/support`, which record
-every request they receive. Each test asserts on records and on what the upstream saw, never on
-operator prose.
+every request they receive. Each test asserts on records and on what the upstream saw.
 
 | ID | Test |
 |---|---|
-| `FW-E2E-169` | The §1 incident: a client sends a declared marker in `User-Agent` to a granted inspected host. One disclosure record names `header:user-agent`; the upstream received the request (`observe`). |
-| `FW-E2E-170` | A marker in a request body split across two writes at every offset of the marker. One record, `location = body`; the upstream received every byte in order. |
-| `FW-E2E-171` | Each marker-encoding in turn, in the target and in the body, produces a record naming that encoding. Table-driven over the closed set, so adding an encoding without a row fails. |
-| `FW-E2E-172` | A stripped credential's value sent to a granted host is refused: the upstream receives no head; a violation record carries `marker`. Paired with the same request without the value, which is admitted. |
-| `FW-E2E-173` | The same value in a body in `refuse`: the upstream receives no byte that begins the value and the connection is not reused. |
-| `FW-E2E-174` | A `tunnel:` host, a `gzip`-coded body and a WebSocket upgrade each add their byte count to **unscanned** for the host and produce no disclosure record. |
-| `FW-E2E-175` | The egress account after a three-host run lists each host with its counts and header names, and nothing for a host that was refused. |
-| `FW-E2E-176` | `compile` with a marker and `net = "allow"` reports `net-disclosure` `Unenforceable`; with one `tunnel:` rule the reason names it; `identity:login` with a four-byte login fails at load naming **marker-min**. |
-| `FW-E2E-177` | [FW-E2E-096](../formwork.md#fw-e2e-096) and [FW-E2E-092](../formwork.md#fw-e2e-092) re-run with **marker-limit** declared markers: the latency budget and the 16 MiB memory bound hold. |
-| `FW-ADV-046` | `FW-INV22`: with `RUST_LOG=trace`, run `FW-E2E-169`..173, then search stdout, stderr, the operator channel, every record and the `explain`/`compile` JSON for every marker-encoding of every marker. No occurrence. |
-| `FW-ADV-047` | The stated limit: the marker sent ROT13-coded, and split across two requests, is admitted with no record. The test asserts the `Partial` reason names the closed encoding set. |
-
-`FW-EGR35` is tested through `fw-mcp-fixture` in `crates/formwork-gateway/tests/gateway.rs`: a
-`tools/call` whose arguments carry a declared marker yields one record; with `refuse` the backend
-receives no frame. The matcher gets unit tests for overlap, a pattern that is a prefix of another,
-and a property test against a naive search once the fuzz infrastructure in `docs/STATUS.md` exists.
+| <a id="draft-fw-e2e-169"></a>`FW-E2E-169` | The §1 incident: a `personal` value in `User-Agent` to a granted inspected host. One disclosure record names `header:user-agent`; the upstream received the request (`audit`). |
+| `FW-E2E-170` | A tagged value in a request body split across two writes at every offset. One record, `location = body`; the upstream received every byte in order. |
+| `FW-E2E-171` | Each tag-encoding in turn, in the target and the body, produces a record naming it. Table-driven over the closed set. |
+| `FW-E2E-172` | A stripped credential's value in a head is blocked: the upstream receives nothing; a violation carries `tagged`. A stripped path is admitted. |
+| `FW-E2E-173` | The same value in a body under `block`: the upstream receives no byte that begins it and the connection is not reused. |
+| `FW-E2E-174` | A `tunnel:` host, a `gzip` body and a WebSocket upgrade each add to **unscanned** and produce no disclosure record. |
+| `FW-E2E-175` | The account after a three-host run lists each host with its counts and header names, and nothing for a refused host. |
+| `FW-E2E-176` | `compile` with a tag and `net = "allow"` reports `net-disclosure` `Unenforceable`; a `tunnel:` rule is named in the reason; a four-byte `identity:login` fails at load naming **tag-min**. |
+| `FW-E2E-177` | [FW-E2E-096](../formwork.md#fw-e2e-096) and [FW-E2E-092](../formwork.md#fw-e2e-092) with **tag-limit** tags: the latency budget and the 16 MiB memory bound hold. |
+| <a id="draft-fw-adv-046"></a>`FW-ADV-046` | `FW-INV22`: under `RUST_LOG=trace`, run 169..173 and search stdout, stderr, the operator channel, every record and the `explain`/`compile` JSON for every encoding of every tagged value. No occurrence. |
+| <a id="draft-fw-adv-047"></a>`FW-ADV-047` | The stated limit: a value sent ROT13-coded, or split across two requests, is admitted with no record; the `Partial` reason names the encoding set. |
 
 **Phasing.**
 
-- **A — account and derived markers.** `FW-FID28`, `FW-FID29`, `FW-EGR33`, `FW-EGR34`, head search
-  only. No blueprint change; `FW-E2E-172`, `FW-E2E-174`, `FW-E2E-175`.
-- **B — declared markers and the body.** `FW-BP26`, `FW-EGR31`, `FW-EGR32`, `FW-FID27`,
-  `FW-FID30`, `FW-INV22`; the remaining tests.
+- **A — credential tags, head blocking, the account.** `FW-EGR33`, `FW-EGR34` (head), `FW-FID28`,
+  `FW-FID29`; tests 172, 174, 175. No blueprint change. Implemented (see Status).
+- **B — declared tags and the body.** `FW-BP26`, `FW-EGR31`, `FW-EGR32`, `FW-FID27`, `FW-FID30`,
+  `FW-INV22`; the remaining tests.
 - **C — the MCP door.** `FW-EGR35`.
-
-Phase A changes no published input and can land alone.
 
 ## 7. Amendments to the landed docs (apply on landing)
 
-**(a) `formwork.md` §5.** Add the rows of §5 above, anchored. Add `marker` to the closed reason set
-under [FW-FID12](../formwork.md#fw-fid12).
-
-**(b) `formwork.md` §7 and §10.** Add `FW-E2E-169`..177 and `FW-ADV-046`..047 and their
-traceability rows.
-
-**(c) `formwork.md` §9 (fidelity matrix).** Add the `net-disclosure` row with the verdicts of §3.7.
-
-**(d) `constitution.md` Vocabulary.** Add: **marker** = a named value the Gateway searches outbound
-requests for, held like a brokered secret · **disclosure** = a marker found in a request the
-session sent · **unscanned** = request bytes the Gateway forwarded without searching.
-
-**(e) `constitution.md` Concepts, Blueprint.** Add "egress markers (`FW-BP26`)" to the enumeration.
-
-**(f) `README.md`.** One paragraph under the egress section: what a marker is, the account, and the
-sentence "this finds a value sent as written or in a common encoding; it does not stop a session
-that sets out to hide one".
-
-**(g) `docs/STATUS.md`.** A phase row for this FEP.
+- **(a) `formwork.md` §5.** The rows of §5, anchored; `tagged` in the [FW-FID12](../formwork.md#fw-fid12) reason set.
+- **(b) `formwork.md` §7 and §10.** The tests of §6 and their traceability rows.
+- **(c) `formwork.md` §9.** The `net-disclosure` row of §3.7.
+- **(d) `constitution.md` Vocabulary.**
+  - **tag**: a named value the Gateway searches outbound requests for, held like a brokered secret;
+  - **class**: `credential`, `personal` or `confidential`;
+  - **disclosure**: a tagged value found in a request the session sent;
+  - **unscanned**: request bytes forwarded without searching.
+- **(e) `constitution.md` Concepts, Blueprint.** Add "egress tags (`FW-BP26`)".
+- **(f) `README.md`.** One paragraph: tags, classes, the account, and "this finds a value sent as
+  written or in a common encoding; it does not stop a session that sets out to hide one".
+- **(g) `docs/STATUS.md`.** A phase row.
 
 ## 8. Decisions (recorded per constitution Precedence & Conflicts)
 
-- **Exact values, not shapes.** A shape pattern (an email regex, a token prefix) fires on source
-  code and documentation in request bodies to a model API. An exact value fires when that value
-  leaves. Shapes stay where they are, in the env scrub.
-- **`observe` by default for declared markers.** A declared marker is often expected somewhere the
-  operator has not listed yet; refusing on first use would turn a visibility feature into a
-  breakage and get it turned off (constitution Growth, the reuse thesis).
-- **`refuse` by default for stripped and brokered markers.** The session cannot hold these by
-  design, so no working flow depends on sending them. This changes behavior for existing
-  blueprints; no release has shipped, so it is made outright.
-- **An aggregate, not a log.** Per-request grant records stay at `debug`, as FEP-9 decided.
+- **Exact values, not shapes.** An email regex fires on every address in the source code sent to a
+  model API. An exact value fires only when that value leaves.
+- **A closed set of classes.** Three classes are enough to say which rule applies (credential: always
+  block; personal and confidential: the operator's choice) and to label records; more would be
+  taxonomy without a different behavior.
+- **`audit` by default for declared tags.** A declared value is often expected somewhere the
+  operator has not listed yet; blocking on first use would turn the feature into a breakage that
+  gets turned off (constitution Growth).
+- **`block`, fixed, for credentials.** No working flow sends a value the session cannot hold.
+- **No tag for a credential location** ([FW-INV9](../formwork.md#fw-inv9), §3.1).
+- **An aggregate, not a log.** Per-request grant records stay at `debug`.
 - **The record names the header, not its value.** FW-FID13's exclusion is unchanged.
-- **`Partial`, never `Enforced`.** The encoding set is closed and an adversary is not bound by it.
+- **`Partial`, never `Enforced`.**
 
 ## 9. Open questions
 
 | Question | Owner | Closes at |
 |---|---|---|
-| Does a first-byte index over `memchr` hold `FW-E2E-096` at **marker-limit**, or is `aho-corasick` needed? Measure both before phase B. | implementer of phase B | phase B review |
-| Should raw matching fold ASCII case for `identity:git-email` (mail addresses are sent in mixed case)? | reviewer | adoption |
-| Should `identity:` exist at all, or should every declared marker come from `env:` and `file:`? It adds four sources the Launcher must read (`git config` among them). | reviewer | adoption |
-| Does the account belong on the operator channel before FEP-9's session record exists, or should phase A wait for it? | reviewer of FEP-9 | FEP-9 adoption |
-| A per-host upload budget (`refuse` above N bytes up) is a natural next step from the account. It is a new blueprint field and is left out. | — | a later FEP |
-| Request bodies with `Content-Encoding: gzip` could be decoded for search at a memory cost. Left **unscanned** here. | — | after phase B measurements |
+| Does the first-byte index hold `FW-E2E-096` with body search at **tag-limit**, or is `aho-corasick` needed? | implementer of phase B | phase B review |
+| Should matching fold ASCII case for `identity:git-email`? | reviewer | adoption |
+| Should `identity:` exist, or should every declared tag come from `env:` and `file:`? It adds five sources the Launcher reads (`git config` among them). | reviewer | adoption |
+| Should `personal` default to `block` instead of `audit`, on GDPR Art. 25's "by default"? | reviewer | adoption |
+| `grade` (`tunnel` or `inspected`) is how much of the connection the Gateway sees, not an authorization; a rename in the landed spec (e.g. **visibility**) is a separate change. | reviewer | before phase B |
+| A per-host upload budget (block above N bytes up) follows from the account; it is a new field and is left out. | — | a later FEP |
+| `gzip` request bodies could be decoded for search at a memory cost; left **unscanned**. | — | after phase B measurements |
