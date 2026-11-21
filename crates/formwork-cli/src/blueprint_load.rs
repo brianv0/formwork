@@ -553,7 +553,7 @@ fn fs_atoms(atoms: &[&str]) -> std::result::Result<FsAtoms, String> {
 }
 
 /// FW-BP13/FW-EGR1: a port tier and host rules reach the network by different doors, so both in
-/// one blueprint is refused; FW-BP14: one host, one grade. Every conflict is named.
+/// one blueprint is refused; FW-BP14: one host, one view. Every conflict is named.
 fn validate_net(layers: &[(RuleSource, BlueprintLayer)], merged: &Blueprint) -> Result<()> {
     let Some(table) = merged.net.host_table() else {
         return Ok(());
@@ -998,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn host_rules_refuse_a_port_tier_and_a_second_grade() {
+    fn host_rules_refuse_a_port_tier_and_a_second_view() {
         let dir = Scratch::new("host-rules");
         std::fs::write(
             dir.path().join("bp.toml"),
@@ -1019,7 +1019,7 @@ mod tests {
             "{:#}",
             load(&dir.path().join("two.toml"), "/home/x").unwrap_err()
         );
-        assert!(msg.contains("two grades"), "{msg}");
+        assert!(msg.contains("two views"), "{msg}");
         std::fs::write(
             dir.path().join("ok.toml"),
             "rules = [\"tunnel:api.anthropic.com\", \"get:api.github.com\"]\n",

@@ -78,7 +78,7 @@ pub fn explanation(e: &Explanation) -> String {
 
 /// One URL's egress verdict (FW-FID11).
 pub fn egress_explanation(e: &crate::EgressExplanation) -> String {
-    let mut out = format!("{}\n  host: {}:{} -- {}\n", e.url, e.host, e.port, e.grade);
+    let mut out = format!("{}\n  host: {}:{} -- {}\n", e.url, e.host, e.port, e.view);
     if let Some(rule) = &e.rule {
         let origin = e
             .source
@@ -122,7 +122,7 @@ pub fn net_table(net: &formwork_blueprint::NetPosture, rules: &[serde_json::Valu
         out.push_str(&format!(
             "  {:40} {:9} methods {:14} paths {:20} ({origin})\n",
             r["rule"].as_str().unwrap_or(""),
-            r["grade"].as_str().unwrap_or(""),
+            r["view"].as_str().unwrap_or(""),
             r["methods"].as_str().unwrap_or(""),
             r["paths"].as_str().unwrap_or(""),
         ));

@@ -230,7 +230,7 @@ pub struct EgressProposal {
     pub withheld: Vec<(String, String)>,
 }
 
-/// FW-DISC12: refused destinations -> host rules at the grade the host already has. A host no rule
+/// FW-DISC12: refused destinations -> host rules at the view the host already has. A host no rule
 /// names is proposed inspected (`allow:host`, FEP-6 §9 j); a request refused on an inspected host
 /// is proposed as that method on that exact path. Metadata names, restricted addresses and names
 /// refused for the class of address they resolved to are never proposed (FW-EGR19), and neither
@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn fw_disc12_hosts_are_proposed_at_their_grade_and_metadata_is_withheld() {
+    fn fw_disc12_hosts_are_proposed_at_their_view_and_metadata_is_withheld() {
         let table = crate::HostTable::new(vec![
             crate::HostRule::parse("get", "api.github.com/repos/**").unwrap(),
             crate::HostRule::parse("deny", "evil.test").unwrap(),

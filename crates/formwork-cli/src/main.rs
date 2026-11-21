@@ -156,7 +156,7 @@ enum Cmd {
         /// Machine-readable JSON instead of the human rendering.
         #[arg(long)]
         json: bool,
-        /// Print the resolved host table: one host rule per line with its grade, methods, paths,
+        /// Print the resolved host table: one host rule per line with its view, methods, paths,
         /// and the layer that wrote it (FW-FID11). (`--net` is the net-posture override every
         /// blueprint-taking subcommand already accepts.)
         #[arg(long)]
@@ -764,7 +764,7 @@ fn explain(args: BlueprintArgs, paths: Vec<String>, json: bool, hosts: bool) -> 
     Ok(())
 }
 
-/// One URL's egress verdict (FW-FID11): the host's grade, which methods the path admits, the
+/// One URL's egress verdict (FW-FID11): the host's view, which methods the path admits, the
 /// deciding rule and the layer that wrote it.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -773,7 +773,7 @@ pub struct EgressExplanation {
     pub host: String,
     pub port: u16,
     /// `tunnel`, `inspected`, or `denied`.
-    pub grade: &'static str,
+    pub view: &'static str,
     /// Per HTTP method on an inspected host: admitted or not, and the deciding rule.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<MethodVerdict>,
@@ -811,7 +811,7 @@ fn explain_url(
         url: url.to_string(),
         host: host.to_string(),
         port,
-        grade: "denied",
+        view: "denied",
         methods: Vec::new(),
         rule: None,
         source: None,
@@ -829,7 +829,7 @@ fn explain_url(
     }
     match table.decide_connect(&host, port) {
         ConnectDecision::Tunnel(rule) => {
-            out.grade = "tunnel";
+            out.view = "tunnel";
             out.source = source_of(Some(rule));
             out.rule = Some(rule.to_string());
             out.reason = Some(
@@ -839,7 +839,7 @@ fn explain_url(
             );
         }
         ConnectDecision::Inspect => {
-            out.grade = "inspected";
+            out.view = "inspected";
             for m in HttpMethod::ALL {
                 let (admitted, rule) = match table.decide_request(&host, port, Some(m), &path) {
                     RequestDecision::Allow(rule) => (true, Some(rule)),
@@ -865,7 +865,7 @@ fn explain_url(
     Ok(out)
 }
 
-/// `explain --hosts` (FW-FID11): every host rule once, with its grade and the layer that wrote it.
+/// `explain --hosts` (FW-FID11): every host rule once, with its view and the layer that wrote it.
 fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
     let resolved = args.resolve()?;
     let (blueprint, provenance) = args.load_with_provenance(&resolved.path, &home())?;
@@ -901,7 +901,7 @@ fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
         .unwrap_or_default()
         .iter()
         .map(|r| {
-            let (grade, methods, path) = match &r.access {
+            let (view, methods, path) = match &r.access {
                 formwork_blueprint::HostAccess::Tunnel => {
                     ("tunnel", "(opaque)".to_string(), "(opaque)".to_string())
                 }
@@ -923,7 +923,7 @@ fn explain_net(args: &BlueprintArgs, json: bool) -> Result<()> {
                 "rule": r.to_string(),
                 "host": r.host.to_string(),
                 "port": r.port,
-                "grade": grade,
+                "view": view,
                 "methods": methods,
                 "paths": path,
                 "broker": serde_json::Value::Null,

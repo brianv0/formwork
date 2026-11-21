@@ -1,4 +1,4 @@
-//! The inspected grade (FW-EGR10, FEP-6 §4.4): the Gateway terminates TLS with a leaf minted by
+//! The inspected view (FW-EGR10, FEP-6 §4.4): the Gateway terminates TLS with a leaf minted by
 //! the session CA after the ClientHello's server name matches the CONNECT host and its ALPN admits
 //! HTTP/1.1 (FW-EGR20), then decides every request by `Host`, method and canonical path before
 //! writing it upstream from what matched (FW-EGR22). Plain HTTP to an inspected rule runs the same
@@ -127,7 +127,7 @@ fn rejected_our_ca(e: &io::Error) -> bool {
     )
 }
 
-/// The inspected grade after `200 Connection Established` (FEP-6 §4.4).
+/// The inspected view after `200 Connection Established` (FEP-6 §4.4).
 pub(crate) async fn serve_inspected(
     mut client: Buffered<TcpStream>,
     dest: Destination,
@@ -843,7 +843,7 @@ fn grant(
     Grant {
         host: host.to_string(),
         port,
-        grade: "inspected",
+        view: "inspected",
         method: Some(method.to_string()),
         path: Some(path.to_string()),
         status: Some(status),

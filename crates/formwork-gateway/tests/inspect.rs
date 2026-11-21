@@ -1,4 +1,4 @@
-//! The inspected grade (FW-EGR10, FW-EGR20-25, FW-CRED16-19, FEP-6 §4.4, §4.7) through the real
+//! The inspected view (FW-EGR10, FW-EGR20-25, FW-CRED16-19, FEP-6 §4.4, §4.7) through the real
 //! Gateway listener: a rustls client that trusts only the session CA CONNECTs through the listener
 //! and speaks HTTP/1.1 to a TLS fixture upstream whose certificate the Gateway trusts through the
 //! fixture-roots input. The upstream records every handshake and request, so each test sees
@@ -519,7 +519,7 @@ async fn fw_e2e_095_upstream_connections_are_pooled() {
     assert_eq!(grants.len(), 20, "FW-FID13: one grant per request");
     assert!(grants
         .iter()
-        .all(|g| g.grade == "inspected" && g.status == Some(200)));
+        .all(|g| g.view == "inspected" && g.status == Some(200)));
 }
 
 /// FW-EGR24: an upstream whose certificate does not chain to the host trust store is refused

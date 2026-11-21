@@ -1,4 +1,4 @@
-//! Gateway egress E2E (FEP-1 Part A, FEP-5 §3.1, FEP-6): the front door, the tunnel grade, the
+//! Gateway egress E2E (FEP-1 Part A, FEP-5 §3.1, FEP-6): the front door, the tunnel view, the
 //! destination classes and the parser, through the real egress listener against loopback fixture
 //! upstreams. Denials are asserted on violation records, never by waiting on a timeout.
 
@@ -83,7 +83,7 @@ async fn fw_e2e_029_host_allowlist_admits_one_denies_the_rest() {
     assert!(
         grants
             .iter()
-            .any(|g| g.grade == "tunnel" && g.host == "allowed.test" && g.bytes_up > 0),
+            .any(|g| g.view == "tunnel" && g.host == "allowed.test" && g.bytes_up > 0),
         "{grants:?}"
     );
 }
@@ -367,7 +367,7 @@ async fn fw_adv_009_no_unauthenticated_door() {
 
 /// Plain HTTP runs the inspected request pipeline without TLS (FEP-6 §4.8): decided by method and
 /// canonical path, forwarded from what matched (FW-EGR22), with traversal, smuggling and a
-/// tunnel-grade host refused.
+/// tunnel-view host refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn plain_http_is_the_inspected_pipeline_without_tls() {
     let up = upstream(None).await;
