@@ -1,8 +1,8 @@
 //! Host-scoped egress (FW-EGR1, FEP-5 §4, FEP-6): host rules in the verb grammar and their
-//! one-grade-per-host-and-port validation (FW-BP14, FW-BP16), the parse of foreign host and path
+//! one-view-per-host-and-port validation (FW-BP14, FW-BP16), the parse of foreign host and path
 //! text into the types rules and requests share (FW-EGR3, FW-EGR11), the destination class table
 //! (FW-EGR17-19), the closed set of refusal reasons (FW-FID12), and the pure decision the Gateway
-//! and `explain` share. A host and port resolve to exactly one grade: *inspected* (`allow:` and
+//! and `explain` share. A host and port resolve to exactly one view: *inspected* (`allow:` and
 //! method verbs, the default: TLS terminated, every request decided, FW-EGR10) or *tunnel*
 //! (`tunnel:`, forwarded after the server-name check, FW-EGR16). `deny:` is terminal.
 
@@ -681,7 +681,7 @@ pub enum HostAccess {
         path: PathGlob,
     },
     /// `deny:host` (terminal for the host) or `deny:host/path` (terminal for matching requests;
-    /// needs the inspected grade, FW-BP14).
+    /// needs the inspected view, FW-BP14).
     Deny { path: Option<PathGlob> },
 }
 
@@ -918,7 +918,7 @@ fn parse_port(p: &str, hostport: &str) -> Result<u16, String> {
     }
 }
 
-/// The one-grade-per-host-and-port rule (FW-BP14): a tunnel rule and an inspected rule that could
+/// The one-view-per-host-and-port rule (FW-BP14): a tunnel rule and an inspected rule that could
 /// match one host on one port (directly or through a wildcard) are a compile error naming both, as
 /// is a path-scoped deny on a host no inspected rule covers. Returns every conflict.
 pub fn validate_host_rules(rules: &[HostRule]) -> Result<(), Vec<String>> {
@@ -932,7 +932,7 @@ pub fn validate_host_rules(rules: &[HostRule]) -> Result<(), Vec<String>> {
             };
             if tunnel.host.overlaps(&inspected.host) && tunnel.same_port(inspected) {
                 errors.push(format!(
-                    "`{tunnel}` and `{inspected}` give one host and port two grades; the tunnel \
+                    "`{tunnel}` and `{inspected}` give one host and port two views; the tunnel \
                      would admit every request and the inspected rule would be decoration -- keep \
                      one (`allow:{}` inspects the whole host)",
                     tunnel.host
@@ -963,7 +963,7 @@ pub fn validate_host_rules(rules: &[HostRule]) -> Result<(), Vec<String>> {
 /// The Gateway's verdict on a CONNECT, or on the host half of a plain-HTTP request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectDecision<'a> {
-    /// Tunnel grade: check the server name, then splice bytes (FW-EGR16).
+    /// Tunnel view: check the server name, then splice bytes (FW-EGR16).
     Tunnel(&'a HostRule),
     /// Terminate TLS and decide per request.
     Inspect,
@@ -1001,7 +1001,7 @@ impl HostTable {
     }
 
     /// Decide a CONNECT (or the host half of a plain-HTTP request): a host-level deny is terminal;
-    /// otherwise the host and port's single grade decides.
+    /// otherwise the host and port's single view decides.
     pub fn decide_connect(&self, host: &CanonicalHost, port: u16) -> ConnectDecision<'_> {
         if let Some(rule) = self.rules.iter().find(|r| {
             matches!(r.access, HostAccess::Deny { path: None })
@@ -1263,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn one_grade_per_host_and_port() {
+    fn one_view_per_host_and_port() {
         assert!(
             validate_host_rules(&[rule("tunnel:api.github.com"), rule("get:api.github.com")])
                 .is_err()
@@ -1288,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn decisions_follow_grade_terminal_deny_and_the_reason_set() {
+    fn decisions_follow_view_terminal_deny_and_the_reason_set() {
         let t = HostTable::new(vec![
             rule("tunnel:api.anthropic.com"),
             rule("post:api.github.com/repos/acme/**"),

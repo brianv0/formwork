@@ -1,9 +1,9 @@
 //! The Gateway's time budgets, measured on loopback fixtures in release builds.
 //!
 //! - FW-E2E-096 (both): the latency budget (FEP-6 §9 f, `formwork.md` §8). What the Gateway adds
-//!   to a request over the same client connecting directly: tunnel grade, a new connection, to the
-//!   first response byte, under 2 ms; inspected grade, a reused connection, per request, under
-//!   1 ms; inspected grade, the first connection to a host (its leaf minted), under 5 ms.
+//!   to a request over the same client connecting directly: tunnel view, a new connection, to the
+//!   first response byte, under 2 ms; inspected view, a reused connection, per request, under
+//!   1 ms; inspected view, the first connection to a host (its leaf minted), under 5 ms.
 //! - FW-E2E-093 (both): streaming. Server-sent events through an inspected host with a brokered
 //!   credential, so through the reflection guard, reach the client within 20 ms of the fixture
 //!   writing them -- decided on the 99th percentile of the events' delays.
@@ -90,7 +90,7 @@ async fn fw_e2e_096_latency_budget() {
 
     let mut report = Vec::new();
 
-    // Tunnel grade: a new connection each time, to the first response byte.
+    // Tunnel view: a new connection each time, to the first response byte.
     let (tunnel_proxy, _) = Session::new(
         &[format!("tunnel:tunnel.test:{}", up.port)],
         resolver(&[("tunnel.test", "127.0.0.1")]),
@@ -112,7 +112,7 @@ async fn fw_e2e_096_latency_budget() {
     );
     drop(tunnel);
 
-    // Inspected grade: one client connection each way, reused for every request.
+    // Inspected view: one client connection each way, reused for every request.
     let mut session = Session::new(
         &[format!("allow:api.test:{}", up.port)],
         resolver(&[("api.test", "127.0.0.1")]),
@@ -141,7 +141,7 @@ async fn fw_e2e_096_latency_budget() {
     );
     drop(reused);
 
-    // Inspected grade: the first connection to a host, its leaf minted on the way.
+    // Inspected view: the first connection to a host, its leaf minted on the way.
     let mut first = InspectedFirst {
         hosts: first_hosts,
         port: up.port,
@@ -398,7 +398,7 @@ async fn measure<P: Pair>(name: &str, target_us: f64, pair: &mut P, cal: &mut Ca
     }
 }
 
-/// The tunnel grade: a new connection to the first response byte, direct and through the Gateway.
+/// The tunnel view: a new connection to the first response byte, direct and through the Gateway.
 struct TunnelNew {
     proxy: EgressProxy,
     port: u16,
@@ -425,7 +425,7 @@ impl Pair for TunnelNew {
     }
 }
 
-/// The inspected grade on reused connections: one request and its whole response.
+/// The inspected view on reused connections: one request and its whole response.
 struct InspectedReused {
     _proxy: EgressProxy,
     request: String,
@@ -451,7 +451,7 @@ impl Pair for InspectedReused {
     }
 }
 
-/// The inspected grade's first connection to a host: a session serves each of its hosts once, so
+/// The inspected view's first connection to a host: a session serves each of its hosts once, so
 /// every sample through the Gateway mints a leaf and opens its upstream connection.
 struct InspectedFirst {
     hosts: Vec<String>,

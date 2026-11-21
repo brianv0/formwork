@@ -142,7 +142,7 @@ impl SessionCa {
     }
 
     /// The bundle confined clients trust: this CA first, then `roots` (the host's, from
-    /// [`native_roots`]), so a tunnel-grade host still verifies for a client that reads only the
+    /// [`native_roots`]), so a tunnel-view host still verifies for a client that reads only the
     /// bundle.
     pub fn trust_bundle(&self, roots: &[CertificateDer<'_>]) -> String {
         let mut out = self.cert_pem();

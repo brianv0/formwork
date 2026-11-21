@@ -312,7 +312,7 @@ fn fw_e2e_094_client_matrix() {
     ];
     let mut matrix = Vec::new();
     let mut mismatches = Vec::new();
-    for (grade, host, fixture) in [
+    for (view, host, fixture) in [
         ("inspected", "inspected.test", &inspected),
         ("tunnel", "tunnel.test", &tunneled),
     ] {
@@ -323,10 +323,10 @@ fn fw_e2e_094_client_matrix() {
                 _ => true,
             };
             if !on_path(tool) || !built || (client == "python-requests" && !requests_present) {
-                matrix.push(format!("{client:16} {grade:9} absent"));
+                matrix.push(format!("{client:16} {view:9} absent"));
                 continue;
             }
-            let path = format!("/{grade}/{client}");
+            let path = format!("/{view}/{client}");
             let url = format!("https://{host}:{}{path}", fixture.port);
             let run_row = || {
                 formwork_env(
@@ -368,7 +368,7 @@ fn fw_e2e_094_client_matrix() {
                     .is_empty()
                     {
                         eprintln!(
-                            "{client} ({grade}): Seatbelt refused the session's own Gateway port \
+                            "{client} ({view}): Seatbelt refused the session's own Gateway port \
                              {port} (the macOS 14 loopback window); the row runs once more"
                         );
                         row_started = std::time::Instant::now();
@@ -403,7 +403,7 @@ fn fw_e2e_094_client_matrix() {
                 format!("  ({})", last.chars().take(140).collect::<String>())
             };
             matrix.push(format!(
-                "{client:16} {grade:9} {}{why}",
+                "{client:16} {view:9} {}{why}",
                 if reached { "reached" } else { "refused" }
             ));
             // Go and rustup verify through the platform on macOS and ignore the trust variables:
@@ -422,7 +422,7 @@ fn fw_e2e_094_client_matrix() {
                         Vec::new()
                     };
                     mismatches.push(format!(
-                        "{client} ({grade}): expected {}, got {}\n{}\n{}\nSandbox network records: \
+                        "{client} ({view}): expected {}, got {}\n{}\n{}\nSandbox network records: \
                          {records:#?}",
                         if expected { "reached" } else { "refused" },
                         if reached { "reached" } else { "refused" },
@@ -431,7 +431,7 @@ fn fw_e2e_094_client_matrix() {
                     ));
                 }
             } else {
-                eprintln!("{client} ({grade}) output:\n{}", out.stdout);
+                eprintln!("{client} ({view}) output:\n{}", out.stdout);
             }
         }
     }

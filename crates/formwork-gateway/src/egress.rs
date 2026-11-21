@@ -9,7 +9,7 @@
 //! 3. the host decision -- not listed, denied, tunnel or inspected;
 //! 4. the destination: one resolution, every address classified, only admitted addresses dialed
 //!    (FW-EGR17-19);
-//! 5. the grade: a tunnel forwards TLS after its ClientHello's server name matches the CONNECT host
+//! 5. the view: a tunnel forwards TLS after its ClientHello's server name matches the CONNECT host
 //!    (FW-EGR16); an inspected host is terminated and each request decided (`inspect`).
 //!
 //! Every refusal is one violation record with a reason from a closed set (FW-FID12) and one
@@ -137,7 +137,7 @@ pub struct Grant {
     pub host: String,
     pub port: u16,
     /// `tunnel` or `inspected`.
-    pub grade: &'static str,
+    pub view: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -451,7 +451,7 @@ impl Shared {
         tracing::debug!(
             host = %g.host,
             port = g.port,
-            grade = g.grade,
+            view = g.view,
             method = g.method.as_deref().unwrap_or("-"),
             path = g.path.as_deref().unwrap_or("-"),
             status = g.status.unwrap_or(0),
@@ -640,7 +640,7 @@ async fn serve_connect(
     }
 }
 
-/// The tunnel grade (FW-EGR16): the ClientHello's server name must be the CONNECT host before a
+/// The tunnel view (FW-EGR16): the ClientHello's server name must be the CONNECT host before a
 /// byte goes upstream; then bytes are copied until either side closes.
 async fn tunnel(
     mut client: Buffered<TcpStream>,
@@ -674,7 +674,7 @@ async fn tunnel(
     shared.grant(Grant {
         host: host.to_string(),
         port,
-        grade: "tunnel",
+        view: "tunnel",
         method: None,
         path: None,
         status: None,

@@ -86,10 +86,10 @@ rules = ["readwrite:$CWD/**", "allow:api.anthropic.com"] # this host only, throu
 allow-credentials = ["broker:anthropic"]                 # the agent sees a placeholder, never the key
 ```
 
-Host rules come in two grades. `allow:host`, and method rules such as
-`get,post:api.github.com/repos/acme/**`, are *inspected*: the Gateway terminates TLS with a
-per-session CA, held in memory and limited to the hosts you named, and checks each request's host,
-method and path; Formwork points common clients (curl, git, Python, Node, npm, pip, uv, cargo) at
+Host rules come in two views, by how much of a connection the Gateway sees. `allow:host`, and
+method rules such as `get,post:api.github.com/repos/acme/**`, are *inspected*: the Gateway
+terminates TLS with a per-session CA, held in memory and limited to the hosts you named, and
+checks each request's host, method and path; Formwork points common clients (curl, git, Python, Node, npm, pip, uv, cargo) at
 that CA. `tunnel:host` forwards the client's own TLS unopened after checking the server name — for
 clients that cannot trust an added CA, such as Go programs and rustup on macOS. Inspected hosts
 speak HTTP/1.1. Private and loopback addresses are reached only through a rule naming the exact

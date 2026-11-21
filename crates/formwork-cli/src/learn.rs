@@ -656,7 +656,7 @@ pub fn conclude_learning_run(
         );
     }
 
-    // FW-DISC12: hosts at the grade the host already has; restricted destinations withheld.
+    // FW-DISC12: hosts at the view the host already has; restricted destinations withheld.
     let egress = propose_host_rules(&observations.egress, blueprint.net.host_table());
     for (target, why) in egress.withheld.iter().chain(observations.withheld.iter()) {
         tracing::info!(target = %target, "learning: withheld, not proposed (FW-DISC12): {why}");
@@ -666,7 +666,7 @@ pub fn conclude_learning_run(
             rule = %rule,
             "learning: a client rejected the session CA; to serve it, replace the host's \
              inspected rule with `{rule}`, which drops its method, path and Host checks and its \
-             brokering (not proposed: the grade drop is an authoring decision)"
+             brokering (not proposed: the view drop is an authoring decision)"
         );
     }
     let observed_channels: Vec<Channel> = observations
